@@ -1,0 +1,46 @@
+{
+  "name": "agent-relay",
+  "version": "0.1.0",
+  "description": "Local desktop orchestrator that relays a task between Codex (specification + review) and Claude Code (implementation) inside an isolated Git worktree.",
+  "private": true,
+  "type": "module",
+  "author": "Agent Relay",
+  "license": "UNLICENSED",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "node scripts/launch.mjs dev",
+    "start": "node scripts/launch.mjs preview",
+    "build": "electron-vite build",
+    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "npm run lint && npm run typecheck && npm run test && npm run build"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "^0.147.0",
+    "execa": "^10.0.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.1",
+    "@vitejs/plugin-react": "^5.0.4",
+    "electron": "^43.3.0",
+    "electron-vite": "^5.0.0",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "globals": "^16.5.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.4",
+    "vite": "^7.1.14",
+    "vitest": "^4.1.10"
+  }
+}

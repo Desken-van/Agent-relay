@@ -1,0 +1,19 @@
+node_modules/
+out/
+dist/
+release/
+.vite/
+
+# Visual Studio local workspace state and Copilot indexes
+.vs/
+*.log
+.DS_Store
+Thumbs.db
+
+# Local environment overrides — never commit real values.
+.env
+.env.local
+
+# Vitest / TS build info
+*.tsbuildinfo
+coverage/

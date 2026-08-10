@@ -1,0 +1,791 @@
+/**
+ * The relay loop.
+ *
+ * Codex specifies -> the user approves -> an isolated worktree is created ->
+ * Claude implements -> Agent Relay collects the evidence -> Codex reviews it in
+ * read-only mode -> either it approves, or its follow-up goes back to the *same*
+ * Claude session for another round.
+ *
+ * Three properties are enforced here rather than hoped for:
+ *
+ *  * **Termination.** A correction round can only start while
+ *    `currentRound < maxRounds`; the check lives in {@link decideReviewOutcome}
+ *    and is applied the moment a review returns.
+ *  * **One run at a time per task.** A task with a live AbortController refuses
+ *    to start another operation, so two Claude sessions can never edit the same
+ *    worktree concurrently.
+ *  * **Nothing is published here.** This class never commits, pushes, or talks
+ *    to GitHub. That lives in the publish service, behind an approval.
+ */
+
+import { AgentRelayError, InvalidTransitionError } from '../../shared/domain/errors';
+import type { GitChangeSet } from '../../shared/domain/git';
+import type { Project, Settings, Task } from '../../shared/domain/models';
+import {
+  decideReviewOutcome,
+  isBusy,
+  transition,
+  type TaskStatus,
+  type WorkflowEvent
+} from '../../shared/domain/workflow';
+import {
+  codexReviewResultSchema,
+  taskSpecificationSchema,
+  type CodexReviewResult,
+  type TaskSpecification
+} from '../../shared/schemas/codex';
+import { buildBranchName, buildWorktreeDirName, isValidBranchName } from '../../shared/util/slug';
+import { buildCorrectionPrompt, buildImplementationPrompt } from '../adapters/codex/prompts';
+import type {
+  ClaudeAdapter,
+  Clock,
+  CodexAdapter,
+  EventPublisher,
+  GitAdapter,
+  IdGenerator,
+  ProjectRepository,
+  RunEventRepository,
+  RunRepository,
+  SettingsRepository,
+  TaskRepository
+} from '../ports';
+import { assertSafeWorktreePath, isSamePath } from './path-safety';
+import { RunRecorder } from './run-recorder';
+import { join } from 'node:path';
+
+export interface OrchestratorDeps {
+  readonly projects: ProjectRepository;
+  readonly tasks: TaskRepository;
+  readonly runs: RunRepository;
+  readonly runEvents: RunEventRepository;
+  readonly settings: SettingsRepository;
+  readonly codex: CodexAdapter;
+  readonly claude: ClaudeAdapter;
+  readonly git: GitAdapter;
+  readonly clock: Clock;
+  readonly ids: IdGenerator;
+  readonly events: EventPublisher;
+}
+
+export class Orchestrator {
+  /** Live cancellation handles, keyed by task id. Presence == a run in flight. */
+  private readonly inFlight = new Map<string, AbortController>();
+
+  constructor(private readonly deps: OrchestratorDeps) {}
+
+  /* ------------------------------------------------------------------ */
+  /* Shared plumbing                                                     */
+  /* ------------------------------------------------------------------ */
+
+  private requireTask(taskId: string): Task {
+    const task = this.deps.tasks.findById(taskId);
+    if (!task) throw new AgentRelayError('NOT_FOUND', `No task with id ${taskId}.`);
+    return task;
+  }
+
+  private requireProject(projectId: string): Project {
+    const project = this.deps.projects.findById(projectId);
+    if (!project) throw new AgentRelayError('NOT_FOUND', `No project with id ${projectId}.`);
+    return project;
+  }
+
+  private recorder(settings: Settings): RunRecorder {
+    return new RunRecorder(
+      this.deps.runs,
+      this.deps.runEvents,
+      this.deps.clock,
+      this.deps.ids,
+      this.deps.events,
+      settings.maxStoredLogBytes
+    );
+  }
+
+  private applyEvent(task: Task, event: WorkflowEvent, patch: Partial<Task> = {}): Task {
+    const status: TaskStatus = transition(task.status, event);
+    const updated = this.deps.tasks.update(task.id, { ...patch, status });
+    this.deps.events.publishTask(updated);
+    return updated;
+  }
+
+  private patchTask(taskId: string, patch: Partial<Task>): Task {
+    const updated = this.deps.tasks.update(taskId, patch);
+    this.deps.events.publishTask(updated);
+    return updated;
+  }
+
+  private beginExclusive(taskId: string): AbortController {
+    if (this.inFlight.has(taskId)) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'This task already has an agent running. Stop it before starting another operation.'
+      );
+    }
+    const controller = new AbortController();
+    this.inFlight.set(taskId, controller);
+    return controller;
+  }
+
+  private endExclusive(taskId: string): void {
+    this.inFlight.delete(taskId);
+  }
+
+  isRunning(taskId: string): boolean {
+    return this.inFlight.has(taskId);
+  }
+
+  /**
+   * Decide which workflow event a failure maps to.
+   * Cancellations are terminal; everything else returns to a retryable state.
+   */
+  private failureEvent(
+    error: unknown,
+    recoverable: WorkflowEvent,
+    fatal: WorkflowEvent
+  ): WorkflowEvent {
+    if (error instanceof AgentRelayError && error.code === 'CANCELLED') return 'cancelled';
+    // A transition error means our own state assumptions were wrong: fail hard
+    // rather than pretending the operation can be retried.
+    if (error instanceof InvalidTransitionError) return fatal;
+    return recoverable;
+  }
+
+  private static describeError(error: unknown): string {
+    if (error instanceof AgentRelayError) {
+      return error.remediation ? `${error.message} — ${error.remediation}` : error.message;
+    }
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 1. Specification                                                    */
+  /* ------------------------------------------------------------------ */
+
+  async generateSpecification(taskId: string): Promise<Task> {
+    let task = this.requireTask(taskId);
+    const project = this.requireProject(task.projectId);
+    const settings = this.deps.settings.get();
+
+    // DRAFT on the first attempt, READY_FOR_IMPLEMENTATION when regenerating.
+    const startEvent: WorkflowEvent =
+      task.status === 'READY_FOR_IMPLEMENTATION' ? 'specification_retry' : 'specification_started';
+
+    const controller = this.beginExclusive(taskId);
+    const handle = this.recorder(settings).start({
+      taskId,
+      agent: 'codex',
+      runType: 'specification',
+      round: task.currentRound
+    });
+
+    try {
+      task = this.applyEvent(task, startEvent, { lastError: null });
+
+      const result = await this.deps.codex.createSpecification(
+        {
+          projectPath: project.localPath,
+          taskTitle: task.title,
+          originalRequest: task.originalRequest,
+          threadId: task.codexThreadId
+        },
+        {
+          signal: controller.signal,
+          timeoutMs: settings.processTimeoutMs,
+          onProgress: (event) => handle.append(event)
+        }
+      );
+
+      handle.finish({
+        status: 'succeeded',
+        finalMessage: result.specification.summary,
+        structuredResult: result.specification
+      });
+
+      return this.applyEvent(task, 'specification_completed', {
+        codexThreadId: result.threadId ?? task.codexThreadId,
+        specificationJson: JSON.stringify(result.specification),
+        // Regenerating invalidates a previous approval — the user must look again.
+        specificationApprovedAt: null,
+        title: result.specification.title || task.title,
+        lastError: null
+      });
+    } catch (error) {
+      const message = Orchestrator.describeError(error);
+      handle.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: message });
+      this.applyEvent(this.requireTask(taskId), this.failureEvent(error, 'specification_aborted', 'specification_failed'), {
+        lastError: message
+      });
+      throw error;
+    } finally {
+      this.endExclusive(taskId);
+    }
+  }
+
+  /**
+   * Record the user's explicit acceptance of the specification.
+   * Nothing may be sent to Claude until this has happened.
+   */
+  approveSpecification(taskId: string): Task {
+    const task = this.requireTask(taskId);
+
+    if (task.status !== 'READY_FOR_IMPLEMENTATION') {
+      throw new InvalidTransitionError(task.status, 'approve_specification');
+    }
+    if (!task.specificationJson) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'There is no specification to approve yet. Generate one first.'
+      );
+    }
+
+    return this.patchTask(taskId, { specificationApprovedAt: this.deps.clock.nowIso() });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 2. Isolation: branch + worktree                                     */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Create the task's dedicated branch and worktree, if it does not have one.
+   *
+   * Refuses when: the project is not a Git repository, the base branch is
+   * missing, the working tree is dirty and the user has not accepted that, the
+   * computed path is unsafe, or another live task already owns the directory.
+   */
+  private async ensureWorktree(
+    task: Task,
+    project: Project,
+    settings: Settings,
+    options: { acceptDirtyWorkingTree: boolean }
+  ): Promise<Task> {
+    if (task.worktreePath && task.branchName) {
+      return task;
+    }
+
+    const handle = this.recorder(settings).start({
+      taskId: task.id,
+      agent: 'system',
+      runType: 'git',
+      round: task.currentRound
+    });
+
+    try {
+      handle.append({ type: 'started', text: `Inspecting ${project.localPath}` });
+
+      const info = await this.deps.git.inspect(project.localPath);
+      if (!info.isRepository) {
+        throw new AgentRelayError(
+          'GIT_FAILED',
+          `${project.localPath} is not a Git repository.`,
+          { remediation: 'Initialise Git for this project first, or register a different folder.' }
+        );
+      }
+
+      const baseBranch = project.defaultBranch;
+      if (!(await this.deps.git.branchExists(project.localPath, baseBranch))) {
+        throw new AgentRelayError(
+          'GIT_FAILED',
+          `The project's base branch "${baseBranch}" does not exist in ${project.localPath}.`,
+          {
+            details: `Available branches: ${info.branches.join(', ') || '(none)'}`,
+            remediation: 'Update the project settings to point at a branch that exists.'
+          }
+        );
+      }
+
+      if (!info.isClean && !options.acceptDirtyWorkingTree) {
+        throw new AgentRelayError(
+          'GIT_DIRTY',
+          `${project.localPath} has uncommitted changes.`,
+          {
+            details: info.dirtyFiles.slice(0, 20).join('\n'),
+            remediation:
+              'Commit or stash them, or re-run and explicitly accept the dirty working tree. Agent Relay works in a separate worktree, so your changes are not touched — but the branch you are cutting from will not include them.'
+          }
+        );
+      }
+
+      const branchName = buildBranchName(task.id, task.title);
+      if (!isValidBranchName(branchName)) {
+        throw new AgentRelayError('VALIDATION_FAILED', `Computed an invalid branch name: ${branchName}`);
+      }
+
+      const worktreePath = join(settings.worktreesRoot, buildWorktreeDirName(task.id, task.title));
+
+      // Hard path checks before anything is created on disk.
+      assertSafeWorktreePath({
+        worktreePath,
+        worktreesRoot: settings.worktreesRoot,
+        repositoryPath: info.root ?? project.localPath
+      });
+
+      // No two live tasks may share a worktree.
+      const conflict = this.deps.tasks
+        .listActiveWorktreePaths()
+        .find((entry) => entry.taskId !== task.id && isSamePath(entry.worktreePath, worktreePath));
+      if (conflict) {
+        throw new AgentRelayError(
+          'WORKTREE_CONFLICT',
+          `Task ${conflict.taskId} is already using that worktree directory.`,
+          { details: worktreePath }
+        );
+      }
+
+      handle.append({
+        type: 'log',
+        text: `Creating branch ${branchName} from ${baseBranch} at ${worktreePath}`
+      });
+
+      const worktree = await this.deps.git.createWorktree({
+        repositoryPath: info.root ?? project.localPath,
+        baseBranch,
+        branchName,
+        worktreePath
+      });
+
+      handle.append({ type: 'log', text: `Worktree ready at ${worktree.path}` });
+      handle.finish({
+        status: 'succeeded',
+        finalMessage: `Created ${branchName} in ${worktree.path}`,
+        structuredResult: { branchName, worktreePath: worktree.path, baseBranch }
+      });
+
+      return this.patchTask(task.id, {
+        branchName,
+        worktreePath: worktree.path,
+        baseBranch
+      });
+    } catch (error) {
+      const message = Orchestrator.describeError(error);
+      handle.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: message });
+      throw error;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 3. Implementation                                                   */
+  /* ------------------------------------------------------------------ */
+
+  async sendToClaude(taskId: string, options: { acceptDirtyWorkingTree?: boolean } = {}): Promise<Task> {
+    let task = this.requireTask(taskId);
+    const project = this.requireProject(task.projectId);
+    const settings = this.deps.settings.get();
+
+    if (task.status !== 'READY_FOR_IMPLEMENTATION') {
+      throw new InvalidTransitionError(task.status, 'implementation_started');
+    }
+    if (!task.specificationApprovedAt) {
+      throw new AgentRelayError(
+        'APPROVAL_REQUIRED',
+        'The specification has not been approved yet.',
+        { remediation: 'Review the specification and choose "Approve specification" first.' }
+      );
+    }
+
+    const specification = readSpecification(task);
+
+    const controller = this.beginExclusive(taskId);
+    try {
+      // Worktree creation happens before the state moves to IMPLEMENTING, so a
+      // Git failure leaves the task retryable rather than stuck.
+      task = await this.ensureWorktree(task, project, settings, {
+        acceptDirtyWorkingTree: options.acceptDirtyWorkingTree ?? false
+      });
+
+      const worktreePath = task.worktreePath;
+      const branchName = task.branchName;
+      if (!worktreePath || !branchName) {
+        throw new AgentRelayError('INTERNAL', 'The task has no worktree after creation.');
+      }
+
+      task = this.applyEvent(task, 'implementation_started', {
+        currentRound: 1,
+        lastError: null
+      });
+
+      const prompt = buildImplementationPrompt({
+        specification,
+        worktreePath,
+        branchName,
+        originalRequest: task.originalRequest
+      });
+
+      return await this.runClaude(task, settings, controller, prompt, {
+        runType: 'implementation',
+        recoverableFailure: 'implementation_aborted'
+      });
+    } catch (error) {
+      this.recordFailureIfStillRunning(taskId, error, 'implementation_aborted');
+      throw error;
+    } finally {
+      this.endExclusive(taskId);
+    }
+  }
+
+  async sendCorrections(taskId: string): Promise<Task> {
+    let task = this.requireTask(taskId);
+    const settings = this.deps.settings.get();
+
+    if (task.status !== 'CHANGES_REQUESTED') {
+      throw new InvalidTransitionError(task.status, 'corrections_sent');
+    }
+
+    // The round budget is the reason this loop terminates. Re-check it here as
+    // well as at review time, because this entry point is reachable from the UI.
+    if (task.currentRound >= task.maxRounds) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        `This task has already used its ${task.maxRounds} review round(s).`,
+        { remediation: 'Raise the maximum for new tasks in Settings, or finish this one manually.' }
+      );
+    }
+
+    const review = readReview(task);
+    if (!review) {
+      throw new AgentRelayError('VALIDATION_FAILED', 'There is no review to send corrections from.');
+    }
+    if (!task.worktreePath || !task.branchName) {
+      throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to work in.');
+    }
+
+    const controller = this.beginExclusive(taskId);
+    try {
+      const nextRound = task.currentRound + 1;
+      task = this.applyEvent(task, 'corrections_sent', {
+        currentRound: nextRound,
+        lastError: null
+      });
+
+      const prompt = buildCorrectionPrompt({
+        review,
+        round: nextRound,
+        maxRounds: task.maxRounds
+      });
+
+      return await this.runClaude(task, settings, controller, prompt, {
+        runType: 'correction',
+        recoverableFailure: 'correction_aborted'
+      });
+    } catch (error) {
+      this.recordFailureIfStillRunning(taskId, error, 'correction_aborted');
+      throw error;
+    } finally {
+      this.endExclusive(taskId);
+    }
+  }
+
+  /** Shared body of the first implementation round and every correction round. */
+  private async runClaude(
+    task: Task,
+    settings: Settings,
+    controller: AbortController,
+    prompt: string,
+    options: { runType: 'implementation' | 'correction'; recoverableFailure: WorkflowEvent }
+  ): Promise<Task> {
+    const worktreePath = task.worktreePath;
+    const branchName = task.branchName;
+    if (!worktreePath || !branchName) {
+      throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to work in.');
+    }
+
+    // Re-validate the path every round: settings could have changed, or the
+    // directory could have been moved between rounds.
+    const project = this.requireProject(task.projectId);
+    assertSafeWorktreePath({
+      worktreePath,
+      worktreesRoot: settings.worktreesRoot,
+      repositoryPath: project.localPath
+    });
+
+    const handle = this.recorder(settings).start({
+      taskId: task.id,
+      agent: 'claude',
+      runType: options.runType,
+      round: task.currentRound
+    });
+
+    try {
+      const result = await this.deps.claude.run(
+        {
+          worktreePath,
+          branchName,
+          prompt,
+          // Resuming keeps every correction round inside one conversation.
+          sessionId: task.claudeSessionId,
+          maxTurns: settings.claudeMaxTurns
+        },
+        {
+          signal: controller.signal,
+          timeoutMs: settings.processTimeoutMs,
+          onProgress: (event) => handle.append(event)
+        }
+      );
+
+      handle.finish({
+        status: result.isError ? 'failed' : 'succeeded',
+        finalMessage: result.finalMessage,
+        structuredResult: { numTurns: result.numTurns, sessionId: result.sessionId }
+      });
+
+      if (result.isError) {
+        const message = result.finalMessage || 'Claude reported an error.';
+        return this.applyEvent(this.requireTask(task.id), options.recoverableFailure, {
+          claudeSessionId: result.sessionId ?? task.claudeSessionId,
+          lastError: message
+        });
+      }
+
+      return this.applyEvent(this.requireTask(task.id), 'implementation_completed', {
+        claudeSessionId: result.sessionId ?? task.claudeSessionId,
+        lastError: null
+      });
+    } catch (error) {
+      const message = Orchestrator.describeError(error);
+      handle.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: message });
+      this.applyEvent(
+        this.requireTask(task.id),
+        this.failureEvent(error, options.recoverableFailure, 'implementation_failed'),
+        { lastError: message }
+      );
+      throw error;
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 4. Review                                                           */
+  /* ------------------------------------------------------------------ */
+
+  async reviewWithCodex(taskId: string): Promise<Task> {
+    let task = this.requireTask(taskId);
+    const settings = this.deps.settings.get();
+
+    if (task.status !== 'READY_FOR_REVIEW') {
+      throw new InvalidTransitionError(task.status, 'review_started');
+    }
+
+    const specification = readSpecification(task);
+    const worktreePath = task.worktreePath;
+    const baseBranch = task.baseBranch;
+    if (!worktreePath || !baseBranch) {
+      throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to review.');
+    }
+
+    const controller = this.beginExclusive(taskId);
+    const handle = this.recorder(settings).start({
+      taskId,
+      agent: 'codex',
+      runType: 'review',
+      round: task.currentRound
+    });
+
+    try {
+      task = this.applyEvent(task, 'review_started', { lastError: null });
+
+      handle.append({ type: 'log', text: 'Collecting Git changes from the worktree…' });
+      const changes = await this.deps.git.collectChanges(worktreePath, baseBranch, {
+        maxDiffBytes: settings.maxDiffBytes
+      });
+      handle.append({
+        type: 'log',
+        text: `${changes.changedFiles.length} changed file(s), ${changes.diffBytes} diff characters${changes.diffTruncated ? ' (truncated for review)' : ''}.`,
+        data: { changedFiles: changes.changedFiles.length, diffBytes: changes.diffBytes }
+      });
+
+      const claudeReport = this.deps.runs.findLatestByType(taskId, 'correction')?.finalMessage
+        ?? this.deps.runs.findLatestByType(taskId, 'implementation')?.finalMessage
+        ?? '';
+
+      const outcome = await this.deps.codex.reviewImplementation(
+        {
+          worktreePath,
+          threadId: task.codexThreadId,
+          specification,
+          changes,
+          claudeReport,
+          testOutput: extractTestOutput(claudeReport),
+          round: task.currentRound,
+          maxRounds: task.maxRounds
+        },
+        {
+          signal: controller.signal,
+          timeoutMs: settings.processTimeoutMs,
+          onProgress: (event) => handle.append(event)
+        }
+      );
+
+      handle.finish({
+        status: 'succeeded',
+        finalMessage: outcome.review.summary,
+        structuredResult: outcome.review
+      });
+
+      return this.applyReviewOutcome(taskId, outcome.review, outcome.threadId, settings);
+    } catch (error) {
+      const message = Orchestrator.describeError(error);
+      handle.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: message });
+      this.applyEvent(this.requireTask(taskId), this.failureEvent(error, 'review_aborted', 'review_failed'), {
+        lastError: message
+      });
+      throw error;
+    } finally {
+      this.endExclusive(taskId);
+    }
+  }
+
+  /**
+   * Turn a Codex verdict into a state change, applying the round budget.
+   *
+   * This is where the loop is guaranteed to end: when the budget is exhausted
+   * the task is moved to FAILED with an explanatory message instead of being
+   * left in a state from which another Claude round could start.
+   */
+  private applyReviewOutcome(
+    taskId: string,
+    review: CodexReviewResult,
+    threadId: string | null,
+    _settings: Settings
+  ): Task {
+    const task = this.requireTask(taskId);
+    const decision = decideReviewOutcome(review.verdict, task.currentRound, task.maxRounds);
+
+    const updated = this.applyEvent(task, decision.event, {
+      codexThreadId: threadId ?? task.codexThreadId,
+      lastReviewJson: JSON.stringify(review),
+      lastError: decision.haltReason ?? null
+    });
+
+    if (decision.haltReason) {
+      return this.applyEvent(updated, 'max_rounds_reached', { lastError: decision.haltReason });
+    }
+
+    return updated;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 5. Control                                                          */
+  /* ------------------------------------------------------------------ */
+
+  /** Approve the finished work for publishing. Does not publish anything. */
+  approveForPublishing(taskId: string): Task {
+    const task = this.requireTask(taskId);
+    return this.applyEvent(task, 'publish_approved');
+  }
+
+  /**
+   * Stop the task. Aborts any in-flight agent process and moves the task to
+   * CANCELLED — one of the three ways the relay loop is allowed to end.
+   */
+  stop(taskId: string): Task {
+    const task = this.requireTask(taskId);
+    const controller = this.inFlight.get(taskId);
+
+    if (controller) {
+      controller.abort();
+      // The in-flight operation's own catch block writes the CANCELLED state and
+      // closes its run record; returning the current task avoids racing it.
+      return task;
+    }
+
+    return this.applyEvent(task, 'cancelled', { lastError: 'Stopped by the user.' });
+  }
+
+  async collectChanges(taskId: string): Promise<GitChangeSet> {
+    const task = this.requireTask(taskId);
+    const settings = this.deps.settings.get();
+
+    if (!task.worktreePath || !task.baseBranch) {
+      throw new AgentRelayError('WORKTREE_INVALID', 'This task does not have a worktree yet.');
+    }
+
+    const project = this.requireProject(task.projectId);
+    assertSafeWorktreePath({
+      worktreePath: task.worktreePath,
+      worktreesRoot: settings.worktreesRoot,
+      repositoryPath: project.localPath
+    });
+
+    return this.deps.git.collectChanges(task.worktreePath, task.baseBranch, {
+      maxDiffBytes: settings.maxDiffBytes
+    });
+  }
+
+  /**
+   * If an error escaped before the inner handler could record it, make sure the
+   * task does not stay stuck in a busy state.
+   */
+  private recordFailureIfStillRunning(
+    taskId: string,
+    error: unknown,
+    recoverable: WorkflowEvent
+  ): void {
+    const task = this.deps.tasks.findById(taskId);
+    if (!task || !isBusy(task.status)) return;
+
+    try {
+      this.applyEvent(task, this.failureEvent(error, recoverable, 'implementation_failed'), {
+        lastError: Orchestrator.describeError(error)
+      });
+    } catch {
+      // The inner handler already moved the task; nothing further to do.
+    }
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                     */
+/* -------------------------------------------------------------------------- */
+
+function isCancelled(error: unknown): boolean {
+  return error instanceof AgentRelayError && error.code === 'CANCELLED';
+}
+
+export function readSpecification(task: Task): TaskSpecification {
+  if (!task.specificationJson) {
+    throw new AgentRelayError('VALIDATION_FAILED', 'This task has no specification yet.');
+  }
+  try {
+    return taskSpecificationSchema.parse(JSON.parse(task.specificationJson));
+  } catch (error) {
+    throw new AgentRelayError('PARSE_FAILED', 'The stored specification could not be read.', {
+      details: error instanceof Error ? error.message : String(error),
+      remediation: 'Generate the specification again.'
+    });
+  }
+}
+
+export function readReview(task: Task): CodexReviewResult | null {
+  if (!task.lastReviewJson) return null;
+  const parsed = codexReviewResultSchema.safeParse(JSON.parse(task.lastReviewJson));
+  return parsed.success ? parsed.data : null;
+}
+
+/**
+ * Pull test output out of Claude's report.
+ *
+ * Agent Relay does not run the project's test suite itself — it has no reliable
+ * way to know the command, and running arbitrary project scripts is exactly the
+ * kind of thing that should stay under the agent's (sandboxed) control. Claude
+ * is instructed to run the tests and paste the meaningful output, so what we do
+ * here is lift the fenced blocks that look like command output and hand them to
+ * the reviewer separately from the prose.
+ */
+export function extractTestOutput(report: string): string {
+  if (!report) return '';
+
+  const blocks: string[] = [];
+  const fence = /```[a-zA-Z0-9_-]*\n([\s\S]*?)```/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = fence.exec(report)) !== null) {
+    const body = match[1]?.trim();
+    if (!body) continue;
+    if (
+      /\b(pass(ed|ing)?|fail(ed|ing)?|error|test|spec|suite|assert|✓|✗|npm run|npm test|pytest|vitest|jest|cargo test|go test|dotnet test)\b/i.test(
+        body
+      )
+    ) {
+      blocks.push(body);
+    }
+  }
+
+  return blocks.join('\n\n---\n\n');
+}
