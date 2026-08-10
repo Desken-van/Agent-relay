@@ -5,18 +5,40 @@
  *
  *   claude --print
  *          --output-format stream-json --verbose
+ *          --setting-sources project
  *          --permission-mode acceptEdits
  *          --max-turns <n>
  *          [--resume <session-id>]
+ *          [--allowedTools <rule> …]
+ *          --disallowedTools <rule> …
  *
  * with the prompt written to **stdin**, never onto the command line. Two reasons:
  * a specification plus a review follow-up routinely exceeds the ~32 KB Windows
  * command-line limit, and keeping model-authored text out of argv removes any
  * question of argument injection.
  *
- * `--dangerously-skip-permissions` is deliberately never used. `acceptEdits` is
- * the supported way to let Claude write files unattended while still refusing
- * the operations that flag would unlock.
+ * Three deliberate choices about permissions. What each one actually does is
+ * narrower than it sounds, so be precise about it:
+ *
+ *  * `--setting-sources project` excludes the operator's *user* and *local*
+ *    settings — personal permission rules, plugins, hooks and MCP servers from
+ *    unrelated work — which otherwise make the same task behave differently on
+ *    two machines. The **target repository's own project settings still load**,
+ *    and may add permissions or hooks of their own.
+ *  * `--allowedTools` **pre-approves** matching tool calls, so they run without
+ *    a prompt. It is not an exclusive allowlist: a call that matches nothing
+ *    here is not thereby refused, it falls through to the permission mode and
+ *    the project's settings. Under `acceptEdits` that means file edits proceed,
+ *    some read-only commands may be approved automatically, and whatever is
+ *    left needs an answer nobody is there to give — which is what produces the
+ *    denials handled below.
+ *  * `--disallowedTools` refuses tool calls that **directly match** its
+ *    patterns, and cannot be loosened by project settings. It is a
+ *    command-pattern filter, not a sandbox: the same operation reached
+ *    indirectly — a project script, a task runner wrapping git — does not match
+ *    and is not caught.
+ *
+ * `--dangerously-skip-permissions` is deliberately never used.
  */
 
 import { existsSync } from 'node:fs';
@@ -32,11 +54,58 @@ import type {
 } from '../../ports';
 import { locateExecutable, configuredPathIsBroken } from '../process/executable-locator';
 import type { ProcessRunner } from '../process/process-runner';
-import { consumeLine, createStreamState, finalizeState } from './stream-parser';
+import { consumeLine, createStreamState, describeDenials, finalizeState } from './stream-parser';
 
 export interface ClaudeAdapterOptions {
   readonly configuredPath?: string | null;
   readonly model?: string | null;
+  /**
+   * Permission rules granted for this run, from Settings. Empty means "grant
+   * nothing beyond edits", not "grant everything".
+   */
+  readonly allowedTools?: readonly string[];
+}
+
+/**
+ * Commands Agent Relay refuses when a tool call names them directly, whatever
+ * the project settings say. These are the operations the application reserves
+ * for its own confirmation dialog, plus the Git commands that could move work
+ * out of the worktree the task is isolated in.
+ *
+ * Direct invocation is the limit of what pattern matching can see; a script that
+ * wraps one of these is not matched.
+ */
+const DESTRUCTIVE_COMMANDS = [
+  'git commit',
+  'git push',
+  'git reset',
+  'git clean',
+  'git checkout',
+  'git switch',
+  'git merge',
+  'git rebase',
+  'gh'
+] as const;
+
+/** Shell-ish tools the deny list has to cover; Windows agents reach for both. */
+const GUARDED_TOOLS = ['Bash', 'PowerShell'] as const;
+
+/**
+ * Build the fixed deny list.
+ *
+ * Three spellings per command because Claude Code's rule matching is literal:
+ * `Tool(cmd)` catches the bare command, and the two wildcard forms catch it with
+ * arguments. Emitting all three costs nothing and avoids depending on which
+ * spelling a given CLI version treats as a prefix.
+ */
+export function destructiveToolDenyRules(): string[] {
+  const rules: string[] = [];
+  for (const tool of GUARDED_TOOLS) {
+    for (const command of DESTRUCTIVE_COMMANDS) {
+      rules.push(`${tool}(${command})`, `${tool}(${command}:*)`, `${tool}(${command} *)`);
+    }
+  }
+  return rules;
 }
 
 /** stderr fragments that mean "you are not logged in", not "your code is bad". */
@@ -93,7 +162,7 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       }
       throw new AgentRelayError('TOOL_MISSING', 'Claude Code was not found on this machine.', {
         remediation:
-          'Install it with `npm install -g @anthropic-ai/claude-code`, run `claude` once to log in, then set the path in Settings if it is still not discovered.'
+          'Install it with `winget install --id Anthropic.ClaudeCode -e`, run `claude` once to log in, then restart Agent Relay so it picks up the new PATH. Set an explicit path in Settings if it is still not discovered.'
       });
     }
     return path;
@@ -123,7 +192,7 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
         version: null,
         detail: 'Claude Code was not found on PATH or in the standard Windows install locations.',
         remediation:
-          'Install it with `npm install -g @anthropic-ai/claude-code`, then run `claude` once to log in.',
+          'Install it with `winget install --id Anthropic.ClaudeCode -e`, run `claude` once to log in, then restart Agent Relay so the updated PATH is picked up.',
         checkedAt
       };
     }
@@ -173,6 +242,9 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       'stream-json',
       // stream-json in print mode requires --verbose; without it the CLI errors out.
       '--verbose',
+      // Ignore the operator's personal Claude configuration; see the file header.
+      '--setting-sources',
+      'project',
       // Let Claude edit files unattended, without unlocking everything
       // `--dangerously-skip-permissions` would.
       '--permission-mode',
@@ -190,6 +262,17 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
     if (request.sessionId) {
       args.push('--resume', request.sessionId);
     }
+
+    // Both permission lists are variadic, so they go last and in this order:
+    // `--disallowedTools` terminates the pre-approval list, and being last it
+    // can safely run to the end of argv. Each rule is its own entry — joining
+    // them into one comma-separated string makes a rule containing a comma
+    // ambiguous.
+    const allowed = this.options.allowedTools ?? [];
+    if (allowed.length > 0) {
+      args.push('--allowedTools', ...allowed);
+    }
+    args.push('--disallowedTools', ...destructiveToolDenyRules());
 
     context.onProgress({
       type: 'started',
@@ -249,12 +332,21 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       );
     }
 
+    // Fail closed. The CLI exits 0 after a denial and its result envelope still
+    // says "success", because from the model's side nothing crashed — it simply
+    // could not run something and carried on. Reporting that as a good round is
+    // how an implementation with no tests run gets sent to the reviewer.
+    const denialSummary = describeDenials(finalized.denials);
+
     return {
       sessionId: finalized.sessionId,
-      finalMessage: finalized.finalMessage,
+      finalMessage: denialSummary
+        ? `${denialSummary}\n\n${finalized.finalMessage}`.trim()
+        : finalized.finalMessage,
       isError: finalized.isError,
       numTurns: finalized.numTurns,
-      rawResultJson: finalized.rawResultJson
+      rawResultJson: finalized.rawResultJson,
+      permissionDenials: finalized.denials
     };
   }
 }

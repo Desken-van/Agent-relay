@@ -73,6 +73,14 @@ export function wellKnownWindowsLocations(command: string): string[] {
 
   const bases: string[] = [
     join(appData, 'npm'),
+    // WinGet puts a stable shim for every package it installs here and adds the
+    // directory to the user PATH. Checking it explicitly matters because the
+    // PATH change only reaches processes started afterwards: an Electron window
+    // launched from a shell that was already open would otherwise report a
+    // freshly installed tool as missing. The versioned `WinGet\Packages\…`
+    // directory next to it is deliberately not enumerated — the shim is the
+    // supported entry point and does not move on upgrade.
+    join(localAppData, 'Microsoft', 'WinGet', 'Links'),
     join(localAppData, 'Programs', command),
     join(localAppData, 'Programs', command, 'bin'),
     join(home, '.local', 'bin'),

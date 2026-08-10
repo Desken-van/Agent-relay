@@ -24,13 +24,25 @@ export class SqliteSettingsRepository implements SettingsRepository {
       value: string;
     }[];
 
+    const shape = settingsSchema.shape as Record<string, { safeParse(value: unknown): { success: boolean } }>;
+
     const stored: Record<string, unknown> = {};
     for (const row of rows) {
+      let value: unknown;
       try {
-        stored[row.key] = JSON.parse(row.value);
+        value = JSON.parse(row.value);
       } catch {
         // A corrupted value falls back to the default rather than bricking startup.
+        continue;
       }
+
+      // Validate key by key, so one unusable value — a hand-edited row, or a
+      // field whose rules tightened in a later version — costs the user that
+      // single setting instead of every setting they have ever changed.
+      const field = shape[row.key];
+      if (!field || !field.safeParse(value).success) continue;
+
+      stored[row.key] = value;
     }
 
     const merged = { ...this.defaults, ...stored };

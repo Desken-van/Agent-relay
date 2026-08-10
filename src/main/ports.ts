@@ -183,12 +183,31 @@ export interface ClaudeImplementationRequest {
   readonly maxTurns: number;
 }
 
+/**
+ * A tool call Claude Code refused to run because it lacked permission.
+ *
+ * Defined here rather than in the adapter that happens to parse it: the
+ * orchestrator reasons about denials, so the shape belongs to the port, and the
+ * adapter is what conforms to it. Nothing inward may import an adapter.
+ */
+export interface ClaudePermissionDenial {
+  readonly tool: string;
+  /** Correlation id from the CLI, used to deduplicate. Null when absent. */
+  readonly toolUseId: string | null;
+  readonly reason: string;
+}
+
 export interface ClaudeImplementationResult {
   readonly sessionId: string | null;
   readonly finalMessage: string;
   readonly isError: boolean;
   readonly numTurns: number | null;
   readonly rawResultJson: string | null;
+  /**
+   * Tool calls Claude was refused. Non-empty always implies `isError`, because a
+   * round that was blocked from part of its work did not succeed.
+   */
+  readonly permissionDenials: readonly ClaudePermissionDenial[];
 }
 
 export interface ClaudeAdapter {

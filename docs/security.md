@@ -151,12 +151,95 @@ a worktree directory.
 uncommitted work, Git refuses and Agent Relay surfaces that rather than
 destroying it.
 
-### Claude is told not to publish
+### Claude is told not to publish, and directly-named attempts are refused
 
 The implementation prompt explicitly forbids `git commit`, `git push`,
 `git reset --hard`, `git clean`, creating a pull request, touching a remote, and
-editing anything outside the worktree. This is instruction, not enforcement —
-see "What this does not protect you from" below.
+editing anything outside the worktree.
+
+The prompt is only instruction. What backs it is the deny list below, which
+refuses those commands when a tool call names them directly — so the promise no
+longer rests solely on the model choosing to comply. It is not the same thing as
+making the operations impossible; see the limits at the end of this section.
+
+### What Claude Code is allowed to do
+
+Claude runs headless, with nobody available to answer a permission prompt. Four
+flags shape what it can reach, and each does something narrower than its name
+suggests.
+
+**`--permission-mode acceptEdits`** lets it write files without asking. That is
+the point of the isolated worktree: edits land on a dedicated branch in a
+directory that is not your checkout. It also means some worktree-scoped
+filesystem operations and read-only commands proceed on their own.
+
+**`--setting-sources project`** excludes the operator's *user* and *local*
+configuration — personal permission rules, plugins, hooks and MCP servers
+belonging to unrelated work. Without it, what an unattended agent may do depends
+on whatever else that person has been doing, the same task behaves differently
+on two machines, and a rule written months ago for another project silently
+applies here. **Verified**, by running one command that a personal rule allows:
+it ran without the flag and was refused with it.
+
+The **target repository's own project settings still load**, and may add
+permissions or hooks of their own. That is deliberate — a project's `CLAUDE.md`
+and configuration are context the implementation needs — but it means a
+repository you do not trust can widen what is pre-approved inside its own task.
+
+**`--allowedTools`** carries the rules from *Settings → Claude permissions*, one
+per line, as separate argv entries. It **pre-approves** matching tool calls so
+they run without a prompt. It is *not* an exclusive allowlist: a call matching
+nothing here is not thereby refused — it falls through to the permission mode
+and the project's settings, as described above. The default pre-approves running
+the tests, through either shell:
+
+```
+Bash(npm test *)
+PowerShell(npm test *)
+```
+
+Both spellings are present because Claude picks the shell itself; in the live
+probe it reached for PowerShell. Rules are trimmed, length-limited, rejected if
+they contain control characters, and capped at 50. An empty list pre-approves no
+commands at all — Claude can still edit files, and anything needing approval is
+denied rather than waiting.
+
+**`--disallowedTools`** carries a fixed list that Settings cannot reach and
+project configuration cannot loosen, covering both `Bash(…)` and `PowerShell(…)`
+forms of:
+
+`git commit` · `git push` · `git reset` · `git clean` · `git checkout` ·
+`git switch` · `git merge` · `git rebase` · `gh`
+
+Each appears in three spellings — bare, `:*` and ` *` — so the bare command and
+its argument forms all match. These are the operations Agent Relay reserves for
+its own confirmation dialog, plus the Git commands that could move work out of
+the worktree the task is isolated in.
+
+**What this is not.** The deny list is a command-pattern filter over what a tool
+call literally says. It refuses a direct `git commit`; it does not see the same
+operation reached indirectly through a project script, a task runner, an alias,
+or a program that calls Git as a library. Treat it as closing the obvious path,
+not as a boundary that holds against a determined or confused agent. The
+isolation that genuinely holds remains the separate worktree and branch.
+
+`--dangerously-skip-permissions` is never used, and neither is `--bare`: it
+would also discard `CLAUDE.md` and the project context the implementation needs.
+
+### A denied tool call fails the round
+
+In `--print` mode a refused tool call is not an error from the CLI's side. It
+reports the denial, the model carries on — often working around it — and the
+process still exits `0` with a result envelope that says `success`.
+
+Taken at face value, a round where the tests were blocked is indistinguishable
+from one where they passed. Agent Relay therefore **fails closed**: denials are
+collected both from `permission_denied` events and from the `permission_denials`
+array in the result envelope, deduplicated by the CLI's `tool_use_id`, surfaced
+on the timeline as errors naming the tool and a truncated reason, and any denial
+at all marks the run unsuccessful regardless of what the envelope claims. The
+task returns to a retryable state with the denial recorded, rather than
+advancing to review on work that was quietly incomplete.
 
 ### Codex reviews are read-only
 
@@ -197,13 +280,19 @@ while recording the refusal.
 
 Being honest about the boundary matters more than the list above.
 
-* **Claude Code can modify any file inside its worktree, and runs commands.**
-  It is given `--permission-mode acceptEdits` so it can work unattended. Agent
-  Relay does not sandbox it beyond the worktree, and *"do not commit"* is an
-  instruction in a prompt, not an enforced boundary. A determined or confused
-  agent could still run `git` itself. The isolation that genuinely holds is that
-  the worktree is a separate directory on a separate branch — your checkout and
-  your other branches are not touched.
+* **Claude Code can modify any file inside its worktree, and can run commands.**
+  It is given `--permission-mode acceptEdits` so it can work unattended; what is
+  listed in *Settings → Claude permissions* runs without a prompt, and that list
+  is a pre-approval rather than the full extent of what is possible — read-only
+  commands and the repository's own project settings can permit more. Agent
+  Relay does not sandbox it beyond the worktree. The deny list closes the
+  directly-named commands that would commit, publish, or move work out of the
+  worktree, but it is a command-pattern filter: an indirect invocation — a
+  script that shells out, a task runner wrapping `git` — is not something
+  pattern matching can catch. Grant narrowly, and run Agent Relay on code you
+  trust. The isolation that genuinely holds is that the worktree is a separate
+  directory on a separate branch — your checkout and your other branches are not
+  touched.
 * **Prompt injection is not solved.** Content in the repository being worked on
   is fed to both models. A hostile repository could attempt to steer either
   agent. Only run Agent Relay on code you trust.

@@ -53,7 +53,7 @@ Every action button carries a **blast-radius marker**:
 | **Node.js ≥ 22.13** | everything | Required for the built-in `node:sqlite` module |
 | **Git** | everything | Plus `user.name` / `user.email` before any commit |
 | **Codex** | specification + review | Ships with the app's dependencies; you only need to log in |
-| **Claude Code CLI** | implementation | `npm install -g @anthropic-ai/claude-code` |
+| **Claude Code CLI** | implementation | `winget install --id Anthropic.ClaudeCode -e` |
 | **GitHub CLI (`gh`)** | publishing only | Optional — everything else works without it |
 
 The app **starts and stays usable when any of these are missing**, and tells you
@@ -109,15 +109,47 @@ makes resuming a conversation possible.
 ### Claude Code
 
 ```powershell
-npm install -g @anthropic-ai/claude-code
+winget install --id Anthropic.ClaudeCode -e
+# open a new terminal: the installer appends to PATH
 claude                   # run once and complete the login flow
-claude --version
+claude auth status       # → "loggedIn": true
 ```
 
 Credentials live in `~/.claude`. If `claude` is not discoverable, set an
 explicit path in **Settings → Executables**; Agent Relay looks in your
-configured path, then `PATH`, then the standard Windows install locations. It
-never reads VS Code extension internals or another application's private files.
+configured path, then `PATH`, then the standard Windows install locations —
+including WinGet's `Links` shim directory, so a fresh install is found even if
+Agent Relay was started before PATH was refreshed. It never reads VS Code
+extension internals or another application's private files.
+
+### What Claude is allowed to run
+
+Claude works unattended, so **Settings → Claude permissions** lists the shell
+commands Agent Relay *pre-approves* — they run without a prompt. The default is
+the narrowest thing that still lets Claude verify its own work, in either shell:
+
+```
+Bash(npm test *)
+PowerShell(npm test *)
+```
+
+This is a pre-approval, not the whole picture. Under `acceptEdits` Claude also
+edits files in its worktree, and some read-only commands run on their own.
+
+Agent Relay passes `--setting-sources project`, so your personal Claude
+settings, plugins and permission rules from other work are not inherited into a
+task — but the **target repository's own project settings still load** and may
+add permissions or hooks.
+
+Commit, push, reset, clean, checkout, switch, merge, rebase and `gh` are refused
+when a command names them directly, and Settings cannot re-enable them.
+That is a command-pattern filter rather than a sandbox: a project script that
+wraps one of them is not caught, so run Agent Relay on code you trust.
+Publishing still requires the confirmation dialog.
+
+If a tool call is refused, the round **fails** rather than quietly continuing —
+otherwise an implementation whose tests never ran would reach the reviewer
+looking healthy. See [docs/security.md](docs/security.md) §5.
 
 ### GitHub CLI
 

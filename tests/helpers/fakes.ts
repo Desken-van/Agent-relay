@@ -15,6 +15,7 @@ import type {
   ClaudeAdapter,
   ClaudeImplementationRequest,
   ClaudeImplementationResult,
+  ClaudePermissionDenial,
   CodexAdapter,
   CodexReviewOutcome,
   CodexReviewRequest,
@@ -118,6 +119,7 @@ export class FakeClaudeAdapter implements ClaudeAdapter {
   sessionId: string | null = 'claude-session-1';
   finalMessage = 'Implemented the change and ran the tests.\n\n```\n2 passed\n```';
   isError = false;
+  permissionDenials: ClaudePermissionDenial[] = [];
   error: Error | null = null;
   /** Set to observe cancellation without a real process. */
   onRun: ((request: ClaudeImplementationRequest, context: AgentRunContext) => void) | null = null;
@@ -134,9 +136,11 @@ export class FakeClaudeAdapter implements ClaudeAdapter {
     return {
       sessionId: this.sessionId,
       finalMessage: this.finalMessage,
-      isError: this.isError,
+      // A denial always fails the round, mirroring the real adapter.
+      isError: this.isError || this.permissionDenials.length > 0,
       numTurns: 3,
-      rawResultJson: null
+      rawResultJson: null,
+      permissionDenials: this.permissionDenials
     };
   }
 

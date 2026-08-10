@@ -17,7 +17,7 @@ is the only one that touches a remote, and it is clearly marked.
 | Git | `git --version` | https://git-scm.com/download/win |
 | Git identity | `git config --global user.name` and `user.email` | `git config --global user.name "You"` |
 | Codex, logged in | `codex login status` | Ships with the app's dependencies; run `npx codex login` |
-| Claude Code, logged in | `claude --version` | `npm install -g @anthropic-ai/claude-code`, then run `claude` once |
+| Claude Code, logged in | `claude --version` and `claude auth status` | `winget install --id Anthropic.ClaudeCode -e`, then run `claude` once. **Open a new terminal afterwards** — the installer appends to PATH, and a shell that was already running will not see it |
 | GitHub CLI *(section 9 only)* | `gh auth status` | `winget install --id GitHub.cli`, then `gh auth login` |
 
 ```powershell
@@ -63,6 +63,26 @@ Deliberately break one: put nonsense in *Claude Code path* and save.
 not exist"* — not a crash. Clear the field and save again.
 
 ✅ Pass if missing tools are reported clearly and the app stays usable.
+
+### 2b. Claude permissions
+
+Scroll to **Claude permissions**. **Expect** a textarea pre-filled with:
+
+```
+Bash(npm test *)
+PowerShell(npm test *)
+```
+
+These are the shell commands Agent Relay pre-approves, so they run without a
+prompt. They are not the full extent of what Claude can do — it also edits files
+in its worktree, and the target repository's own project settings still load.
+**Expect** a note that commit, push, reset, clean, checkout, switch, merge,
+rebase and `gh` are refused when named directly and cannot be granted here, and
+that this is a pattern filter rather than a sandbox.
+
+Leave the default alone for the rest of this document unless a step says
+otherwise. If the project you are testing uses a different test command, add a
+matching rule — narrowly, e.g. `Bash(pnpm test *)`, not `Bash(*)`.
 
 ---
 
@@ -140,6 +160,21 @@ leaves the task retryable.
 ### 5c. Guard rails
 
 **Expect** *Send to Claude* to be disabled until the specification is approved.
+
+### 5d. A blocked command fails the round
+
+Claude runs with no one available to answer a permission prompt, so a command
+that is neither pre-approved nor auto-approved is refused outright rather than
+waiting.
+
+To see the handling, temporarily clear the **Claude permissions** textarea, save,
+and run a task whose specification asks for tests to be run. **Expect** red
+*Permission denied* entries on the timeline naming the tool, and the round to end
+**unsuccessfully** — not as *Ready for review* — with the denial recorded as the
+task's last error. A round in which the tests were silently skipped must never
+look like a clean one.
+
+Restore the default rules afterwards.
 
 ---
 
