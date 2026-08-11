@@ -21,13 +21,54 @@ import { join } from 'node:path';
 // exports are installed dynamically, so Node's ESM named-export detection
 // cannot see them and `import { BrowserWindow } from 'electron'` fails at load
 // time. Electron provides `electron/main` precisely for ESM main processes.
-import { app, BrowserWindow, session } from 'electron/main';
+import { app, BrowserWindow, dialog, session } from 'electron/main';
 // `shell` is part of Electron's common (main + renderer) surface.
 import { shell } from 'electron/common';
 import { buildApplication, type Application } from './container';
+import { DATA_DIR_ENV_VAR, prepareDataDirOverride } from './infra/data-dir';
 import { registerIpc, unregisterIpc } from './ipc/register-ipc';
 import { ElectronConfirmationService } from './services/confirmation-service';
 import { WindowEventPublisher } from './services/event-bus';
+
+/**
+ * Redirect the whole profile before anything can write to the old one.
+ *
+ * This runs at module load, ahead of `requestSingleInstanceLock()` below, which
+ * is the first thing that touches `userData` — it puts its lock file there. Any
+ * later call would leave Chromium's `Preferences`, storage and lock behind in
+ * the default directory while the database went somewhere else.
+ *
+ * Once `userData` is repointed, `app.getPath('userData')` returns the override,
+ * so the database and worktrees follow automatically and there is no second
+ * place that has to agree about where the override points.
+ */
+function redirectUserDataIfOverridden(): boolean {
+  let override: string | null;
+
+  try {
+    override = prepareDataDirOverride();
+    // `setPath` is inside the same `try` because it can reject the path too;
+    // either failure means the override did not take effect.
+    if (override) app.setPath('userData', override);
+  } catch (error) {
+    // Falling back to the real profile would write this run's data into the
+    // user's own — the precise accident the override exists to prevent. Report
+    // it once and let the caller stop.
+    const message = error instanceof Error ? error.message : String(error);
+    dialog.showErrorBox(
+      'Agent Relay cannot start',
+      `${message}\n\nUnset ${DATA_DIR_ENV_VAR} or point it at a writable directory.`
+    );
+    return false;
+  }
+
+  return true;
+}
+
+// `app.exit()` is not guaranteed to stop the current script synchronously, so
+// startup is gated on the returned result rather than on the exit call having
+// taken effect. Nothing below runs when the override failed.
+const userDataReady = redirectUserDataIfOverridden();
 
 const isDev = !app.isPackaged;
 
@@ -38,9 +79,11 @@ const events = new WindowEventPublisher();
 const confirmation = new ElectronConfirmationService();
 
 function resolvePaths(): { dataDir: string; documentsDir: string } {
-  const override = process.env.AGENT_RELAY_DATA_DIR;
   return {
-    dataDir: override && override.trim().length > 0 ? override : app.getPath('userData'),
+    // Already the override when one is set: `redirectUserDataIfOverridden()`
+    // repointed `userData` at module load, so this is the single source of
+    // truth for both the Chromium profile and the database.
+    dataDir: app.getPath('userData'),
     documentsDir: app.getPath('documents')
   };
 }
@@ -152,10 +195,14 @@ function bootstrap(): void {
   void application.diagnostics.run(true).catch(() => undefined);
 }
 
-// A second instance would open a second SQLite connection to the same file and
-// two orchestrators against the same worktrees. Refuse, and focus the original.
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
+if (!userDataReady) {
+  // The override was requested and could not be honoured. Take no lock, build
+  // no application, open no window — just stop.
+  app.exit(1);
+} else if (!app.requestSingleInstanceLock()) {
+  // A second instance would open a second SQLite connection to the same file
+  // and two orchestrators against the same worktrees. Refuse, and focus the
+  // original.
   app.quit();
 } else {
   app.on('second-instance', () => {

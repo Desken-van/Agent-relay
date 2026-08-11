@@ -1,4 +1,5 @@
-import { homedir } from 'node:os';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
@@ -27,7 +28,8 @@ import { ExecaProcessRunner, type ProcessRunner } from '../../src/main/adapters/
 import {
   findOnPath,
   locateExecutable,
-  wellKnownWindowsLocations
+  wellKnownWindowsLocations,
+  wingetClaudePackageCandidates
 } from '../../src/main/adapters/process/executable-locator';
 import { extractTestOutput } from '../../src/main/services/orchestrator';
 import { makeChangeSet, makeReview, makeSpecification } from '../helpers/fakes';
@@ -827,6 +829,120 @@ describe('executable locator', () => {
     expect(located?.source).toBe('bundled');
   });
 
+  it('resolves a WinGet-installed Claude when PATH does not have it', () => {
+    // The exact case a stale process hits: WinGet appended the package
+    // directory to PATH after this process inherited its environment.
+    const root = mkdtempSync(join(tmpdir(), 'agent-relay-winget-'));
+    try {
+      const packages = join(root, 'Microsoft', 'WinGet', 'Packages');
+      const claudePackage = join(packages, 'Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe');
+      mkdirSync(claudePackage, { recursive: true });
+      const executable = join(claudePackage, 'claude.exe');
+      writeFileSync(executable, '');
+
+      const located = locateExecutable('claude', {
+        env: { LOCALAPPDATA: root, PATH: join(root, 'nothing-here') }
+      });
+
+      expect(located?.source).toBe('well-known');
+      expect(located?.path).toBe(executable);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores unrelated WinGet packages, and nested executables', () => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-relay-winget-'));
+    try {
+      const packages = join(root, 'Microsoft', 'WinGet', 'Packages');
+
+      // A different vendor's package that happens to ship a claude.exe.
+      const other = join(packages, 'SomeoneElse.ClaudeLookalike_abc123');
+      mkdirSync(other, { recursive: true });
+      writeFileSync(join(other, 'claude.exe'), '');
+
+      // A prefix that is close but not exact.
+      const nearMiss = join(packages, 'Anthropic.ClaudeCodeExtra');
+      mkdirSync(nearMiss, { recursive: true });
+      writeFileSync(join(nearMiss, 'claude.exe'), '');
+
+      // The real prefix, but the executable is nested one level down.
+      const nested = join(packages, 'Anthropic.ClaudeCode_nested', 'bin');
+      mkdirSync(nested, { recursive: true });
+      writeFileSync(join(nested, 'claude.exe'), '');
+
+      const candidates = wingetClaudePackageCandidates({ LOCALAPPDATA: root });
+
+      // Neither the other vendor nor the near-miss prefix is considered.
+      expect(candidates.some((c) => c.includes('SomeoneElse'))).toBe(false);
+      expect(candidates.some((c) => c.includes('ClaudeLookalike'))).toBe(false);
+      expect(candidates.some((c) => c.includes('ClaudeCodeExtra'))).toBe(false);
+
+      // The matching directory yields exactly one candidate, directly inside it
+      // — the scan does not descend into `bin`.
+      expect(candidates).toEqual([join(packages, 'Anthropic.ClaudeCode_nested', 'claude.exe')]);
+
+      // And since nothing is actually there, discovery still finds nothing.
+      expect(
+        locateExecutable('claude', { env: { LOCALAPPDATA: root, PATH: join(root, 'nothing-here') } })
+      ).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('returns candidates deterministically when several matching packages exist', () => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-relay-winget-'));
+    try {
+      const packages = join(root, 'Microsoft', 'WinGet', 'Packages');
+      for (const suffix of ['zzz', 'aaa', 'mmm']) {
+        const dir = join(packages, `Anthropic.ClaudeCode_${suffix}`);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, 'claude.exe'), '');
+      }
+
+      const candidates = wingetClaudePackageCandidates({ LOCALAPPDATA: root });
+      expect(candidates).toEqual([
+        join(packages, 'Anthropic.ClaudeCode_aaa', 'claude.exe'),
+        join(packages, 'Anthropic.ClaudeCode_mmm', 'claude.exe'),
+        join(packages, 'Anthropic.ClaudeCode_zzz', 'claude.exe')
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a missing WinGet Packages directory as no candidate, not an error', () => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-relay-winget-'));
+    try {
+      // No Microsoft\WinGet\Packages at all — a machine without WinGet.
+      expect(() => wingetClaudePackageCandidates({ LOCALAPPDATA: root })).not.toThrow();
+      expect(wingetClaudePackageCandidates({ LOCALAPPDATA: root })).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('prefers PATH over the WinGet package directory', () => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-relay-winget-'));
+    try {
+      const packages = join(root, 'Microsoft', 'WinGet', 'Packages');
+      const claudePackage = join(packages, 'Anthropic.ClaudeCode_x');
+      mkdirSync(claudePackage, { recursive: true });
+      writeFileSync(join(claudePackage, 'claude.exe'), '');
+
+      const onPath = join(root, 'on-path');
+      mkdirSync(onPath, { recursive: true });
+      writeFileSync(join(onPath, 'claude.exe'), '');
+
+      const located = locateExecutable('claude', { env: { LOCALAPPDATA: root, PATH: onPath } });
+      expect(located?.source).toBe('path');
+      expect(located?.path).toBe(join(onPath, 'claude.exe'));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('looks in the WinGet Links directory', () => {
     // The official Claude Code package installs a shim here and appends the
     // directory to PATH, which an already-running shell will not have picked up.
@@ -842,12 +958,47 @@ describe('executable locator', () => {
     expect(candidates).toContain(join(expected, 'claude.exe'));
   });
 
-  it('does not enumerate the versioned WinGet Packages directory', () => {
-    // Package directories carry a version and a hash; the stable shim is the
-    // supported entry point, so hard-coding those paths would rot on upgrade.
-    expect(wellKnownWindowsLocations('claude').some((c) => c.includes('WinGet\\Packages'))).toBe(
-      false
+  it('scans the WinGet Packages directory only for claude, and only when bounded', () => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-relay-winget-'));
+    try {
+      const packages = join(root, 'Microsoft', 'WinGet', 'Packages');
+      const claudePackage = join(packages, 'Anthropic.ClaudeCode_someSourceId');
+      mkdirSync(claudePackage, { recursive: true });
+      writeFileSync(join(claudePackage, 'claude.exe'), '');
+
+      // Only `claude` triggers the package scan; other tools do not get one.
+      expect(
+        wellKnownWindowsLocations('gh', { LOCALAPPDATA: root }).some((c) =>
+          c.includes('WinGet\\Packages')
+        )
+      ).toBe(false);
+
+      const claudeCandidates = wellKnownWindowsLocations('claude', { LOCALAPPDATA: root });
+      expect(claudeCandidates).toContain(join(claudePackage, 'claude.exe'));
+
+      // The Links shim is still checked, and is preferred over the package dir.
+      const links = join(root, 'Microsoft', 'WinGet', 'Links', 'claude.exe');
+      expect(claudeCandidates.indexOf(links)).toBeLessThan(
+        claudeCandidates.indexOf(join(claudePackage, 'claude.exe'))
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('hard-codes no username, source id, or absolute install path', () => {
+    // The source-id suffix differs per WinGet source and the path is per-user;
+    // discovery must derive both at runtime.
+    const source = readFileSync(
+      join(process.cwd(), 'src/main/adapters/process/executable-locator.ts'),
+      'utf8'
     );
+
+    expect(source).not.toMatch(/8wekyb3d8bbwe/);
+    expect(source).not.toMatch(/nickp/i);
+    expect(source).not.toMatch(/C:\\\\Users\\\\/);
+    // The prefix itself is intentionally present; the suffix is not.
+    expect(source).toContain('Anthropic.ClaudeCode_');
   });
 
   it('still looks in the native ~/.local/bin location', () => {

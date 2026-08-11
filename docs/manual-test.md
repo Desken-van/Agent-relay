@@ -17,7 +17,7 @@ is the only one that touches a remote, and it is clearly marked.
 | Git | `git --version` | https://git-scm.com/download/win |
 | Git identity | `git config --global user.name` and `user.email` | `git config --global user.name "You"` |
 | Codex, logged in | `codex login status` | Ships with the app's dependencies; run `npx codex login` |
-| Claude Code, logged in | `claude --version` and `claude auth status` | `winget install --id Anthropic.ClaudeCode -e`, then run `claude` once. **Open a new terminal afterwards** — the installer appends to PATH, and a shell that was already running will not see it |
+| Claude Code, logged in | `claude --version` and `claude auth status` | `winget install --id Anthropic.ClaudeCode -e`, then run `claude` once. A shell that was already open will not see the new PATH entry, so open a new terminal — or rely on Agent Relay's own discovery, which checks both WinGet's `Links` shim directory and the `Anthropic.ClaudeCode_*` package directory |
 | GitHub CLI *(section 9 only)* | `gh auth status` | `winget install --id GitHub.cli`, then `gh auth login` |
 
 ```powershell
@@ -298,9 +298,20 @@ git -C <your-repo> worktree list
 git -C <your-repo> worktree remove <worktree-path>     # refuses if work is uncommitted
 git -C <your-repo> branch -d agent-relay/<...>         # your call, not the app's
 
-# Application data (database, worktrees root)
+# Application data (database, worktrees root, Electron profile)
 %APPDATA%\agent-relay
 ```
 
 Removing a project inside the app only unregisters it — the folder on disk is
 never touched.
+
+> **Testing against a throwaway profile.** Set `AGENT_RELAY_DATA_DIR` to an
+> empty directory before launching and the whole run is redirected there —
+> `agent-relay.sqlite`, the worktrees root, *and* Electron's Chromium profile
+> (`Preferences`, storage, the single-instance lock). Your real profile under
+> `%APPDATA%\agent-relay` is left alone; nothing is migrated or deleted. Set it
+> only for the child process, so it does not leak into later sessions:
+>
+> ```powershell
+> $env:AGENT_RELAY_DATA_DIR = 'H:\some-throwaway-dir'; npm run dev
+> ```

@@ -121,6 +121,18 @@ Executables are resolved explicitly (configured path → `PATH` → well-known
 Windows locations) rather than by attempting a spawn, because on Windows a
 missing command surfaces as `exit code 1` from `cmd.exe`, not `ENOENT`.
 
+The well-known list includes two WinGet locations, since its `PATH` change only
+reaches processes started after the install: the `WinGet\Links` shim directory,
+used by packages that publish a shim, and — for `claude` only — direct children
+of `WinGet\Packages` whose name begins `Anthropic.ClaudeCode_`, checked for a
+`claude.exe` directly inside. The official Claude Code package publishes no
+shim, so without the second check a stale process reports it as missing.
+
+That scan is deliberately bounded: one directory level, an exact name prefix, no
+recursion, no other package, and nothing outside WinGet's own tree. It reads
+directory names only, and an absent or unreadable `Packages` directory yields no
+candidate rather than an error.
+
 ---
 
 ## 5. Filesystem and Git safety

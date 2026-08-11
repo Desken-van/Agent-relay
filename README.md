@@ -117,9 +117,19 @@ claude auth status       # → "loggedIn": true
 
 Credentials live in `~/.claude`. If `claude` is not discoverable, set an
 explicit path in **Settings → Executables**; Agent Relay looks in your
-configured path, then `PATH`, then the standard Windows install locations —
-including WinGet's `Links` shim directory, so a fresh install is found even if
-Agent Relay was started before PATH was refreshed. It never reads VS Code
+configured path, then `PATH`, then the standard Windows install locations.
+
+Two of those cover WinGet, because its `PATH` change only reaches processes
+started *after* the install — so a window launched from an already-open shell
+would otherwise report a freshly installed Claude as missing:
+
+* `%LOCALAPPDATA%\Microsoft\WinGet\Links`, where WinGet puts a shim **when a
+  package publishes one** — not every package does;
+* direct children of `%LOCALAPPDATA%\Microsoft\WinGet\Packages` named
+  `Anthropic.ClaudeCode_*`, checked for a `claude.exe` sitting directly inside.
+  This is what finds the official Claude Code package, which ships no shim.
+
+The scan does not recurse, matches no other package, and never reads VS Code
 extension internals or another application's private files.
 
 ### What Claude is allowed to run
