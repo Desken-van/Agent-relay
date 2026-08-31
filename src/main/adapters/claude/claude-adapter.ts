@@ -58,7 +58,6 @@ import { consumeLine, createStreamState, describeDenials, finalizeState } from '
 
 export interface ClaudeAdapterOptions {
   readonly configuredPath?: string | null;
-  readonly model?: string | null;
   /**
    * Permission rules granted for this run, from Settings. Empty means "grant
    * nothing beyond edits", not "grant everything".
@@ -253,8 +252,10 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       String(request.maxTurns)
     ];
 
-    if (this.options.model) {
-      args.push('--model', this.options.model);
+    // The task's snapshotted model. Null means no `--model` at all, so the CLI
+    // uses its own default; it never means "substitute something else".
+    if (request.model) {
+      args.push('--model', request.model);
     }
 
     // Resuming keeps the correction round in the *same* conversation, so Claude
@@ -325,10 +326,21 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
         });
       }
 
+      // Deliberately no retry and no fallback to another model: if the task
+      // asked for a model it cannot use, the user needs to see that, not a
+      // silently different result from a model they did not choose.
+      const model = request.model ? ` (model: ${request.model})` : '';
       throw new AgentRelayError(
         'TOOL_FAILED',
-        `Claude Code exited with code ${result.exitCode ?? 'unknown'}.`,
-        { details: output.slice(0, 2000) }
+        `Claude Code exited with code ${result.exitCode ?? 'unknown'}${model}.`,
+        {
+          details: output.slice(0, 2000),
+          ...(request.model
+            ? {
+                remediation: `Check that "${request.model}" is a model your Claude account can use, or choose a different one when creating the task.`
+              }
+            : {})
+        }
       );
     }
 

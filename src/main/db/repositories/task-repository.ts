@@ -7,7 +7,7 @@ import { toTask, type TaskRow } from '../rows';
 const COLUMNS = `id, project_id, title, original_request, status, current_round, max_rounds,
                  codex_thread_id, claude_session_id, worktree_path, branch_name, base_branch,
                  specification_json, specification_approved_at, last_review_json, last_error,
-                 created_at, updated_at`;
+                 codex_model, claude_model, created_at, updated_at`;
 
 /**
  * Persistence for tasks.
@@ -44,11 +44,11 @@ export class SqliteTaskRepository implements TaskRepository {
         `INSERT INTO tasks (id, project_id, title, original_request, status, current_round,
                             max_rounds, codex_thread_id, claude_session_id, worktree_path,
                             branch_name, base_branch, specification_json, specification_approved_at,
-                            last_review_json, last_error, created_at, updated_at)
+                            last_review_json, last_error, codex_model, claude_model, created_at, updated_at)
          VALUES (@id, @projectId, @title, @originalRequest, @status, @currentRound,
                  @maxRounds, @codexThreadId, @claudeSessionId, @worktreePath,
                  @branchName, @baseBranch, @specificationJson, @specificationApprovedAt,
-                 @lastReviewJson, @lastError, @createdAt, @updatedAt)`
+                 @lastReviewJson, @lastError, @codexModel, @claudeModel, @createdAt, @updatedAt)`
       )
       .run({ ...task, createdAt: now, updatedAt: now });
 
@@ -82,6 +82,8 @@ export class SqliteTaskRepository implements TaskRepository {
                 specification_approved_at = @specificationApprovedAt,
                 last_review_json = @lastReviewJson,
                 last_error = @lastError,
+                codex_model = @codexModel,
+                claude_model = @claudeModel,
                 updated_at = @updatedAt
           WHERE id = @id`
       )

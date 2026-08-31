@@ -14,7 +14,8 @@ const TOOL_TITLES: Record<string, string> = {
 };
 
 export function SettingsView(): React.JSX.Element {
-  const { settings, diagnostics, refreshDiagnostics, refreshSettings, perform, notify } = useStore();
+  const { settings, diagnostics, refreshDiagnostics, refreshSettings, refreshCodexModels, perform, notify } =
+    useStore();
 
   // Only the user's unsaved edits are held locally; the baseline is whatever the
   // store currently has. Deriving rather than copying means a settings refresh
@@ -226,14 +227,35 @@ export function SettingsView(): React.JSX.Element {
                   />
                 </Field>
 
-                <Field label="Codex model" hint="Leave empty to use the Codex default.">
+                <Field
+                  label="Default Codex model for new tasks"
+                  hint="Pre-selects the picker on the New task form. Leave empty for the Codex default."
+                >
                   <input
                     className="input input--mono"
                     value={draft.codexModel ?? ''}
-                    placeholder="(default)"
+                    placeholder="(tool default)"
                     onChange={(e) => set('codexModel', e.target.value.trim() || null)}
                   />
                 </Field>
+
+                <Field
+                  label="Default Claude model for new tasks"
+                  hint="Pre-selects the picker on the New task form. An alias such as opus, or a full model id."
+                >
+                  <input
+                    className="input input--mono"
+                    value={draft.claudeModel ?? ''}
+                    placeholder="(tool default)"
+                    onChange={(e) => set('claudeModel', e.target.value.trim() || null)}
+                  />
+                </Field>
+
+                <Notice tone="info">
+                  These two are only defaults for the <strong>New task</strong> form. Each task
+                  stores its own pair when it is created, so changing them here never affects a task
+                  that already exists.
+                </Notice>
               </div>
             </Card>
 
@@ -292,12 +314,22 @@ export function SettingsView(): React.JSX.Element {
                 className="btn btn--primary"
                 onClick={() =>
                   void perform('save-settings', 'Could not save settings', async () => {
+                    // Captured before the write, so the comparison below is
+                    // against what was actually stored a moment ago.
+                    const codexPathChanged =
+                      settings?.codexExecutablePath !== draft.codexExecutablePath;
+
                     // Only after the write succeeds: a rejected save must leave
                     // the user's text on screen to correct, not discard it.
                     await expect('settings:update', draft);
                     discardEdits();
                     await refreshSettings();
                     await refreshDiagnostics(true);
+
+                    // A different Codex binary is a different catalogue. Fetch
+                    // it now rather than making the user press Refresh models.
+                    if (codexPathChanged) await refreshCodexModels(true);
+
                     notify({ tone: 'success', title: 'Settings saved' });
                   })
                 }

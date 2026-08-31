@@ -8,12 +8,13 @@ import { ApiError, call, expect } from '../lib/api';
 import { formatDateTime, pluralize } from '../lib/format';
 import { useStore } from '../state/store';
 import { ChangesPanel } from './ChangesPanel';
+import { codexModelLabel } from './TasksView';
 import { Card, Empty, Field, Notice, Rounds, Scope, Spinner, StatusBadge } from './primitives';
 import { RelayTimeline } from './RelayTimeline';
 
 export function RunView(): React.JSX.Element {
   const store = useStore();
-  const { selectedTaskId, detail, refreshDetail, perform, notify, busy } = store;
+  const { selectedTaskId, detail, refreshDetail, perform, notify, busy, codexModels } = store;
 
   const [changes, setChanges] = useState<GitChangeSet | null>(null);
   const [loadingChanges, setLoadingChanges] = useState(false);
@@ -119,6 +120,15 @@ export function RunView(): React.JSX.Element {
               <span className="kv__v mono selectable">{task.codexThreadId ?? '—'}</span>
               <span className="kv__k">Claude session</span>
               <span className="kv__v mono selectable">{task.claudeSessionId ?? '—'}</span>
+              {/* Snapshotted when the task was created; not editable afterwards. */}
+              <span className="kv__k">Codex model</span>
+              <span className="kv__v mono selectable" title={task.codexModel ?? undefined}>
+                {task.codexModel === null
+                  ? 'Tool default'
+                  : codexModelLabel(task.codexModel, codexModels?.models ?? [])}
+              </span>
+              <span className="kv__k">Claude model</span>
+              <span className="kv__v mono selectable">{task.claudeModel ?? 'Tool default'}</span>
               <span className="kv__k">Created</span>
               <span className="kv__v">{formatDateTime(task.createdAt)}</span>
             </div>

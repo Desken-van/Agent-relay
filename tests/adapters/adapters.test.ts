@@ -296,7 +296,8 @@ describe('Claude adapter', () => {
 
   /** Run the adapter against a recording runner and return the argv it built. */
   async function captureClaudeArgs(
-    options: { allowedTools?: readonly string[] } = {}
+    options: { allowedTools?: readonly string[] } = {},
+    request: { model?: string | null; sessionId?: string | null } = {}
   ): Promise<string[]> {
     let captured: string[] = [];
     const runner: ProcessRunner = {
@@ -321,7 +322,14 @@ describe('Claude adapter', () => {
     });
 
     await adapter.run(
-      { worktreePath: process.cwd(), branchName: 'b', prompt: 'p', sessionId: null, maxTurns: 3 },
+      {
+        worktreePath: process.cwd(),
+        branchName: 'b',
+        prompt: 'p',
+        sessionId: request.sessionId ?? null,
+        maxTurns: 3,
+        model: request.model ?? null
+      },
       { signal: new AbortController().signal, timeoutMs: 1000, onProgress: () => undefined }
     );
 
@@ -366,7 +374,8 @@ describe('Claude adapter', () => {
         branchName: 'agent-relay/x',
         prompt: 'do the thing',
         sessionId: null,
-        maxTurns: 5
+        maxTurns: 5,
+        model: null
       },
       { signal: new AbortController().signal, timeoutMs: 1000, onProgress: () => undefined }
     );
@@ -405,7 +414,8 @@ describe('Claude adapter', () => {
         branchName: 'b',
         prompt: 'p',
         sessionId: 'sess-abc',
-        maxTurns: 3
+        maxTurns: 3,
+        model: null
       },
       { signal: new AbortController().signal, timeoutMs: 1000, onProgress: () => undefined }
     );
@@ -438,7 +448,7 @@ describe('Claude adapter', () => {
 
     const adapter = new ClaudeCliAdapter(runner, { configuredPath: process.execPath });
     await adapter.run(
-      { worktreePath: process.cwd(), branchName: 'b', prompt: longPrompt, sessionId: null, maxTurns: 3 },
+      { worktreePath: process.cwd(), branchName: 'b', prompt: longPrompt, sessionId: null, maxTurns: 3, model: null },
       { signal: new AbortController().signal, timeoutMs: 1000, onProgress: () => undefined }
     );
 
@@ -465,7 +475,7 @@ describe('Claude adapter', () => {
     const adapter = new ClaudeCliAdapter(runner, { configuredPath: process.execPath });
     await expect(
       adapter.run(
-        { worktreePath: process.cwd(), branchName: 'b', prompt: 'p', sessionId: null, maxTurns: 3 },
+        { worktreePath: process.cwd(), branchName: 'b', prompt: 'p', sessionId: null, maxTurns: 3, model: null },
         { signal: new AbortController().signal, timeoutMs: 1000, onProgress: () => undefined }
       )
     ).rejects.toMatchObject({ code: 'TOOL_UNAUTHENTICATED' });
@@ -500,7 +510,8 @@ describe('Claude adapter', () => {
         branchName: 'agent-relay/x',
         prompt: 'do the thing',
         sessionId: 'sess-abc',
-        maxTurns: 5
+        maxTurns: 5,
+        model: null
       },
       { signal: new AbortController().signal, timeoutMs: 1000, onProgress: () => undefined }
     );
@@ -524,6 +535,93 @@ describe('Claude adapter', () => {
       '--disallowedTools',
       ...destructiveToolDenyRules()
     ]);
+  });
+
+  it('passes the task model through --model on a fresh run', async () => {
+    const captured = await captureClaudeArgs({}, { model: 'opus' });
+    const index = captured.indexOf('--model');
+
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect(captured[index + 1]).toBe('opus');
+  });
+
+  it('passes --model alongside --resume on a correction round', async () => {
+    const captured = await captureClaudeArgs({}, { model: 'opus', sessionId: 'sess-abc' });
+
+    expect(captured[captured.indexOf('--model') + 1]).toBe('opus');
+    expect(captured[captured.indexOf('--resume') + 1]).toBe('sess-abc');
+  });
+
+  it('accepts a full model id, not just an alias', async () => {
+    const captured = await captureClaudeArgs({}, { model: 'claude-opus-5' });
+    expect(captured[captured.indexOf('--model') + 1]).toBe('claude-opus-5');
+  });
+
+  it('omits --model entirely when the task has no override', async () => {
+    const captured = await captureClaudeArgs({}, { model: null });
+    expect(captured).not.toContain('--model');
+  });
+
+  it('keeps the permission arguments intact when a model is set', async () => {
+    const captured = await captureClaudeArgs(
+      { allowedTools: ['Bash(npm test *)'] },
+      { model: 'sonnet' }
+    );
+
+    // The model must not disturb the security-relevant ordering.
+    expect(captured.slice(0, 8)).toEqual([
+      '--print',
+      '--output-format',
+      'stream-json',
+      '--verbose',
+      '--setting-sources',
+      'project',
+      '--permission-mode',
+      'acceptEdits'
+    ]);
+    expect(captured).toContain('--allowedTools');
+    expect(captured).toContain('--disallowedTools');
+    expect(captured.indexOf('--model')).toBeLessThan(captured.indexOf('--allowedTools'));
+  });
+
+  it('names the model in the error and never retries with another one', async () => {
+    let runs = 0;
+    const runner: ProcessRunner = {
+      async run() {
+        runs += 1;
+        return {
+          command: 'claude',
+          exitCode: 1,
+          stdout: '',
+          stderr: 'Error: model "gpt-nonsense" is not available for this account',
+          timedOut: false,
+          cancelled: false,
+          durationMs: 1,
+          failed: true
+        };
+      }
+    };
+
+    const adapter = new ClaudeCliAdapter(runner, { configuredPath: process.execPath });
+    await expect(
+      adapter.run(
+        {
+          worktreePath: process.cwd(),
+          branchName: 'b',
+          prompt: 'p',
+          sessionId: null,
+          maxTurns: 3,
+          model: 'gpt-nonsense'
+        },
+        { signal: new AbortController().signal, timeoutMs: 1000, onProgress: () => undefined }
+      )
+    ).rejects.toMatchObject({
+      code: 'TOOL_FAILED',
+      message: expect.stringContaining('gpt-nonsense')
+    });
+
+    // Exactly one attempt: no silent fallback to a different model.
+    expect(runs).toBe(1);
   });
 
   it('isolates the run from the operator\'s personal Claude configuration', async () => {
@@ -635,7 +733,7 @@ describe('Claude adapter', () => {
 
     const adapter = new ClaudeCliAdapter(runner, { configuredPath: process.execPath });
     const result = await adapter.run(
-      { worktreePath: process.cwd(), branchName: 'b', prompt: 'p', sessionId: null, maxTurns: 3 },
+      { worktreePath: process.cwd(), branchName: 'b', prompt: 'p', sessionId: null, maxTurns: 3, model: null },
       { signal: new AbortController().signal, timeoutMs: 1000, onProgress: () => undefined }
     );
 
@@ -678,7 +776,7 @@ describe('Claude adapter', () => {
 
     const adapter = new ClaudeCliAdapter(runner, { configuredPath: process.execPath });
     const result = await adapter.run(
-      { worktreePath: process.cwd(), branchName: 'b', prompt: 'p', sessionId: null, maxTurns: 3 },
+      { worktreePath: process.cwd(), branchName: 'b', prompt: 'p', sessionId: null, maxTurns: 3, model: null },
       { signal: new AbortController().signal, timeoutMs: 1000, onProgress: () => undefined }
     );
 
@@ -706,7 +804,7 @@ describe('Claude adapter', () => {
     const adapter = new ClaudeCliAdapter(runner, { configuredPath: process.execPath });
     await expect(
       adapter.run(
-        { worktreePath: process.cwd(), branchName: 'b', prompt: 'p', sessionId: null, maxTurns: 3 },
+        { worktreePath: process.cwd(), branchName: 'b', prompt: 'p', sessionId: null, maxTurns: 3, model: null },
         { signal: new AbortController().signal, timeoutMs: 60_000, onProgress: () => undefined }
       )
     ).rejects.toMatchObject({ code: 'TIMEOUT' });

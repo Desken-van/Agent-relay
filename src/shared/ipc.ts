@@ -13,12 +13,14 @@
  */
 
 import { z } from 'zod';
+import type { CodexModelCatalogResult } from './domain/codex-catalog';
 import type { DiagnosticsReport } from './domain/diagnostics';
 import type { SerializedError } from './domain/errors';
 import type { GitChangeSet, ProjectValidation, RepositoryInfo, WorktreeInfo } from './domain/git';
 import {
   APPROVAL_ACTIONS,
   GITHUB_VISIBILITIES,
+  modelIdSchema,
   type Approval,
   type Project,
   type Run,
@@ -92,6 +94,9 @@ export const ipcInputSchemas = {
 
   'diagnostics:run': z.object({ force: z.boolean().optional() }).strict(),
 
+  /** Picker-visible Codex models. Never starts a thread or a turn. */
+  'codex:listModels': z.object({ refresh: z.boolean().optional() }).strict(),
+
   'dialog:pickDirectory': z
     .object({ title: z.string().max(200).optional(), defaultPath: z.string().optional() })
     .strict(),
@@ -138,7 +143,14 @@ export const ipcInputSchemas = {
       projectId: z.string().min(1),
       title: z.string().min(1).max(300),
       originalRequest: z.string().min(1).max(100_000),
-      maxRounds: z.number().int().min(1).max(20).optional()
+      maxRounds: z.number().int().min(1).max(20).optional(),
+      /**
+       * `.optional()` with no `.default()` on purpose: an omitted field must
+       * stay `undefined` so the service can tell "inherit the Settings
+       * default" apart from an explicit `null` meaning "Tool default".
+       */
+      codexModel: modelIdSchema.optional(),
+      claudeModel: modelIdSchema.optional()
     })
     .strict(),
 
@@ -207,6 +219,8 @@ export interface IpcResponseMap {
   'settings:update': Settings;
 
   'diagnostics:run': DiagnosticsReport;
+
+  'codex:listModels': CodexModelCatalogResult;
 
   'dialog:pickDirectory': string | null;
 

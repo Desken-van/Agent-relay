@@ -47,6 +47,49 @@ export type GithubVisibility = (typeof GITHUB_VISIBILITIES)[number];
 
 export const taskStatusSchema = z.enum(TASK_STATUSES);
 
+/** Upper bound on a model identifier. Real ones are far shorter. */
+export const MODEL_ID_MAX_LENGTH = 200;
+
+/**
+ * A model identifier, normalised.
+ *
+ * Trimmed, and an empty or whitespace-only value becomes `null` rather than
+ * `''` — the UI's "Tool default" and a cleared text box must both land on the
+ * same stored value, or two representations of "no override" would exist.
+ *
+ * Note for callers: `null` and `undefined` mean different things upstream.
+ * `null` is an explicit "use the tool default"; `undefined` means the field was
+ * omitted and a default should be inherited. Never collapse them with `??`.
+ */
+export const modelIdSchema = z
+  .string()
+  .max(MODEL_ID_MAX_LENGTH, `A model id may be at most ${MODEL_ID_MAX_LENGTH} characters.`)
+  // Checked *before* trimming, deliberately. Trimming first would strip a
+  // trailing newline or tab and then accept the value as clean, so a control
+  // character at either end would pass exactly where it matters most.
+  .refine(
+    (value) => !hasControlCharacter(value),
+    'A model id may not contain control characters.'
+  )
+  .transform((value) => value.trim())
+  .transform((value) => (value.length === 0 ? null : value))
+  .nullable();
+
+/**
+ * Claude Code model aliases the picker offers.
+ *
+ * The CLI documents these as "an alias for the latest model"; a full model name
+ * such as `claude-opus-5` is equally valid, which is why this is a convenience
+ * list for the UI and never a validation allow-list. Whether the account can
+ * actually use a model is known only to the CLI.
+ */
+export const CLAUDE_MODEL_ALIASES = [
+  { value: 'opus', label: 'Opus' },
+  { value: 'sonnet', label: 'Sonnet' },
+  { value: 'haiku', label: 'Haiku' },
+  { value: 'fable', label: 'Fable' }
+] as const;
+
 export const taskSchema = z.object({
   id: idSchema,
   projectId: idSchema,
@@ -68,6 +111,16 @@ export const taskSchema = z.object({
   /** JSON-serialised `CodexReviewResult` from the most recent review. */
   lastReviewJson: z.string().nullable(),
   lastError: z.string().nullable(),
+  /**
+   * Model snapshot, taken once when the task is created and never changed.
+   *
+   * A task's model has to be fixed: its Codex thread and Claude session are
+   * resumed for reviews and corrections, and swapping the model underneath an
+   * existing conversation is behaviour neither tool defines. `null` means no
+   * override — the tool uses its own default.
+   */
+  codexModel: z.string().min(1).max(MODEL_ID_MAX_LENGTH).nullable(),
+  claudeModel: z.string().min(1).max(MODEL_ID_MAX_LENGTH).nullable(),
   createdAt: isoDateTime,
   updatedAt: isoDateTime
 });
@@ -250,8 +303,15 @@ export const settingsSchema = z.object({
    * match on the fixed destructive deny list, which is applied afterwards.
    */
   claudeAllowedTools: z.array(claudeToolRuleSchema).max(CLAUDE_ALLOWED_TOOLS_LIMIT),
-  /** Codex model override, or null for the Codex default. */
-  codexModel: z.string().nullable()
+  /**
+   * Default Codex model offered when *creating a new task*.
+   *
+   * This is only a form default. A task snapshots its own pair at creation, so
+   * changing this never affects a task that already exists.
+   */
+  codexModel: modelIdSchema,
+  /** Default Claude model offered when creating a new task. Same semantics. */
+  claudeModel: modelIdSchema
 });
 
 export type Settings = z.infer<typeof settingsSchema>;

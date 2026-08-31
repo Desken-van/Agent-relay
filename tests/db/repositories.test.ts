@@ -19,6 +19,9 @@ let clock: FixedClock;
 let ids: SequentialIdGenerator;
 let tempDir: string;
 
+/** Built at runtime: a raw control byte in a source file makes it binary. */
+const NUL = String.fromCharCode(0);
+
 const DEFAULTS: Settings = defaultSettings({ dataDir: 'C:\\data', documentsDir: 'C:\\docs' });
 
 beforeEach(() => {
@@ -53,6 +56,8 @@ function seedTask(repo: SqliteTaskRepository, projectId: string): string {
     projectId,
     title: 'Task',
     originalRequest: 'Do the thing',
+    codexModel: null,
+    claudeModel: null,
     status: 'DRAFT',
     currentRound: 0,
     maxRounds: 3,
@@ -424,7 +429,7 @@ describe('settings repository', () => {
     expect(() => repo.update({ claudeAllowedTools: ['Bash(' + 'x'.repeat(400) + ')'] })).toThrow(
       /not valid/i
     );
-    expect(() => repo.update({ claudeAllowedTools: [`Bash(npm test) rm -rf`] })).toThrow(
+    expect(() => repo.update({ claudeAllowedTools: [`Bash(npm test)${NUL}rm -rf`] })).toThrow(
       /not valid/i
     );
 

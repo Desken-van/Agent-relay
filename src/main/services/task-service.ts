@@ -18,6 +18,21 @@ export interface CreateTaskInput {
   readonly title: string;
   readonly originalRequest: string;
   readonly maxRounds?: number;
+  /**
+   * Model selection is deliberately three-state, and the three states are not
+   * interchangeable:
+   *
+   *   `undefined` — field omitted: inherit the current Settings default.
+   *   `null`      — explicitly "Tool default": store no override, even when a
+   *                 Settings default exists.
+   *   `string`    — this exact model.
+   *
+   * This is why the code below tests `=== undefined` rather than using `??`,
+   * which would silently turn an explicit `null` into the Settings default and
+   * make "Tool default" unselectable whenever a default was configured.
+   */
+  readonly codexModel?: string | null;
+  readonly claudeModel?: string | null;
 }
 
 export interface TaskServiceDeps {
@@ -45,6 +60,12 @@ export class TaskService {
     }
 
     const settings = this.deps.settings.get();
+
+    // Snapshot, not a reference: from here on this task's models are fixed, and
+    // later Settings edits cannot reach it.
+    const codexModel = input.codexModel === undefined ? settings.codexModel : input.codexModel;
+    const claudeModel = input.claudeModel === undefined ? settings.claudeModel : input.claudeModel;
+
     const requested = input.maxRounds ?? settings.maxReviewRounds;
     // Settings define the ceiling; a task may ask for fewer rounds but not more.
     const maxRounds = Math.min(Math.max(1, requested), settings.maxReviewRounds);
@@ -65,7 +86,9 @@ export class TaskService {
       specificationJson: null,
       specificationApprovedAt: null,
       lastReviewJson: null,
-      lastError: null
+      lastError: null,
+      codexModel,
+      claudeModel
     });
 
     this.deps.events.publishTask(task);

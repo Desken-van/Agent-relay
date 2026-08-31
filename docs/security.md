@@ -238,6 +238,35 @@ isolation that genuinely holds remains the separate worktree and branch.
 `--dangerously-skip-permissions` is never used, and neither is `--bare`: it
 would also discard `CLAUDE.md` and the project context the implementation needs.
 
+### Listing Codex models exposes four fields and nothing else
+
+The catalogue speaks JSON-RPC to `codex app-server` — `initialize`,
+`initialized`, `model/list` — and never opens a thread or a turn, so listing
+models cannot cost anything or touch a conversation. The handshake replies with
+`codexHome`, `userAgent` and platform details; none of it is retained. What
+reaches the renderer is `model`, `displayName`, `description`, `isDefault`, plus
+a short `detail` string when the list is unavailable. Raw stdout, stderr and the
+catalogue's internal `id` never cross the boundary.
+
+Anything unexpected — non-JSON output, a JSON-RPC error, a missing result, an
+unsolicited or repeated response id, a repeated page cursor, more than ten
+pages, a timeout, a non-zero exit — produces `available: false` with an empty
+list. A partial catalogue is never returned, and no exception reaches the
+renderer.
+
+### Model selection is a task snapshot, and never silently substituted
+
+Each task stores the Codex and Claude models it was created with. Runtime reads
+them from the task, not from current Settings, so editing Settings cannot change
+what an in-flight task runs, and resuming a Codex thread or a Claude session
+always uses the model that conversation started with.
+
+Neither picker validates against a closed list — a model your account cannot use
+is rejected by the tool. When that happens the run fails with an error naming the
+model. Agent Relay never falls back to a different model and never retries: a
+result quietly produced by a model the user did not choose would be worse than a
+visible failure.
+
 ### A denied tool call fails the round
 
 In `--print` mode a refused tool call is not an error from the CLI's side. It

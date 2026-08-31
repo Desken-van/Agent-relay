@@ -21,6 +21,7 @@ import {
   useRef,
   type ReactNode
 } from 'react';
+import type { CodexModelCatalogResult } from '@shared/domain/codex-catalog';
 import type { DiagnosticsReport } from '@shared/domain/diagnostics';
 import type { SerializedError } from '@shared/domain/errors';
 import type { Project, Run, RunEvent, Settings, Task } from '@shared/domain/models';
@@ -48,6 +49,9 @@ interface State {
   liveEvents: Record<string, RunEvent[]>;
   settings: Settings | null;
   diagnostics: DiagnosticsReport | null;
+  /** Picker-visible Codex models; null until the first load finishes. */
+  codexModels: CodexModelCatalogResult | null;
+  codexModelsLoading: boolean;
   busy: Record<string, boolean>;
   toasts: Toast[];
   loading: boolean;
@@ -67,6 +71,8 @@ type Action =
   | { type: 'clear-live' }
   | { type: 'settings'; settings: Settings }
   | { type: 'diagnostics'; diagnostics: DiagnosticsReport }
+  | { type: 'codex-models'; catalog: CodexModelCatalogResult }
+  | { type: 'codex-models-loading'; value: boolean }
   | { type: 'busy'; key: string; value: boolean }
   | { type: 'toast'; toast: Toast }
   | { type: 'dismiss-toast'; id: number }
@@ -82,6 +88,8 @@ const initialState: State = {
   liveEvents: {},
   settings: null,
   diagnostics: null,
+  codexModels: null,
+  codexModelsLoading: false,
   busy: {},
   toasts: [],
   loading: true
@@ -165,6 +173,12 @@ function reducer(state: State, action: Action): State {
     case 'diagnostics':
       return { ...state, diagnostics: action.diagnostics };
 
+    case 'codex-models':
+      return { ...state, codexModels: action.catalog, codexModelsLoading: false };
+
+    case 'codex-models-loading':
+      return { ...state, codexModelsLoading: action.value };
+
     case 'busy':
       return { ...state, busy: { ...state.busy, [action.key]: action.value } };
 
@@ -192,6 +206,7 @@ export interface StoreValue extends State {
   refreshDetail(taskId: string): Promise<void>;
   refreshSettings(): Promise<void>;
   refreshDiagnostics(force?: boolean): Promise<void>;
+  refreshCodexModels(refresh?: boolean): Promise<void>;
   notify(toast: Omit<Toast, 'id'>): void;
   notifyError(title: string, error: unknown): void;
   dismissToast(id: number): void;
@@ -270,6 +285,22 @@ export function StoreProvider({ children }: { children: ReactNode }): React.JSX.
     if (result.ok) dispatch({ type: 'diagnostics', diagnostics: result.data });
   }, []);
 
+  /**
+   * Load the Codex catalogue. Never throws and never blocks the task form: an
+   * unreachable catalogue simply arrives as `available: false`, and the picker
+   * falls back to Tool default plus a typed model id.
+   */
+  const refreshCodexModels = useCallback(async (refresh = false) => {
+    dispatch({ type: 'codex-models-loading', value: true });
+    const result = await call('codex:listModels', { refresh });
+    dispatch({
+      type: 'codex-models',
+      catalog: result.ok
+        ? result.data
+        : { available: false, models: [], detail: 'The Codex model list could not be read.' }
+    });
+  }, []);
+
   const perform = useCallback(
     async <T,>(key: string, title: string, action: () => Promise<T>): Promise<T | null> => {
       dispatch({ type: 'busy', key, value: true });
@@ -291,8 +322,9 @@ export function StoreProvider({ children }: { children: ReactNode }): React.JSX.
       await Promise.all([refreshProjects(), refreshSettings()]);
       dispatch({ type: 'loading', value: false });
       await refreshDiagnostics(false);
+      await refreshCodexModels(false);
     })();
-  }, [refreshProjects, refreshSettings, refreshDiagnostics]);
+  }, [refreshProjects, refreshSettings, refreshDiagnostics, refreshCodexModels]);
 
   // Push events from the main process.
   useEffect(() => {
@@ -336,6 +368,7 @@ export function StoreProvider({ children }: { children: ReactNode }): React.JSX.
       refreshDetail,
       refreshSettings,
       refreshDiagnostics,
+      refreshCodexModels,
       notify,
       notifyError,
       dismissToast: (id) => dispatch({ type: 'dismiss-toast', id }),
@@ -348,6 +381,7 @@ export function StoreProvider({ children }: { children: ReactNode }): React.JSX.
       refreshDetail,
       refreshSettings,
       refreshDiagnostics,
+      refreshCodexModels,
       notify,
       notifyError,
       perform

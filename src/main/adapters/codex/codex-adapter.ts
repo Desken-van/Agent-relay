@@ -47,7 +47,6 @@ import { buildReviewPrompt, buildSpecificationPrompt } from './prompts';
 export interface CodexAdapterOptions {
   /** Explicit path to the codex executable; otherwise the bundled one is used. */
   readonly configuredPath?: string | null;
-  readonly model?: string | null;
 }
 
 /**
@@ -88,6 +87,57 @@ interface TurnOutcome {
   readonly finalResponse: string;
 }
 
+/**
+ * Options for one Codex turn.
+ *
+ * `model` is the task's snapshot, passed in by the caller — never adapter
+ * configuration. Adapters are rebuilt from Settings on every call, so a
+ * constructor option would silently make an existing thread follow whatever
+ * Settings currently say.
+ *
+ * A null model omits the key entirely rather than sending an empty string, so
+ * Codex applies its own default. Exported for tests: `startThread` and
+ * `resumeThread` are handed the same object, so proving this function correct
+ * proves both paths carry the model.
+ */
+export function buildThreadOptions(
+  model: string | null,
+  overrides: Partial<ThreadOptions>
+): ThreadOptions {
+  const base: ThreadOptions = {
+    // Codex refuses to run outside a Git repository unless told otherwise;
+    // a fresh worktree is a valid repository, but a brand-new project may not be.
+    skipGitRepoCheck: true,
+    ...overrides
+  };
+  return model ? { ...base, model } : base;
+}
+
+/**
+ * The part of the Codex client this adapter actually uses.
+ *
+ * Narrow on purpose: it makes "does resuming carry the model too?" answerable
+ * by a test with a fake client, instead of by reading the source.
+ */
+export interface CodexThreadOpener<TThread> {
+  startThread(options: ThreadOptions): TThread;
+  resumeThread(id: string, options: ThreadOptions): TThread;
+}
+
+/**
+ * Continue an existing thread, or begin one — with identical options either way.
+ *
+ * The single call site is what guarantees a resumed conversation runs on the
+ * same model as the turn that created it.
+ */
+export function openThread<TThread>(
+  client: CodexThreadOpener<TThread>,
+  threadId: string | null,
+  options: ThreadOptions
+): TThread {
+  return threadId === null ? client.startThread(options) : client.resumeThread(threadId, options);
+}
+
 export class CodexSdkAdapter implements CodexAdapter {
   constructor(
     private readonly runner: ProcessRunner,
@@ -116,14 +166,8 @@ export class CodexSdkAdapter implements CodexAdapter {
     return new Codex(executable ? { codexPathOverride: executable } : {});
   }
 
-  private threadOptions(overrides: Partial<ThreadOptions>): ThreadOptions {
-    const base: ThreadOptions = {
-      // Codex refuses to run outside a Git repository unless told otherwise;
-      // a fresh worktree is a valid repository, but a brand-new project may not be.
-      skipGitRepoCheck: true,
-      ...overrides
-    };
-    return this.options.model ? { ...base, model: this.options.model } : base;
+  private threadOptions(model: string | null, overrides: Partial<ThreadOptions>): ThreadOptions {
+    return buildThreadOptions(model, overrides);
   }
 
   /**
@@ -138,9 +182,7 @@ export class CodexSdkAdapter implements CodexAdapter {
     context: AgentRunContext
   ): Promise<TurnOutcome> {
     const codex = this.createClient();
-    const thread = threadId
-      ? codex.resumeThread(threadId, threadOptions)
-      : codex.startThread(threadOptions);
+    const thread = openThread(codex, threadId, threadOptions);
 
     const messages: string[] = [];
     let failure: string | null = null;
@@ -263,7 +305,7 @@ export class CodexSdkAdapter implements CodexAdapter {
     const outcome = await this.runTurn(
       request.threadId,
       prompt,
-      this.threadOptions({
+      this.threadOptions(request.model, {
         // Specifying requires reading the repository, never writing to it.
         sandboxMode: 'read-only',
         workingDirectory: request.projectPath,
@@ -308,7 +350,7 @@ export class CodexSdkAdapter implements CodexAdapter {
     const outcome = await this.runTurn(
       request.threadId,
       prompt,
-      this.threadOptions({
+      this.threadOptions(request.model, {
         // Not configurable. A review must not be able to edit what it reviews.
         sandboxMode: 'read-only',
         workingDirectory: request.worktreePath,

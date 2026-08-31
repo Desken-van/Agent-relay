@@ -69,6 +69,10 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
 
     'diagnostics:run': (input) => app.diagnostics.run(input.force ?? false),
 
+    // Never rejects: an unreachable catalogue comes back as available:false,
+    // so a missing or broken Codex cannot stop the task form from working.
+    'codex:listModels': (input) => app.codexModels.list({ refresh: input.refresh ?? false }),
+
     'dialog:pickDirectory': async (input) => {
       const window = getWindow();
       const options = {

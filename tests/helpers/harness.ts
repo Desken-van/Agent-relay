@@ -188,6 +188,8 @@ export function createHarness(
         maxRounds: 3,
         codexThreadId: null,
         claudeSessionId: null,
+        codexModel: null,
+        claudeModel: null,
         worktreePath: null,
         branchName: null,
         baseBranch: null,

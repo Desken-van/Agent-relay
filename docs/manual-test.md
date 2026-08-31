@@ -106,6 +106,16 @@ and **Add project** to refuse.
 1. **Tasks → New task.** Give it a title and a real request, e.g.
    *"Add a CONTRIBUTING.md describing how to run the tests."*
 2. Set **Maximum review rounds** to 2.
+2b. Pick the two models. **Codex model** covers the specification and every
+   review; **Claude model** covers the implementation and every correction.
+   Both default to whatever *Settings* holds, and both offer *Tool default* and
+   *Custom model ID…*; Claude also lists `opus`, `sonnet`, `haiku`, `fable`.
+   **Expect** the Codex dropdown to list real models read from the CLI, with
+   the account default marked, plus a *Refresh models* button. If the list
+   cannot be read, expect a notice with *Retry* and the picker still usable.
+   **Expect** the chosen pair to appear on the task row and in the Run screen's
+   Task panel, and to be **unchangeable** after the task exists — editing the
+   Settings defaults afterwards must not alter it.
 3. **Create task** — you land on the **Run** screen with status *Draft*.
 4. Press **Generate specification** (marked read-only, blue).
 5. **Expect:** a Codex node appears on the left lane of the timeline and streams

@@ -56,6 +56,8 @@ export interface TaskRow {
   specification_approved_at: string | null;
   last_review_json: string | null;
   last_error: string | null;
+  codex_model: string | null;
+  claude_model: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -78,6 +80,8 @@ export function toTask(row: TaskRow): Task {
     specificationApprovedAt: row.specification_approved_at,
     lastReviewJson: row.last_review_json,
     lastError: row.last_error,
+    codexModel: row.codex_model,
+    claudeModel: row.claude_model,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };

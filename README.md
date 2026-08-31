@@ -132,6 +132,38 @@ would otherwise report a freshly installed Claude as missing:
 The scan does not recurse, matches no other package, and never reads VS Code
 extension internals or another application's private files.
 
+### Choosing models per task
+
+Each task picks its own pair on the **New task** form:
+
+| Picker | Used for |
+|---|---|
+| **Codex model** | the specification, every regeneration, and every review |
+| **Claude model** | the implementation and every correction round |
+
+The **Codex** list is read live from the CLI (`codex app-server` → `model/list`),
+showing each picker-visible model's display name and marking the account
+default; hidden models are excluded. If that list cannot be read the picker
+still works — **Tool default** and **Custom model ID** remain, with a *Retry*
+button and a note explaining why. **Claude** lists the documented aliases
+`opus`, `sonnet`, `haiku`, `fable`.
+
+Neither list is a validation allow-list: a model your account cannot use is
+refused by the tool, not by Agent Relay, and the resulting error names the model
+rather than quietly substituting another. The catalogue fallback is a *display*
+fallback only — a task that stored a model always runs on that model or fails.
+
+The pair is a **snapshot taken when the task is created** and cannot be changed
+afterwards. That is deliberate: a task's Codex thread and Claude session are
+resumed for reviews and corrections, and swapping the model underneath an
+existing conversation is behaviour neither tool defines. The two fields under
+*Settings → Locations* are only defaults for the form — changing them never
+affects a task that already exists.
+
+Reasoning effort is left to each model's own default and is not stored. Note
+that it varies between models, so changing model can change effort as a side
+effect.
+
 ### What Claude is allowed to run
 
 Claude works unattended, so **Settings → Claude permissions** lists the shell
