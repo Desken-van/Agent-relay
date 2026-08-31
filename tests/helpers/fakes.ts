@@ -16,6 +16,7 @@ import type {
   ClaudeImplementationRequest,
   ClaudeImplementationResult,
   ClaudePermissionDenial,
+  ClaudeStreamEvidence,
   CodexAdapter,
   CodexReviewOutcome,
   CodexReviewRequest,
@@ -120,6 +121,14 @@ export class FakeClaudeAdapter implements ClaudeAdapter {
   finalMessage = 'Implemented the change and ran the tests.\n\n```\n2 passed\n```';
   isError = false;
   permissionDenials: ClaudePermissionDenial[] = [];
+  /** Telemetry only; overridden by the few tests that assert on it. */
+  evidence: ClaudeStreamEvidence = {
+    toolExecutions: [],
+    resultEnvelopeSeen: true,
+    malformedLineCount: 0,
+    incompleteToolUseCount: 0,
+    orphanToolResultCount: 0
+  };
   error: Error | null = null;
   /** Set to observe cancellation without a real process. */
   onRun: ((request: ClaudeImplementationRequest, context: AgentRunContext) => void) | null = null;
@@ -140,7 +149,8 @@ export class FakeClaudeAdapter implements ClaudeAdapter {
       isError: this.isError || this.permissionDenials.length > 0,
       numTurns: 3,
       rawResultJson: null,
-      permissionDenials: this.permissionDenials
+      permissionDenials: this.permissionDenials,
+      evidence: this.evidence
     };
   }
 

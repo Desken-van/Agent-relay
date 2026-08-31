@@ -358,7 +358,8 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       isError: finalized.isError,
       numTurns: finalized.numTurns,
       rawResultJson: finalized.rawResultJson,
-      permissionDenials: finalized.denials
+      permissionDenials: finalized.denials,
+      evidence: finalized.evidence
     };
   }
 }
