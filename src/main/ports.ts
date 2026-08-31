@@ -232,6 +232,15 @@ export interface ClaudePermissionDenial {
   /** See {@link ClaudeToolExecution.commandTruncated}; the same rules apply. */
   readonly commandTruncated: boolean;
   /**
+   * {@link ClaudeToolExecution.toolUseSequence} of the call this refused, or
+   * null when no call could be tied to it.
+   *
+   * Filled in later if the denial is reported before the call it names. Only
+   * ever taken from a matching `tool_use_id`: a denial with no id stays null,
+   * and an identical command is not a link — see the note on that field.
+   */
+  readonly toolUseSequence: number | null;
+  /**
    * Which part of the stream reported it.
    *
    * A denial normally arrives twice — as a `permission_denied` event and again
@@ -250,6 +259,28 @@ export interface ClaudePermissionDenial {
 export interface ClaudeToolExecution {
   /** `tool_use.id`; null when the CLI omitted it, and then it cannot correlate. */
   readonly toolUseId: string | null;
+  /**
+   * Position of this call in the order Claude *made* the calls: 1, 2, 3…
+   *
+   * Array position cannot answer that question. A result may be flushed ahead
+   * of its call, so an entry can be created before the call that owns it is
+   * known, and its slot reflects when the stream first mentioned the id rather
+   * than when Claude invoked anything.
+   *
+   * This is invocation order, never completion order — results arriving out of
+   * order do not move it. Numbers are assigned once, when a real `tool_use` is
+   * first seen: a re-delivered call keeps the number it already had, and a
+   * placeholder standing in for a call that has not arrived holds null and
+   * reserves nothing, so the sequence has no gaps. Anonymous calls each get
+   * their own number, because they are separate invocations even though they
+   * cannot be correlated to a result.
+   *
+   * Null means no call was seen at all — an orphan result.
+   *
+   * Scoped to one parser, and so to one CLI process: a resumed round starts
+   * again at 1 and its numbers say nothing about the round before it.
+   */
+  readonly toolUseSequence: number | null;
   readonly tool: string;
   /**
    * The command for Bash/PowerShell; null for tools that do not run one.

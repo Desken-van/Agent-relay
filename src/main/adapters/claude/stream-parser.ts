@@ -46,6 +46,8 @@ export type { ClaudePermissionDenial, ClaudeStreamEvidence, ClaudeToolExecution 
  */
 interface PendingToolExecution {
   toolUseId: string | null;
+  /** Invocation order, assigned when a real `tool_use` is first seen. */
+  toolUseSequence: number | null;
   tool: string;
   command: string | null;
   commandTruncated: boolean;
@@ -73,6 +75,14 @@ export interface StreamState {
   resultEnvelopeSeen: boolean;
   /** Non-empty lines that were not valid JSON. */
   malformedLineCount: number;
+  /**
+   * Number the next distinct `tool_use` will receive.
+   *
+   * Lives on the state, not in a module-level counter, so it is scoped to one
+   * parser and therefore to one CLI process. A resumed round builds a fresh
+   * state and starts again at 1.
+   */
+  nextToolUseSequence: number;
 }
 
 export function createStreamState(): StreamState {
@@ -86,7 +96,8 @@ export function createStreamState(): StreamState {
     denials: [],
     executions: [],
     resultEnvelopeSeen: false,
-    malformedLineCount: 0
+    malformedLineCount: 0,
+    nextToolUseSequence: 1
   };
 }
 
@@ -149,6 +160,41 @@ function readCommand(input: unknown): RecordedCommand {
 }
 
 /**
+ * The invocation number of the call `toolUseId` names, or null.
+ *
+ * Null covers both "no id" and "that call has not been seen yet"; the second
+ * case is repaired later by {@link attachDenialSequence}.
+ */
+function knownSequence(state: StreamState, toolUseId: string | null): number | null {
+  const known = findExecution(state, toolUseId);
+  if (known === null) return null;
+  return known.toolUseSequence;
+}
+
+/**
+ * Give denials already recorded for `toolUseId` the invocation number that has
+ * just become known.
+ *
+ * The CLI can report a refusal before the call it refused appears in the
+ * stream. Without this the denial would keep a null it no longer deserves, and
+ * a later policy could not place the refusal among the other invocations.
+ *
+ * Only an exact id link is repaired. An anonymous denial stays null: pairing it
+ * with an anonymous call — or with one running the same command — would be a
+ * guess, and it is precisely the guess that would let "a retry succeeded after
+ * this was blocked" be asserted about two unrelated invocations.
+ */
+function attachDenialSequence(state: StreamState, toolUseId: string | null, sequence: number): void {
+  if (toolUseId === null) return;
+
+  state.denials.forEach((denial, index) => {
+    if (denial.toolUseId === toolUseId && denial.toolUseSequence === null) {
+      state.denials[index] = { ...denial, toolUseSequence: sequence };
+    }
+  });
+}
+
+/**
  * Record a tool call.
  *
  * Merges into the placeholder left by a result that outran its call, and
@@ -159,19 +205,30 @@ function readCommand(input: unknown): RecordedCommand {
 function recordToolUse(state: StreamState, use: ParsedToolUse): void {
   const existing = findExecution(state, use.toolUseId);
   if (existing) {
+    // A re-delivered call is not a second invocation, and must not consume a
+    // number — doing so would leave a gap that reads as a missing call.
     if (existing.toolUseSeen) return;
+
     // The placeholder a result left behind: fill in what the call now tells us,
-    // and it stops being an orphan.
+    // and it stops being an orphan. It reserved no number while it waited, so
+    // it takes the next one now, in the order the call actually appeared.
     existing.tool = use.tool;
     existing.command = use.command;
     existing.commandTruncated = use.commandTruncated;
     existing.summary = use.summary;
     existing.toolUseSeen = true;
+    existing.toolUseSequence = state.nextToolUseSequence;
+    state.nextToolUseSequence += 1;
+    attachDenialSequence(state, use.toolUseId, existing.toolUseSequence);
     return;
   }
 
+  const toolUseSequence = state.nextToolUseSequence;
+  state.nextToolUseSequence += 1;
+
   state.executions.push({
     toolUseId: use.toolUseId,
+    toolUseSequence,
     tool: use.tool,
     command: use.command,
     commandTruncated: use.commandTruncated,
@@ -181,6 +238,8 @@ function recordToolUse(state: StreamState, use: ParsedToolUse): void {
     resultConflict: false,
     toolUseSeen: true
   });
+
+  attachDenialSequence(state, use.toolUseId, toolUseSequence);
 }
 
 /**
@@ -224,6 +283,9 @@ function recordToolResult(state: StreamState, toolUseId: string | null, isError:
 
   state.executions.push({
     toolUseId,
+    // Nothing was invoked as far as this stream showed, so there is no place in
+    // the invocation order to claim — and no number is spent holding one.
+    toolUseSequence: null,
     tool: 'unknown tool',
     command: null,
     commandTruncated: false,
@@ -275,6 +337,10 @@ function mergeDenial(
     toolUseId: existing.toolUseId === null ? next.toolUseId : existing.toolUseId,
     command: fillCommand ? next.command : existing.command,
     commandTruncated: fillCommand ? next.commandTruncated : existing.commandTruncated,
+    // Whichever report managed to name an invocation, keep it: merging must
+    // never lose a link that one half of the stream had established.
+    toolUseSequence:
+      existing.toolUseSequence === null ? next.toolUseSequence : existing.toolUseSequence,
     source: existing.source === next.source ? existing.source : 'both'
   };
 }
@@ -501,6 +567,7 @@ export function consumeLine(line: string, state: StreamState): ParsedStreamEvent
         ),
         command: command.text,
         commandTruncated: command.truncated,
+        toolUseSequence: knownSequence(state, toolUseId),
         source: 'stream'
       };
       return recordDenial(state, denial) ? [denialEvent(denial)] : [];
@@ -585,6 +652,7 @@ export function consumeLine(line: string, state: StreamState): ParsedStreamEvent
         ),
         command: command.text,
         commandTruncated: command.truncated,
+        toolUseSequence: knownSequence(state, toolUseId),
         source: 'result'
       };
       if (recordDenial(state, denial)) events.push(denialEvent(denial));
@@ -619,6 +687,7 @@ export function consumeLine(line: string, state: StreamState): ParsedStreamEvent
 export function collectEvidence(state: StreamState): ClaudeStreamEvidence {
   const toolExecutions: ClaudeToolExecution[] = state.executions.map((entry) => ({
     toolUseId: entry.toolUseId,
+    toolUseSequence: entry.toolUseSequence,
     tool: entry.tool,
     command: entry.command,
     commandTruncated: entry.commandTruncated,

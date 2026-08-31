@@ -954,3 +954,277 @@ describe('secrets and the truncation boundary', () => {
     expect(denials[0]?.command).not.toContain(FAKE_TOKEN);
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* Invocation order                                                            */
+/* -------------------------------------------------------------------------- */
+
+describe('tool use sequence', () => {
+  /** Invocation numbers in the order the entries happen to sit in the array. */
+  const sequences = (state: StreamState) =>
+    finalizeState(state).evidence.toolExecutions.map((entry) => entry.toolUseSequence);
+
+  it('numbers two ordinary calls 1 and 2', () => {
+    const state = feed([
+      toolUse('t1', 'Bash', { command: 'npm test' }),
+      toolUse('t2', 'Bash', { command: 'npm run build' })
+    ]);
+
+    expect(sequences(state)).toEqual([1, 2]);
+  });
+
+  it('numbers two calls of the same command separately', () => {
+    // The retry question — "did the second attempt happen after the first?" —
+    // is only answerable if identical commands still get distinct positions.
+    const state = feed([
+      toolUse('t1', 'Bash', { command: 'npm test' }),
+      toolResult('t1', { is_error: true }),
+      toolUse('t2', 'Bash', { command: 'npm test' }),
+      toolResult('t2', { is_error: false })
+    ]);
+
+    expect(sequences(state)).toEqual([1, 2]);
+  });
+
+  it('keeps the original number when a call is re-delivered', () => {
+    const state = feed([
+      toolUse('t1', 'Bash', { command: 'npm test' }),
+      toolUse('t1', 'Bash', { command: 'npm test' }),
+      toolUse('t2', 'Bash', { command: 'npm run build' })
+    ]);
+
+    // No gap: the duplicate consumed nothing, so the next real call is 2.
+    expect(sequences(state)).toEqual([1, 2]);
+  });
+
+  it('numbers anonymous calls separately', () => {
+    const state = feed([
+      toolUse(null, 'Bash', { command: 'npm test' }),
+      toolUse(null, 'Bash', { command: 'npm run build' })
+    ]);
+
+    expect(sequences(state)).toEqual([1, 2]);
+  });
+
+  it('leaves an orphan result without a number', () => {
+    const state = feed([toolResult('stray', { is_error: true })]);
+
+    expect(sequences(state)).toEqual([null]);
+  });
+
+  it('numbers a placeholder only once its call arrives', () => {
+    const early = feed([toolResult('t1', { is_error: false })]);
+    expect(sequences(early)).toEqual([null]);
+
+    const settled = feed([
+      toolResult('t1', { is_error: false }),
+      toolUse('t1', 'Bash', { command: 'npm test' })
+    ]);
+    expect(sequences(settled)).toEqual([1]);
+  });
+
+  it('orders late calls by when the calls arrived, not their results', () => {
+    // Two results land first, then their calls in the opposite order. The
+    // numbers must follow the calls: that is what invocation order means.
+    const state = feed([
+      toolResult('x', { is_error: true }),
+      toolResult('y', { is_error: false }),
+      toolUse('y', 'Bash', { command: 'npm run build' }),
+      toolUse('x', 'Bash', { command: 'npm test' })
+    ]);
+
+    const executions = finalizeState(state).evidence.toolExecutions;
+    const byId = new Map(executions.map((entry) => [entry.toolUseId, entry.toolUseSequence]));
+    expect(byId.get('y')).toBe(1);
+    expect(byId.get('x')).toBe(2);
+  });
+
+  it('does not let result order disturb the numbering', () => {
+    const state = feed([
+      toolUse('t1', 'Bash', { command: 'npm test' }),
+      toolUse('t2', 'Bash', { command: 'npm run build' }),
+      toolResult('t2'),
+      toolResult('t1')
+    ]);
+
+    expect(sequences(state)).toEqual([1, 2]);
+  });
+
+  it('starts again at 1 in a new parser', () => {
+    // One parser is one CLI process. A resumed round must not appear to
+    // continue the invocation order of the round before it.
+    const first = feed([
+      toolUse('t1', 'Bash', { command: 'npm test' }),
+      toolUse('t2', 'Bash', { command: 'npm run build' })
+    ]);
+    expect(sequences(first)).toEqual([1, 2]);
+
+    const resumed = feed([toolUse('t1', 'Bash', { command: 'npm test' })]);
+    expect(sequences(resumed)).toEqual([1]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Placing a denial among the invocations                                      */
+/* -------------------------------------------------------------------------- */
+
+describe('denial invocation link', () => {
+  const denialFor = (id: string | null, extra: Record<string, unknown> = {}) => ({
+    type: 'system',
+    subtype: 'permission_denied',
+    tool_name: 'Bash',
+    ...(id === null ? {} : { tool_use_id: id }),
+    decision_reason: 'requires approval',
+    ...extra
+  });
+
+  it('takes the number of the call it names', () => {
+    const { denials } = finalizeState(
+      feed([
+        toolUse('t1', 'Bash', { command: 'npm run lint' }),
+        toolUse('t2', 'Bash', { command: 'npm test' }),
+        denialFor('t2')
+      ])
+    );
+
+    expect(denials[0]?.toolUseSequence).toBe(2);
+  });
+
+  it('is filled in when the denial is reported before the call', () => {
+    const { denials } = finalizeState(
+      feed([denialFor('t1'), toolUse('t1', 'Bash', { command: 'npm test' })])
+    );
+
+    expect(denials).toHaveLength(1);
+    expect(denials[0]?.toolUseSequence).toBe(1);
+  });
+
+  it('keeps the number through a stream and envelope merge', () => {
+    const { denials } = finalizeState(
+      feed([
+        toolUse('t1', 'Bash', { command: 'npm test' }),
+        denialFor('t1'),
+        resultEnvelope({ permission_denials: [{ tool_name: 'Bash', tool_use_id: 't1' }] })
+      ])
+    );
+
+    expect(denials).toHaveLength(1);
+    expect(denials[0]).toMatchObject({ source: 'both', toolUseSequence: 1 });
+  });
+
+  it('gains the number from the envelope when the event had none', () => {
+    const { denials } = finalizeState(
+      feed([
+        denialFor('t1'),
+        toolUse('t1', 'Bash', { command: 'npm test' }),
+        resultEnvelope({ permission_denials: [{ tool_name: 'Bash', tool_use_id: 't1' }] })
+      ])
+    );
+
+    expect(denials[0]).toMatchObject({ source: 'both', toolUseSequence: 1 });
+  });
+
+  it('leaves a denial with no id unlinked', () => {
+    const { denials } = finalizeState(
+      feed([toolUse('t1', 'Bash', { command: 'npm test' }), denialFor(null)])
+    );
+
+    expect(denials[0]?.toolUseSequence).toBeNull();
+  });
+
+  it('does not link an anonymous denial to an anonymous call', () => {
+    const { denials } = finalizeState(
+      feed([toolUse(null, 'Bash', { command: 'npm test' }), denialFor(null)])
+    );
+
+    expect(denials[0]?.toolUseSequence).toBeNull();
+  });
+
+  it('does not link on a matching command', () => {
+    // The denial names t9, which no call carries. An identical command on
+    // another invocation is not evidence that this is the same attempt.
+    const { denials } = finalizeState(
+      feed([
+        toolUse('t1', 'Bash', { command: 'npm test' }),
+        denialFor('t9', { tool_input: { command: 'npm test' } })
+      ])
+    );
+
+    expect(denials[0]?.toolUseSequence).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Ordering a round without heuristics                                         */
+/* -------------------------------------------------------------------------- */
+
+describe('reconstructing what happened in order', () => {
+  /** Real calls, in invocation order. Total, because the numbers are unique. */
+  const invocations = (state: StreamState) =>
+    finalizeState(state)
+      .evidence.toolExecutions.filter((entry) => entry.toolUseSequence !== null)
+      .sort((a, b) => (a.toolUseSequence ?? 0) - (b.toolUseSequence ?? 0));
+
+  it('distinguishes a failure followed by a pass', () => {
+    // Results arrive in the opposite order to the calls, so array position
+    // would tell the story backwards.
+    const state = feed([
+      toolUse('t1', 'Bash', { command: 'npm test' }),
+      toolUse('t2', 'Bash', { command: 'npm test' }),
+      toolResult('t2', { is_error: false }),
+      toolResult('t1', { is_error: true })
+    ]);
+
+    expect(invocations(state).map((entry) => entry.isError)).toEqual([true, false]);
+  });
+
+  it('distinguishes a pass followed by a failure', () => {
+    const state = feed([
+      toolUse('t1', 'Bash', { command: 'npm test' }),
+      toolUse('t2', 'Bash', { command: 'npm test' }),
+      toolResult('t2', { is_error: true }),
+      toolResult('t1', { is_error: false })
+    ]);
+
+    expect(invocations(state).map((entry) => entry.isError)).toEqual([false, true]);
+  });
+
+  it('places a refused attempt before the retry that followed it', () => {
+    const state = feed([
+      toolUse('t1', 'Bash', { command: 'npm test' }),
+      {
+        type: 'system',
+        subtype: 'permission_denied',
+        tool_name: 'Bash',
+        tool_use_id: 't1',
+        decision_reason: 'requires approval'
+      },
+      toolUse('t2', 'Bash', { command: 'npm test' }),
+      toolResult('t2', { is_error: false })
+    ]);
+
+    const finalized = finalizeState(state);
+    const denied = finalized.denials[0]?.toolUseSequence;
+    const succeeded = invocations(state).find((entry) => entry.isError === false);
+
+    expect(denied).toBe(1);
+    expect(succeeded?.toolUseSequence).toBe(2);
+    // The whole point: the retry provably came after the refusal, without
+    // comparing command text or trusting array order.
+    expect((succeeded?.toolUseSequence ?? 0) > (denied ?? 0)).toBe(true);
+  });
+
+  it('gives every real call a distinct number', () => {
+    const state = feed([
+      toolUse('t1', 'Bash', { command: 'npm test' }),
+      toolResult('stray'),
+      toolUse(null, 'Bash', { command: 'npm test' }),
+      toolUse('t1', 'Bash', { command: 'npm test' }),
+      toolUse('t3', 'Read', { file_path: 'src/app.ts' })
+    ]);
+
+    const numbers = invocations(state).map((entry) => entry.toolUseSequence);
+    expect(numbers).toEqual([1, 2, 3]);
+    expect(new Set(numbers).size).toBe(numbers.length);
+  });
+});
