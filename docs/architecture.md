@@ -208,15 +208,27 @@ thread.runStreamed(input, { outputSchema, signal })
 
 ```
 claude --print --output-format stream-json --verbose
+       --setting-sources project
        --permission-mode acceptEdits --max-turns <n> [--resume <session-id>]
+       [--allowedTools <rule> …] --disallowedTools <rule> …
 ```
 
 * The prompt goes down **stdin**, never on the command line: a specification plus
   a review follow-up routinely exceeds the ~32 KB Windows command-line limit.
 * `--dangerously-skip-permissions` is never used.
+* `--setting-sources project` keeps the run reproducible by excluding the
+  operator's personal Claude configuration; the target repository's own project
+  settings still load. Both permission lists go last, because they are variadic;
+  each rule is its own argv entry.
+* `--allowedTools` **pre-approves** matching calls rather than restricting the
+  set — unmatched calls fall through to the permission mode and project
+  settings. It comes from Settings and defaults to running the project's tests
+  through either shell. The deny list is fixed, not user-editable, and refuses
+  directly-named Git/GitHub commands only. See [security.md](security.md) §5.
 * The stream parser is deliberately permissive — an unrecognised event type is
   surfaced as generic progress, never thrown, so a CLI upgrade cannot break a
-  running round.
+  running round. The one thing it is strict about is a **permission denial**,
+  which fails the round even when the CLI exits 0 and reports success.
 
 ### Git
 

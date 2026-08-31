@@ -173,6 +173,49 @@ export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 /* Settings                                                                    */
 /* -------------------------------------------------------------------------- */
 
+/** True when a rule contains a control character, which no real rule does. */
+function hasControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}
+
+/** Upper bound on how many permission rules a user may grant. */
+export const CLAUDE_ALLOWED_TOOLS_LIMIT = 50;
+
+/** Upper bound on the length of a single permission rule. */
+export const CLAUDE_TOOL_RULE_MAX_LENGTH = 200;
+
+/**
+ * One Claude Code permission rule, e.g. `Bash(npm test *)`.
+ *
+ * Surrounding whitespace is trimmed, because these arrive from a textarea where
+ * a stray space is invisible and would silently stop a rule from matching.
+ */
+export const claudeToolRuleSchema = z
+  .string()
+  .max(CLAUDE_TOOL_RULE_MAX_LENGTH, `A permission rule may be at most ${CLAUDE_TOOL_RULE_MAX_LENGTH} characters.`)
+  .transform((rule) => rule.trim())
+  .refine((rule) => rule.length > 0, 'A permission rule cannot be empty.')
+  .refine(
+    (rule) => !hasControlCharacter(rule),
+    'A permission rule may not contain control characters.'
+  );
+
+/**
+ * The permission rules pre-approved by default.
+ *
+ * Deliberately just enough to run the project's tests, through either shell. A
+ * broad rule such as `Bash(*)` would pre-approve the whole shell for an agent
+ * nobody is watching.
+ */
+export const DEFAULT_CLAUDE_ALLOWED_TOOLS: readonly string[] = [
+  'Bash(npm test *)',
+  'PowerShell(npm test *)'
+];
+
 export const settingsSchema = z.object({
   /** Absolute path to the Claude Code executable, or null to auto-discover. */
   claudeExecutablePath: z.string().nullable(),
@@ -196,6 +239,17 @@ export const settingsSchema = z.object({
   maxDiffBytes: z.number().int().min(1_000).max(5_000_000),
   /** Claude Code `--max-turns` value for a single implementation run. */
   claudeMaxTurns: z.number().int().min(1).max(500),
+  /**
+   * Extra Claude Code permission rules pre-approved for the unattended
+   * implementation run, passed through to `--allowedTools`.
+   *
+   * Matching commands execute without a prompt inside the task's worktree, so
+   * the list is meant to stay short. It is a pre-approval, not the complete set
+   * of what Claude can do — see the adapter for what else the permission mode
+   * and the project's own settings allow. Nothing here can re-enable a direct
+   * match on the fixed destructive deny list, which is applied afterwards.
+   */
+  claudeAllowedTools: z.array(claudeToolRuleSchema).max(CLAUDE_ALLOWED_TOOLS_LIMIT),
   /** Codex model override, or null for the Codex default. */
   codexModel: z.string().nullable()
 });

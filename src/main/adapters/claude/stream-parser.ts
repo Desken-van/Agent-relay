@@ -11,6 +11,7 @@
  * application restart) and the **final result**.
  */
 
+import type { ClaudePermissionDenial } from '../../ports';
 import type { RunEventType } from '../../../shared/domain/models';
 
 export interface ParsedStreamEvent {
@@ -18,6 +19,18 @@ export interface ParsedStreamEvent {
   readonly text: string;
   readonly data?: Record<string, unknown>;
 }
+
+/**
+ * Re-exported for convenience at the call sites in this adapter. The contract
+ * itself lives in `ports.ts`, because the orchestrator reasons about denials.
+ *
+ * They matter more than they look: in `--print` mode there is nobody to answer
+ * a permission prompt, so a denial is silent from the model's point of view. It
+ * carries on, often working around the block, and the run still exits 0. Left
+ * unreported, a round in which the tests never ran is indistinguishable from a
+ * clean one.
+ */
+export type { ClaudePermissionDenial };
 
 export interface StreamState {
   sessionId: string | null;
@@ -27,6 +40,8 @@ export interface StreamState {
   rawResultJson: string | null;
   /** Lines that were not valid JSON — usually a plain-text fallback. */
   plainTextLines: string[];
+  /** Every distinct permission denial seen, in the order encountered. */
+  denials: ClaudePermissionDenial[];
 }
 
 export function createStreamState(): StreamState {
@@ -36,7 +51,39 @@ export function createStreamState(): StreamState {
     isError: false,
     numTurns: null,
     rawResultJson: null,
-    plainTextLines: []
+    plainTextLines: [],
+    denials: []
+  };
+}
+
+/** Longest denial explanation kept; the CLI's text is short, but it is model-adjacent. */
+const MAX_DENIAL_REASON = 300;
+
+/**
+ * Record a denial unless it is already known.
+ *
+ * The same denial arrives twice in a normal run — once as a `permission_denied`
+ * event and again in the `result` envelope's `permission_denials` array — so
+ * identity is the CLI's `tool_use_id` where there is one, and the tool/reason
+ * pair otherwise.
+ */
+function recordDenial(state: StreamState, denial: ClaudePermissionDenial): boolean {
+  const isDuplicate = state.denials.some((seen) =>
+    denial.toolUseId !== null && seen.toolUseId !== null
+      ? seen.toolUseId === denial.toolUseId
+      : seen.tool === denial.tool && seen.reason === denial.reason
+  );
+  if (isDuplicate) return false;
+
+  state.denials.push(denial);
+  return true;
+}
+
+function denialEvent(denial: ClaudePermissionDenial): ParsedStreamEvent {
+  return {
+    type: 'error',
+    text: `Permission denied: ${denial.tool} — ${denial.reason}`,
+    data: { tool: denial.tool, toolUseId: denial.toolUseId, permissionDenied: true }
   };
 }
 
@@ -44,6 +91,10 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
 }
 
 function readString(record: Record<string, unknown>, ...keys: string[]): string | null {
@@ -150,6 +201,27 @@ export function consumeLine(line: string, state: StreamState): ParsedStreamEvent
 
   if (type === 'system') {
     const subtype = readString(record, 'subtype') ?? 'system';
+
+    // A refused tool call. Surfaced as an error, not as bookkeeping.
+    if (subtype === 'permission_denied') {
+      const denial: ClaudePermissionDenial = {
+        tool: readString(record, 'tool_name', 'toolName') ?? 'unknown tool',
+        toolUseId: readString(record, 'tool_use_id', 'toolUseId'),
+        reason: truncate(
+          readString(record, 'decision_reason', 'message', 'reason') ?? 'no reason given',
+          MAX_DENIAL_REASON
+        )
+      };
+      return recordDenial(state, denial) ? [denialEvent(denial)] : [];
+    }
+
+    // Only `init` actually starts a session. Everything else the CLI files
+    // under `system` — thinking_tokens, and whatever it adds next — is
+    // progress, and must not look like a second session opening.
+    if (subtype !== 'init') {
+      return [{ type: 'progress', text: `Claude ${subtype}`, data: { subtype } }];
+    }
+
     const cwd = readString(record, 'cwd');
     return [
       {
@@ -192,13 +264,34 @@ export function consumeLine(line: string, state: StreamState): ParsedStreamEvent
     const errorText = readString(record, 'error');
     if (errorText && !state.finalMessage) state.finalMessage = errorText;
 
-    return [
-      {
-        type: state.isError ? 'error' : 'result',
-        text: state.finalMessage ?? '(Claude returned no final message)',
-        data: { numTurns: state.numTurns, isError: state.isError }
-      }
-    ];
+    // The result envelope repeats every denial, and is the only place they
+    // appear when the CLI decided not to emit an event for one.
+    const events: ParsedStreamEvent[] = [];
+    for (const raw of asArray(record['permission_denials'])) {
+      const entry = asRecord(raw);
+      if (!entry) continue;
+
+      const denial: ClaudePermissionDenial = {
+        tool: readString(entry, 'tool_name', 'toolName') ?? 'unknown tool',
+        toolUseId: readString(entry, 'tool_use_id', 'toolUseId'),
+        reason: truncate(
+          readString(entry, 'decision_reason', 'message', 'reason') ?? 'this command requires approval',
+          MAX_DENIAL_REASON
+        )
+      };
+      if (recordDenial(state, denial)) events.push(denialEvent(denial));
+    }
+
+    // A run that was blocked from doing part of its job did not succeed, no
+    // matter what the envelope claims.
+    if (state.denials.length > 0) state.isError = true;
+
+    events.push({
+      type: state.isError ? 'error' : 'result',
+      text: state.finalMessage ?? '(Claude returned no final message)',
+      data: { numTurns: state.numTurns, isError: state.isError, denials: state.denials.length }
+    });
+    return events;
   }
 
   if (type === 'error') {
@@ -221,13 +314,30 @@ export function finalizeState(state: StreamState): {
   isError: boolean;
   numTurns: number | null;
   rawResultJson: string | null;
+  denials: readonly ClaudePermissionDenial[];
 } {
   const fallback = state.plainTextLines.join('\n').trim();
   return {
     sessionId: state.sessionId,
     finalMessage: state.finalMessage ?? (fallback.length > 0 ? fallback : ''),
-    isError: state.isError,
+    // A denial seen anywhere in the stream fails the run, even if no `result`
+    // envelope ever arrived to set the flag.
+    isError: state.isError || state.denials.length > 0,
     numTurns: state.numTurns,
-    rawResultJson: state.rawResultJson
+    rawResultJson: state.rawResultJson,
+    denials: state.denials
   };
+}
+
+/** One line explaining what was blocked, for the run's final message. */
+export function describeDenials(denials: readonly ClaudePermissionDenial[]): string {
+  if (denials.length === 0) return '';
+
+  const tools = [...new Set(denials.map((denial) => denial.tool))].join(', ');
+  const detail = denials.map((denial) => `${denial.tool}: ${denial.reason}`).join(' | ');
+
+  return (
+    `Claude was denied permission for ${denials.length} tool call(s) (${tools}), so this round is ` +
+    `treated as unsuccessful — work such as running the tests may have been skipped. ${detail}`
+  );
 }

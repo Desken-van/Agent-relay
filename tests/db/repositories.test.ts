@@ -405,6 +405,55 @@ describe('settings repository', () => {
     db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('legacyOption', '"gone"');
     expect(repo.get()).toEqual(DEFAULTS);
   });
+
+  it('defaults the Claude permission rules to running the tests and nothing else', () => {
+    const repo = new SqliteSettingsRepository(db, DEFAULTS);
+    expect(repo.get().claudeAllowedTools).toEqual(['Bash(npm test *)', 'PowerShell(npm test *)']);
+  });
+
+  it('trims permission rules on the way in', () => {
+    const repo = new SqliteSettingsRepository(db, DEFAULTS);
+    const updated = repo.update({ claudeAllowedTools: ['  Bash(npm test *)  '] });
+    expect(updated.claudeAllowedTools).toEqual(['Bash(npm test *)']);
+  });
+
+  it('rejects an empty, over-long or control-character permission rule', () => {
+    const repo = new SqliteSettingsRepository(db, DEFAULTS);
+
+    expect(() => repo.update({ claudeAllowedTools: ['   '] })).toThrow(/not valid/i);
+    expect(() => repo.update({ claudeAllowedTools: ['Bash(' + 'x'.repeat(400) + ')'] })).toThrow(
+      /not valid/i
+    );
+    expect(() => repo.update({ claudeAllowedTools: [`Bash(npm test) rm -rf`] })).toThrow(
+      /not valid/i
+    );
+
+    expect(repo.get().claudeAllowedTools).toEqual(DEFAULTS.claudeAllowedTools);
+  });
+
+  it('refuses more permission rules than the limit allows', () => {
+    const repo = new SqliteSettingsRepository(db, DEFAULTS);
+    const tooMany = Array.from({ length: 51 }, (_, i) => `Bash(cmd${i} *)`);
+    expect(() => repo.update({ claudeAllowedTools: tooMany })).toThrow(/not valid/i);
+  });
+
+  it('accepts an empty permission list, meaning "no commands at all"', () => {
+    const repo = new SqliteSettingsRepository(db, DEFAULTS);
+    expect(repo.update({ claudeAllowedTools: [] }).claudeAllowedTools).toEqual([]);
+  });
+
+  it('drops only the corrupt permission rules, keeping the user\'s other settings', () => {
+    const repo = new SqliteSettingsRepository(db, DEFAULTS);
+    repo.update({ githubOwner: 'someone-else', maxReviewRounds: 7 });
+
+    // A hand-edited row, or a value written before the rules tightened.
+    db.prepare('UPDATE settings SET value = ? WHERE key = ?').run('"Bash(*)"', 'claudeAllowedTools');
+
+    const loaded = repo.get();
+    expect(loaded.claudeAllowedTools).toEqual(DEFAULTS.claudeAllowedTools);
+    expect(loaded.githubOwner).toBe('someone-else');
+    expect(loaded.maxReviewRounds).toBe(7);
+  });
 });
 
 describe('durability on disk', () => {

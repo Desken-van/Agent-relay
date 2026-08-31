@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { ToolDiagnostic } from '@shared/domain/diagnostics';
-import type { Settings } from '@shared/domain/models';
+import { DEFAULT_CLAUDE_ALLOWED_TOOLS, type Settings } from '@shared/domain/models';
 import { call, expect } from '../lib/api';
 import { formatDateTime } from '../lib/format';
 import { useStore } from '../state/store';
@@ -22,6 +22,9 @@ export function SettingsView(): React.JSX.Element {
   const [edits, setEdits] = useState<Settings | null>(null);
   const draft = edits ?? settings;
   const [checking, setChecking] = useState(false);
+  // Raw textarea contents for the permission rules, kept separately so partially
+  // typed lines survive; null means "show whatever the draft holds".
+  const [rulesText, setRulesText] = useState<string | null>(null);
 
   const tools: ToolDiagnostic[] = diagnostics
     ? [diagnostics.codex, diagnostics.claude, diagnostics.git, diagnostics.github]
@@ -30,6 +33,18 @@ export function SettingsView(): React.JSX.Element {
   const set = <K extends keyof Settings>(key: K, value: Settings[K]): void => {
     if (!draft) return;
     setEdits({ ...draft, [key]: value });
+  };
+
+  /**
+   * Drop every unsaved edit.
+   *
+   * The permission rules are held in two places — the parsed array in `edits`
+   * and the raw textarea text — so both have to go, or Reset leaves the old
+   * text on screen while the value behind it has already reverted.
+   */
+  const discardEdits = (): void => {
+    setEdits(null);
+    setRulesText(null);
   };
 
   return (
@@ -222,14 +237,65 @@ export function SettingsView(): React.JSX.Element {
               </div>
             </Card>
 
+            <Card title="Claude permissions">
+              <div className="stack">
+                <Field
+                  label="Shell commands pre-approved for Claude"
+                  hint="One Claude Code permission rule per line, e.g. Bash(npm test *). Matching commands run unattended, without a prompt. The default pre-approves npm test through both Bash and PowerShell."
+                >
+                  <textarea
+                    className="input input--mono"
+                    rows={4}
+                    spellCheck={false}
+                    value={rulesText ?? draft.claudeAllowedTools.join('\n')}
+                    placeholder={DEFAULT_CLAUDE_ALLOWED_TOOLS.join('\n')}
+                    onChange={(e) => {
+                      // The textarea keeps the raw text so a blank line being
+                      // typed does not vanish under the cursor; only non-empty
+                      // lines are committed to the settings draft.
+                      setRulesText(e.target.value);
+                      set(
+                        'claudeAllowedTools',
+                        e.target.value
+                          .split('\n')
+                          .map((line) => line.trim())
+                          .filter((line) => line.length > 0)
+                      );
+                    }}
+                  />
+                </Field>
+
+                <Notice tone="warn">
+                  These rules <strong>pre-approve</strong> matching commands — they are not the
+                  full limit of what Claude can do. Under <span className="mono">acceptEdits</span>{' '}
+                  it also edits files in its worktree, and some read-only commands run
+                  automatically. Keep the list narrow: prefer{' '}
+                  <span className="mono">Bash(npm test *)</span> over a blanket{' '}
+                  <span className="mono">Bash(*)</span>.
+                </Notice>
+
+                <Notice tone="info">
+                  Your personal Claude settings and plugins are excluded from task runs, but the
+                  target repository&apos;s own project settings still load and may add permissions
+                  or hooks. Commit, push, reset, clean, checkout, switch, merge, rebase and{' '}
+                  <span className="mono">gh</span> are refused when a command names them directly —
+                  a pattern filter, not a sandbox, so a project script that wraps them is not
+                  caught. Publishing still requires the confirmation dialog, and a denied command
+                  fails the round.
+                </Notice>
+              </div>
+            </Card>
+
             <div className="row">
               <button
                 type="button"
                 className="btn btn--primary"
                 onClick={() =>
                   void perform('save-settings', 'Could not save settings', async () => {
+                    // Only after the write succeeds: a rejected save must leave
+                    // the user's text on screen to correct, not discard it.
                     await expect('settings:update', draft);
-                    setEdits(null);
+                    discardEdits();
                     await refreshSettings();
                     await refreshDiagnostics(true);
                     notify({ tone: 'success', title: 'Settings saved' });
@@ -238,7 +304,7 @@ export function SettingsView(): React.JSX.Element {
               >
                 Save settings
               </button>
-              <button type="button" className="btn btn--ghost" onClick={() => setEdits(null)}>
+              <button type="button" className="btn btn--ghost" onClick={discardEdits}>
                 Reset
               </button>
             </div>

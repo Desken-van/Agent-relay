@@ -12,7 +12,7 @@
  */
 
 import { join } from 'node:path';
-import type { Settings } from '../shared/domain/models';
+import { DEFAULT_CLAUDE_ALLOWED_TOOLS, type Settings } from '../shared/domain/models';
 import { ClaudeCliAdapter } from './adapters/claude/claude-adapter';
 import { CodexSdkAdapter } from './adapters/codex/codex-adapter';
 import { CliGitAdapter } from './adapters/git/git-adapter';
@@ -68,6 +68,7 @@ export function defaultSettings(paths: ApplicationPaths): Settings {
     maxStoredLogBytes: 2_000_000,
     maxDiffBytes: 400_000,
     claudeMaxTurns: 80,
+    claudeAllowedTools: [...DEFAULT_CLAUDE_ALLOWED_TOOLS],
     codexModel: null
   };
 }
@@ -123,7 +124,10 @@ function adapterFactories(
     },
     claude: () => {
       const current = settings.get();
-      return new ClaudeCliAdapter(runner, { configuredPath: current.claudeExecutablePath });
+      return new ClaudeCliAdapter(runner, {
+        configuredPath: current.claudeExecutablePath,
+        allowedTools: current.claudeAllowedTools
+      });
     },
     git: () => new CliGitAdapter(runner, {}),
     github: () => {

@@ -1,0 +1,43 @@
+name: Verify
+
+on:
+  # No branch filter: this must also run for stacked pull requests whose base is
+  # a feature branch rather than main.
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One run per pull request (or per branch for pushes); a new commit cancels the
+# run that is already in flight for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    # Windows is the only platform this application targets, and several tests
+    # assert Windows-specific behaviour: executable discovery through PATHEXT
+    # and WinGet, path containment, and spawning .cmd shims without a shell.
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # package.json pins no engine; 22 is the minimum that provides the
+          # node:sqlite module the database layer is built on.
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # lint -> typecheck (node + web) -> vitest -> electron-vite build.
+      - name: Verify
+        run: npm run verify

@@ -14,7 +14,7 @@
  * another application's private files.
  */
 
-import { accessSync, constants, statSync } from 'node:fs';
+import { accessSync, constants, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 
@@ -63,16 +63,75 @@ export function findOnPath(command: string, env: NodeJS.ProcessEnv = process.env
   return null;
 }
 
+/**
+ * Directory-name prefix WinGet gives the official Claude Code package.
+ *
+ * The full name carries a source id — `Anthropic.ClaudeCode_<source-id>` — that
+ * differs per WinGet source and is not something to hard-code, so only the
+ * prefix is matched.
+ */
+const WINGET_CLAUDE_PACKAGE_PREFIX = 'Anthropic.ClaudeCode_';
+
+function localAppDataDir(env: NodeJS.ProcessEnv): string {
+  return env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local');
+}
+
+/**
+ * Claude Code executables inside WinGet's package-scoped directories.
+ *
+ * Needed because not every WinGet package gets a shim in `WinGet\Links`: the
+ * Claude Code package installs into `WinGet\Packages\Anthropic.ClaudeCode_<id>\`
+ * and appends *that* directory to the user PATH. A process started before the
+ * install — an already-open terminal, or a shortcut holding a stale environment
+ * block — never sees the PATH change, and would report Claude as missing while
+ * it sits right there on disk.
+ *
+ * The scan is deliberately bounded: direct children of the Packages directory
+ * only, name prefix must match exactly, and `claude.exe` must sit directly
+ * inside. No recursion, no globbing, and nothing outside WinGet's own tree —
+ * in particular never another application's private directories.
+ *
+ * A missing or unreadable Packages directory simply means "no candidate"; on a
+ * machine without WinGet this must not be an error.
+ */
+export function wingetClaudePackageCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
+  const packagesRoot = join(localAppDataDir(env), 'Microsoft', 'WinGet', 'Packages');
+
+  let entries;
+  try {
+    entries = readdirSync(packagesRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  return entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(WINGET_CLAUDE_PACKAGE_PREFIX))
+    .map((entry) => entry.name)
+    // Sorted so that a machine with more than one matching package directory
+    // resolves the same way on every run.
+    .sort()
+    .map((name) => join(packagesRoot, name, 'claude.exe'));
+}
+
 /** Standard Windows install locations, checked in order of likelihood. */
-export function wellKnownWindowsLocations(command: string): string[] {
+export function wellKnownWindowsLocations(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env
+): string[] {
   const home = homedir();
-  const localAppData = process.env.LOCALAPPDATA ?? join(home, 'AppData', 'Local');
-  const appData = process.env.APPDATA ?? join(home, 'AppData', 'Roaming');
-  const programFiles = process.env.ProgramFiles ?? 'C:\\Program Files';
-  const programFilesX86 = process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)';
+  const localAppData = localAppDataDir(env);
+  const appData = env.APPDATA ?? join(home, 'AppData', 'Roaming');
+  const programFiles = env.ProgramFiles ?? 'C:\\Program Files';
+  const programFilesX86 = env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)';
 
   const bases: string[] = [
     join(appData, 'npm'),
+    // Where WinGet places a shim when a package publishes one. Checking it
+    // explicitly matters because WinGet's PATH change only reaches processes
+    // started afterwards: a window launched from an already-open shell would
+    // otherwise report a freshly installed tool as missing. Not every package
+    // uses a shim, which is what `wingetClaudePackageCandidates` covers.
+    join(localAppData, 'Microsoft', 'WinGet', 'Links'),
     join(localAppData, 'Programs', command),
     join(localAppData, 'Programs', command, 'bin'),
     join(home, '.local', 'bin'),
@@ -98,6 +157,12 @@ export function wellKnownWindowsLocations(command: string): string[] {
       results.push(join(base, name));
     }
   }
+
+  // Last, because a published shim is the more stable location when both exist.
+  if (command === 'claude') {
+    results.push(...wingetClaudePackageCandidates(env));
+  }
+
   return results;
 }
 
@@ -126,11 +191,15 @@ export function locateExecutable(command: string, options: LocateOptions = {}): 
     if (isExecutableFile(bundled)) return { path: bundled, source: 'bundled' };
   }
 
-  const onPath = findOnPath(command, options.env ?? process.env);
+  const env = options.env ?? process.env;
+
+  const onPath = findOnPath(command, env);
   if (onPath) return { path: onPath, source: 'path' };
 
   if (process.platform === 'win32') {
-    for (const candidate of wellKnownWindowsLocations(command)) {
+    // Same environment as the PATH lookup, so an injected one relocates the
+    // well-known roots too and the whole search becomes testable.
+    for (const candidate of wellKnownWindowsLocations(command, env)) {
       if (isExecutableFile(candidate)) return { path: candidate, source: 'well-known' };
     }
   }
