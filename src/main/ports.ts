@@ -350,6 +350,26 @@ export interface ClaudeStreamEvidence {
   readonly toolExecutions: readonly ClaudeToolExecution[];
   /** True when the CLI emitted its final `result` envelope. */
   readonly resultEnvelopeSeen: boolean;
+  /**
+   * `is_error` as the final envelope stated it, or null when it did not.
+   *
+   * Null covers three different silences — no envelope, no field, and two
+   * envelopes that disagreed — and none of them is success. Read alongside
+   * {@link resultEnvelopeConflict} to tell the last case from the others.
+   *
+   * Separate from {@link ClaudeImplementationResult.isError}, which is the
+   * outcome the application acts on and folds in denials and process failures.
+   * This field is only what the envelope literally said.
+   */
+  readonly resultEnvelopeIsError: boolean | null;
+  /**
+   * True when more than one final envelope arrived and they disagreed.
+   *
+   * The CLI should send exactly one. If it sends two that contradict each other,
+   * {@link resultEnvelopeIsError} goes to null rather than keeping either value,
+   * on the same reasoning as {@link ClaudeToolExecution.resultConflict}.
+   */
+  readonly resultEnvelopeConflict: boolean;
   /** Non-empty stdout lines that were not valid JSON. */
   readonly malformedLineCount: number;
   /** Calls seen but never answered: `toolUseSeen && !resultReceived`. */

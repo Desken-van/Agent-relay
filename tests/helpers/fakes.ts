@@ -125,6 +125,8 @@ export class FakeClaudeAdapter implements ClaudeAdapter {
   evidence: ClaudeStreamEvidence = {
     toolExecutions: [],
     resultEnvelopeSeen: true,
+    resultEnvelopeIsError: false,
+    resultEnvelopeConflict: false,
     malformedLineCount: 0,
     incompleteToolUseCount: 0,
     orphanToolResultCount: 0

@@ -73,6 +73,10 @@ export interface StreamState {
   executions: PendingToolExecution[];
   /** True once the CLI's final `result` envelope has been parsed. */
   resultEnvelopeSeen: boolean;
+  /** `is_error` as an envelope stated it; null while unstated or contradicted. */
+  resultEnvelopeIsError: boolean | null;
+  /** True once two envelopes have disagreed about `is_error`. */
+  resultEnvelopeConflict: boolean;
   /** Non-empty lines that were not valid JSON. */
   malformedLineCount: number;
   /**
@@ -96,6 +100,8 @@ export function createStreamState(): StreamState {
     denials: [],
     executions: [],
     resultEnvelopeSeen: false,
+    resultEnvelopeIsError: null,
+    resultEnvelopeConflict: false,
     malformedLineCount: 0,
     nextToolUseSequence: 1
   };
@@ -240,6 +246,32 @@ function recordToolUse(state: StreamState, use: ParsedToolUse): void {
   });
 
   attachDenialSequence(state, use.toolUseId, toolUseSequence);
+}
+
+/**
+ * Record what a final `result` envelope said about `is_error`.
+ *
+ * Only a literal boolean counts. A missing field stays null, and a second
+ * envelope contradicting the first sends the value back to null and raises the
+ * conflict flag — the same reasoning as two disagreeing tool results: choosing
+ * a side would turn a stream we cannot trust into a clean answer.
+ *
+ * Telemetry only. The outcome the application acts on is decided elsewhere in
+ * this file and is not touched by any of this.
+ */
+function recordEnvelopeOutcome(state: StreamState, record: Record<string, unknown>): void {
+  const stated = typeof record['is_error'] === 'boolean' ? record['is_error'] : null;
+
+  if (state.resultEnvelopeConflict) return;
+  if (stated === null) return;
+
+  if (state.resultEnvelopeIsError !== null && state.resultEnvelopeIsError !== stated) {
+    state.resultEnvelopeIsError = null;
+    state.resultEnvelopeConflict = true;
+    return;
+  }
+
+  state.resultEnvelopeIsError = stated;
 }
 
 /**
@@ -620,6 +652,7 @@ export function consumeLine(line: string, state: StreamState): ParsedStreamEvent
   if (type === 'result') {
     state.rawResultJson = trimmed;
     state.resultEnvelopeSeen = true;
+    recordEnvelopeOutcome(state, record);
     state.isError = record['is_error'] === true || readString(record, 'subtype') === 'error';
 
     const result = readString(record, 'result', 'final_message', 'text');
@@ -701,6 +734,8 @@ export function collectEvidence(state: StreamState): ClaudeStreamEvidence {
   return {
     toolExecutions,
     resultEnvelopeSeen: state.resultEnvelopeSeen,
+    resultEnvelopeIsError: state.resultEnvelopeIsError,
+    resultEnvelopeConflict: state.resultEnvelopeConflict,
     malformedLineCount: state.malformedLineCount,
     // A call whose result never arrived. Counted separately from a failed one:
     // "we do not know how this ended" and "this ended badly" are different
