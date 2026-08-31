@@ -174,6 +174,15 @@ Every child process in the application is created in exactly one place:
 * Retained output is bounded; a runaway agent cannot fill the disk.
 * Cancellation is an `AbortSignal`; timeouts are enforced per run.
 
+One narrow exception to "run once, collect output": `InteractiveProcessRunner`,
+implemented by the same class, keeps stdin open so a line-oriented protocol can
+be driven turn by turn. It exists because `codex app-server` starts shutting
+down at stdin EOF and never answers, so `run({ input })` cannot talk to it. The
+controller handed to callers exposes only `writeLine` and `closeInput`, input is
+bounded by message count and bytes, embedded newlines are refused (framing is
+one record per line), and every security flag comes from the same shared options
+builder as the other two paths.
+
 Executable discovery is explicit
 ([`executable-locator.ts`](../src/main/adapters/process/executable-locator.ts)):
 configured path → `PATH` (honouring `PATHEXT`) → well-known Windows locations.
@@ -198,6 +207,11 @@ thread.runStreamed(input, { outputSchema, signal })
 ```
 
 * Specification runs with `sandboxMode: 'read-only'`.
+* `model` comes from the **task**, on the request, not from adapter
+  configuration. Adapters are rebuilt from Settings on every call, so a
+  constructor option would make an existing thread follow whatever Settings
+  currently say. `startThread` and `resumeThread` receive the same options
+  object, so both carry the task's model; `null` omits the key entirely.
 * **Review also runs `read-only`, and that is not configurable** — a review that
   can edit the code it is judging is not a review.
 * The same Zod schema that validates the response is projected to JSON Schema via
@@ -209,9 +223,15 @@ thread.runStreamed(input, { outputSchema, signal })
 ```
 claude --print --output-format stream-json --verbose
        --setting-sources project
-       --permission-mode acceptEdits --max-turns <n> [--resume <session-id>]
+       --permission-mode acceptEdits --max-turns <n>
+       [--model <task model>] [--resume <session-id>]
        [--allowedTools <rule> …] --disallowedTools <rule> …
 ```
+
+* `--model` is the task's snapshot and is passed on a fresh run and alongside
+  `--resume` alike, so a correction round never changes model mid-conversation.
+  A task with no override omits the flag. An unusable model produces a
+  `TOOL_FAILED` naming it — never a retry with something else.
 
 * The prompt goes down **stdin**, never on the command line: a specification plus
   a review follow-up routinely exceeds the ~32 KB Windows command-line limit.

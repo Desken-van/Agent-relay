@@ -97,6 +97,20 @@ export const MIGRATIONS: readonly Migration[] = [
         );
       `);
     }
+  },
+  {
+    version: 2,
+    name: 'task-model-selection',
+    up(db) {
+      // Both nullable, and deliberately without a backfill: NULL means "no
+      // override, let the tool pick", which is exactly the behaviour every task
+      // created before this migration already had. Two separate statements
+      // because SQLite's ALTER TABLE takes one column at a time.
+      db.exec(`
+        ALTER TABLE tasks ADD COLUMN codex_model TEXT;
+        ALTER TABLE tasks ADD COLUMN claude_model TEXT;
+      `);
+    }
   }
 ];
 

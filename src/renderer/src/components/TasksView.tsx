@@ -1,4 +1,11 @@
 import { useEffect, useState } from 'react';
+import { CLAUDE_MODEL_ALIASES } from '@shared/domain/models';
+import {
+  choiceFromModel,
+  choiceToModel,
+  isChoiceIncomplete,
+  type ModelChoice
+} from '@shared/domain/model-choice';
 import { expect } from '../lib/api';
 import { formatDateTime, truncateMiddle } from '../lib/format';
 import { useStore } from '../state/store';
@@ -14,7 +21,10 @@ export function TasksView(): React.JSX.Element {
     refreshTasks,
     perform,
     notify,
-    settings
+    settings,
+    codexModels,
+    codexModelsLoading,
+    refreshCodexModels
   } = useStore();
 
   const [title, setTitle] = useState('');
@@ -26,6 +36,31 @@ export function TasksView(): React.JSX.Element {
   const maxRounds = settings?.maxReviewRounds ?? 3;
   const [chosenRounds, setChosenRounds] = useState<number | null>(null);
   const rounds = Math.min(chosenRounds ?? maxRounds, maxRounds);
+
+  // `null` means "untouched": the picker follows the current Settings default,
+  // and re-derives when the catalogue arrives so a known slug shows as a named
+  // preset rather than Custom. The moment the user picks anything, their choice
+  // is stored and a later catalogue update cannot overwrite it.
+  const [codexChoice, setCodexChoice] = useState<ModelChoice | null>(null);
+  const [claudeChoice, setClaudeChoice] = useState<ModelChoice | null>(null);
+
+  const codexPresets = (codexModels?.models ?? []).map((option) => ({
+    value: option.model,
+    label: option.isDefault ? `${option.displayName} (default)` : option.displayName
+  }));
+
+  const codexSelection =
+    codexChoice ?? choiceFromModel(settings?.codexModel ?? null, codexPresets);
+  const claudeSelection =
+    claudeChoice ?? choiceFromModel(settings?.claudeModel ?? null, CLAUDE_MODEL_ALIASES);
+
+  const codexModel = choiceToModel(codexSelection);
+  const claudeModel = choiceToModel(claudeSelection);
+
+  // An empty Custom box is not the same as Tool default, so it blocks Create
+  // instead of quietly submitting null.
+  const modelsIncomplete =
+    isChoiceIncomplete(codexSelection) || isChoiceIncomplete(claudeSelection);
 
   useEffect(() => {
     if (selectedProject) void refreshTasks(selectedProject.id);
@@ -80,6 +115,13 @@ export function TasksView(): React.JSX.Element {
                       ) : null}
                       {task.codexThreadId ? <span title="Codex thread stored">codex ✓</span> : null}
                       {task.claudeSessionId ? <span title="Claude session stored">claude ✓</span> : null}
+                      <span
+                        className="mono"
+                        title={`Codex: ${task.codexModel ?? 'Tool default'} · Claude: ${task.claudeModel ?? 'Tool default'}`}
+                      >
+                        {codexModelLabel(task.codexModel, codexModels?.models ?? [])} /{' '}
+                        {task.claudeModel ?? 'default'}
+                      </span>
                     </div>
                   </div>
                   <Rounds used={task.currentRound} max={task.maxRounds} />
@@ -116,6 +158,47 @@ export function TasksView(): React.JSX.Element {
               />
             </Field>
 
+            <ModelPicker
+              label="Codex model — specification + review"
+              hint="Fixed for the life of the task. Its Codex thread is resumed for every review, so the model cannot change later."
+              presets={codexPresets}
+              choice={codexSelection}
+              onChange={setCodexChoice}
+              footer={
+                codexModels && !codexModels.available ? (
+                  <Notice tone="warn">
+                    {codexModels.detail ?? 'The Codex model list is unavailable.'} You can still
+                    choose <strong>Tool default</strong> or type an exact model ID.{' '}
+                    <button
+                      type="button"
+                      className="btn btn--sm btn--ghost"
+                      disabled={codexModelsLoading}
+                      onClick={() => void refreshCodexModels(true)}
+                    >
+                      {codexModelsLoading ? 'Retrying…' : 'Retry'}
+                    </button>
+                  </Notice>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn--sm btn--ghost"
+                    disabled={codexModelsLoading}
+                    onClick={() => void refreshCodexModels(true)}
+                  >
+                    {codexModelsLoading ? 'Refreshing…' : 'Refresh models'}
+                  </button>
+                )
+              }
+            />
+
+            <ModelPicker
+              label="Claude model — implementation + corrections"
+              hint="Fixed for the life of the task. Availability depends on your Claude account, not on this list."
+              presets={CLAUDE_MODEL_ALIASES}
+              choice={claudeSelection}
+              onChange={setClaudeChoice}
+            />
+
             <Field
               label={`Maximum review rounds: ${rounds}`}
               hint={`The relay loop stops after this many Codex reviews. Ceiling from Settings: ${maxRounds}.`}
@@ -132,17 +215,25 @@ export function TasksView(): React.JSX.Element {
             <button
               type="button"
               className="btn btn--primary"
-              disabled={!title.trim() || !request.trim()}
+              disabled={!title.trim() || !request.trim() || modelsIncomplete}
               onClick={() =>
                 void perform('create-task', 'Could not create the task', async () => {
                   const task = await expect('tasks:create', {
                     projectId: selectedProject.id,
                     title: title.trim(),
                     originalRequest: request.trim(),
-                    maxRounds: rounds
+                    maxRounds: rounds,
+                    // Always the actual choice, never omitted: sending `null`
+                    // for "Tool default" is what stops a configured Settings
+                    // default from being inherited against the user's wish.
+                    codexModel,
+                    claudeModel
                   });
                   setTitle('');
                   setRequest('');
+                  // Back to whatever Settings currently defaults to.
+                  setCodexChoice(null);
+                  setClaudeChoice(null);
                   await refreshTasks(selectedProject.id);
                   selectTask(task.id);
                   setSection('run');
@@ -162,4 +253,94 @@ export function TasksView(): React.JSX.Element {
       </div>
     </div>
   );
+}
+
+/** Sentinel values for the two non-model entries in the dropdown. */
+const TOOL_DEFAULT = '__tool_default__';
+const CUSTOM = '__custom__';
+
+/**
+ * A model chooser: tool default, a preset, or an exact id typed by hand.
+ *
+ * Fully controlled — the mode lives in the parent alongside the value, so there
+ * is no local state to drift out of step with a catalogue that loads later or a
+ * form that gets reset.
+ *
+ * `presets` is a convenience list, never a validation allow-list: a model the
+ * list has never heard of is a legitimate choice, and only the tool knows what
+ * an account may actually use. An empty `presets` still gives a usable picker.
+ */
+function ModelPicker({
+  label,
+  hint,
+  presets,
+  choice,
+  onChange,
+  footer
+}: {
+  label: string;
+  hint: string;
+  presets: readonly { readonly value: string; readonly label: string }[];
+  choice: ModelChoice;
+  onChange: (next: ModelChoice) => void;
+  footer?: React.ReactNode;
+}): React.JSX.Element {
+  const selected =
+    choice.kind === 'default' ? TOOL_DEFAULT : choice.kind === 'preset' ? choice.value : CUSTOM;
+
+  return (
+    <Field label={label} hint={hint}>
+      <select
+        className="input"
+        value={selected}
+        onChange={(e) => {
+          const next = e.target.value;
+          if (next === TOOL_DEFAULT) onChange({ kind: 'default' });
+          else if (next === CUSTOM) onChange({ kind: 'custom', draft: '' });
+          else onChange({ kind: 'preset', value: next });
+        }}
+      >
+        <option value={TOOL_DEFAULT}>Tool default</option>
+        {presets.map((preset) => (
+          <option key={preset.value} value={preset.value}>
+            {preset.label}
+          </option>
+        ))}
+        <option value={CUSTOM}>Custom model ID…</option>
+      </select>
+
+      {choice.kind === 'custom' ? (
+        <>
+          <input
+            className="input input--mono"
+            placeholder="exact model id, e.g. gpt-5.6-sol"
+            value={choice.draft}
+            spellCheck={false}
+            // Stored untrimmed so typing a space does not fight the caret; the
+            // trim happens in choiceToModel and again in the IPC schema.
+            onChange={(e) => onChange({ kind: 'custom', draft: e.target.value })}
+          />
+          {isChoiceIncomplete(choice) ? (
+            <div className="faint" style={{ fontSize: 12 }}>
+              Enter a model ID, or choose <strong>Tool default</strong>.
+            </div>
+          ) : null}
+        </>
+      ) : null}
+      {footer}
+    </Field>
+  );
+}
+
+/**
+ * Show a model the way the user chose it: the catalogue's display name when we
+ * recognise the slug, the raw slug when we do not (an old task, a hand-typed
+ * id, or an unreachable catalogue), and "default" for no override.
+ */
+export function codexModelLabel(
+  model: string | null,
+  catalogue: readonly { readonly model: string; readonly displayName: string }[]
+): string {
+  if (model === null) return 'default';
+  return catalogue.find((option) => option.model === model)?.displayName ?? model;
 }

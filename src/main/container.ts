@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { DEFAULT_CLAUDE_ALLOWED_TOOLS, type Settings } from '../shared/domain/models';
 import { ClaudeCliAdapter } from './adapters/claude/claude-adapter';
 import { CodexSdkAdapter } from './adapters/codex/codex-adapter';
+import { CodexAppServerModelCatalog } from './adapters/codex/codex-model-catalog';
 import { CliGitAdapter } from './adapters/git/git-adapter';
 import { GhGitHubAdapter } from './adapters/github/github-adapter';
 import { ExecaProcessRunner, type ProcessRunner } from './adapters/process/process-runner';
@@ -31,6 +32,7 @@ import type {
   ClaudeAdapter,
   Clock,
   CodexAdapter,
+  CodexModelCatalog,
   ConfirmationService,
   EventPublisher,
   GitAdapter,
@@ -69,7 +71,9 @@ export function defaultSettings(paths: ApplicationPaths): Settings {
     maxDiffBytes: 400_000,
     claudeMaxTurns: 80,
     claudeAllowedTools: [...DEFAULT_CLAUDE_ALLOWED_TOOLS],
-    codexModel: null
+    // Defaults for the *new task* form only. A task snapshots its own pair.
+    codexModel: null,
+    claudeModel: null
   };
 }
 
@@ -86,6 +90,7 @@ export interface Application {
   readonly orchestrator: Orchestrator;
   readonly publishService: PublishService;
   readonly diagnostics: ToolDiagnosticsService;
+  readonly codexModels: CodexModelCatalog;
   readonly close: () => void;
 }
 
@@ -118,8 +123,7 @@ function adapterFactories(
     codex: () => {
       const current = settings.get();
       return new CodexSdkAdapter(runner, {
-        configuredPath: current.codexExecutablePath,
-        model: current.codexModel
+        configuredPath: current.codexExecutablePath
       });
     },
     claude: () => {
@@ -247,6 +251,16 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     events: options.events
   });
 
+  // One long-lived instance: the cache only earns its keep if it outlives a
+  // single call, and it keys on the resolved executable so a Settings change
+  // that repoints Codex invalidates it on its own.
+  const codexModels = new CodexAppServerModelCatalog(
+    runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner(),
+    // Read on every list, not captured here: changing the Codex path in
+    // Settings must take effect without restarting the application.
+    { getConfiguredPath: () => settings.get().codexExecutablePath }
+  );
+
   const diagnostics = new ToolDiagnosticsService({
     codex: adapters.codex,
     claude: adapters.claude,
@@ -268,6 +282,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     orchestrator,
     publishService,
     diagnostics,
+    codexModels,
     close: () => closeDatabase(db)
   };
 }

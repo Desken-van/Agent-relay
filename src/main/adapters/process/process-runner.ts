@@ -61,8 +61,57 @@ export interface ProcessRunner {
   ): Promise<ProcessResult>;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Interactive (line-oriented duplex) execution                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The only thing a session callback may do to the child.
+ *
+ * Deliberately two methods. A caller cannot reach the subprocess, its streams,
+ * its pid, or anything else that would let it sidestep the limits below.
+ */
+export interface InteractiveSessionController {
+  /** Write one NDJSON record. The newline is added here. */
+  writeLine(line: string): void;
+  /** Close stdin. Idempotent; further writes are refused. */
+  closeInput(): void;
+}
+
+export interface InteractiveRunOptions extends ProcessRunOptions {
+  /** Called once the child is up, to send the opening message(s). */
+  onStart?(controller: InteractiveSessionController): void | Promise<void>;
+  /** One stdout line, already redacted. Reply by writing the next line. */
+  onStdoutLine(line: string, controller: InteractiveSessionController): void | Promise<void>;
+  /** Stderr, kept separate so a diagnostic can never be parsed as a response. */
+  onStderrLine?(line: string): void;
+  /** Hard ceiling on messages written to stdin. */
+  readonly maxInputMessages?: number;
+  /** Hard ceiling on total stdin bytes. */
+  readonly maxInputBytes?: number;
+}
+
+/**
+ * A process you can talk to line by line.
+ *
+ * Split from {@link ProcessRunner} on purpose: only the Codex model catalogue
+ * needs a duplex conversation, and every other adapter should keep depending on
+ * the narrower "run once, collect output" contract. Both are implemented by
+ * `ExecaProcessRunner`, so there is still exactly one place in the application
+ * that creates a child process.
+ */
+export interface InteractiveProcessRunner {
+  runInteractive(
+    file: string,
+    args: readonly string[],
+    options: InteractiveRunOptions
+  ): Promise<ProcessResult>;
+}
+
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 2_000_000;
+const DEFAULT_MAX_INPUT_MESSAGES = 100;
+const DEFAULT_MAX_INPUT_BYTES = 256 * 1024;
 
 /** Accumulates text up to a byte budget, then silently drops the remainder. */
 class BoundedBuffer {
@@ -94,48 +143,79 @@ class BoundedBuffer {
   }
 }
 
-export class ExecaProcessRunner implements ProcessRunner {
+/**
+ * Reject anything that is not a plain executable path plus string arguments.
+ * Shared by every execution path so none of them can be laxer than another.
+ */
+function assertSpawnable(file: string, args: readonly string[]): void {
+  if (typeof file !== 'string' || file.trim().length === 0) {
+    throw new AgentRelayError('VALIDATION_FAILED', 'An executable path is required.');
+  }
+  for (const arg of args) {
+    if (typeof arg !== 'string') {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'Process arguments must all be strings; refusing to spawn.'
+      );
+    }
+  }
+}
+
+/**
+ * The security posture, in one place.
+ *
+ * Buffered, streaming and interactive execution all go through this. Copying
+ * these flags into three call sites is how two of them eventually drift, and
+ * `shell: false` is not a setting anyone should be able to lose by accident.
+ */
+function baseExecaOptions(options: ProcessRunOptions): Options {
+  return {
+    cwd: options.cwd,
+    timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    cancelSignal: options.signal,
+    // Kill the whole tree; agent CLIs spawn helpers of their own.
+    forceKillAfterDelay: 5_000,
+    env: {
+      ...scrubEnvironment(process.env, options.passthroughEnvNames ?? []),
+      ...(options.env ?? {})
+    },
+    extendEnv: false,
+    // Never, under any circumstance, interpret the command as a shell string.
+    shell: false,
+    windowsHide: true,
+    preferLocal: options.preferLocal ?? false,
+    reject: false,
+    stripFinalNewline: true
+  };
+}
+
+/**
+ * What the caller is told the command was.
+ *
+ * Argv only — stdin never appears here, because prompts and JSON-RPC payloads
+ * are exactly the model-authored text that must not end up in a log line.
+ */
+function commandLabelFor(file: string, args: readonly string[]): string {
+  return `${file} ${args.join(' ')}`.trim();
+}
+
+export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunner {
   async run(
     file: string,
     args: readonly string[],
     options: ProcessRunOptions = {}
   ): Promise<ProcessResult> {
-    if (typeof file !== 'string' || file.trim().length === 0) {
-      throw new AgentRelayError('VALIDATION_FAILED', 'An executable path is required.');
-    }
-    for (const arg of args) {
-      if (typeof arg !== 'string') {
-        throw new AgentRelayError(
-          'VALIDATION_FAILED',
-          'Process arguments must all be strings; refusing to spawn.'
-        );
-      }
-    }
+    assertSpawnable(file, args);
 
     const startedAt = Date.now();
     const maxBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
 
     const execaOptions: Options = {
-      cwd: options.cwd,
-      timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      cancelSignal: options.signal,
-      // Kill the whole tree; agent CLIs spawn helpers of their own.
-      forceKillAfterDelay: 5_000,
-      env: {
-        ...scrubEnvironment(process.env, options.passthroughEnvNames ?? []),
-        ...(options.env ?? {})
-      },
-      extendEnv: false,
-      // Never, under any circumstance, interpret the command as a shell string.
-      shell: false,
-      windowsHide: true,
-      preferLocal: options.preferLocal ?? false,
-      reject: false,
-      stripFinalNewline: true,
+      ...baseExecaOptions(options),
       ...(options.input === undefined ? {} : { input: options.input })
     };
 
-    const commandLabel = `${file} ${args.join(' ')}`.trim();
+    const commandLabel = commandLabelFor(file, args);
 
     if (options.onLine) {
       return this.runStreaming(file, args, execaOptions, {
@@ -215,6 +295,179 @@ export class ExecaProcessRunner implements ProcessRunner {
       const failure = toFailureResult(error, ctx);
       // Preserve whatever we managed to stream before the failure.
       return { ...failure, stdout: combined.toString() || failure.stdout };
+    }
+  }
+
+  /**
+   * Run a child you can hold a line-by-line conversation with.
+   *
+   * The child stays alive with stdin open until the caller closes it, which is
+   * the whole reason this exists: a protocol that answers a request only while
+   * stdin is still open cannot be driven by `run({ input })`, where execa writes
+   * the payload and immediately signals EOF.
+   *
+   * Everything that makes `run` safe applies unchanged — same options builder,
+   * same scrubbed environment, same redaction, same bounded output, same tree
+   * kill. What is added is bounded *input*, and a controller narrow enough that
+   * a callback cannot reach the process itself.
+   */
+  async runInteractive(
+    file: string,
+    args: readonly string[],
+    options: InteractiveRunOptions
+  ): Promise<ProcessResult> {
+    assertSpawnable(file, args);
+
+    const startedAt = Date.now();
+    const maxBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+    const maxMessages = options.maxInputMessages ?? DEFAULT_MAX_INPUT_MESSAGES;
+    const maxInputBytes = options.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES;
+    const commandLabel = commandLabelFor(file, args);
+    const ctx = { maxBytes, startedAt, commandLabel };
+
+    const stdoutBuffer = new BoundedBuffer(maxBytes);
+    const stderrBuffer = new BoundedBuffer(maxBytes);
+
+    const subprocess = execa(file, [...args], {
+      ...baseExecaOptions(options),
+      buffer: false
+    });
+
+    let inputClosed = false;
+    let sessionOver = false;
+    let messages = 0;
+    let inputBytes = 0;
+
+    const controller: InteractiveSessionController = {
+      writeLine(line: string): void {
+        // A controller that outlived its session would be writing into a
+        // process nobody is reading from any more.
+        if (sessionOver) {
+          throw new AgentRelayError(
+            'VALIDATION_FAILED',
+            'This interactive session has ended; its controller can no longer be used.'
+          );
+        }
+        if (inputClosed) {
+          throw new AgentRelayError('VALIDATION_FAILED', 'stdin is already closed.');
+        }
+        if (typeof line !== 'string') {
+          throw new AgentRelayError('VALIDATION_FAILED', 'Only strings can be written.');
+        }
+        // One record per line is the entire framing contract; an embedded
+        // newline would silently split one message into two.
+        if (/[\r\n]/.test(line)) {
+          throw new AgentRelayError(
+            'VALIDATION_FAILED',
+            'A written line may not contain a carriage return or newline.'
+          );
+        }
+
+        messages += 1;
+        inputBytes += Buffer.byteLength(line, 'utf8') + 1;
+        if (messages > maxMessages) {
+          throw new AgentRelayError(
+            'VALIDATION_FAILED',
+            `This session may write at most ${maxMessages} messages.`
+          );
+        }
+        if (inputBytes > maxInputBytes) {
+          throw new AgentRelayError(
+            'VALIDATION_FAILED',
+            `This session may write at most ${maxInputBytes} bytes to stdin.`
+          );
+        }
+
+        subprocess.stdin?.write(`${line}\n`);
+      },
+
+      closeInput(): void {
+        if (inputClosed) return;
+        inputClosed = true;
+        subprocess.stdin?.end();
+      }
+    };
+
+    /** Close stdin and kill the tree. Safe to call more than once. */
+    const terminate = (): void => {
+      if (!inputClosed) {
+        inputClosed = true;
+        subprocess.stdin?.end();
+      }
+      // `forceKillAfterDelay` escalates to the whole tree if it ignores this.
+      subprocess.kill();
+    };
+
+    // stderr is drained in parallel and never offered to the line handler:
+    // a warning on stderr must not be mistaken for a protocol response.
+    const drainStderr = (async () => {
+      try {
+        for await (const raw of subprocess.iterable({ from: 'stderr' })) {
+          const line = redactSecrets(String(raw));
+          stderrBuffer.push(`${line}\n`);
+          options.onStderrLine?.(line);
+        }
+      } catch {
+        // The process ending mid-read is normal; the exit path reports it.
+      }
+    })();
+
+    try {
+      await options.onStart?.(controller);
+
+      let callbackError: unknown = null;
+
+      for await (const raw of subprocess.iterable({ from: 'stdout' })) {
+        const line = redactSecrets(String(raw));
+        stdoutBuffer.push(`${line}\n`);
+
+        try {
+          await options.onStdoutLine(line, controller);
+        } catch (error) {
+          // Kill *before* unwinding the iterator. Letting the throw escape the
+          // loop first makes execa's cleanup wait on a child that is still
+          // running, which turns an instant failure into a full timeout.
+          callbackError = error;
+          terminate();
+          break;
+        }
+      }
+
+      if (callbackError !== null) throw callbackError;
+
+      const result = await subprocess;
+      await drainStderr;
+
+      return {
+        command: commandLabel,
+        exitCode: result.exitCode ?? null,
+        stdout: stdoutBuffer.toString(),
+        stderr: stderrBuffer.toString(),
+        timedOut: Boolean(result.timedOut),
+        cancelled: Boolean(result.isCanceled),
+        durationMs: Date.now() - startedAt,
+        failed: Boolean(result.failed)
+      };
+    } catch (error) {
+      // Includes a throw from the caller's own callback. Whatever the cause,
+      // the child must not outlive this function — and must not be left to the
+      // timeout, which would stall an immediate failure for the full duration.
+      terminate();
+      const failure = toFailureResult(error, ctx);
+      return {
+        ...failure,
+        stdout: stdoutBuffer.toString() || failure.stdout,
+        stderr: stderrBuffer.toString() || failure.stderr
+      };
+    } finally {
+      sessionOver = true;
+      terminate();
+      // Give the stderr reader a moment to finish, but never wait on it: it
+      // only ends when the child does, and the child may already be gone.
+      await Promise.race([
+        drainStderr.catch(() => undefined),
+        new Promise((resolve) => setTimeout(resolve, 250))
+      ]);
     }
   }
 }

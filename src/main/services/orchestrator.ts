@@ -185,7 +185,9 @@ export class Orchestrator {
           projectPath: project.localPath,
           taskTitle: task.title,
           originalRequest: task.originalRequest,
-          threadId: task.codexThreadId
+          threadId: task.codexThreadId,
+          // Snapshotted on the task: a regenerated spec keeps the same model.
+          model: task.codexModel
         },
         {
           signal: controller.signal,
@@ -511,7 +513,10 @@ export class Orchestrator {
           prompt,
           // Resuming keeps every correction round inside one conversation.
           sessionId: task.claudeSessionId,
-          maxTurns: settings.claudeMaxTurns
+          maxTurns: settings.claudeMaxTurns,
+          // From the task, never from current Settings: a correction round must
+          // resume the same session on the same model it started with.
+          model: task.claudeModel
         },
         {
           signal: controller.signal,
@@ -603,7 +608,8 @@ export class Orchestrator {
           claudeReport,
           testOutput: extractTestOutput(claudeReport),
           round: task.currentRound,
-          maxRounds: task.maxRounds
+          maxRounds: task.maxRounds,
+          model: task.codexModel
         },
         {
           signal: controller.signal,

@@ -7,6 +7,10 @@
  * loop testable without touching a network or a real repository.
  */
 
+import type {
+  CodexModelCatalogResult,
+  CodexModelOption
+} from '../shared/domain/codex-catalog';
 import type { DiagnosticsReport, ToolDiagnostic } from '../shared/domain/diagnostics';
 import type { GitChangeSet, RepositoryInfo, WorktreeInfo } from '../shared/domain/git';
 import type {
@@ -130,6 +134,14 @@ export interface CodexSpecificationRequest {
   readonly originalRequest: string;
   /** Existing thread to continue, or null to start a new one. */
   readonly threadId: string | null;
+  /**
+   * The task's snapshotted Codex model, or null for the tool's own default.
+   *
+   * Carried on the request rather than configured on the adapter: adapters are
+   * rebuilt from Settings on every call, so a constructor option would make the
+   * model follow current Settings instead of the task that owns the thread.
+   */
+  readonly model: string | null;
 }
 
 export interface CodexSpecificationResult {
@@ -147,12 +159,21 @@ export interface CodexReviewRequest {
   readonly testOutput: string;
   readonly round: number;
   readonly maxRounds: number;
+  /** Same snapshotted model as the specification that opened this thread. */
+  readonly model: string | null;
 }
 
 export interface CodexReviewOutcome {
   readonly threadId: string | null;
   readonly review: CodexReviewResult;
   readonly rawResponse: string;
+}
+
+export type { CodexModelCatalogResult, CodexModelOption };
+
+export interface CodexModelCatalog {
+  /** Never rejects: an unreachable catalogue is `available: false`. */
+  list(options?: { refresh?: boolean }): Promise<CodexModelCatalogResult>;
 }
 
 export interface CodexAdapter {
@@ -181,6 +202,8 @@ export interface ClaudeImplementationRequest {
   /** Existing session to resume via `--resume`, or null to start fresh. */
   readonly sessionId: string | null;
   readonly maxTurns: number;
+  /** The task's snapshotted Claude model, or null for the tool's own default. */
+  readonly model: string | null;
 }
 
 /**
