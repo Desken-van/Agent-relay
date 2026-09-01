@@ -196,6 +196,18 @@ export interface CodexAdapter {
 }
 
 export interface ClaudeImplementationRequest {
+  /**
+   * Permission rules to pre-approve for this run.
+   *
+   * Supplied by the caller so that the rules the CLI is given and the rules the
+   * round is later judged against come from one reading of Settings. The
+   * adapter can read Settings itself, but a second read is a second answer:
+   * Settings edited while a worktree was being prepared would otherwise leave
+   * the policy assessing a list the process never had.
+   *
+   * Omitted means "use whatever the adapter was constructed with".
+   */
+  readonly allowedTools?: readonly string[];
   readonly worktreePath: string;
   readonly branchName: string;
   readonly prompt: string;
@@ -381,12 +393,24 @@ export interface ClaudeStreamEvidence {
 export interface ClaudeImplementationResult {
   readonly sessionId: string | null;
   readonly finalMessage: string;
+  /**
+   * The CLI reported a failure: an `error` event, or a final envelope saying so.
+   *
+   * Not the round's verdict. A refused tool call leaves this false — the CLI
+   * exits 0 and calls the round a success — which is exactly why the outcome is
+   * decided from {@link evidence} and {@link permissionDenials} by the round
+   * policy instead. Kept for diagnostics and for the process-level failures the
+   * policy has no opinion about.
+   */
   readonly isError: boolean;
   readonly numTurns: number | null;
   readonly rawResultJson: string | null;
-  /**
-   * Tool calls Claude was refused. Non-empty always implies `isError`, because a
-   * round that was blocked from part of its work did not succeed.
+/**
+   * Tool calls Claude was refused.
+   *
+   * Non-empty does *not* imply {@link isError}: whether a refusal sank the round
+   * depends on what was refused and whether the work was verified regardless,
+   * which is a judgement the round policy makes.
    */
   readonly permissionDenials: readonly ClaudePermissionDenial[];
   /**

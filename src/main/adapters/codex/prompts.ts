@@ -248,6 +248,40 @@ export interface CorrectionPromptInput {
   readonly maxRounds: number;
 }
 
+/**
+ * The prompt for a round whose only job is to make the verification pass.
+ *
+ * Distinct from a correction prompt because there is no review to act on: the
+ * reviewer was satisfied, and it was the evidence that fell short. Telling
+ * Claude to "address the findings" when there are none would invite it to
+ * invent some.
+ */
+export function buildVerificationRetryPrompt(input: {
+  readonly reason: string;
+  readonly round: number;
+  readonly maxRounds: number;
+}): string {
+  return `Your implementation was reviewed and approved, but it cannot be published yet.
+
+This is round ${input.round} of at most ${input.maxRounds}.
+
+=== WHY ===
+${input.reason}
+
+=== WHAT TO DO ===
+Make the project's verification command pass, and run it. Do not change the
+behaviour that was already approved beyond what is needed for the checks to
+succeed. If the checks reveal a real defect, fix the defect rather than the
+check.
+
+Keep working in the same worktree on the same branch. The same rules still apply:
+do not commit, do not push, do not touch any remote, do not modify anything
+outside this worktree, and do not discard or revert unrelated work already there.
+
+End your reply with a short summary of what you changed, the exact verification
+command you ran, and its result.`;
+}
+
 export function buildCorrectionPrompt(input: CorrectionPromptInput): string {
   const { review } = input;
 

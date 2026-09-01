@@ -429,8 +429,12 @@ describe('what the evidence is allowed to hold', () => {
 /* The invariant this phase must not move                                      */
 /* -------------------------------------------------------------------------- */
 
-describe('fail-closed behaviour is unchanged', () => {
-  it('fails the round on a denial the envelope calls a success', () => {
+describe('the parser reports, and does not judge', () => {
+  it('surfaces a denial without calling the round a failure', () => {
+    // `isError` means "the CLI reported a failure". A refusal is not that: the
+    // CLI exits 0 and its envelope says success. The round policy decides what
+    // the refusal meant, using evidence this parser cannot interpret — such as
+    // whether the verification command ran successfully anyway.
     const finalized = finalizeState(
       feed([
         {
@@ -445,10 +449,12 @@ describe('fail-closed behaviour is unchanged', () => {
       ])
     );
 
-    expect(finalized.isError).toBe(true);
+    expect(finalized.isError).toBe(false);
+    expect(finalized.denials).toHaveLength(1);
+    expect(finalized.evidence.resultEnvelopeIsError).toBe(false);
   });
 
-  it('fails the round on a denial even with no result envelope', () => {
+  it('still reports a denial when no envelope ever arrived', () => {
     const finalized = finalizeState(
       feed([
         {
@@ -460,7 +466,17 @@ describe('fail-closed behaviour is unchanged', () => {
       ])
     );
 
+    expect(finalized.denials).toHaveLength(1);
+    // No envelope is itself a fact the policy fails closed on.
+    expect(finalized.evidence.resultEnvelopeSeen).toBe(false);
+    expect(finalized.evidence.resultEnvelopeIsError).toBeNull();
+  });
+
+  it('reports an error the CLI actually raised', () => {
+    const finalized = finalizeState(feed([resultEnvelope({ is_error: true })]));
+
     expect(finalized.isError).toBe(true);
+    expect(finalized.evidence.resultEnvelopeIsError).toBe(true);
   });
 
   it('leaves a clean round passing, whatever the evidence says', () => {

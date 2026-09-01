@@ -17,6 +17,7 @@ import type {
   ClaudeImplementationResult,
   ClaudePermissionDenial,
   ClaudeStreamEvidence,
+  ClaudeToolExecution,
   CodexAdapter,
   CodexReviewOutcome,
   CodexReviewRequest,
@@ -115,22 +116,57 @@ export class FakeCodexAdapter implements CodexAdapter {
 /* Claude                                                                      */
 /* -------------------------------------------------------------------------- */
 
+/** One completed, successful `npm test` — what the default rules look for. */
+export function passingToolExecution(
+  overrides: Partial<ClaudeToolExecution> = {}
+): ClaudeToolExecution {
+  return {
+    toolUseId: 'fake-tool-1',
+    toolUseSequence: 1,
+    tool: 'Bash',
+    command: 'npm test',
+    commandTruncated: false,
+    summary: 'Bash: npm test',
+    toolUseSeen: true,
+    resultReceived: true,
+    isError: false,
+    resultConflict: false,
+    ...overrides
+  };
+}
+
+/** Stream evidence for a round that verified itself and reported cleanly. */
+export function passingVerificationEvidence(
+  overrides: Partial<ClaudeStreamEvidence> = {}
+): ClaudeStreamEvidence {
+  return {
+    toolExecutions: [passingToolExecution()],
+    resultEnvelopeSeen: true,
+    resultEnvelopeIsError: false,
+    resultEnvelopeConflict: false,
+    malformedLineCount: 0,
+    incompleteToolUseCount: 0,
+    orphanToolResultCount: 0,
+    ...overrides
+  };
+}
+
 export class FakeClaudeAdapter implements ClaudeAdapter {
   calls: ClaudeImplementationRequest[] = [];
   sessionId: string | null = 'claude-session-1';
   finalMessage = 'Implemented the change and ran the tests.\n\n```\n2 passed\n```';
   isError = false;
   permissionDenials: ClaudePermissionDenial[] = [];
-  /** Telemetry only; overridden by the few tests that assert on it. */
-  evidence: ClaudeStreamEvidence = {
-    toolExecutions: [],
-    resultEnvelopeSeen: true,
-    resultEnvelopeIsError: false,
-    resultEnvelopeConflict: false,
-    malformedLineCount: 0,
-    incompleteToolUseCount: 0,
-    orphanToolResultCount: 0
-  };
+  /**
+   * Evidence of a normal, healthy round: the default verification command ran
+   * once and passed.
+   *
+   * This is not incidental detail. Since the round policy decides the outcome
+   * from evidence, a fake that produced none would model a round that never
+   * checked its work — and every test using it would be asserting against a
+   * failure. Tests that want a different story replace this.
+   */
+  evidence: ClaudeStreamEvidence = passingVerificationEvidence();
   error: Error | null = null;
   /** Set to observe cancellation without a real process. */
   onRun: ((request: ClaudeImplementationRequest, context: AgentRunContext) => void) | null = null;
@@ -147,8 +183,9 @@ export class FakeClaudeAdapter implements ClaudeAdapter {
     return {
       sessionId: this.sessionId,
       finalMessage: this.finalMessage,
-      // A denial always fails the round, mirroring the real adapter.
-      isError: this.isError || this.permissionDenials.length > 0,
+      // Only a CLI-level failure, mirroring the real adapter. What a denial
+      // means for the round is the policy's decision, not the adapter's.
+      isError: this.isError,
       numTurns: 3,
       rawResultJson: null,
       permissionDenials: this.permissionDenials,

@@ -691,10 +691,9 @@ export function consumeLine(line: string, state: StreamState): ParsedStreamEvent
       if (recordDenial(state, denial)) events.push(denialEvent(denial));
     }
 
-    // A run that was blocked from doing part of its job did not succeed, no
-    // matter what the envelope claims.
-    if (state.denials.length > 0) state.isError = true;
-
+    // Denials are recorded, not judged. What a refusal means for the round is
+    // decided by the round policy, which can see whether the work was verified
+    // anyway; this parser can only see that something was refused.
     events.push({
       type: state.isError ? 'error' : 'result',
       text: state.finalMessage ?? '(Claude returned no final message)',
@@ -763,9 +762,10 @@ export function finalizeState(state: StreamState): {
   return {
     sessionId: state.sessionId,
     finalMessage: state.finalMessage ?? (fallback.length > 0 ? fallback : ''),
-    // A denial seen anywhere in the stream fails the run, even if no `result`
-    // envelope ever arrived to set the flag.
-    isError: state.isError || state.denials.length > 0,
+    // Strictly what the CLI reported: an `error` event, or a final envelope
+    // that said so. Not a verdict on the round — a refused tool call leaves
+    // this false, and the round policy is what decides whether that matters.
+    isError: state.isError,
     numTurns: state.numTurns,
     rawResultJson: state.rawResultJson,
     denials: state.denials,
@@ -775,15 +775,15 @@ export function finalizeState(state: StreamState): {
   };
 }
 
-/** One line explaining what was blocked, for the run's final message. */
-export function describeDenials(denials: readonly ClaudePermissionDenial[]): string {
+/** One line naming what was blocked, for a log or an error detail. */
+export function summariseDenials(denials: readonly ClaudePermissionDenial[]): string {
   if (denials.length === 0) return '';
 
   const tools = [...new Set(denials.map((denial) => denial.tool))].join(', ');
   const detail = denials.map((denial) => `${denial.tool}: ${denial.reason}`).join(' | ');
 
-  return (
-    `Claude was denied permission for ${denials.length} tool call(s) (${tools}), so this round is ` +
-    `treated as unsuccessful — work such as running the tests may have been skipped. ${detail}`
-  );
+  // Deliberately states only what happened. The previous wording here claimed
+  // work "may have been skipped", which the evidence now often disproves — and
+  // a warning that is routinely false is one people learn to ignore.
+  return `Claude was denied permission for ${denials.length} tool call(s) (${tools}). ${detail}`;
 }

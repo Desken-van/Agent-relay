@@ -55,7 +55,7 @@ import type {
 } from '../../ports';
 import { locateExecutable, configuredPathIsBroken } from '../process/executable-locator';
 import type { ProcessRunner } from '../process/process-runner';
-import { consumeLine, createStreamState, describeDenials, finalizeState } from './stream-parser';
+import { consumeLine, createStreamState, finalizeState } from './stream-parser';
 
 export interface ClaudeAdapterOptions {
   readonly configuredPath?: string | null;
@@ -238,7 +238,9 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
     // can safely run to the end of argv. Each rule is its own entry — joining
     // them into one comma-separated string makes a rule containing a comma
     // ambiguous.
-    const allowed = this.options.allowedTools ?? [];
+    // The request wins: it carries the snapshot the caller judged the round
+    // against. Falling back to the constructor keeps direct callers working.
+    const allowed = request.allowedTools ?? this.options.allowedTools ?? [];
     if (allowed.length > 0) {
       args.push('--allowedTools', ...allowed);
     }
@@ -313,17 +315,15 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       );
     }
 
-    // Fail closed. The CLI exits 0 after a denial and its result envelope still
-    // says "success", because from the model's side nothing crashed — it simply
-    // could not run something and carried on. Reporting that as a good round is
-    // how an implementation with no tests run gets sent to the reviewer.
-    const denialSummary = describeDenials(finalized.denials);
-
+    // Denials travel with the result rather than being folded into the message
+    // or the error flag. The CLI exits 0 after a refusal and its envelope still
+    // says "success", so something has to fail closed — but that something is
+    // the round policy, which can also see whether the work was verified anyway.
+    // Deciding it here, with only half the picture, is what produced a blanket
+    // "the tests may have been skipped" on rounds where they demonstrably ran.
     return {
       sessionId: finalized.sessionId,
-      finalMessage: denialSummary
-        ? `${denialSummary}\n\n${finalized.finalMessage}`.trim()
-        : finalized.finalMessage,
+      finalMessage: finalized.finalMessage,
       isError: finalized.isError,
       numTurns: finalized.numTurns,
       rawResultJson: finalized.rawResultJson,

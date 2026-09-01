@@ -85,7 +85,9 @@ export type RoundReasonCode =
   | 'envelope_missing'
   | 'envelope_error'
   | 'envelope_conflict'
+  | 'cli_error'
   | 'stream_malformed'
+  | 'telemetry_conflict'
   | 'security_denial'
   | 'unknown_denial'
   | 'verification_denial_unresolved'
@@ -120,6 +122,13 @@ export interface RoundAssessment {
   readonly verificationStatus: VerificationStatus;
   /** Invocation number of the attempt the status came from, or null. */
   readonly verificationSequence: number | null;
+  /**
+   * The attempt the status came from, or null when none matched.
+   *
+   * Carried so a caller can name the command that was actually run without
+   * re-deriving the match and risking a different answer.
+   */
+  readonly verificationAttempt: VerificationAttempt | null;
   readonly classifiedDenials: readonly ClassifiedDenial[];
   readonly resolvedVerificationDenials: readonly ClassifiedDenial[];
   /** Denials that still stand: everything except a resolved verification denial. */
@@ -146,6 +155,14 @@ export interface VerificationPolicyConfig {
 export interface ClaudeRoundEvidence {
   readonly evidence: ClaudeStreamEvidence;
   readonly permissionDenials: readonly ClaudePermissionDenial[];
+  /**
+   * The CLI reported a failure — an `error` event, or an envelope saying so.
+   *
+   * Read, not merely recorded. The CLI can raise an error event and still close
+   * with `is_error: false`, and a round that hits both cannot be called a
+   * success on the strength of the half that was cheerful.
+   */
+  readonly isError: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -231,6 +248,7 @@ function ambiguousShellSequences(
 interface VerificationOutcome {
   readonly status: VerificationStatus;
   readonly sequence: number | null;
+  readonly latest: VerificationAttempt | null;
   readonly attempts: readonly VerificationAttempt[];
 }
 
@@ -259,17 +277,19 @@ function assessVerification(
     return {
       status: ambiguityAfterLatest ? 'unknown' : 'not_run',
       sequence: null,
+      latest: null,
       attempts
     };
   }
 
   if (ambiguityAfterLatest || !hasDefinitiveOutcome(latest.execution)) {
-    return { status: 'unknown', sequence: latest.sequence, attempts };
+    return { status: 'unknown', sequence: latest.sequence, latest, attempts };
   }
 
   return {
     status: latest.execution.isError === true ? 'failed' : 'passed',
     sequence: latest.sequence,
+    latest,
     attempts
   };
 }
@@ -385,6 +405,7 @@ function configurationFailure(problems: readonly VerificationConfigProblem[]): R
     disposition: 'fail',
     verificationStatus: 'unknown',
     verificationSequence: null,
+    verificationAttempt: null,
     classifiedDenials: [],
     resolvedVerificationDenials: [],
     unresolvedDenials: [],
@@ -453,6 +474,16 @@ export function assessClaudeRound(
     blocks.push('telemetry');
     hardFail = true;
   }
+  if (round.isError) {
+    // The CLI raised an error. When the envelope disagreed — an error event
+    // followed by `is_error: false` — the two halves of the stream contradict
+    // each other, which is its own reason to distrust the whole record rather
+    // than to believe the more convenient half.
+    reasonCodes.push('cli_error');
+    if (evidence.resultEnvelopeIsError === false) reasonCodes.push('telemetry_conflict');
+    blocks.push('telemetry');
+    hardFail = true;
+  }
   if (evidence.malformedLineCount > 0) {
     reasonCodes.push('stream_malformed');
     blocks.push('telemetry');
@@ -508,9 +539,11 @@ export function assessClaudeRound(
 
   /* --- leftover ambiguity ------------------------------------------------- */
 
-  // Gaps that did not touch verification or any denial. Not enough to fail the
-  // round — nothing that mattered was affected — but enough that it is not a
-  // clean pass either.
+  // A call with no answer, a result belonging to no call, two results that
+  // disagreed. None of these say what went wrong, and that is the point: the
+  // record of what this round did is incomplete, so it is not a record anything
+  // should be published on. Failing here rather than warning is the difference
+  // between "we noticed" and "we acted on it".
   const telemetryClean =
     evidence.incompleteToolUseCount === 0 &&
     evidence.orphanToolResultCount === 0 &&
@@ -518,6 +551,8 @@ export function assessClaudeRound(
 
   if (!telemetryClean) {
     reasonCodes.push('telemetry_incomplete');
+    blocks.push('telemetry');
+    hardFail = true;
   }
 
   /* --- verdict ------------------------------------------------------------ */
@@ -534,6 +569,7 @@ export function assessClaudeRound(
     disposition,
     verificationStatus: verification.status,
     verificationSequence: verification.sequence,
+    verificationAttempt: verification.latest,
     classifiedDenials,
     resolvedVerificationDenials,
     unresolvedDenials,

@@ -12,7 +12,11 @@
  */
 
 import { join } from 'node:path';
-import { DEFAULT_CLAUDE_ALLOWED_TOOLS, type Settings } from '../shared/domain/models';
+import {
+  DEFAULT_CLAUDE_ALLOWED_TOOLS,
+  DEFAULT_CLAUDE_VERIFICATION_TOOLS,
+  type Settings
+} from '../shared/domain/models';
 import { ClaudeCliAdapter } from './adapters/claude/claude-adapter';
 import { CodexSdkAdapter } from './adapters/codex/codex-adapter';
 import { CodexAppServerModelCatalog } from './adapters/codex/codex-model-catalog';
@@ -71,6 +75,7 @@ export function defaultSettings(paths: ApplicationPaths): Settings {
     maxDiffBytes: 400_000,
     claudeMaxTurns: 80,
     claudeAllowedTools: [...DEFAULT_CLAUDE_ALLOWED_TOOLS],
+    claudeVerificationTools: [...DEFAULT_CLAUDE_VERIFICATION_TOOLS],
     // Defaults for the *new task* form only. A task snapshots its own pair.
     codexModel: null,
     claudeModel: null

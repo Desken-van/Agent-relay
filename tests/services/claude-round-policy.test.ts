@@ -81,10 +81,15 @@ const assess = (
   toolExecutions: readonly ClaudeToolExecution[],
   denials: readonly ClaudePermissionDenial[] = [],
   evidenceOverrides: Partial<ClaudeStreamEvidence> = {},
-  config: VerificationPolicyConfig = CONFIG
+  config: VerificationPolicyConfig = CONFIG,
+  cliReportedError = false
 ) =>
   assessClaudeRound(
-    { evidence: evidence(toolExecutions, evidenceOverrides), permissionDenials: denials },
+    {
+      evidence: evidence(toolExecutions, evidenceOverrides),
+      permissionDenials: denials,
+      isError: cliReportedError
+    },
     config
   );
 
@@ -123,16 +128,58 @@ describe('a round that verified its work', () => {
     expect(result.publishBlock).toBe('none');
   });
 
-  it('warns rather than passes when unrelated telemetry has gaps', () => {
+  it('fails when the record of what ran has a gap in it', () => {
+    // The verification itself is fine. The round is not: a call whose result
+    // never arrived means the account of what this round did is incomplete,
+    // and an incomplete account is not something to publish on.
     reset();
     const verified = execution();
     const unrelated = execution({ tool: 'Read', command: null, resultReceived: false });
 
     const result = assess([verified, unrelated]);
 
-    expect(result.disposition).toBe('warn');
+    expect(result.disposition).toBe('fail');
     expect(result.verificationStatus).toBe('passed');
     expect(result.reasonCodes).toContain('telemetry_incomplete');
+    expect(result.publishBlock).toBe('telemetry');
+  });
+
+  it('fails on a result that belongs to no call', () => {
+    reset();
+    const orphan: ClaudeToolExecution = {
+      toolUseId: 'stray',
+      toolUseSequence: null,
+      tool: 'unknown tool',
+      command: null,
+      commandTruncated: false,
+      summary: 'result without a matching tool use',
+      toolUseSeen: false,
+      resultReceived: true,
+      isError: false,
+      resultConflict: false
+    };
+
+    const result = assess([execution(), orphan]);
+
+    expect(result.disposition).toBe('fail');
+    expect(result.publishBlock).toBe('telemetry');
+  });
+
+  it('fails when any call had two results that disagreed', () => {
+    reset();
+    const verified = execution();
+    const contradicted = execution({
+      tool: 'Bash',
+      command: 'npm run build',
+      isError: null,
+      resultConflict: true
+    });
+
+    const result = assess([verified, contradicted]);
+
+    expect(result.disposition).toBe('fail');
+    expect(result.reasonCodes).toContain('telemetry_incomplete');
+    expect(result.publishBlock).toBe('telemetry');
   });
 });
 
@@ -450,6 +497,30 @@ describe('stream integrity', () => {
 
     expect(result.disposition).toBe('fail');
     expect(result.reasonCodes).toContain('envelope_conflict');
+  });
+
+  it('fails when the CLI raised an error, whatever the envelope said', () => {
+    // The exact shape the parser produces for an `error` event followed by a
+    // success envelope. Believing the cheerful half is how a crashed round
+    // reads as a clean one.
+    reset();
+    const result = assess([execution()], [], { resultEnvelopeIsError: false }, CONFIG, true);
+
+    expect(result.disposition).toBe('fail');
+    expect(result.reasonCodes).toContain('cli_error');
+    expect(result.reasonCodes).toContain('telemetry_conflict');
+    expect(result.publishBlock).toBe('telemetry');
+    // The verification really did pass; it is the round that cannot be trusted.
+    expect(result.verificationStatus).toBe('passed');
+  });
+
+  it('fails on a CLI error even when the envelope agreed', () => {
+    reset();
+    const result = assess([execution()], [], { resultEnvelopeIsError: true }, CONFIG, true);
+
+    expect(result.disposition).toBe('fail');
+    expect(result.reasonCodes).toContain('cli_error');
+    expect(result.reasonCodes).not.toContain('telemetry_conflict');
   });
 
   it('fails when any line of the stream was unreadable', () => {

@@ -271,6 +271,11 @@ export function parseShellToolRule(rule: string): ShellToolRule | null {
   const analysis = analyseCommand(body);
   if (analysis.compound || analysis.canonical === null) return null;
 
+  // A rule whose command is a shell wrapper could never match anything, since
+  // the matcher refuses wrappers. Rejecting it here turns a rule that would
+  // silently never fire into one the user is told about.
+  if (isShellWrapper(analysis.canonical)) return null;
+
   const prefix = analysis.canonical;
   return {
     tool,
@@ -278,6 +283,48 @@ export function parseShellToolRule(rule: string): ShellToolRule | null {
     wildcard,
     canonical: `${tool}(${prefix}${wildcard ? ' *' : ''})`
   };
+}
+
+/**
+ * Why a rule is unusable, or null when it is fine.
+ *
+ * `parseShellToolRule` answers "can this be matched against"; this answers "and
+ * if not, what should the user change". Kept separate so the parser stays a
+ * simple predicate and every caller does not have to build its own diagnosis.
+ */
+export type RuleProblem =
+  /** Not `Tool(command)` at all. */
+  | 'syntax'
+  /** A tool other than Bash or PowerShell. */
+  | 'unsupported_tool'
+  /** Nothing between the parentheses. */
+  | 'empty_body'
+  /** A `*` anywhere but as the single final character. */
+  | 'wildcard'
+  /** Chained, piped, backgrounded, or spanning lines. */
+  | 'compound'
+  /** Runs another command — `cmd /c`, `powershell -Command`, and friends. */
+  | 'wrapper';
+
+export function describeRuleProblem(rule: string): RuleProblem | null {
+  const text = rule.trim();
+  const shape = RULE_SHAPE.exec(text);
+  if (shape === null) return 'syntax';
+
+  const [, rawTool = '', rawBody = ''] = shape;
+  if (canonicalTool(rawTool) === null) return 'unsupported_tool';
+  if (rawBody.includes('\n') || rawBody.includes('\r')) return 'compound';
+
+  const wildcard = rawBody.endsWith('*');
+  const body = wildcard ? rawBody.slice(0, rawBody.length - 1) : rawBody;
+  if (body.includes('*')) return 'wildcard';
+
+  const analysis = analyseCommand(body);
+  if (analysis.compound) return 'compound';
+  if (analysis.canonical === null) return 'empty_body';
+  if (isShellWrapper(analysis.canonical)) return 'wrapper';
+
+  return null;
 }
 
 /** True when a tool name refers to the same tool as the rule, ignoring case. */
@@ -349,6 +396,8 @@ export interface VerificationConfigProblem {
   readonly code: VerificationConfigProblemCode;
   /** The offending rule, or null for a problem about the list as a whole. */
   readonly rule: string | null;
+  /** For `unparsable`, what specifically is wrong with it. */
+  readonly detail: RuleProblem | null;
 }
 
 export type VerificationConfig =
@@ -373,7 +422,7 @@ export function resolveVerificationConfig(
   const problems: VerificationConfigProblem[] = [];
 
   if (verificationTools.length === 0) {
-    return { ok: false, problems: [{ code: 'empty', rule: null }] };
+    return { ok: false, problems: [{ code: 'empty', rule: null, detail: null }] };
   }
 
   const allowed = new Set(
@@ -387,18 +436,20 @@ export function resolveVerificationConfig(
   for (const text of verificationTools) {
     const rule = parseShellToolRule(text);
     if (rule === null) {
-      problems.push({ code: 'unparsable', rule: text });
+      problems.push({ code: 'unparsable', rule: text, detail: describeRuleProblem(text) });
       continue;
     }
     if (!allowed.has(rule.canonical)) {
-      problems.push({ code: 'not_allowed', rule: text });
+      problems.push({ code: 'not_allowed', rule: text, detail: null });
       continue;
     }
     rules.push(rule);
   }
 
   if (problems.length > 0) return { ok: false, problems };
-  if (rules.length === 0) return { ok: false, problems: [{ code: 'empty', rule: null }] };
+  if (rules.length === 0) {
+    return { ok: false, problems: [{ code: 'empty', rule: null, detail: null }] };
+  }
 
   return { ok: true, rules };
 }

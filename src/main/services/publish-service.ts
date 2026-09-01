@@ -10,12 +10,25 @@
  *   3. {@link ConfirmationService} must return true — in production that is a
  *      native modal owned by the main process, which a compromised renderer
  *      cannot answer on the user's behalf;
- *   4. only then does the adapter get called.
+ *   4. the most recent Claude implementation round must have *shown* that it
+ *      checked its work — see {@link PublishService.assertRoundPublishable};
+ *   5. only then does the adapter get called.
  *
- * Step 4 is unreachable without step 3, which is what the
+ * Step 5 is unreachable without step 3, which is what the
  * "publishing cannot occur without approval" tests assert.
+ *
+ * Step 4 is the newer one, and it is a gate rather than a warning because the
+ * failure it prevents is silent: a round in which the tests were blocked exits
+ * cleanly and reads as a success. Codex approving the diff does not cover it —
+ * a reviewer reads the change, not the evidence that it runs.
  */
 
+import {
+  assessmentPublishRefusal,
+  latestClaudeRoundResult,
+  readClaudeAssessment,
+  type PublishRefusalCode
+} from '../../shared/domain/claude-assessment';
 import { AgentRelayError } from '../../shared/domain/errors';
 import type { Approval, ApprovalAction, GithubVisibility, Project, Task } from '../../shared/domain/models';
 import { assertPublishable } from '../../shared/domain/workflow';
@@ -148,6 +161,29 @@ export class PublishService {
     };
   }
 
+  /**
+   * Refuse to publish a task whose latest Claude round did not verify itself.
+   *
+   * "Latest" means the last Claude round in run order, chosen by the same
+   * shared selector the orchestrator and the timeline use — so the evidence
+   * being checked belongs to the code that is about to ship, and all three
+   * agree about which round that is.
+   *
+   * A block is not permanent: a later clean round produces its own assessment,
+   * and once that round has been reviewed and approved the gate opens. The
+   * earlier denial stays in the run history either way; nothing here rewrites it.
+   */
+  private assertRoundPublishable(task: Task): void {
+    const refusal = assessmentPublishRefusal(
+      readClaudeAssessment(latestClaudeRoundResult(this.deps.runs.listByTask(task.id)))
+    );
+    if (!refusal.blocked) return;
+
+    throw new AgentRelayError('VALIDATION_FAILED', PUBLISH_REFUSAL_MESSAGES[refusal.code], {
+      remediation: PUBLISH_REFUSAL_REMEDIATIONS[refusal.code]
+    });
+  }
+
   async execute(request: PublishRequest): Promise<PublishOutcome> {
     const task = this.requireTask(request.taskId);
     const project = this.requireProject(task.projectId);
@@ -183,6 +219,11 @@ export class PublishService {
     // 3. Domain gate: even with an approval, the task must be in a publishable
     //    state. Belt and braces against a UI that got ahead of itself.
     assertPublishable(task.status, true, request.action);
+
+    // 4. Evidence gate: the latest implementation round has to have proved it
+    //    verified the work. Deliberately after the approval is resolved, so the
+    //    audit trail records what the user was asked and what came of it.
+    this.assertRoundPublishable(task);
 
     const settings = this.deps.settings.get();
     const recorder = new RunRecorder(
@@ -395,3 +436,49 @@ export function defaultPullRequestBody(task: Task): string {
     `Review rounds used: ${task.currentRound} of ${task.maxRounds}.`
   ].join('\n');
 }
+
+/* -------------------------------------------------------------------------- */
+/* Why publishing was refused                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One message per refusal code.
+ *
+ * A total record rather than a switch, so adding a block kind fails to compile
+ * until it has been given something honest to say.
+ */
+const PUBLISH_REFUSAL_MESSAGES: Record<PublishRefusalCode, string> = {
+  verification:
+    'The latest Claude round did not pass verification, so this change has not been shown to work.',
+  security:
+    'The latest Claude round had a security-critical command blocked, so it is not eligible for publishing.',
+  telemetry:
+    'The latest Claude round left ambiguous evidence, so whether the change was verified cannot be established.',
+  configuration:
+    'The latest Claude round could not be judged because the verification settings were unusable.',
+  none: 'Publishing is blocked.',
+  absent:
+    'The latest Claude round predates verification tracking, so there is no evidence it checked its work.',
+  malformed:
+    'The verification record for the latest Claude round could not be read, so it cannot be relied on.',
+  unsupported_version:
+    'The verification record for the latest Claude round was written by a newer version of Agent Relay.'
+};
+
+const RUN_ANOTHER_ROUND =
+  'Run another implementation or correction round, then have Codex review and approve it again.';
+
+const PUBLISH_REFUSAL_REMEDIATIONS: Record<PublishRefusalCode, string> = {
+  verification: `Fix the failing checks, then ${RUN_ANOTHER_ROUND.charAt(0).toLowerCase()}${RUN_ANOTHER_ROUND.slice(1)}`,
+  security:
+    'Publishing is done through this dialog, not by the agent. ' + RUN_ANOTHER_ROUND,
+  telemetry: RUN_ANOTHER_ROUND,
+  configuration:
+    'Fix the verification commands under Settings → Claude permissions, then ' +
+    'run another implementation or correction round.',
+  none: RUN_ANOTHER_ROUND,
+  absent: RUN_ANOTHER_ROUND,
+  malformed: RUN_ANOTHER_ROUND,
+  unsupported_version:
+    'Update Agent Relay, or run another implementation round with this version.'
+};

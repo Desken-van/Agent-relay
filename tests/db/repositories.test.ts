@@ -418,8 +418,14 @@ describe('settings repository', () => {
 
   it('trims permission rules on the way in', () => {
     const repo = new SqliteSettingsRepository(db, DEFAULTS);
-    const updated = repo.update({ claudeAllowedTools: ['  Bash(npm test *)  '] });
+    // Both lists together: the verification rules have to stay a subset of the
+    // allowed ones, so narrowing one means narrowing the other.
+    const updated = repo.update({
+      claudeAllowedTools: ['  Bash(npm test *)  '],
+      claudeVerificationTools: ['  Bash(npm test *)  ']
+    });
     expect(updated.claudeAllowedTools).toEqual(['Bash(npm test *)']);
+    expect(updated.claudeVerificationTools).toEqual(['Bash(npm test *)']);
   });
 
   it('rejects an empty, over-long or control-character permission rule', () => {
@@ -442,9 +448,14 @@ describe('settings repository', () => {
     expect(() => repo.update({ claudeAllowedTools: tooMany })).toThrow(/not valid/i);
   });
 
-  it('accepts an empty permission list, meaning "no commands at all"', () => {
+  it('refuses a permission list that leaves the verification rules unrunnable', () => {
+    // Granting nothing used to be allowed. It no longer is: a verification rule
+    // Claude was never permitted to run could only ever be denied, so a round
+    // configured this way could never be published and would never say why.
     const repo = new SqliteSettingsRepository(db, DEFAULTS);
-    expect(repo.update({ claudeAllowedTools: [] }).claudeAllowedTools).toEqual([]);
+
+    expect(() => repo.update({ claudeAllowedTools: [] })).toThrow(/cannot be used/i);
+    expect(repo.get().claudeAllowedTools).toEqual(DEFAULTS.claudeAllowedTools);
   });
 
   it('drops only the corrupt permission rules, keeping the user\'s other settings', () => {

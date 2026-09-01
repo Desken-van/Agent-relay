@@ -10,6 +10,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Run, RunEvent } from '@shared/domain/models';
 import { call } from '../lib/api';
+import {
+  readClaudeAssessment,
+  type ClaudeVerificationStatus
+} from '@shared/domain/claude-assessment';
 import { decodeEvent, formatDuration, formatTime } from '../lib/format';
 import { useStore } from '../state/store';
 import { agentTone, Empty } from './primitives';
@@ -90,6 +94,7 @@ function RelayNode({
           <span className="relay__label">{RUN_LABELS[run.runType]}</span>
           {run.round > 0 ? <span className="tag">round {run.round}</span> : null}
           <RunStatusTag run={run} />
+          <VerificationTag run={run} />
           <span className="relay__time">{formatDuration(run.startedAt, run.finishedAt)}</span>
         </button>
 
@@ -112,6 +117,92 @@ function RunStatusTag({ run }: { run: Run }): React.JSX.Element {
     default:
       return <span className="tag">{run.status}</span>;
   }
+}
+
+/**
+ * How a round's verification ended, for the run header.
+ *
+ * Renders nothing for a run with no assessment — a specification round, or an
+ * implementation round from before this existed. An older task has to keep
+ * opening cleanly, so an unreadable or newer record is simply not shown rather
+ * than being guessed at or thrown over.
+ */
+function VerificationTag({ run }: { run: Run }): React.JSX.Element | null {
+  const result = readClaudeAssessment(run.structuredResult);
+  if (!result.ok) return null;
+
+  const status: ClaudeVerificationStatus = result.assessment.verificationStatus;
+  const tone =
+    status === 'passed' ? 'ok' : status === 'failed' ? 'danger' : 'warn';
+
+  return (
+    <span className={`tag tag--${tone}`} title={result.assessment.reasonCodes.join(', ')}>
+      verification {status.replace(/_/g, ' ')}
+    </span>
+  );
+}
+
+/** One denied command, as the warning event recorded it. */
+interface DenialDetail {
+  readonly tool?: unknown;
+  readonly command?: unknown;
+  readonly reason?: unknown;
+  readonly category?: unknown;
+  readonly resolved?: unknown;
+}
+
+function asText(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/**
+ * A warning line, with the denials behind it available on demand.
+ *
+ * Collapsed by default: the sentence is the part that matters, and a round with
+ * six auxiliary denials should not push the rest of the log off the screen.
+ */
+function WarningLine({
+  text,
+  data
+}: {
+  text: string;
+  data: Record<string, unknown> | null;
+}): React.JSX.Element {
+  const raw = data?.['denials'];
+  const denials: DenialDetail[] = Array.isArray(raw) ? (raw as DenialDetail[]) : [];
+
+  return (
+    <div className="logs__warning">
+      <div className="logs__text selectable">{text}</div>
+      {denials.length > 0 ? (
+        <details className="logs__denials">
+          <summary>
+            {denials.length} denied command{denials.length === 1 ? '' : 's'}
+          </summary>
+          <ul>
+            {denials.map((denial, index) => (
+              <li key={index}>
+                <span className="mono">{asText(denial.tool) ?? 'unknown tool'}</span>
+                {': '}
+                <span className="mono selectable">
+                  {asText(denial.command) ?? '(command not reported)'}
+                </span>
+                <div className="faint">
+                  {asText(denial.category) ?? 'unknown'}
+                  {/* "retried", not "retried successfully": a denied command
+                      can be run again and fail, and the retry still resolves
+                      the denial. What the retry produced is the verification
+                      status in the run header, not a claim made here. */}
+                  {denial.resolved === true ? ' · retried' : ''}
+                  {asText(denial.reason) === null ? '' : ` · ${asText(denial.reason) ?? ''}`}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+    </div>
+  );
 }
 
 function RelayNodeBody({ run }: { run: Run }): React.JSX.Element {
@@ -174,7 +265,11 @@ function RelayNodeBody({ run }: { run: Run }): React.JSX.Element {
               <div key={event.id} className={`logs__line logs__line--${event.type}`}>
                 <span className="logs__time">{formatTime(event.timestamp)}</span>
                 <span className="logs__type">{event.type.replace(/_/g, ' ')}</span>
-                <span className="logs__text selectable">{decoded.text}</span>
+                {event.type === 'warning' ? (
+                  <WarningLine text={decoded.text} data={decoded.data} />
+                ) : (
+                  <span className="logs__text selectable">{decoded.text}</span>
+                )}
               </div>
             );
           })}

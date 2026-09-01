@@ -1092,6 +1092,31 @@ pre,
   color: var(--ok);
 }
 
+/* A warning belongs to a run that SUCCEEDED, so it is amber, never red: it
+   must read as "look at this" and never as "this round failed". */
+.logs__line--warning .logs__type {
+  color: var(--warn);
+}
+.logs__warning {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.logs__line--warning .logs__text {
+  color: #f0cf8a;
+}
+.logs__denials > summary {
+  cursor: pointer;
+  color: #97a0b8;
+  font-size: 11px;
+}
+.logs__denials ul {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  display: grid;
+  gap: 6px;
+}
+
 /* ------------------------------------------------------------------ */
 /* Findings                                                            */
 /* ------------------------------------------------------------------ */

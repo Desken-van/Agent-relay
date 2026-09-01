@@ -140,6 +140,13 @@ export const TRANSITIONS: TransitionTable = {
     publish_started: 'PUBLISHING',
     // Explicit "I'm done" without opening a pull request.
     publish_completed: 'COMPLETED',
+    // A round can be approved by a reviewer and still be refused by the publish
+    // gate — a reviewer reads the change, the gate checks whether it was ever
+    // run. Without this edge that combination is a dead end: the only way out
+    // would be to cancel a task whose code is probably fine and needs one more
+    // round. Going back through IMPLEMENTING means the new round must be
+    // reviewed and approved again before it can be published.
+    corrections_sent: 'IMPLEMENTING',
     cancelled: 'CANCELLED'
   },
   PUBLISHING: {
