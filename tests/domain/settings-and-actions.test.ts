@@ -20,6 +20,7 @@ import {
 import {
   clearLocalEdits,
   resetPermissionRules,
+  settingsSaveState,
   type Settings
 } from '../../src/shared/domain/models';
 import { defaultSettings } from '../../src/main/container';
@@ -214,6 +215,13 @@ describe('the Settings form draft', () => {
     const cleared = clearLocalEdits();
 
     expect(cleared).toEqual({ draft: null, allowedText: null, verificationText: null });
+
+    // Clearing the three fields is only half the job, and asserting only that
+    // is how the Save button stayed enabled after a successful save: the state
+    // the user actually sees is the button, so check the button.
+    expect(
+      settingsSaveState({ saved: defaults, draft: cleared.draft, blockingProblems: 0 })
+    ).toEqual({ dirty: false, canSave: false });
   });
 
   it('keeps custom rules on screen after a save', () => {
@@ -247,5 +255,142 @@ describe('the Settings form draft', () => {
   it('Reset and Save are not the same operation', () => {
     expect(resetPermissionRules().allowedText).not.toBeNull();
     expect(clearLocalEdits().allowedText).toBeNull();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Whether Save has anything to do                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The button's own state, composed exactly the way the form composes it.
+ *
+ * The defect these cover was invisible to every earlier test: Save was wired to
+ * validation alone, so it stayed lit after a successful save and gave no sign
+ * that the work had landed. Each case below walks a real sequence of user
+ * actions and asserts the button, not the internals.
+ */
+describe('the Save button state', () => {
+  const base: Settings = defaultSettings({ dataDir: 'C:\\data', documentsDir: 'C:\\docs' });
+
+  const CUSTOM = {
+    claudeAllowedTools: ['Bash(npm test *)', 'Bash(npm run test:unit *)'],
+    claudeVerificationTools: ['Bash(npm run test:unit *)']
+  };
+
+  /** `draft = edits ?? settings`, as the component derives it. */
+  const buttonState = (saved: Settings, edits: Settings | null, problems = 0) =>
+    settingsSaveState({ saved, draft: edits ?? saved, blockingProblems: problems });
+
+  it('is off when nothing has been touched', () => {
+    expect(buttonState(base, null)).toEqual({ dirty: false, canSave: false });
+  });
+
+  it('comes on when a field changes', () => {
+    expect(buttonState(base, { ...base, ...CUSTOM })).toEqual({ dirty: true, canSave: true });
+  });
+
+  it('stays off while settings are still loading', () => {
+    expect(settingsSaveState({ saved: null, draft: null, blockingProblems: 0 })).toEqual({
+      dirty: false,
+      canSave: false
+    });
+  });
+
+  it('goes off after a successful save, keeping the custom rules', () => {
+    // custom → Save → the store now holds the custom values, the draft is
+    // cleared, and the button must go quiet. This is the reported defect.
+    const stored: Settings = { ...base, ...CUSTOM };
+    const afterSave = clearLocalEdits();
+
+    expect(buttonState(stored, afterSave.draft)).toEqual({ dirty: false, canSave: false });
+    // And the form still shows the custom text, not the shipped defaults.
+    expect(afterSave.allowedText).toBeNull();
+    expect(stored.claudeAllowedTools).toEqual(CUSTOM.claudeAllowedTools);
+  });
+
+  it('goes off after Reset then Save', () => {
+    // custom → Reset → Save. The exact sequence from the GUI acceptance run,
+    // where the toast appeared and the button stayed lit anyway.
+    const storedCustom: Settings = { ...base, ...CUSTOM };
+
+    const reset = resetPermissionRules();
+    const resetDraft: Settings = {
+      ...storedCustom,
+      claudeAllowedTools: reset.claudeAllowedTools,
+      claudeVerificationTools: reset.claudeVerificationTools
+    };
+    expect(buttonState(storedCustom, resetDraft).canSave).toBe(true);
+
+    // Save persists the defaults; the store now holds them.
+    const storedDefaults: Settings = resetDraft;
+    const afterSave = clearLocalEdits();
+
+    expect(buttonState(storedDefaults, afterSave.draft)).toEqual({
+      dirty: false,
+      canSave: false
+    });
+  });
+
+  it('comes back on when something is edited after a save', () => {
+    const stored: Settings = { ...base, ...CUSTOM };
+    const afterSave = clearLocalEdits();
+    expect(buttonState(stored, afterSave.draft).canSave).toBe(false);
+
+    const edited: Settings = { ...stored, claudeMaxTurns: stored.claudeMaxTurns + 1 };
+    expect(buttonState(stored, edited)).toEqual({ dirty: true, canSave: true });
+  });
+
+  it('leaves the form clean when Reset restores defaults that are already stored', () => {
+    // Pressing Reset with the defaults already saved changes nothing, so the
+    // button must not light up and imply there is work pending.
+    const reset = resetPermissionRules();
+    const storedDefaults: Settings = {
+      ...base,
+      claudeAllowedTools: reset.claudeAllowedTools,
+      claudeVerificationTools: reset.claudeVerificationTools
+    };
+    const resetDraft: Settings = {
+      ...storedDefaults,
+      claudeAllowedTools: reset.claudeAllowedTools,
+      claudeVerificationTools: reset.claudeVerificationTools
+    };
+
+    expect(buttonState(storedDefaults, resetDraft)).toEqual({ dirty: false, canSave: false });
+  });
+
+  it('keeps the draft, and the button, alive when a save fails', () => {
+    // A rejected save must leave the user's text on screen to correct. The
+    // component only clears the draft after the call resolves, so a failure
+    // leaves the draft in place — and the button has to stay usable.
+    const stored: Settings = base;
+    const draft: Settings = { ...base, ...CUSTOM };
+
+    expect(buttonState(stored, draft)).toEqual({ dirty: true, canSave: true });
+  });
+
+  it('offers nothing to save while a rule is unusable, however dirty the draft', () => {
+    const draft: Settings = { ...base, claudeVerificationTools: ['Bash(npm * test)'] };
+
+    expect(buttonState(base, draft, 1)).toEqual({ dirty: true, canSave: false });
+  });
+
+  it('notices a change in any field, not only the permission lists', () => {
+    for (const draft of [
+      { ...base, githubOwner: 'someone-else' },
+      { ...base, maxReviewRounds: base.maxReviewRounds + 1 },
+      { ...base, claudeModel: 'opus' },
+      { ...base, worktreesRoot: 'H:\\elsewhere' }
+    ]) {
+      expect(buttonState(base, draft).dirty).toBe(true);
+    }
+  });
+
+  it('does not care about key order', () => {
+    const reordered = Object.fromEntries(
+      Object.entries(base).reverse()
+    ) as unknown as Settings;
+
+    expect(buttonState(base, reordered)).toEqual({ dirty: false, canSave: false });
   });
 });

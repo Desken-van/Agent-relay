@@ -405,6 +405,51 @@ export function resetPermissionRules(): PermissionRuleDraft {
 }
 
 /**
+ * Whether the form has unsaved changes, and whether Save should be offered.
+ *
+ * Two independent conditions, and the bug this exists to fix was having only
+ * one of them: the button was enabled whenever the rules validated, so a
+ * successful save left it looking as though the work had not been done. A
+ * button that never goes quiet cannot tell anyone whether their change landed.
+ *
+ * `dirty` compares the whole settings object, not just the permission lists —
+ * every field on this form goes through the same draft.
+ */
+export interface SettingsSaveState {
+  /** The draft differs from what is stored. */
+  readonly dirty: boolean;
+  /** There is something to save, and it is valid. */
+  readonly canSave: boolean;
+}
+
+/** Stable key order, so two equal objects always serialise the same way. */
+function canonicalSettings(settings: Settings): string {
+  const entries = Object.entries(settings).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return JSON.stringify(entries);
+}
+
+export function settingsAreEqual(a: Settings, b: Settings): boolean {
+  return canonicalSettings(a) === canonicalSettings(b);
+}
+
+export function settingsSaveState(input: {
+  /** What the store currently holds; null while settings are still loading. */
+  readonly saved: Settings | null;
+  /** The draft the form would submit; null when there are no local edits. */
+  readonly draft: Settings | null;
+  /** How many verification rules the validator rejected. */
+  readonly blockingProblems: number;
+}): SettingsSaveState {
+  const { saved, draft, blockingProblems } = input;
+
+  // Nothing loaded, or no draft to compare: there is nothing to save.
+  if (saved === null || draft === null) return { dirty: false, canSave: false };
+
+  const dirty = !settingsAreEqual(saved, draft);
+  return { dirty, canSave: dirty && blockingProblems === 0 };
+}
+
+/**
  * What a successful **Save** applies: nothing.
  *
  * The draft is dropped so the form re-reads the values that were just stored.

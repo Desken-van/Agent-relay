@@ -9,6 +9,7 @@ import {
   DEFAULT_CLAUDE_VERIFICATION_TOOLS,
   clearLocalEdits,
   resetPermissionRules,
+  settingsSaveState,
   type Settings
 } from '@shared/domain/models';
 import { call, expect } from '../lib/api';
@@ -115,6 +116,21 @@ export function SettingsView(): React.JSX.Element {
     setRulesText(cleared.allowedText);
     setVerificationText(cleared.verificationText);
   };
+
+  /**
+   * Whether Save has anything to do.
+   *
+   * Validity alone is not enough: with no unsaved change, saving would write
+   * the values that are already there and tell the user nothing. Comparing the
+   * draft against the store is also what makes Reset honest — restoring
+   * defaults that are already stored leaves the form clean rather than
+   * pretending there is work pending.
+   */
+  const saveState = settingsSaveState({
+    saved: settings,
+    draft,
+    blockingProblems: verificationProblems.length
+  });
 
   return (
     <div className="content--split" style={{ display: 'grid' }}>
@@ -426,7 +442,7 @@ export function SettingsView(): React.JSX.Element {
               <button
                 type="button"
                 className="btn btn--primary"
-                disabled={verificationProblems.length > 0}
+                disabled={!saveState.canSave}
                 onClick={() =>
                   void perform('save-settings', 'Could not save settings', async () => {
                     // Captured before the write, so the comparison below is
