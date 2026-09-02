@@ -335,7 +335,7 @@ names only; `--show-token` is never used.
 
 ## 8. Testing strategy
 
-711 tests, none of which contact Codex, Claude, or GitHub.
+722 tests, none of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|

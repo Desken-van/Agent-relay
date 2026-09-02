@@ -390,28 +390,30 @@ Being precise about what was actually exercised, rather than merely written:
 | **Git** | ✅ **Genuinely verified.** 19 integration tests drive the real `git` binary against real temporary repositories: worktree creation and isolation, change collection, diff truncation, refusal to force-remove, commit, and the destructive-command guard. |
 | **SQLite** | ✅ **Genuinely verified.** Migrations, cascades, ordering, and on-disk durability across close/reopen — and confirmed running inside Electron. |
 | **Electron app** | ✅ **Genuinely verified.** Launches on Windows 11, creates its database in WAL mode, renders the UI, and completes a full renderer→main→adapter→renderer diagnostics round-trip. |
-| **Claude Code CLI** | ⚠️ **Not verified against a live CLI** — it is not installed on this machine. The adapter is written against the documented `--print --output-format stream-json` contract, and its parser, argument construction, `--resume` handling, stdin prompt delivery, auth-failure detection, and timeout behaviour are covered by tests using an injected process runner. Treat the first real run as the acceptance test. |
-| **GitHub CLI** | ⚠️ **Not verified against a live `gh`** — not installed. `gh auth status` parsing (both modern and legacy formats), URL extraction, and owner/repo validation are unit-tested. **No real GitHub mutation was performed at any point.** |
+| **Claude Code CLI** | ✅ **Genuinely verified end to end.** Live implementation and correction rounds exercised `stream-json` parsing, tool-use evidence, a failed verification followed by *Retry verification*, and resume of the same Claude session. The diagnostic reports the installed CLI and authenticated profile without exposing credentials. |
+| **GitHub CLI** | ⚠️ **Live diagnostics verified; remote publish mutations not yet exercised through Agent Relay.** The running app resolved `gh`, reported its version and authenticated account, and the parser and owner/repository validation remain unit-tested. Creating a repository, pushing a task branch, and opening a pull request through Agent Relay still require a dedicated live acceptance run. |
 
-Test suite: **711 tests, 24 files, all passing.** No test contacts Codex,
+Test suite: **722 tests, 24 files, all passing.** No test contacts Codex,
 Claude, or GitHub.
 
 ---
 
 ## Known limitations
 
-* **Claude Code and GitHub CLI are unverified against live tools** on this
-  machine — see the table above.
+* **Agent Relay's GitHub mutation path is not yet live-verified.** Live `gh`
+  discovery and authentication diagnostics passed, but create-repository,
+  push-branch, and open-pull-request were deliberately not exercised through
+  the application.
 * **`node:sqlite` is marked experimental upstream.** It was chosen over a native
   binding because `better-sqlite3` publishes no prebuilt binary for Electron's
   current ABI, so installing it would require Visual Studio Build Tools and a
   Python with `distutils` (removed in Python 3.12+). Node emits an
   `ExperimentalWarning` under Node 22; the API used here is small and stable.
-* **Agent Relay does not run your test suite.** It has no reliable way to know
-  the command. Claude is instructed to run the tests and paste the output, and
-  Agent Relay lifts fenced command output from that report to hand to the
-  reviewer separately. If Claude does not run tests, the reviewer sees no test
-  output.
+* **Agent Relay does not choose or execute your verification command itself.**
+  Claude runs commands inside the task worktree. Agent Relay correlates the
+  structured tool invocation and result, checks it against the configured
+  verification rules, and fails closed when acceptable evidence is absent,
+  malformed, denied, or unsuccessful.
 * **Large diffs are truncated** before review, at the configured budget. The
   reviewer is told the diff was truncated, but a truncated review is a partial
   review.
@@ -451,7 +453,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              711 tests; no network, no real agents
+├─ tests/              722 tests; no network, no real agents
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```
