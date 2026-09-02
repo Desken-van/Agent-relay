@@ -1,5 +1,6 @@
 import { AgentRelayError } from '../../../shared/domain/errors';
 import type { Task } from '../../../shared/domain/models';
+import { BUSY_STATUSES } from '../../../shared/domain/workflow';
 import type { Clock, NewTask, TaskPatch, TaskRepository } from '../../ports';
 import type { Db } from '../database';
 import { toTask, type TaskRow } from '../rows';
@@ -27,6 +28,24 @@ export class SqliteTaskRepository implements TaskRepository {
     const rows = this.db
       .prepare(`SELECT ${COLUMNS} FROM tasks WHERE project_id = ? ORDER BY created_at DESC`)
       .all(projectId) as TaskRow[];
+    return rows.map(toTask);
+  }
+
+  /**
+   * Every task in a busy status, across all projects.
+   *
+   * The statuses come from the workflow module rather than being spelled out
+   * here, so a new busy status cannot be added to the machine and forgotten by
+   * the code that has to recover from a crash.
+   *
+   * Ordered by id so the result is stable: reconciliation must not depend on
+   * whatever order the storage engine happens to return.
+   */
+  listBusy(): Task[] {
+    const placeholders = BUSY_STATUSES.map(() => '?').join(', ');
+    const rows = this.db
+      .prepare(`SELECT ${COLUMNS} FROM tasks WHERE status IN (${placeholders}) ORDER BY id ASC`)
+      .all(...BUSY_STATUSES) as TaskRow[];
     return rows.map(toTask);
   }
 

@@ -393,7 +393,7 @@ Being precise about what was actually exercised, rather than merely written:
 | **Claude Code CLI** | ✅ **Genuinely verified end to end.** Live implementation and correction rounds exercised `stream-json` parsing, tool-use evidence, a failed verification followed by *Retry verification*, and resume of the same Claude session. The diagnostic reports the installed CLI and authenticated profile without exposing credentials. |
 | **GitHub CLI** | ⚠️ **Live diagnostics verified; remote publish mutations not yet exercised through Agent Relay.** The running app resolved `gh`, reported its version and authenticated account, and the parser and owner/repository validation remain unit-tested. Creating a repository, pushing a task branch, and opening a pull request through Agent Relay still require a dedicated live acceptance run. |
 
-Test suite: **722 tests, 24 files, all passing.** No test contacts Codex,
+Test suite: **760 tests, 26 files, all passing.** No test contacts Codex,
 Claude, or GitHub.
 
 ---
@@ -417,6 +417,14 @@ Claude, or GitHub.
 * **Large diffs are truncated** before review, at the configured budget. The
   reviewer is told the diff was truncated, but a truncated review is a partial
   review.
+* **An interrupted round is handed back, never resumed.** If Agent Relay stops
+  mid-round — a crash, a reboot, closing the window — the next start closes the
+  abandoned run as failed and returns the task to the safe state before it:
+  *Specifying* → *Draft*, *Implementing* → *Ready for implementation* or
+  *Changes requested*, *Reviewing* → *Ready for review*, *Publishing* → *Ready
+  to publish*. Restarting the work is your decision; the agent is not
+  relaunched for you, and the branch, worktree, session ids, round counter and
+  stored evidence are all left as the interrupted round left them.
 * **"Do not commit" is an instruction to Claude, not an enforced sandbox.** The
   isolation that genuinely holds is the separate worktree and branch.
 * **Stopping a task is terminal.** *Stop* moves it to `CANCELLED` — one of the
@@ -453,7 +461,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              722 tests; no network, no real agents
+├─ tests/              760 tests; no network, no real agents
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

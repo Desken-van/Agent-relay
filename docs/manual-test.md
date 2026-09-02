@@ -314,6 +314,29 @@ Then press **Send corrections** (if the task is in *Changes requested*).
 
 ✅ Pass if nothing was lost and both agent conversations resume.
 
+### 8b. Interrupted mid-round
+
+Start a round — *Send to Claude*, or *Review with Codex* — and while the agent
+node is still streaming, **close the window** without pressing *Stop*.
+
+Start the application again and open the same task.
+
+**Expect**:
+
+* the task **not** stuck in *Implementing* or *Reviewing*: it is back at *Ready
+  for implementation* (or *Changes requested* if it was a correction round), or
+  *Ready for review* respectively;
+* the interrupted run shown as **failed**, with the reason *"Agent Relay stopped
+  before this run completed; recovered during startup."*;
+* **no** agent running — nothing was relaunched on your behalf;
+* the branch, worktree, Codex thread id, Claude session id, round counter,
+  specification and previous rounds' evidence all unchanged;
+* the buttons for the recovered state enabled, so the round can be started again
+  by hand.
+
+Close and start once more. **Expect** nothing further to change — the recovery
+already happened, and repeating it is a no-op.
+
 ---
 
 ## 9. Publishing — **the only section that touches GitHub**
