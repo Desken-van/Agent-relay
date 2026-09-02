@@ -267,20 +267,108 @@ model. Agent Relay never falls back to a different model and never retries: a
 result quietly produced by a model the user did not choose would be worse than a
 visible failure.
 
-### A denied tool call fails the round
+### A denied tool call is judged on the evidence
 
 In `--print` mode a refused tool call is not an error from the CLI's side. It
 reports the denial, the model carries on — often working around it — and the
 process still exits `0` with a result envelope that says `success`.
 
 Taken at face value, a round where the tests were blocked is indistinguishable
-from one where they passed. Agent Relay therefore **fails closed**: denials are
-collected both from `permission_denied` events and from the `permission_denials`
-array in the result envelope, deduplicated by the CLI's `tool_use_id`, surfaced
-on the timeline as errors naming the tool and a truncated reason, and any denial
-at all marks the run unsuccessful regardless of what the envelope claims. The
-task returns to a retryable state with the denial recorded, rather than
-advancing to review on work that was quietly incomplete.
+from one where they passed. Agent Relay therefore reconstructs what actually
+happened from the stream and decides from that.
+
+**What is collected.** Every tool call and its result, correlated strictly by
+`tool_use.id` and numbered in invocation order; every denial, from both
+`permission_denied` events and the `permission_denials` array, deduplicated by
+`tool_use_id`; and whether the stream was complete — a final envelope, no
+unreadable lines, no calls left unanswered. Commands and reasons are redacted
+before truncation, so a secret on the boundary cannot survive as a fragment.
+
+**How a denial is classified.** From the command alone, never from the reason
+text — prose changes between CLI versions, and a wording change must not be able
+to reclassify a blocked push:
+
+| Category | Meaning |
+| --- | --- |
+| **security** | Names something on the deny list, in any segment of a chained command. |
+| **verification** | Matches a configured verification rule. |
+| **auxiliary** | A readable, ordinary command that proves nothing and threatens nothing. |
+| **unknown** | Anything that cannot be read: no command, a truncated preview, no link to an invocation, or a chained command with nothing forbidden visible. |
+
+**What fails the round.** A security denial; a denial that cannot be classified;
+a verification denial that was never re-run; no verification attempt at all;
+ambiguous verification telemetry; a missing, contradicted or failing final
+envelope; an error the CLI raised, even when the envelope then claimed success;
+an unreadable line anywhere in the stream; and any gap in the record of what ran
+— a call with no result, a result belonging to no call, or two results that
+disagreed. Each returns the task to a retryable state with an error naming what
+the evidence showed.
+
+An incomplete record is failed rather than warned about on purpose. "We noticed
+the account of this round is missing a piece" and "we acted on it" are different
+things, and only the second one keeps unverifiable work from being published.
+
+**What does not.** An auxiliary denial in a round whose verification ran and
+passed. That is now a warning on a successful round, because claiming the tests
+"may have been skipped" when the same stream shows them passing is simply false,
+and a warning that is routinely false is one people learn to ignore.
+
+**A verification denial can be resolved.** If the blocked command is later run
+again — same tool, same rule, higher invocation number, and a definitive result
+— the denial no longer stands. A higher invocation number alone is not enough,
+and a later *different* command resolves nothing. Invocation numbers restart
+with every Claude process, so they are only ever compared within one round.
+
+**Failing tests are a warning, not a failure.** The round reaches the reviewer;
+publishing is blocked until a later round passes.
+
+### Publishing requires evidence, not just approval
+
+Codex approving a diff means somebody read the change. It does not mean the
+change was ever run. Before any commit, push or pull request, the publish gate
+also requires that the most recent Claude round recorded a version-1 assessment
+with no publish block — in addition to the Codex approval and the confirmation
+dialog, neither of which it replaces.
+
+Absence is a refusal. A task from before this existed, a record that cannot be
+parsed, and a record written by a newer version are all blocked, and the verdict
+is never reconstructed from a run's final message: what the model said about
+itself is not evidence.
+
+A block is not permanent, and a refused publish is not a dead end. A task in
+*Ready to publish* whose round the gate refused can start another Claude round
+directly — the reviewer was satisfied, so there are no findings to act on, and
+the round gets a prompt saying the change was approved but its checks did not
+pass. That round goes back through *Ready for review*, so a **new** Codex review
+and a **new** publish approval are both required before the gate is asked again.
+The earlier denial stays in the run history; nothing is rewritten.
+
+### Verification rules are configuration, and are re-checked
+
+*Settings → Claude verification commands* is validated in three places, and only
+the last two of them count.
+
+The renderer disables Save and explains what is wrong, which is a convenience.
+The **settings repository** re-runs the same validator inside `update()`, so a
+configuration no round could satisfy cannot be written by any path that reaches
+the table — not the form, not IPC, not a future caller. The **orchestrator**
+checks once more before each round, because a row can still arrive from a hand
+edit or an older build.
+
+That check runs *before* the branch and worktree are created, so a round that
+cannot legally start leaves nothing behind: no branch, no directory, no run row
+that could be mistaken for an attempt, and no change of task status.
+
+One consequence worth stating plainly: the pre-approved list can no longer be
+emptied. Every verification rule must also be pre-approved, so granting nothing
+would leave a configuration that could only ever be denied.
+
+**One reading of Settings per round.** The rules the CLI is given and the rules
+the round is judged against come from a single snapshot taken immediately before
+the process starts, and that snapshot is passed to the adapter rather than read
+again by it. Preparing a worktree takes long enough for Settings to be saved
+underneath it, and a round argued against rules the process never had would be
+worse than either version alone.
 
 ### Codex reviews are read-only
 

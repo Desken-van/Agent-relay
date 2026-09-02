@@ -189,9 +189,57 @@ That is a command-pattern filter rather than a sandbox: a project script that
 wraps one of them is not caught, so run Agent Relay on code you trust.
 Publishing still requires the confirmation dialog.
 
-If a tool call is refused, the round **fails** rather than quietly continuing —
-otherwise an implementation whose tests never ran would reach the reviewer
-looking healthy. See [docs/security.md](docs/security.md) §5.
+### What counts as checking the work
+
+**Settings → Claude permissions** has a second list, *Claude verification
+commands*. It answers a different question from the one above: not "may Claude
+run this" but "does running this show the change works". The default is the
+same pair, and it is a strict subset of the pre-approved list — a rule Claude
+was never allowed to run could never prove anything.
+
+```
+Bash(npm test *)
+PowerShell(npm test *)
+```
+
+After each round Agent Relay reads what actually happened in the Claude stream —
+which tool calls were made, which results came back, what was refused — and
+decides one of three things:
+
+| Verdict | What happens |
+| --- | --- |
+| **Passed, nothing refused** | The round goes to review. |
+| **Passed, but something was refused, or the checks failed** | The round goes to review with an amber warning on the timeline. |
+| **Nothing verified, or the evidence is ambiguous** | The round fails and returns to a retryable state. |
+
+Two things follow from this that are worth knowing up front.
+
+*An auxiliary refusal is no longer fatal.* If Claude tries `npm run lint`, is
+refused, and then runs the tests successfully, that is a warning rather than a
+failed round — the evidence shows the work was checked.
+
+*Failing tests still reach the reviewer, but cannot be published.* Reading a
+change that does not pass its tests is often useful; shipping it is not. The
+publish gate requires the most recent round to have passed verification, on top
+of a Codex approval and your own confirmation. A later clean round lifts the
+block — after a new review and a new approval.
+
+Where the evidence is unreadable — a command too long to record in full, a
+result the stream contradicted, a call whose result never arrived, a chained
+command Agent Relay will not take apart — the round fails rather than being given
+the benefit of the doubt.
+
+If a round is approved by Codex and then refused by the publish gate, the same
+button becomes **Retry verification**: Claude runs again on the same session with
+a prompt explaining that the change was approved but its checks did not pass. A
+new review and a new publish approval are required afterwards.
+
+If a tool call is refused, what happens depends on what was refused. A blocked
+`git push` or a refusal Agent Relay cannot identify **fails** the round; a
+blocked auxiliary command in a round whose tests ran and passed is a **warning**
+on a round that still goes to review. What never happens is an implementation
+whose tests never ran reaching the reviewer looking healthy. See
+[docs/security.md](docs/security.md) §5.
 
 ### GitHub CLI
 
@@ -345,7 +393,7 @@ Being precise about what was actually exercised, rather than merely written:
 | **Claude Code CLI** | ⚠️ **Not verified against a live CLI** — it is not installed on this machine. The adapter is written against the documented `--print --output-format stream-json` contract, and its parser, argument construction, `--resume` handling, stdin prompt delivery, auth-failure detection, and timeout behaviour are covered by tests using an injected process runner. Treat the first real run as the acceptance test. |
 | **GitHub CLI** | ⚠️ **Not verified against a live `gh`** — not installed. `gh auth status` parsing (both modern and legacy formats), URL extraction, and owner/repo validation are unit-tested. **No real GitHub mutation was performed at any point.** |
 
-Test suite: **269 tests, 10 files, all passing.** No test contacts Codex,
+Test suite: **711 tests, 24 files, all passing.** No test contacts Codex,
 Claude, or GitHub.
 
 ---
@@ -403,7 +451,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              269 tests; no network, no real agents
+├─ tests/              711 tests; no network, no real agents
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

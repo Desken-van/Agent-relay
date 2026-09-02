@@ -196,6 +196,18 @@ export interface CodexAdapter {
 }
 
 export interface ClaudeImplementationRequest {
+  /**
+   * Permission rules to pre-approve for this run.
+   *
+   * Supplied by the caller so that the rules the CLI is given and the rules the
+   * round is later judged against come from one reading of Settings. The
+   * adapter can read Settings itself, but a second read is a second answer:
+   * Settings edited while a worktree was being prepared would otherwise leave
+   * the policy assessing a list the process never had.
+   *
+   * Omitted means "use whatever the adapter was constructed with".
+   */
+  readonly allowedTools?: readonly string[];
   readonly worktreePath: string;
   readonly branchName: string;
   readonly prompt: string;
@@ -218,19 +230,195 @@ export interface ClaudePermissionDenial {
   /** Correlation id from the CLI, used to deduplicate. Null when absent. */
   readonly toolUseId: string | null;
   readonly reason: string;
+  /**
+   * The command the CLI refused, when it reported one.
+   *
+   * Taken from `tool_input.command`, or recovered from the matching tool use
+   * by id. Never reconstructed from the reason text: a guess here would later
+   * decide whether a round is safe, and a wrong guess is worse than no answer.
+   * Null means "the CLI did not say".
+   *
+   * May be a truncated preview — see {@link commandTruncated}.
+   */
+  readonly command: string | null;
+  /** See {@link ClaudeToolExecution.commandTruncated}; the same rules apply. */
+  readonly commandTruncated: boolean;
+  /**
+   * {@link ClaudeToolExecution.toolUseSequence} of the call this refused, or
+   * null when no call could be tied to it.
+   *
+   * Filled in later if the denial is reported before the call it names. Only
+   * ever taken from a matching `tool_use_id`: a denial with no id stays null,
+   * and an identical command is not a link — see the note on that field.
+   */
+  readonly toolUseSequence: number | null;
+  /**
+   * Which part of the stream reported it.
+   *
+   * A denial normally arrives twice — as a `permission_denied` event and again
+   * in the result envelope — and stays one record either way. `'both'` means
+   * both reported it, which is the ordinary case and not a second denial.
+   */
+  readonly source: 'stream' | 'result' | 'both';
+}
+
+/**
+ * One tool call Claude made, paired with its result where one arrived.
+ *
+ * Deliberately holds no output. The point is correlation and status — whether a
+ * given call happened and whether it failed — not a second copy of the timeline.
+ */
+export interface ClaudeToolExecution {
+  /** `tool_use.id`; null when the CLI omitted it, and then it cannot correlate. */
+  readonly toolUseId: string | null;
+  /**
+   * Position of this call in the order Claude *made* the calls: 1, 2, 3…
+   *
+   * Array position cannot answer that question. A result may be flushed ahead
+   * of its call, so an entry can be created before the call that owns it is
+   * known, and its slot reflects when the stream first mentioned the id rather
+   * than when Claude invoked anything.
+   *
+   * This is invocation order, never completion order — results arriving out of
+   * order do not move it. Numbers are assigned once, when a real `tool_use` is
+   * first seen: a re-delivered call keeps the number it already had, and a
+   * placeholder standing in for a call that has not arrived holds null and
+   * reserves nothing, so the sequence has no gaps. Anonymous calls each get
+   * their own number, because they are separate invocations even though they
+   * cannot be correlated to a result.
+   *
+   * Null means no call was seen at all — an orphan result.
+   *
+   * Scoped to one parser, and so to one CLI process: a resumed round starts
+   * again at 1 and its numbers say nothing about the round before it.
+   */
+  readonly toolUseSequence: number | null;
+  readonly tool: string;
+  /**
+   * The command for Bash/PowerShell; null for tools that do not run one.
+   *
+   * Redacted, and a preview rather than the whole command when it was long —
+   * see {@link commandTruncated}.
+   */
+  readonly command: string | null;
+  /**
+   * True when {@link command} is only the leading part of what actually ran.
+   *
+   * False whenever `command` is null: "nothing was reported" is not "something
+   * was cut". False also when the command fitted, and then `command` is the
+   * complete redacted text.
+   *
+   * The full text is deliberately nowhere — not in this record, the run events,
+   * the database or the logs. That makes this flag the only evidence that
+   * something is missing, so a later policy **must** treat a truncated command
+   * as unknown and fail closed. In particular it must not be classified as
+   * auxiliary or as a verification command, and no security decision may rest
+   * on a forbidden string being absent from the preview: the part that was cut
+   * is exactly where such a string would hide.
+   */
+  readonly commandTruncated: boolean;
+  /** Short, safe description for tools without a command (file path, pattern…). */
+  readonly summary: string;
+  /**
+   * True when a `tool_use` block for this entry was actually seen.
+   *
+   * False marks an orphan: a `tool_result` arrived whose call never did, so
+   * `tool`, `command` and `summary` are placeholders and describe nothing.
+   * Together with {@link resultReceived} this distinguishes the three shapes a
+   * record can have — a completed call, a call still open, and a result that
+   * cannot be attributed to any call.
+   */
+  readonly toolUseSeen: boolean;
+  /** True once a `tool_result` carrying this id arrived. */
+  readonly resultReceived: boolean;
+  /**
+   * `tool_result.is_error`, or null when the outcome is not known.
+   *
+   * Null is not success — it is "the stream did not say", either because the
+   * field was absent or because two results contradicted each other. It is
+   * never inferred from output text, because "no errors printed" and "the
+   * command succeeded" are different claims.
+   */
+  readonly isError: boolean | null;
+  /**
+   * True when two results for this id disagreed about `is_error`.
+   *
+   * The stream should never do this. When it does, {@link isError} goes back to
+   * null rather than keeping whichever value happened to arrive first: a caller
+   * that forgets this flag entirely still cannot read a contradiction as a pass.
+   * Nothing is lost by refusing to choose — there are only two boolean values,
+   * so this flag already says that both were seen.
+   */
+  readonly resultConflict: boolean;
+}
+
+/**
+ * What the stream actually contained, separate from what it means.
+ *
+ * Phase 6A records this; nothing decides anything differently because of it
+ * yet. A permission denial still fails the round exactly as before.
+ */
+export interface ClaudeStreamEvidence {
+  readonly toolExecutions: readonly ClaudeToolExecution[];
+  /** True when the CLI emitted its final `result` envelope. */
+  readonly resultEnvelopeSeen: boolean;
+  /**
+   * `is_error` as the final envelope stated it, or null when it did not.
+   *
+   * Null covers three different silences — no envelope, no field, and two
+   * envelopes that disagreed — and none of them is success. Read alongside
+   * {@link resultEnvelopeConflict} to tell the last case from the others.
+   *
+   * Separate from {@link ClaudeImplementationResult.isError}, which is the
+   * outcome the application acts on and folds in denials and process failures.
+   * This field is only what the envelope literally said.
+   */
+  readonly resultEnvelopeIsError: boolean | null;
+  /**
+   * True when more than one final envelope arrived and they disagreed.
+   *
+   * The CLI should send exactly one. If it sends two that contradict each other,
+   * {@link resultEnvelopeIsError} goes to null rather than keeping either value,
+   * on the same reasoning as {@link ClaudeToolExecution.resultConflict}.
+   */
+  readonly resultEnvelopeConflict: boolean;
+  /** Non-empty stdout lines that were not valid JSON. */
+  readonly malformedLineCount: number;
+  /** Calls seen but never answered: `toolUseSeen && !resultReceived`. */
+  readonly incompleteToolUseCount: number;
+  /** Results that named no call we ever saw: `!toolUseSeen`. */
+  readonly orphanToolResultCount: number;
 }
 
 export interface ClaudeImplementationResult {
   readonly sessionId: string | null;
   readonly finalMessage: string;
+  /**
+   * The CLI reported a failure: an `error` event, or a final envelope saying so.
+   *
+   * Not the round's verdict. A refused tool call leaves this false — the CLI
+   * exits 0 and calls the round a success — which is exactly why the outcome is
+   * decided from {@link evidence} and {@link permissionDenials} by the round
+   * policy instead. Kept for diagnostics and for the process-level failures the
+   * policy has no opinion about.
+   */
   readonly isError: boolean;
   readonly numTurns: number | null;
   readonly rawResultJson: string | null;
-  /**
-   * Tool calls Claude was refused. Non-empty always implies `isError`, because a
-   * round that was blocked from part of its work did not succeed.
+/**
+   * Tool calls Claude was refused.
+   *
+   * Non-empty does *not* imply {@link isError}: whether a refusal sank the round
+   * depends on what was refused and whether the work was verified regardless,
+   * which is a judgement the round policy makes.
    */
   readonly permissionDenials: readonly ClaudePermissionDenial[];
+  /**
+   * Structured record of what the stream contained. Not persisted, and not yet
+   * consulted by any decision — it exists so a later policy can tell an
+   * incidental refusal apart from a round that never ran its tests.
+   */
+  readonly evidence: ClaudeStreamEvidence;
 }
 
 export interface ClaudeAdapter {

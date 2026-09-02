@@ -44,6 +44,7 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { destructiveToolDenyRules } from '../../../shared/domain/claude-tool-rules';
 import type { ToolDiagnostic } from '../../../shared/domain/diagnostics';
 import { AgentRelayError } from '../../../shared/domain/errors';
 import type {
@@ -54,7 +55,7 @@ import type {
 } from '../../ports';
 import { locateExecutable, configuredPathIsBroken } from '../process/executable-locator';
 import type { ProcessRunner } from '../process/process-runner';
-import { consumeLine, createStreamState, describeDenials, finalizeState } from './stream-parser';
+import { consumeLine, createStreamState, finalizeState } from './stream-parser';
 
 export interface ClaudeAdapterOptions {
   readonly configuredPath?: string | null;
@@ -66,46 +67,14 @@ export interface ClaudeAdapterOptions {
 }
 
 /**
- * Commands Agent Relay refuses when a tool call names them directly, whatever
- * the project settings say. These are the operations the application reserves
- * for its own confirmation dialog, plus the Git commands that could move work
- * out of the worktree the task is isolated in.
+ * The fixed deny list, re-exported from the one place that defines it.
  *
- * Direct invocation is the limit of what pattern matching can see; a script that
- * wraps one of these is not matched.
+ * The rules themselves live in `shared/domain/claude-tool-rules` because the
+ * round policy classifies denials against exactly the same list. A copy here
+ * would be a second source of truth for a security decision. Kept as an export
+ * so callers that already import it from the adapter do not have to care.
  */
-const DESTRUCTIVE_COMMANDS = [
-  'git commit',
-  'git push',
-  'git reset',
-  'git clean',
-  'git checkout',
-  'git switch',
-  'git merge',
-  'git rebase',
-  'gh'
-] as const;
-
-/** Shell-ish tools the deny list has to cover; Windows agents reach for both. */
-const GUARDED_TOOLS = ['Bash', 'PowerShell'] as const;
-
-/**
- * Build the fixed deny list.
- *
- * Three spellings per command because Claude Code's rule matching is literal:
- * `Tool(cmd)` catches the bare command, and the two wildcard forms catch it with
- * arguments. Emitting all three costs nothing and avoids depending on which
- * spelling a given CLI version treats as a prefix.
- */
-export function destructiveToolDenyRules(): string[] {
-  const rules: string[] = [];
-  for (const tool of GUARDED_TOOLS) {
-    for (const command of DESTRUCTIVE_COMMANDS) {
-      rules.push(`${tool}(${command})`, `${tool}(${command}:*)`, `${tool}(${command} *)`);
-    }
-  }
-  return rules;
-}
+export { destructiveToolDenyRules };
 
 /** stderr fragments that mean "you are not logged in", not "your code is bad". */
 const AUTH_HINTS = [
@@ -269,7 +238,9 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
     // can safely run to the end of argv. Each rule is its own entry — joining
     // them into one comma-separated string makes a rule containing a comma
     // ambiguous.
-    const allowed = this.options.allowedTools ?? [];
+    // The request wins: it carries the snapshot the caller judged the round
+    // against. Falling back to the constructor keeps direct callers working.
+    const allowed = request.allowedTools ?? this.options.allowedTools ?? [];
     if (allowed.length > 0) {
       args.push('--allowedTools', ...allowed);
     }
@@ -344,21 +315,20 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       );
     }
 
-    // Fail closed. The CLI exits 0 after a denial and its result envelope still
-    // says "success", because from the model's side nothing crashed — it simply
-    // could not run something and carried on. Reporting that as a good round is
-    // how an implementation with no tests run gets sent to the reviewer.
-    const denialSummary = describeDenials(finalized.denials);
-
+    // Denials travel with the result rather than being folded into the message
+    // or the error flag. The CLI exits 0 after a refusal and its envelope still
+    // says "success", so something has to fail closed — but that something is
+    // the round policy, which can also see whether the work was verified anyway.
+    // Deciding it here, with only half the picture, is what produced a blanket
+    // "the tests may have been skipped" on rounds where they demonstrably ran.
     return {
       sessionId: finalized.sessionId,
-      finalMessage: denialSummary
-        ? `${denialSummary}\n\n${finalized.finalMessage}`.trim()
-        : finalized.finalMessage,
+      finalMessage: finalized.finalMessage,
       isError: finalized.isError,
       numTurns: finalized.numTurns,
       rawResultJson: finalized.rawResultJson,
-      permissionDenials: finalized.denials
+      permissionDenials: finalized.denials,
+      evidence: finalized.evidence
     };
   }
 }

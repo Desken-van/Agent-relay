@@ -80,6 +80,34 @@ in its worktree, and the target repository's own project settings still load.
 rebase and `gh` are refused when named directly and cannot be granted here, and
 that this is a pattern filter rather than a sandbox.
 
+Below it, **expect** a second textarea, *Claude verification commands*,
+pre-filled with the same two rules. This one decides which commands count as
+having *checked the work*, and every rule in it must also appear above.
+
+Try each of these and **expect** the *Save settings* button to be disabled with
+an explanation naming the rule:
+
+| Typed | Expected complaint |
+| --- | --- |
+| (empty) | at least one rule is required |
+| `Bash(npm run docs *)` | missing from the pre-approved list above |
+| `Bash(npm * test)` | `*` only allowed as the final character |
+| `Bash(npm test; git status)` | chained commands are not accepted |
+| `Bash(cmd /c npm test)` | a command that runs another cannot be verified |
+| `Read(**)` | only `Bash(…)` and `PowerShell(…)` |
+| `npm test` | not written as `Tool(command)` |
+
+Press **Reset** and **expect** both textareas to return to:
+
+```
+Bash(npm test *)
+PowerShell(npm test *)
+```
+
+Reset restores the shipped defaults, not the last saved values — otherwise a
+saved rule list the validator now rejects would leave you stuck with the Save
+button disabled and no way back.
+
 Leave the default alone for the rest of this document unless a step says
 otherwise. If the project you are testing uses a different test command, add a
 matching rule — narrowly, e.g. `Bash(pnpm test *)`, not `Bash(*)`.
@@ -171,18 +199,56 @@ leaves the task retryable.
 
 **Expect** *Send to Claude* to be disabled until the specification is approved.
 
-### 5d. A blocked command fails the round
+### 5d. A blocked command is judged on the evidence
 
 Claude runs with no one available to answer a permission prompt, so a command
 that is neither pre-approved nor auto-approved is refused outright rather than
-waiting.
+waiting. What that means for the round depends on *what* was refused.
 
-To see the handling, temporarily clear the **Claude permissions** textarea, save,
-and run a task whose specification asks for tests to be run. **Expect** red
-*Permission denied* entries on the timeline naming the tool, and the round to end
-**unsuccessfully** — not as *Ready for review* — with the denial recorded as the
-task's last error. A round in which the tests were silently skipped must never
-look like a clean one.
+**A blocked auxiliary command, tests still passing.** Leave the defaults in
+place and run a task whose specification also asks for something not on the
+list — a coverage report, say. **Expect** the round to end as *Ready for review*
+with an **amber warning** on the timeline saying how many commands were denied
+and naming the verification command that succeeded. Expand *N denied commands*
+and **expect** each to show its tool, redacted command, category and reason.
+**Expect** the run itself to stay green, and the wording *not* to claim the
+tests may have been skipped.
+
+**Blocked verification.** The permissions list can no longer be emptied — a
+verification rule must always be runnable, so Settings refuses the save. To see
+this case instead, point both lists at a command the project does not have
+(`Bash(npm run check *)` in both), save, and run a task. **Expect** the round to
+end **unsuccessfully**, not as *Ready for review*, with an error saying no
+verification command ran.
+
+**Failing tests.** Run a task against a project whose tests fail. **Expect**
+*Ready for review* with an amber warning saying verification ran and failed, and
+that publishing is blocked. **Expect** *Review with Codex* to be available, and
+a later publish attempt to be refused with a message about verification.
+
+**Unusable configuration.** Clear the **Claude verification commands** textarea
+and save — **expect** the save to be refused both by the disabled button and, if
+you reach it another way, by the main process. If a bad configuration does get
+stored, **expect** *Send to Claude* to fail immediately with a message pointing
+at Settings, **no** Claude node on the timeline, **no** new branch or worktree,
+and the task still at *Ready for implementation*.
+
+### 5e. Recovering from a refused publish
+
+Run a task whose tests fail, let Codex **approve** it, press *Approve for
+publishing*, then try to commit. **Expect** the publish to be refused with a
+message about verification.
+
+From that same state, **expect** the correction button to read **Retry
+verification** and to be enabled. Press it. **Expect** a new Claude round on the
+same session, with a prompt saying the change was reviewed and approved but its
+checks did not pass. After it finishes, **expect** the task at *Ready for
+review* — a new Codex review and a new *Approve for publishing* are both required
+before the commit is allowed again.
+
+For contrast, take a task that reached *Ready to publish* with a clean round.
+**Expect** the same button to stay **disabled**: there is nothing to retry, and
+offering another round on finished work would be busywork.
 
 Restore the default rules afterwards.
 

@@ -1,6 +1,17 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { ToolDiagnostic } from '@shared/domain/diagnostics';
-import { DEFAULT_CLAUDE_ALLOWED_TOOLS, type Settings } from '@shared/domain/models';
+import {
+  resolveVerificationConfig,
+  type RuleProblem
+} from '@shared/domain/claude-tool-rules';
+import {
+  DEFAULT_CLAUDE_ALLOWED_TOOLS,
+  DEFAULT_CLAUDE_VERIFICATION_TOOLS,
+  clearLocalEdits,
+  resetPermissionRules,
+  settingsSaveState,
+  type Settings
+} from '@shared/domain/models';
 import { call, expect } from '../lib/api';
 import { formatDateTime } from '../lib/format';
 import { useStore } from '../state/store';
@@ -26,6 +37,7 @@ export function SettingsView(): React.JSX.Element {
   // Raw textarea contents for the permission rules, kept separately so partially
   // typed lines survive; null means "show whatever the draft holds".
   const [rulesText, setRulesText] = useState<string | null>(null);
+  const [verificationText, setVerificationText] = useState<string | null>(null);
 
   const tools: ToolDiagnostic[] = diagnostics
     ? [diagnostics.codex, diagnostics.claude, diagnostics.git, diagnostics.github]
@@ -37,16 +49,88 @@ export function SettingsView(): React.JSX.Element {
   };
 
   /**
-   * Drop every unsaved edit.
+   * Verification rules that cannot be used, in the user's own words.
    *
-   * The permission rules are held in two places — the parsed array in `edits`
-   * and the raw textarea text — so both have to go, or Reset leaves the old
-   * text on screen while the value behind it has already reverted.
+   * Uses the same validator the main process runs before spawning Claude, so
+   * the form and the gate can never disagree about what is acceptable. This is
+   * a convenience, not a boundary — the main process re-checks regardless of
+   * what the renderer decided.
    */
-  const discardEdits = (): void => {
-    setEdits(null);
-    setRulesText(null);
+  const verificationProblems = useMemo<string[]>(() => {
+    if (!draft) return [];
+
+    const config = resolveVerificationConfig(
+      draft.claudeAllowedTools,
+      draft.claudeVerificationTools
+    );
+    if (config.ok) return [];
+
+    return config.problems.map((problem) => {
+      if (problem.code === 'empty') {
+        return 'At least one verification rule is required, or no round could ever be published.';
+      }
+      if (problem.code === 'not_allowed') {
+        return `${problem.rule ?? 'A rule'} is missing from the pre-approved list above.`;
+      }
+      return `${problem.rule ?? 'A rule'} ${VERIFICATION_RULE_PROBLEMS[problem.detail ?? 'syntax']}`;
+    });
+  }, [draft]);
+
+  /**
+   * **Reset**: put the permission rules back to the shipped defaults.
+   *
+   * The rules live in two places — the parsed array in `edits` and the raw
+   * textarea text — so both have to be set, or Reset would leave the old text
+   * on screen while the value behind it had already changed.
+   *
+   * Restores the defaults rather than the last saved values because this is the
+   * way out of a saved configuration the validator now rejects: reverting to
+   * the rejected text would leave the Save button disabled and no way forward.
+   */
+  const resetToDefaults = (): void => {
+    const next = resetPermissionRules();
+    setEdits(
+      settings === null
+        ? null
+        : {
+            ...settings,
+            claudeAllowedTools: next.claudeAllowedTools,
+            claudeVerificationTools: next.claudeVerificationTools
+          }
+    );
+    setRulesText(next.allowedText);
+    setVerificationText(next.verificationText);
   };
+
+  /**
+   * After a successful **Save**: drop the local draft so the form re-reads what
+   * was stored.
+   *
+   * Emphatically not the same thing as Reset. Sharing one function made a
+   * successful save replace the user's own rules with the defaults on screen —
+   * and then write those defaults on the next save.
+   */
+  const clearEdits = (): void => {
+    const cleared = clearLocalEdits();
+    setEdits(cleared.draft);
+    setRulesText(cleared.allowedText);
+    setVerificationText(cleared.verificationText);
+  };
+
+  /**
+   * Whether Save has anything to do.
+   *
+   * Validity alone is not enough: with no unsaved change, saving would write
+   * the values that are already there and tell the user nothing. Comparing the
+   * draft against the store is also what makes Reset honest — restoring
+   * defaults that are already stored leaves the form clean rather than
+   * pretending there is work pending.
+   */
+  const saveState = settingsSaveState({
+    saved: settings,
+    draft,
+    blockingProblems: verificationProblems.length
+  });
 
   return (
     <div className="content--split" style={{ display: 'grid' }}>
@@ -302,8 +386,54 @@ export function SettingsView(): React.JSX.Element {
                   or hooks. Commit, push, reset, clean, checkout, switch, merge, rebase and{' '}
                   <span className="mono">gh</span> are refused when a command names them directly —
                   a pattern filter, not a sandbox, so a project script that wraps them is not
-                  caught. Publishing still requires the confirmation dialog, and a denied command
-                  fails the round.
+                  caught. Publishing still requires the confirmation dialog.
+                </Notice>
+
+                <Field
+                  label="Claude verification commands"
+                  hint="One rule per line. A round has to run one of these successfully before it can be published."
+                >
+                  <textarea
+                    className="input input--mono"
+                    rows={3}
+                    spellCheck={false}
+                    value={verificationText ?? draft.claudeVerificationTools.join('\n')}
+                    placeholder={DEFAULT_CLAUDE_VERIFICATION_TOOLS.join('\n')}
+                    onChange={(e) => {
+                      setVerificationText(e.target.value);
+                      set(
+                        'claudeVerificationTools',
+                        e.target.value
+                          .split('\n')
+                          .map((line) => line.trim())
+                          .filter((line) => line.length > 0)
+                      );
+                    }}
+                  />
+                </Field>
+
+                {verificationProblems.length > 0 ? (
+                  <Notice tone="error">
+                    <strong>These verification rules cannot be used.</strong> Settings will not
+                    save until they are fixed.
+                    <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+                      {verificationProblems.map((problem: string) => (
+                        <li key={problem}>{problem}</li>
+                      ))}
+                    </ul>
+                  </Notice>
+                ) : null}
+
+                <Notice tone="info">
+                  These decide which commands count as <strong>checking the work</strong> — they
+                  are not a second permission list. Every rule here must also appear above, since
+                  Claude could not otherwise run it. Only{' '}
+                  <span className="mono">Bash(…)</span> and{' '}
+                  <span className="mono">PowerShell(…)</span> are supported, with at most one
+                  trailing <span className="mono">*</span>. Like the list above this is a pattern
+                  filter, not a sandbox: chained commands such as{' '}
+                  <span className="mono">npm test; git status</span> never count as verification,
+                  and neither does a command that wraps another.
                 </Notice>
               </div>
             </Card>
@@ -312,6 +442,7 @@ export function SettingsView(): React.JSX.Element {
               <button
                 type="button"
                 className="btn btn--primary"
+                disabled={!saveState.canSave}
                 onClick={() =>
                   void perform('save-settings', 'Could not save settings', async () => {
                     // Captured before the write, so the comparison below is
@@ -322,7 +453,7 @@ export function SettingsView(): React.JSX.Element {
                     // Only after the write succeeds: a rejected save must leave
                     // the user's text on screen to correct, not discard it.
                     await expect('settings:update', draft);
-                    discardEdits();
+                    clearEdits();
                     await refreshSettings();
                     await refreshDiagnostics(true);
 
@@ -336,7 +467,12 @@ export function SettingsView(): React.JSX.Element {
               >
                 Save settings
               </button>
-              <button type="button" className="btn btn--ghost" onClick={discardEdits}>
+              <button
+                type="button"
+                className="btn btn--ghost"
+                title="Restore the shipped Claude permission and verification rules."
+                onClick={resetToDefaults}
+              >
                 Reset
               </button>
             </div>
@@ -393,3 +529,20 @@ function ToolCard({ tool }: { tool: ToolDiagnostic }): React.JSX.Element {
 export async function recheckTools(): Promise<void> {
   await call('diagnostics:run', { force: true });
 }
+
+/**
+ * Rule problems, phrased as what to change.
+ *
+ * A total record over the problem codes, so a new kind of malformed rule cannot
+ * be added without deciding what to tell the person who typed it.
+ */
+const VERIFICATION_RULE_PROBLEMS: Record<RuleProblem, string> = {
+  syntax: 'is not written as Tool(command).',
+  unsupported_tool: 'uses a tool other than Bash(…) or PowerShell(…).',
+  empty_body: 'names no command.',
+  wildcard: 'may only use a single * as its final character.',
+  compound:
+    'chains commands. A separator such as ; && || | or & never counts as verification, ' +
+    'even inside quotes.',
+  wrapper: 'runs another command, such as cmd /c, which cannot be verified.'
+};

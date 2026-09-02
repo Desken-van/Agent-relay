@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { correctionAction, latestClaudeRoundResult } from '@shared/domain/claude-assessment';
 import type { GitChangeSet } from '@shared/domain/git';
 import type { ApprovalAction } from '@shared/domain/models';
 import { isBusy } from '@shared/domain/workflow';
@@ -17,6 +18,20 @@ export function RunView(): React.JSX.Element {
   const { selectedTaskId, detail, refreshDetail, perform, notify, busy, codexModels } = store;
 
   const [changes, setChanges] = useState<GitChangeSet | null>(null);
+
+  /**
+   * Whether another Claude round can be started, and what to call it.
+   *
+   * Two situations lead here: a review that asked for changes, and a round the
+   * publish gate refused after the reviewer approved it. The second used to be
+   * a dead end in the UI — the orchestrator allowed it, the button did not.
+   */
+  const correction = correctionAction({
+    status: detail?.task.status ?? null,
+    currentRound: detail?.task.currentRound ?? 0,
+    maxRounds: detail?.task.maxRounds ?? 0,
+    latestClaudeStructuredResult: latestClaudeRoundResult(detail?.runs ?? [])
+  });
   const [loadingChanges, setLoadingChanges] = useState(false);
   const [dirtyPrompt, setDirtyPrompt] = useState<string | null>(null);
 
@@ -284,26 +299,17 @@ export function RunView(): React.JSX.Element {
             <button
               type="button"
               className="btn btn--claude btn--wide"
-              disabled={
-                anyBusy ||
-                running ||
-                task.status !== 'CHANGES_REQUESTED' ||
-                task.currentRound >= task.maxRounds
-              }
-              title={
-                task.currentRound >= task.maxRounds
-                  ? 'The review round budget for this task is exhausted.'
-                  : undefined
-              }
+              disabled={anyBusy || running || !correction.enabled}
+              title={correction.disabledReason ?? undefined}
               onClick={() =>
                 void perform('corrections', 'Correction round failed', async () => {
                   await expect('workflow:sendCorrections', { taskId: task.id });
-                  notify({ tone: 'success', title: 'Claude finished the correction round' });
+                  notify({ tone: 'success', title: 'Claude finished the round' });
                   await Promise.all([refreshDetail(task.id), loadChanges()]);
                 })
               }
             >
-              {busy['corrections'] ? <Spinner /> : <Scope kind="local" />} Send corrections
+              {busy['corrections'] ? <Spinner /> : <Scope kind="local" />} {correction.label}
             </button>
 
             <div className="actions__legend">Control</div>

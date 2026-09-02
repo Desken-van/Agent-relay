@@ -1,3 +1,8 @@
+import {
+  resolveVerificationConfig,
+  type RuleProblem,
+  type VerificationConfigProblem
+} from '../../../shared/domain/claude-tool-rules';
 import { AgentRelayError } from '../../../shared/domain/errors';
 import { settingsSchema, type Settings } from '../../../shared/domain/models';
 import type { SettingsRepository } from '../../ports';
@@ -61,6 +66,28 @@ export class SqliteSettingsRepository implements SettingsRepository {
       });
     }
 
+    // The schema checks each field on its own. Whether the verification rules
+    // can actually be used is a question about two fields together, and it has
+    // to be answered here rather than in the form: the renderer is a
+    // convenience, and a configuration that no round could ever satisfy should
+    // not be reachable by any path that writes to this table.
+    const configured = resolveVerificationConfig(
+      next.data.claudeAllowedTools,
+      next.data.claudeVerificationTools
+    );
+    if (!configured.ok) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'The Claude verification commands cannot be used.',
+        {
+          remediation:
+            'Each rule must be Bash(...) or PowerShell(...), may end in a single *, and must ' +
+            'also appear in the pre-approved list.',
+          details: configured.problems.map(describeVerificationProblem).join(' ')
+        }
+      );
+    }
+
     const upsert = this.db.prepare(
       `INSERT INTO settings (key, value) VALUES (?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`
@@ -76,3 +103,25 @@ export class SqliteSettingsRepository implements SettingsRepository {
     return next.data;
   }
 }
+
+/** One verification-configuration problem, phrased as something to change. */
+function describeVerificationProblem(problem: VerificationConfigProblem): string {
+  if (problem.code === 'empty') {
+    return 'At least one verification command is required.';
+  }
+  const rule = problem.rule ?? 'A rule';
+  if (problem.code === 'not_allowed') {
+    return rule + ' is not in the pre-approved list.';
+  }
+  return rule + ' ' + RULE_PROBLEMS[problem.detail ?? 'syntax'];
+}
+
+/** A total record, so a new kind of bad rule must be given something to say. */
+const RULE_PROBLEMS: Record<RuleProblem, string> = {
+  syntax: 'is not written as Tool(command).',
+  unsupported_tool: 'uses a tool other than Bash(...) or PowerShell(...).',
+  empty_body: 'names no command.',
+  wildcard: 'may only use a single * as its final character.',
+  compound: 'chains commands, which never counts as verification.',
+  wrapper: 'runs another command, which cannot be verified.'
+};

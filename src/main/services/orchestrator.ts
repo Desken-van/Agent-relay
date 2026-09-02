@@ -18,6 +18,16 @@
  *    to GitHub. That lives in the publish service, behind an approval.
  */
 
+import {
+  resolveVerificationConfig,
+  type RuleProblem,
+  type VerificationConfigProblem
+} from '../../shared/domain/claude-tool-rules';
+import {
+  correctionAction,
+  latestClaudeRoundResult,
+  readClaudeAssessment
+} from '../../shared/domain/claude-assessment';
 import { AgentRelayError, InvalidTransitionError } from '../../shared/domain/errors';
 import type { GitChangeSet } from '../../shared/domain/git';
 import type { Project, Settings, Task } from '../../shared/domain/models';
@@ -35,7 +45,11 @@ import {
   type TaskSpecification
 } from '../../shared/schemas/codex';
 import { buildBranchName, buildWorktreeDirName, isValidBranchName } from '../../shared/util/slug';
-import { buildCorrectionPrompt, buildImplementationPrompt } from '../adapters/codex/prompts';
+import {
+  buildCorrectionPrompt,
+  buildImplementationPrompt,
+  buildVerificationRetryPrompt
+} from '../adapters/codex/prompts';
 import type {
   ClaudeAdapter,
   Clock,
@@ -50,6 +64,13 @@ import type {
   TaskRepository
 } from '../ports';
 import { assertSafeWorktreePath, isSamePath } from './path-safety';
+import { assessClaudeRound } from './claude-round-policy';
+import {
+  denialDetails,
+  describeFailure,
+  describeWarning,
+  toAssessmentRecord
+} from './claude-round-report';
 import { RunRecorder } from './run-recorder';
 import { join } from 'node:path';
 
@@ -385,6 +406,11 @@ export class Orchestrator {
 
     const specification = readSpecification(task);
 
+    // Before the worktree, not after: creating a branch and a directory for a
+    // round that cannot legally start leaves debris the user has to clean up,
+    // for a failure that was knowable before any of it happened.
+    Orchestrator.assertVerificationConfigured(settings);
+
     const controller = this.beginExclusive(taskId);
     try {
       // Worktree creation happens before the state moves to IMPLEMENTING, so a
@@ -411,7 +437,7 @@ export class Orchestrator {
         originalRequest: task.originalRequest
       });
 
-      return await this.runClaude(task, settings, controller, prompt, {
+      return await this.runClaude(task, controller, prompt, {
         runType: 'implementation',
         recoverableFailure: 'implementation_aborted'
       });
@@ -423,17 +449,36 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Start another Claude round on an existing worktree.
+   *
+   * Two entry states, because there are two ways a task ends up needing one:
+   * the reviewer asked for changes, or the reviewer was happy and the publish
+   * gate refused the round on its evidence. The second is not a failure of the
+   * code, so it gets its own prompt.
+   */
   async sendCorrections(taskId: string): Promise<Task> {
     let task = this.requireTask(taskId);
     const settings = this.deps.settings.get();
 
-    if (task.status !== 'CHANGES_REQUESTED') {
+    // The same decision the button makes, from the same function. Asking it
+    // here is what makes it a rule rather than a UI convenience: a renderer is
+    // not a domain boundary, and this entry point is reachable without one.
+    const action = correctionAction({
+      status: task.status,
+      currentRound: task.currentRound,
+      maxRounds: task.maxRounds,
+      latestClaudeStructuredResult: latestClaudeRoundResult(this.deps.runs.listByTask(taskId))
+    });
+
+    if (action.kind === 'unavailable') {
       throw new InvalidTransitionError(task.status, 'corrections_sent');
     }
+    const recovering = action.kind === 'retry_verification';
 
-    // The round budget is the reason this loop terminates. Re-check it here as
+    // The round budget is the reason this loop terminates. Re-checked here as
     // well as at review time, because this entry point is reachable from the UI.
-    if (task.currentRound >= task.maxRounds) {
+    if (!action.enabled) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
         `This task has already used its ${task.maxRounds} review round(s).`,
@@ -441,8 +486,12 @@ export class Orchestrator {
       );
     }
 
+    // Same gate as the first round, and for the same reason: an unusable
+    // configuration must not reach the point of writing a run row.
+    Orchestrator.assertVerificationConfigured(settings);
+
     const review = readReview(task);
-    if (!review) {
+    if (!review && !recovering) {
       throw new AgentRelayError('VALIDATION_FAILED', 'There is no review to send corrections from.');
     }
     if (!task.worktreePath || !task.branchName) {
@@ -457,13 +506,20 @@ export class Orchestrator {
         lastError: null
       });
 
-      const prompt = buildCorrectionPrompt({
-        review,
-        round: nextRound,
-        maxRounds: task.maxRounds
-      });
+      const prompt = recovering
+        ? buildVerificationRetryPrompt({
+            reason: this.describeBlockedRound(task.id),
+            round: nextRound,
+            maxRounds: task.maxRounds
+          })
+        : buildCorrectionPrompt({
+            // Checked above for the non-recovery path.
+            review: review as NonNullable<typeof review>,
+            round: nextRound,
+            maxRounds: task.maxRounds
+          });
 
-      return await this.runClaude(task, settings, controller, prompt, {
+      return await this.runClaude(task, controller, prompt, {
         runType: 'correction',
         recoverableFailure: 'correction_aborted'
       });
@@ -475,10 +531,64 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Why the last round could not be published, for the retry prompt.
+   *
+   * Read back from the stored assessment rather than remembered in the task, so
+   * it says what was actually recorded. A round with no readable assessment
+   * gets a neutral sentence instead of a guess.
+   */
+  private describeBlockedRound(taskId: string): string {
+    const stored = readClaudeAssessment(
+      latestClaudeRoundResult(this.deps.runs.listByTask(taskId))
+    );
+    if (!stored.ok) {
+      return 'The previous round left no usable record of whether its checks ran.';
+    }
+
+    const { assessment } = stored;
+    if (assessment.verificationStatus === 'failed') {
+      const command = assessment.verification?.command ?? 'the verification command';
+      return `The previous round ran \u2018${command}\u2019 and it failed.`;
+    }
+    if (assessment.verificationStatus === 'not_run') {
+      return 'The previous round never ran the project\u2019s verification command.';
+    }
+    return 'The previous round did not leave clear evidence that its checks passed.';
+  }
+
+  /**
+   * Refuse to start Claude at all when the verification rules cannot be used.
+   *
+   * Checked here rather than trusting the Settings form: the renderer validates
+   * for the user's benefit, but it is not a security boundary, and Settings can
+   * be changed by other means between rounds. Throwing before the recorder
+   * starts means no run row is written — an unusable configuration must not
+   * leave behind something that looks like an implementation attempt.
+   */
+  private static assertVerificationConfigured(settings: Settings): void {
+    const configured = resolveVerificationConfig(
+      settings.claudeAllowedTools,
+      settings.claudeVerificationTools
+    );
+    if (configured.ok) return;
+
+    throw new AgentRelayError(
+      'VALIDATION_FAILED',
+      'Claude verification rules are not usable, so this round cannot be judged.',
+      {
+        remediation:
+          'Open Settings → Claude permissions and fix the verification commands. Each rule must ' +
+          'be Bash(...) or PowerShell(...), may end in a single *, and must also appear in the ' +
+          'pre-approved list.',
+        details: configured.problems.map(describeConfigProblem).join(' ')
+      }
+    );
+  }
+
   /** Shared body of the first implementation round and every correction round. */
   private async runClaude(
     task: Task,
-    settings: Settings,
     controller: AbortController,
     prompt: string,
     options: { runType: 'implementation' | 'correction'; recoverableFailure: WorkflowEvent }
@@ -489,6 +599,13 @@ export class Orchestrator {
       throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to work in.');
     }
 
+    // Read once, here, and use this one object for everything that follows: the
+    // permission rules the CLI is given, the rules the round is judged against,
+    // the timeout, the turn limit and the log budget. Preparing a worktree is
+    // slow enough for Settings to change underneath it, and a round argued
+    // against rules the process never had is worse than either version alone.
+    const settings = this.deps.settings.get();
+
     // Re-validate the path every round: settings could have changed, or the
     // directory could have been moved between rounds.
     const project = this.requireProject(task.projectId);
@@ -497,6 +614,10 @@ export class Orchestrator {
       worktreesRoot: settings.worktreesRoot,
       repositoryPath: project.localPath
     });
+
+    // Before anything is spawned and before a run exists: an unusable
+    // configuration is a settings problem, not a failed implementation.
+    Orchestrator.assertVerificationConfigured(settings);
 
     const handle = this.recorder(settings).start({
       taskId: task.id,
@@ -514,6 +635,8 @@ export class Orchestrator {
           // Resuming keeps every correction round inside one conversation.
           sessionId: task.claudeSessionId,
           maxTurns: settings.claudeMaxTurns,
+          // From the same snapshot the policy will use below.
+          allowedTools: settings.claudeAllowedTools,
           // From the task, never from current Settings: a correction round must
           // resume the same session on the same model it started with.
           model: task.claudeModel
@@ -525,17 +648,60 @@ export class Orchestrator {
         }
       );
 
+      // What the round actually proved. Evidence from this process only:
+      // invocation numbers restart with every Claude process, so a resumed
+      // correction round is judged entirely on its own stream.
+      const assessment = assessClaudeRound(result, {
+        allowedTools: settings.claudeAllowedTools,
+        verificationTools: settings.claudeVerificationTools
+      });
+      const record = toAssessmentRecord(assessment);
+      const failed = assessment.disposition === 'fail';
+
+      // Appended before the run is closed, so it belongs to this round and is
+      // replayed from the database in the same place after a restart.
+      const warning = describeWarning(assessment);
+      if (warning !== null) {
+        handle.append({
+          type: 'warning',
+          text: warning,
+          data: {
+            verificationStatus: assessment.verificationStatus,
+            publishBlock: assessment.publishBlock,
+            denials: denialDetails(assessment.classifiedDenials)
+          }
+        });
+      }
+
+      const failureMessage = failed ? describeFailure(assessment) : null;
+
       handle.finish({
-        status: result.isError ? 'failed' : 'succeeded',
+        status: failed ? 'failed' : 'succeeded',
         finalMessage: result.finalMessage,
-        structuredResult: { numTurns: result.numTurns, sessionId: result.sessionId }
+        errorMessage: failureMessage ?? undefined,
+        structuredResult: {
+          numTurns: result.numTurns,
+          sessionId: result.sessionId,
+          // Kept for diagnostics. It conflates a CLI failure with a denial, so
+          // it is no longer what decides the outcome.
+          cliReportedError: result.isError,
+          evidence: {
+            toolCalls: result.evidence.toolExecutions.length,
+            resultEnvelopeSeen: result.evidence.resultEnvelopeSeen,
+            resultEnvelopeIsError: result.evidence.resultEnvelopeIsError,
+            resultEnvelopeConflict: result.evidence.resultEnvelopeConflict,
+            malformedLineCount: result.evidence.malformedLineCount,
+            incompleteToolUseCount: result.evidence.incompleteToolUseCount,
+            orphanToolResultCount: result.evidence.orphanToolResultCount
+          },
+          assessment: record
+        }
       });
 
-      if (result.isError) {
-        const message = result.finalMessage || 'Claude reported an error.';
+      if (failed) {
         return this.applyEvent(this.requireTask(task.id), options.recoverableFailure, {
           claudeSessionId: result.sessionId ?? task.claudeSessionId,
-          lastError: message
+          lastError: failureMessage
         });
       }
 
@@ -794,4 +960,52 @@ export function extractTestOutput(report: string): string {
   }
 
   return blocks.join('\n\n---\n\n');
+}
+
+/* -------------------------------------------------------------------------- */
+/* Configuration diagnostics                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One configuration problem, phrased as something the user can change.
+ *
+ * Built from the problem codes, never the other way round: the wording here is
+ * a rendering of a decision already made in `claude-tool-rules`.
+ */
+function describeConfigProblem(problem: VerificationConfigProblem): string {
+  if (problem.code === 'empty') {
+    return (
+      'No verification commands are configured, so no round could ever be shown to have ' +
+      'checked its work.'
+    );
+  }
+
+  const rule = problem.rule ?? 'A rule';
+  if (problem.code === 'not_allowed') {
+    return `${rule} is not in the pre-approved list, so Claude could never run it.`;
+  }
+  return `${rule} is not usable: ${describeRuleProblemText(problem.detail)}`;
+}
+
+/** Plain-language form of a rule diagnosis. */
+function describeRuleProblemText(problem: RuleProblem | null): string {
+  switch (problem) {
+    case 'syntax':
+      return 'it is not written as Tool(command).';
+    case 'unsupported_tool':
+      return 'only Bash(...) and PowerShell(...) are supported.';
+    case 'empty_body':
+      return 'it names no command.';
+    case 'wildcard':
+      return 'a * is only allowed as the single final character.';
+    case 'compound':
+      return (
+        'chained commands are not accepted, and a separator inside a quoted argument counts ' +
+        'as chaining.'
+      );
+    case 'wrapper':
+      return 'a command that runs another command, such as cmd /c, cannot be verified.';
+    default:
+      return 'it could not be parsed.';
+  }
 }

@@ -247,8 +247,60 @@ claude --print --output-format stream-json --verbose
   directly-named Git/GitHub commands only. See [security.md](security.md) §5.
 * The stream parser is deliberately permissive — an unrecognised event type is
   surfaced as generic progress, never thrown, so a CLI upgrade cannot break a
-  running round. The one thing it is strict about is a **permission denial**,
-  which fails the round even when the CLI exits 0 and reports success.
+  running round. It **collects evidence and does not judge**: tool calls
+  correlated by `tool_use.id` and numbered in invocation order, results with
+  their `is_error` flag, denials with the command that was refused, and whether
+  the stream was complete. `isError` on the result means only that the CLI
+  reported a failure.
+
+### Round policy
+
+What a Claude round *proved* is decided by a pure function, separately from
+parsing it:
+
+```
+shared/domain/claude-tool-rules.ts   grammar, command normalisation, the deny list
+        ▲                    ▲
+        │                    │
+adapters/claude          services/claude-round-policy.ts   evidence → verdict
+(--disallowedTools)              │
+                                 ▼
+                         services/claude-round-report.ts   verdict → record + text
+                                 │
+                                 ▼
+                         shared/domain/claude-assessment.ts   versioned DTO
+```
+
+* **`claude-tool-rules`** is in `shared` because three places need the same
+  answers: the adapter building `--disallowedTools`, the policy classifying
+  denials, and the Settings form validating what the user typed. A second copy
+  would be a second source of truth for a security decision.
+* **`claude-round-policy`** is in `services` because it is defined over the
+  evidence contract in `ports.ts`; a module in `shared` importing from `main`
+  would invert the dependency direction.
+* **`claude-assessment`** is the narrow, versioned thing that crosses into the
+  renderer and into `runs.structured_result`. It carries redacted, bounded text
+  and never raw tool output, and reading it never throws — an older run, a newer
+  version and a hand-edited row each come back as a describable absence.
+
+The orchestrator validates the verification configuration twice: once in
+`sendToClaude`/`sendCorrections` before the worktree is created, so an unusable
+configuration leaves no branch or directory behind, and once inside `runClaude`
+against the snapshot the round will actually use. That snapshot is read
+immediately before the process starts and supplies the permission rules, the
+turn limit, the timeout, the log budget and the policy configuration — and it is
+passed to the adapter through the request, so the adapter does not read Settings
+a second time and reach a different answer.
+
+`pass`/`warn` map to a succeeded run, `fail` to the existing recoverable state,
+and a round worth a second look gets a `warning` event. `warning` is an event
+type, not a run status: the run did succeed, and a fourth outcome would make
+every consumer that switches on status wrong at once.
+
+`READY_TO_PUBLISH` gains one transition, `corrections_sent → IMPLEMENTING`, so a
+task the publish gate refused can run another round instead of being cancelled.
+It is an edge, not a status: the round returns through `READY_FOR_REVIEW`, which
+is what forces a new review and a new publish approval.
 
 ### Git
 
@@ -283,7 +335,7 @@ names only; `--show-token` is never used.
 
 ## 8. Testing strategy
 
-248 tests, none of which contact Codex, Claude, or GitHub.
+711 tests, none of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|

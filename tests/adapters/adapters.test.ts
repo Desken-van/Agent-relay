@@ -9,7 +9,7 @@ import {
 import {
   consumeLine,
   createStreamState,
-  describeDenials,
+  summariseDenials,
   finalizeState
 } from '../../src/main/adapters/claude/stream-parser';
 import { describeItem } from '../../src/main/adapters/codex/codex-adapter';
@@ -17,7 +17,8 @@ import {
   buildCorrectionPrompt,
   buildImplementationPrompt,
   buildReviewPrompt,
-  buildSpecificationPrompt
+  buildSpecificationPrompt,
+  buildVerificationRetryPrompt
 } from '../../src/main/adapters/codex/prompts';
 import {
   extractGithubUrl,
@@ -189,10 +190,13 @@ describe('Claude permission denials', () => {
     expect(events[0]?.text).toContain('This command requires approval');
 
     const final = finalizeState(state);
-    expect(final.isError).toBe(true);
+    // The parser records the refusal; it no longer rules on the round. The CLI
+    // said success, so  stays false and the policy decides from here.
+    expect(final.isError).toBe(false);
     expect(final.denials).toHaveLength(1);
     expect(final.denials[0]?.tool).toBe('Bash');
-    expect(describeDenials(final.denials)).toContain('Bash');
+    expect(summariseDenials(final.denials)).toContain('Bash');
+    expect(summariseDenials(final.denials)).not.toContain('may have been skipped');
   });
 
   it('catches a denial reported only in the result envelope', () => {
@@ -206,13 +210,15 @@ describe('Claude permission denials', () => {
       state
     );
 
-    // The denial is announced before the result it invalidates.
+    // The denial is announced before the result it qualifies.
     expect(events[0]?.type).toBe('error');
     expect(events[0]?.text).toContain('PowerShell');
-    expect(events[1]?.type).toBe('error');
 
     const final = finalizeState(state);
-    expect(final.isError).toBe(true);
+    // The CLI said success, and the parser reports what the CLI said. Whether a
+    // round with a refused command counts as successful is decided by the round
+    // policy, which can also see whether the work was verified anyway.
+    expect(final.isError).toBe(false);
     expect(final.denials).toHaveLength(1);
   });
 
@@ -279,7 +285,7 @@ describe('Claude permission denials', () => {
     const final = finalizeState(state);
     expect(final.isError).toBe(false);
     expect(final.denials).toHaveLength(0);
-    expect(describeDenials(final.denials)).toBe('');
+    expect(summariseDenials(final.denials)).toBe('');
   });
 });
 
@@ -737,9 +743,11 @@ describe('Claude adapter', () => {
       { signal: new AbortController().signal, timeoutMs: 1000, onProgress: () => undefined }
     );
 
-    expect(result.isError).toBe(true);
+    // Reported, not judged: the adapter hands the denial and the evidence to
+    // the caller instead of folding a verdict into the message or the flag.
+    expect(result.isError).toBe(false);
     expect(result.permissionDenials).toHaveLength(1);
-    expect(result.finalMessage).toContain('denied permission');
+    expect(result.finalMessage).not.toContain('may have been skipped');
     // The model's own summary is kept, after the warning.
     expect(result.finalMessage).toContain('All done.');
     expect(result.sessionId).toBe('sess-1');
@@ -1270,5 +1278,52 @@ describe('extractTestOutput', () => {
     const output = extractTestOutput(report);
     expect(output).toContain('1 passed');
     expect(output).toContain('2 failed');
+  });
+});
+
+
+/* -------------------------------------------------------------------------- */
+/* Verification retry prompt                                                   */
+/* -------------------------------------------------------------------------- */
+
+describe('the verification retry prompt', () => {
+  // The prompt is hard-wrapped for readability, so assertions run against a
+  // whitespace-normalised copy rather than depending on where lines break.
+  const flatten = (text: string): string => text.replace(/\s+/g, ' ');
+
+  const prompt = buildVerificationRetryPrompt({
+    reason: 'The previous round ran ‘npm test’ and it failed.',
+    round: 2,
+    maxRounds: 5
+  });
+
+  it('says why the round is happening, without inventing review findings', () => {
+    expect(prompt).toContain('reviewed and approved');
+    expect(prompt).toContain('npm test');
+    expect(flatten(prompt)).toContain('round 2 of at most 5');
+    // There is no review to act on; asking for one would invite invention.
+    expect(prompt).not.toMatch(/finding/i);
+  });
+
+  it('repeats every constraint the correction prompt carries', () => {
+    // A retry round is as unattended as any other, so the same limits have to
+    // be restated. A prompt is only instruction — the deny list is what backs
+    // it — but an instruction that is simply missing is worse than redundant.
+    expect(flatten(prompt)).toContain('same worktree on the same branch');
+    expect(prompt).toContain('do not commit');
+    expect(prompt).toContain('do not push');
+    expect(flatten(prompt)).toContain('do not touch any remote');
+    expect(flatten(prompt)).toContain('outside this worktree');
+    expect(flatten(prompt)).toMatch(/do not discard or revert unrelated work/i);
+  });
+
+  it('asks for the verification command and its result in the final message', () => {
+    // The round exists to prove the checks pass, so the report has to name
+    // what was run rather than asserting that something was.
+    expect(flatten(prompt)).toContain('exact verification command you ran, and its result');
+  });
+
+  it('tells it to fix the defect rather than the check', () => {
+    expect(flatten(prompt)).toContain('fix the defect rather than the check');
   });
 });

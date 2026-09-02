@@ -178,6 +178,14 @@ export const RUN_EVENT_TYPES = [
   'assistant_message',
   'progress',
   'result',
+  /**
+   * A round that succeeded, with something the reviewer should know first.
+   *
+   * Deliberately an event type rather than a run status: the run did succeed,
+   * and inventing a fourth outcome would make every consumer that switches on
+   * status wrong at once. The timeline shows it in amber; the run stays green.
+   */
+  'warning',
   'error',
   'cancelled',
   'finished'
@@ -269,6 +277,36 @@ export const DEFAULT_CLAUDE_ALLOWED_TOOLS: readonly string[] = [
   'PowerShell(npm test *)'
 ];
 
+/**
+ * The rules whose success counts as having verified the work, by default.
+ *
+ * Identical to {@link DEFAULT_CLAUDE_ALLOWED_TOOLS} today, and still spelled out
+ * separately: the two lists answer different questions, and deriving one from
+ * the other would quietly turn every newly permitted command into evidence that
+ * the change works.
+ */
+export const DEFAULT_CLAUDE_VERIFICATION_TOOLS: readonly string[] = [
+  'Bash(npm test *)',
+  'PowerShell(npm test *)'
+];
+
+/**
+ * The permission rules a fresh install ships with.
+ *
+ * Used by the Settings form's Reset, so "reset" means the same thing there as
+ * it does for a new profile: back to the two rules that let Claude run the
+ * project's tests, and nothing else.
+ */
+export function defaultClaudePermissionRules(): {
+  claudeAllowedTools: string[];
+  claudeVerificationTools: string[];
+} {
+  return {
+    claudeAllowedTools: [...DEFAULT_CLAUDE_ALLOWED_TOOLS],
+    claudeVerificationTools: [...DEFAULT_CLAUDE_VERIFICATION_TOOLS]
+  };
+}
+
 export const settingsSchema = z.object({
   /** Absolute path to the Claude Code executable, or null to auto-discover. */
   claudeExecutablePath: z.string().nullable(),
@@ -304,6 +342,21 @@ export const settingsSchema = z.object({
    */
   claudeAllowedTools: z.array(claudeToolRuleSchema).max(CLAUDE_ALLOWED_TOOLS_LIMIT),
   /**
+   * Which of the allowed commands count as *checking the work*.
+   *
+   * A strict subset of `claudeAllowedTools`, and not derived from it: being
+   * permitted to run a command says nothing about whether running it
+   * demonstrates the change is correct. `Bash(git status *)` may be perfectly
+   * reasonable to allow and proves nothing.
+   *
+   * A round whose verification did not demonstrably run and pass cannot be
+   * published, so an empty list is rejected at save time rather than quietly
+   * blocking every round afterwards.
+   */
+  claudeVerificationTools: z
+    .array(claudeToolRuleSchema)
+    .max(CLAUDE_ALLOWED_TOOLS_LIMIT),
+  /**
    * Default Codex model offered when *creating a new task*.
    *
    * This is only a form default. A task snapshots its own pair at creation, so
@@ -315,3 +368,99 @@ export const settingsSchema = z.object({
 });
 
 export type Settings = z.infer<typeof settingsSchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Settings form state                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The two textareas in the Claude permissions card, and the parsed values
+ * behind them.
+ *
+ * `null` text means "show whatever is in the saved settings"; a string means the
+ * user has typed something the draft has not necessarily caught up with. Both
+ * have to move together, or the form shows one thing and saves another.
+ */
+export interface PermissionRuleDraft {
+  readonly claudeAllowedTools: string[];
+  readonly claudeVerificationTools: string[];
+  readonly allowedText: string | null;
+  readonly verificationText: string | null;
+}
+
+/**
+ * What **Reset** applies: the shipped rules, in both lists and both textareas.
+ *
+ * Reset restores the defaults rather than the last saved values because it is
+ * the way out of a saved configuration the validator now rejects — reverting to
+ * the rejected text would leave the Save button disabled and no way forward.
+ */
+export function resetPermissionRules(): PermissionRuleDraft {
+  const rules = defaultClaudePermissionRules();
+  return {
+    ...rules,
+    allowedText: rules.claudeAllowedTools.join('\n'),
+    verificationText: rules.claudeVerificationTools.join('\n')
+  };
+}
+
+/**
+ * Whether the form has unsaved changes, and whether Save should be offered.
+ *
+ * Two independent conditions, and the bug this exists to fix was having only
+ * one of them: the button was enabled whenever the rules validated, so a
+ * successful save left it looking as though the work had not been done. A
+ * button that never goes quiet cannot tell anyone whether their change landed.
+ *
+ * `dirty` compares the whole settings object, not just the permission lists —
+ * every field on this form goes through the same draft.
+ */
+export interface SettingsSaveState {
+  /** The draft differs from what is stored. */
+  readonly dirty: boolean;
+  /** There is something to save, and it is valid. */
+  readonly canSave: boolean;
+}
+
+/** Stable key order, so two equal objects always serialise the same way. */
+function canonicalSettings(settings: Settings): string {
+  const entries = Object.entries(settings).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return JSON.stringify(entries);
+}
+
+export function settingsAreEqual(a: Settings, b: Settings): boolean {
+  return canonicalSettings(a) === canonicalSettings(b);
+}
+
+export function settingsSaveState(input: {
+  /** What the store currently holds; null while settings are still loading. */
+  readonly saved: Settings | null;
+  /** The draft the form would submit; null when there are no local edits. */
+  readonly draft: Settings | null;
+  /** How many verification rules the validator rejected. */
+  readonly blockingProblems: number;
+}): SettingsSaveState {
+  const { saved, draft, blockingProblems } = input;
+
+  // Nothing loaded, or no draft to compare: there is nothing to save.
+  if (saved === null || draft === null) return { dirty: false, canSave: false };
+
+  const dirty = !settingsAreEqual(saved, draft);
+  return { dirty, canSave: dirty && blockingProblems === 0 };
+}
+
+/**
+ * What a successful **Save** applies: nothing.
+ *
+ * The draft is dropped so the form re-reads the values that were just stored.
+ * Deliberately not the same operation as Reset — sharing one made a successful
+ * save silently replace the user's own rules with the defaults, and then write
+ * those defaults on the next save.
+ */
+export function clearLocalEdits(): {
+  readonly draft: null;
+  readonly allowedText: null;
+  readonly verificationText: null;
+} {
+  return { draft: null, allowedText: null, verificationText: null };
+}
