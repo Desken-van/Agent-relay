@@ -17,6 +17,24 @@ export class SqliteRunRepository implements RunRepository {
     return rows.map(toRun);
   }
 
+  /**
+   * Every run still marked `running`, across all tasks.
+   *
+   * Ordered by start time and then rowid so two callers always see the same
+   * sequence — reconciliation has to be reproducible, and `ORDER BY` nothing is
+   * whatever the storage engine felt like.
+   */
+  listRunning(): Run[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${COLUMNS} FROM runs
+          WHERE status = 'running'
+          ORDER BY started_at ASC, rowid ASC`
+      )
+      .all() as RunRow[];
+    return rows.map(toRun);
+  }
+
   findById(id: string): Run | null {
     const row = this.db.prepare(`SELECT ${COLUMNS} FROM runs WHERE id = ?`).get(id) as
       | RunRow

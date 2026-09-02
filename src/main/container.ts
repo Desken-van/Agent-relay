@@ -24,6 +24,7 @@ import { CliGitAdapter } from './adapters/git/git-adapter';
 import { GhGitHubAdapter } from './adapters/github/github-adapter';
 import { ExecaProcessRunner, type ProcessRunner } from './adapters/process/process-runner';
 import { closeDatabase, openDatabase, type Db } from './db/database';
+import { SqliteTransactionRunner } from './db/transaction-runner';
 import { SqliteApprovalRepository } from './db/repositories/approval-repository';
 import { SqliteProjectRepository } from './db/repositories/project-repository';
 import { SqliteRunEventRepository } from './db/repositories/run-event-repository';
@@ -51,6 +52,7 @@ import type {
 import { ToolDiagnosticsService } from './services/diagnostics-service';
 import { Orchestrator } from './services/orchestrator';
 import { ProjectService } from './services/project-service';
+import { reconcileInterruptedWork, type ReconciliationPlan } from './services/startup-reconciliation';
 import { PublishService } from './services/publish-service';
 import { TaskService } from './services/task-service';
 
@@ -96,6 +98,13 @@ export interface Application {
   readonly publishService: PublishService;
   readonly diagnostics: ToolDiagnosticsService;
   readonly codexModels: CodexModelCatalog;
+  /**
+   * What startup reconciliation corrected, if anything.
+   *
+   * Exposed so the value is observable — a recovery that leaves no trace is one
+   * nobody can prove ran.
+   */
+  readonly reconciliation: ReconciliationPlan;
   readonly close: () => void;
 }
 
@@ -204,6 +213,17 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   const runEvents = new SqliteRunEventRepository(db);
   const approvals = new SqliteApprovalRepository(db);
 
+  // Before anything else can act on the database: an abrupt exit leaves runs
+  // marked running and tasks stuck in a busy status, and nothing later clears
+  // them. Running here means it is finished before IPC is registered and before
+  // a window exists, so no new work can race the recovery.
+  const reconciliation = reconcileInterruptedWork({
+    tasks,
+    runs,
+    clock,
+    transactions: new SqliteTransactionRunner(db)
+  });
+
   const adapters = lateBound(adapterFactories(settings, runner));
 
   const projectService = new ProjectService({
@@ -288,6 +308,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     publishService,
     diagnostics,
     codexModels,
+    reconciliation,
     close: () => closeDatabase(db)
   };
 }

@@ -160,6 +160,76 @@ Rules enforced by [`workflow.ts`](../src/shared/domain/workflow.ts):
 * **Publishing has its own gate.** `assertPublishable()` requires both a granted
   approval *and* a publishable status.
 
+### Recovering from an abrupt exit
+
+A run is written as `running` before an agent is spawned, and the task moves
+into a busy status around the same moment. Nothing else ever closes those rows:
+the orchestrator only finishes runs it started itself. A crash, a reboot or a
+forced quit therefore leaves a task claiming work is in progress that is not,
+with every button that matters disabled — permanently, because the next launch
+has no reason to think otherwise.
+
+[`startup-reconciliation.ts`](../src/main/services/startup-reconciliation.ts)
+corrects that, and runs inside `buildApplication()` — before IPC is registered
+and before a window exists, so no new work can race the repair.
+
+It is two pieces. `planReconciliation()` is pure: rows in, changes out, no
+clock and no database, so the judgement calls are testable on their own.
+`applyReconciliation()` performs the plan through the repositories inside one
+transaction, because a task returned to a usable status while its run still
+claims to be running would invite a second agent against the same worktree.
+
+| Left in | Recovered with | Ends at |
+|---------|----------------|---------|
+| `SPECIFYING` | `specification_aborted` | `DRAFT` |
+| `IMPLEMENTING`, implementation round | `implementation_aborted` | `READY_FOR_IMPLEMENTATION` |
+| `IMPLEMENTING`, correction round | `correction_aborted` | `CHANGES_REQUESTED` |
+| `REVIEWING` | `review_aborted` | `READY_FOR_REVIEW` |
+| `PUBLISHING` | `publish_aborted` | `READY_TO_PUBLISH` |
+
+Every stale run is closed as **failed** with a neutral reason — *"Agent Relay
+stopped before this run completed; recovered during startup."* Not `cancelled`,
+which would put a decision in the user's mouth, and not a success, because there
+is no result: that absence is the whole problem.
+
+Two independent decisions, and the independence is the point. **Every** running
+run is closed, whatever its task now claims — a specification run is written
+before the task becomes `SPECIFYING`, and a review run can outlive `REVIEWING`,
+so a stale run routinely belongs to a task that is already in a good state.
+**Only** a busy task is moved, and only once however many stale runs it has;
+rolling a settled task back because of a leftover run would undo work the user
+can see.
+
+Which kind of Claude round `IMPLEMENTING` was part-way through has exactly two
+answers, in order:
+
+1. **A run still marked `running` for the task's current round.** Runs are
+   written with `round: task.currentRound`, so such a row is the work that was
+   actually in flight. If more than one exists, the greatest round wins, then the
+   latest start, then the greatest id — a total order, so the answer never
+   depends on which row SQLite returned first.
+2. **The round counter.** The first implementation sets `currentRound` to 1 and
+   every `corrections_sent` increments it, so `IMPLEMENTING` at round 2 or above
+   can only have been reached through a correction; at round 1 it is the first
+   implementation.
+
+A task's **finished** runs are deliberately not consulted. `sendCorrections`
+moves the task and increments the round *before* the recorder writes the new run,
+and in that window the newest Claude run is still the previous *implementation*.
+Reading intent from it recovered a first correction as
+`READY_FOR_IMPLEMENTATION`, discarding the review the user was acting on. A
+finished round records what already happened; it says nothing about what the next
+one was going to be.
+
+Contradictory data falls to the counter — a running row whose round does not
+match the task's is debris the state machine has already moved past, and the
+counter is what the machine itself maintains.
+
+Nothing is resumed. No agent starts, no Git command runs, no worktree or branch
+is touched, no session or thread id changes, no round is counted, and no
+approval is granted or revoked. The work is handed back for the user to restart
+if they want to.
+
 ---
 
 ## 5. Process execution
@@ -335,7 +405,7 @@ names only; `--show-token` is never used.
 
 ## 8. Testing strategy
 
-722 tests, none of which contact Codex, Claude, or GitHub.
+760 tests, none of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|

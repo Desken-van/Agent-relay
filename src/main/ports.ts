@@ -37,6 +37,17 @@ export interface Clock {
   nowIso(): string;
 }
 
+/**
+ * Runs a unit of work inside one database transaction.
+ *
+ * Exists so a service can be atomic without holding a database handle and
+ * writing SQL of its own. Nesting is safe — the SQLite layer uses a savepoint
+ * for an inner transaction.
+ */
+export interface TransactionRunner {
+  run(work: () => void): void;
+}
+
 export interface IdGenerator {
   next(): string;
 }
@@ -62,6 +73,13 @@ export type TaskPatch = Partial<Omit<Task, 'id' | 'projectId' | 'createdAt' | 'u
 
 export interface TaskRepository {
   listByProject(projectId: string): Task[];
+  /**
+   * Every task sitting in a busy status, across all projects.
+   *
+   * Only startup reconciliation needs this: a task is busy because an agent is
+   * running, and after a crash the rows saying so are the only trace left.
+   */
+  listBusy(): Task[];
   findById(id: string): Task | null;
   create(task: NewTask): Task;
   update(id: string, patch: TaskPatch): Task;
@@ -74,6 +92,13 @@ export type NewRun = Omit<Run, 'finishedAt' | 'finalMessage' | 'structuredResult
 
 export interface RunRepository {
   listByTask(taskId: string): Run[];
+  /**
+   * Every run still marked `running`, across all tasks.
+   *
+   * A run is only ever finished by the code that started it, so after an abrupt
+   * exit these are exactly the runs nothing will ever close on its own.
+   */
+  listRunning(): Run[];
   findById(id: string): Run | null;
   create(run: NewRun): Run;
   finish(
