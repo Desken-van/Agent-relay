@@ -414,6 +414,92 @@ worse than either version alone.
 
 ---
 
+## 5b. Operational targets are read-only
+
+The Operations workflow inspects things outside Agent Relay. In Phase 7C-A it
+can do nothing else — there is no write path, no migration runner and no
+deployment step anywhere in it.
+
+### Nothing can send work
+
+* A diagnostic is selected by **probe id** from a closed enum of two. There is no
+  field in the IPC contract, the domain schema, the database or the probe
+  request through which a SQL statement, a shell command or an executable path
+  can reach an adapter. The statements each probe runs are written into the
+  probe script and are never assembled from input.
+* The adapter implementation is chosen from a fixed table keyed on the
+  `adapterType` **enum**. A stored row cannot name a module, a path or a command
+  to load, and a hand-edited row naming an unknown adapter resolves to nothing.
+* The probe process is spawned with a **fixed script path and no arguments at
+  all**; the target's database path travels on stdin, so it is never a
+  command-line token and never lands in a log line.
+
+### Nothing can be written, and nothing is read from inside
+
+* The connection is opened with `readOnly: true`, so SQLite refuses writes at
+  the file level and creates no `-wal` or `-shm`. `ATTACH`, `VACUUM`,
+  extensions and every writable pragma are never issued.
+* The two flags in the result mean different things, and the wording is worth
+  being exact about. `readOnly` records **how the trusted probe process opened
+  the connection** — SQLite returns no such flag, so nothing reads it back.
+  `queryOnly` is read back: `PRAGMA query_only = ON` is set and then queried,
+  and SQLite's answer is what is reported. The file-level proof below is what
+  does not depend on either claim.
+* **No probe reads a row of a user table, and none counts one.** Every statement
+  reads schema metadata — `sqlite_schema` or `pragma_table_info` — and none can
+  name a user table, which a test enforces by checking what follows every
+  `FROM` in the probe's vocabulary. Counting *schema entries* is allowed and is
+  what makes the omission counts honest; counting data is not, and is not
+  reachable. `schema_summary` returns names, declared types and two flags —
+  never a default value, a `CREATE` statement, an index or a trigger, each of
+  which can quote a literal from the data.
+* **The listing statements are bounded in SQL.** Both carry `LIMIT ?` with a
+  bound parameter, so a deliberately enormous schema cannot be materialised in
+  the probe process before a JavaScript-side limit discards it. Nothing is ever
+  interpolated into a statement: the database path never appears in SQL at all,
+  and a table name is bound, never spliced.
+* This is asserted rather than asserted-about: a test hashes the file, its size
+  and its modification time before and after both probes, and checks the
+  directory afterwards holds exactly the file it held before.
+
+### Credentials stay outside
+
+* A target carries at most a `credentialRef` — an identifier in an external
+  credential store. There is no field for a password, a token or a connection
+  string, and `.strict()` refuses one that tries to ride along.
+* A reference that matches any shape `redactSecrets` recognises is refused, so
+  pasting the real thing fails loudly rather than persisting quietly.
+* A `local_sqlite` target accepts **no** reference: a file is opened by path, so
+  the field could only be noise or a leak. Enforced in the domain schema and in
+  a table `CHECK`.
+* Every probe result and every error message is redacted before it is written to
+  disk, not on the way to the screen.
+
+### Bounds cannot be switched off
+
+Timeout, retained output bytes, tables, columns per table, total columns and
+string length each have a default, a floor and a ceiling. A caller may choose a
+value inside the range; a value outside it is a validation failure rather than
+a silent clamp, and there is no value meaning "no limit". That is enforced in
+one function, which parses every caller's options through the same schema — an
+out-of-range value, a fraction, `Infinity`, `NaN`, `null` or an unknown field is
+refused before a target is looked up, a run row is written, an adapter is chosen
+or a child process exists.
+
+A recorded failure always carries a message. A blank one is refused by the table
+and by the row mapper, so the service substitutes a fixed fallback rather than
+leaving a run open — and the fallback quotes nothing, because whatever failed
+said nothing worth quoting.
+
+### An interrupted probe claims nothing
+
+A diagnostic run is written as `running` before the probe is spawned. If the
+application stops in between, the next start closes that row as failed with **no
+result** and a reason stating the outcome is *unknown* — not that the target
+failed, which nothing has any evidence for.
+
+---
+
 ## 6. The publishing gate
 
 No commit, push, repository creation, or pull request can happen without a

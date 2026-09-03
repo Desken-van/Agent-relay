@@ -363,7 +363,7 @@ describe('planning a recovery', () => {
   });
 
   it('does nothing when there is nothing to recover', () => {
-    expect(planReconciliation(work({}))).toEqual({ closures: [], recoveries: [] });
+    expect(planReconciliation(work({}))).toEqual({ closures: [], recoveries: [], diagnostics: [] });
   });
 });
 
@@ -545,7 +545,7 @@ describe('reconciling a real database', () => {
     const snapshot = { task: tasks.findById(task.id), runs: runs.listByTask(task.id) };
 
     const second = reconcileInterruptedWork(deps());
-    expect(second).toEqual({ closures: [], recoveries: [] });
+    expect(second).toEqual({ closures: [], recoveries: [], diagnostics: [] });
     expect(tasks.findById(task.id)).toEqual(snapshot.task);
     expect(runs.listByTask(task.id)).toEqual(snapshot.runs);
   });
@@ -744,7 +744,7 @@ describe('crash windows on a real database', () => {
     reconcileInterruptedWork(deps());
     const snapshot = { task: tasks.findById(subject.id), runs: runs.listByTask(subject.id) };
 
-    expect(reconcileInterruptedWork(deps())).toEqual({ closures: [], recoveries: [] });
+    expect(reconcileInterruptedWork(deps())).toEqual({ closures: [], recoveries: [], diagnostics: [] });
     expect(tasks.findById(subject.id)).toEqual(snapshot.task);
     expect(runs.listByTask(subject.id)).toEqual(snapshot.runs);
   });

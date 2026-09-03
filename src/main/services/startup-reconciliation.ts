@@ -31,7 +31,13 @@
 
 import type { Run, RunType, Task } from '../../shared/domain/models';
 import { canTransition, transition, type TaskStatus, type WorkflowEvent } from '../../shared/domain/workflow';
-import type { Clock, RunRepository, TaskRepository, TransactionRunner } from '../ports';
+import type {
+  Clock,
+  OperationDiagnosticRepository,
+  RunRepository,
+  TaskRepository,
+  TransactionRunner
+} from '../ports';
 
 /**
  * What a recovered run and task are told about themselves.
@@ -41,6 +47,17 @@ import type { Clock, RunRepository, TaskRepository, TransactionRunner } from '..
  */
 export const INTERRUPTION_REASON =
   'Agent Relay stopped before this run completed; recovered during startup.';
+
+/**
+ * What a recovered diagnostic run is told about itself.
+ *
+ * Worded to say the outcome is *unknown*, not that the probe failed. A probe
+ * that was interrupted may well have been about to succeed; recording it as a
+ * failure of the target would be a claim about that target which nothing here
+ * has any evidence for.
+ */
+export const DIAGNOSTIC_INTERRUPTION_REASON =
+  'Agent Relay stopped before this diagnostic finished; its result is unknown.';
 
 export interface RunClosure {
   readonly runId: string;
@@ -57,15 +74,32 @@ export interface TaskRecovery {
   readonly reason: string;
 }
 
+/** A diagnostic run an abrupt exit left open. */
+export interface DiagnosticClosure {
+  readonly diagnosticId: string;
+  readonly targetId: string;
+  readonly reason: string;
+}
+
 export interface ReconciliationPlan {
   readonly closures: readonly RunClosure[];
   readonly recoveries: readonly TaskRecovery[];
+  /**
+   * Interrupted read-only diagnostics.
+   *
+   * Kept as its own list rather than folded into {@link closures}: a
+   * diagnostic belongs to an operational target, not to a task, and nothing
+   * about the development workflow should have to filter it out.
+   */
+  readonly diagnostics: readonly DiagnosticClosure[];
 }
 
-export const EMPTY_PLAN: ReconciliationPlan = { closures: [], recoveries: [] };
+export const EMPTY_PLAN: ReconciliationPlan = { closures: [], recoveries: [], diagnostics: [] };
 
 /** Everything the plan is derived from. */
 export interface InterruptedWork {
+  /** Every diagnostic run still marked `running`, whatever target it belongs to. */
+  readonly runningDiagnostics?: readonly { id: string; targetId: string }[];
   /** Every run still marked `running`, whatever task it belongs to. */
   readonly runningRuns: readonly Run[];
   /** Every task sitting in a busy status. */
@@ -170,6 +204,18 @@ function recoveryEventFor(task: Task, work: InterruptedWork): WorkflowEvent | nu
  * happened to return rows in.
  */
 export function planReconciliation(work: InterruptedWork): ReconciliationPlan {
+  // A third, independent list. A read-only diagnostic belongs to an
+  // operational target, never to a task, so an interrupted one closes on its
+  // own and moves nothing else — there is no status to roll back, because a
+  // probe that reads cannot have left anything half-done.
+  const diagnostics: DiagnosticClosure[] = (work.runningDiagnostics ?? [])
+    .map((run) => ({
+      diagnosticId: run.id,
+      targetId: run.targetId,
+      reason: DIAGNOSTIC_INTERRUPTION_REASON
+    }))
+    .sort((a, b) => (a.diagnosticId < b.diagnosticId ? -1 : a.diagnosticId > b.diagnosticId ? 1 : 0));
+
   const closures: RunClosure[] = work.runningRuns
     .map((run) => ({
       runId: run.id,
@@ -196,7 +242,7 @@ export function planReconciliation(work: InterruptedWork): ReconciliationPlan {
   }
   recoveries.sort((a, b) => (a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0));
 
-  return { closures, recoveries };
+  return { closures, recoveries, diagnostics };
 }
 
 export interface ReconciliationDeps {
@@ -204,14 +250,27 @@ export interface ReconciliationDeps {
   readonly runs: RunRepository;
   readonly clock: Clock;
   readonly transactions: TransactionRunner;
+  /**
+   * Optional so every existing caller and test keeps working unchanged, and
+   * so a build without the Operations registry simply has nothing to recover.
+   */
+  readonly operationDiagnostics?: OperationDiagnosticRepository;
 }
 
 /** Read the rows a plan is built from. */
 export function collectInterruptedWork(deps: {
   readonly tasks: TaskRepository;
   readonly runs: RunRepository;
+  readonly operationDiagnostics?: OperationDiagnosticRepository;
 }): InterruptedWork {
-  return { runningRuns: deps.runs.listRunning(), busyTasks: deps.tasks.listBusy() };
+  return {
+    runningRuns: deps.runs.listRunning(),
+    busyTasks: deps.tasks.listBusy(),
+    runningDiagnostics: (deps.operationDiagnostics?.listRunning() ?? []).map((run) => ({
+      id: run.id,
+      targetId: run.targetId
+    }))
+  };
 }
 
 /**
@@ -226,7 +285,13 @@ export function applyReconciliation(
   plan: ReconciliationPlan,
   deps: ReconciliationDeps
 ): ReconciliationPlan {
-  if (plan.closures.length === 0 && plan.recoveries.length === 0) return plan;
+  if (
+    plan.closures.length === 0 &&
+    plan.recoveries.length === 0 &&
+    plan.diagnostics.length === 0
+  ) {
+    return plan;
+  }
 
   deps.transactions.run(() => {
     const finishedAt = deps.clock.nowIso();
@@ -238,6 +303,18 @@ export function applyReconciliation(
       deps.runs.finish(closure.runId, {
         status: 'failed',
         finishedAt,
+        errorMessage: closure.reason
+      });
+    }
+
+    for (const closure of plan.diagnostics) {
+      // `failed`, with no structured result. There is nothing to invent: the
+      // probe never reported, so the honest record is that the run ended
+      // without an answer — which is exactly what a null result means here.
+      deps.operationDiagnostics?.finish(closure.diagnosticId, {
+        status: 'failed',
+        finishedAt,
+        failureKind: 'cancelled',
         errorMessage: closure.reason
       });
     }

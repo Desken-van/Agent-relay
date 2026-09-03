@@ -25,6 +25,18 @@ import type {
   Settings,
   Task
 } from '../shared/domain/models';
+import type {
+  OperationEnvironment,
+  OperationTarget,
+  OperationTargetConfig
+} from '../shared/domain/operations';
+import type {
+  DiagnosticFailureKind,
+  DiagnosticLimits,
+  DiagnosticProbeId,
+  DiagnosticResult,
+  OperationDiagnosticRun
+} from '../shared/domain/operations-diagnostics';
 import type { PublishConfirmation } from '../shared/ipc';
 import type { CodexReviewResult, TaskSpecification } from '../shared/schemas/codex';
 
@@ -546,3 +558,104 @@ export interface EventPublisher {
   publishRunEvent(taskId: string, event: RunEvent): void;
   publishDiagnostics(report: DiagnosticsReport): void;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Operations                                                                  */
+/* -------------------------------------------------------------------------- */
+
+export type NewOperationTarget = Omit<OperationTarget, 'createdAt' | 'updatedAt'>;
+
+export interface StoredTargetPatch {
+  readonly name?: string;
+  readonly environment?: OperationEnvironment;
+  readonly config?: OperationTargetConfig;
+  readonly credentialRef?: string | null;
+  readonly enabled?: boolean;
+}
+
+export interface OperationTargetRepository {
+  list(): OperationTarget[];
+  findById(id: string): OperationTarget | null;
+  create(target: NewOperationTarget): OperationTarget;
+  update(id: string, patch: StoredTargetPatch): OperationTarget;
+  delete(id: string): void;
+}
+
+export interface NewDiagnosticRun {
+  readonly id: string;
+  readonly targetId: string;
+  readonly probeId: DiagnosticProbeId;
+  readonly startedAt: string;
+}
+
+/**
+ * How a diagnostic run ended.
+ *
+ * A union rather than one shape with optional fields, so the combinations that
+ * make no sense cannot be written down: a success carrying an error message, a
+ * failure still holding the result of an earlier attempt. The table enforces
+ * the same three shapes, and the repository checks them again at runtime —
+ * a type is a promise to the compiler, not to a caller that reached for `as`.
+ */
+export type DiagnosticOutcome =
+  | {
+      readonly status: 'succeeded';
+      readonly finishedAt: string;
+      readonly result: DiagnosticResult;
+      readonly failureKind?: never;
+      readonly errorMessage?: never;
+    }
+  | {
+      readonly status: 'failed';
+      readonly finishedAt: string;
+      readonly failureKind: DiagnosticFailureKind;
+      /** Never empty: a failure with nothing to say is not a record of anything. */
+      readonly errorMessage: string;
+      readonly result?: never;
+    };
+
+export interface OperationDiagnosticRepository {
+  listByTarget(targetId: string, limit?: number): OperationDiagnosticRun[];
+  findById(id: string): OperationDiagnosticRun | null;
+  /** Every run still marked `running`, across all targets. */
+  listRunning(): OperationDiagnosticRun[];
+  /** The still-running run for one target, if any. */
+  findRunningForTarget(targetId: string): OperationDiagnosticRun | null;
+  countByTarget(targetId: string): number;
+  start(run: NewDiagnosticRun): OperationDiagnosticRun;
+  finish(id: string, outcome: DiagnosticOutcome): OperationDiagnosticRun;
+}
+
+/**
+ * A read-only probe against one target.
+ *
+ * The port takes a *probe id*, never a statement. An implementation is chosen by
+ * the registry from a fixed table keyed on {@link OperationTarget.adapterType},
+ * so nothing that crosses IPC or comes out of a model can select, name or
+ * describe the code that runs.
+ */
+export interface OperationProbeAdapter {
+  probe(request: OperationProbeRequest): Promise<OperationProbeOutcome>;
+}
+
+export interface OperationProbeRequest {
+  readonly target: OperationTarget;
+  readonly probeId: DiagnosticProbeId;
+  readonly limits: DiagnosticLimits;
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * What a probe attempt produced.
+ *
+ * Never a rejected promise: a failure is a fact about the target, and the
+ * service has to persist it as one. `kind` distinguishes the four ways a probe
+ * can fail to prove anything, so `failed` never has to stand for all of them.
+ */
+export type OperationProbeOutcome =
+  | { readonly ok: true; readonly result: DiagnosticResult }
+  | {
+      readonly ok: false;
+      readonly kind: DiagnosticFailureKind;
+      readonly message: string;
+    };

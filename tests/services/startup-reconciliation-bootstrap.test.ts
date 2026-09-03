@@ -192,7 +192,7 @@ describe('starting up on a database left mid-round', () => {
     first.close();
 
     const second = start();
-    expect(second.reconciliation).toEqual({ closures: [], recoveries: [] });
+    expect(second.reconciliation).toEqual({ closures: [], recoveries: [], diagnostics: [] });
   });
 
   it('reports nothing for a database that was closed cleanly', () => {
@@ -209,6 +209,6 @@ describe('starting up on a database left mid-round', () => {
     });
     app.close();
 
-    expect(start().reconciliation).toEqual({ closures: [], recoveries: [] });
+    expect(start().reconciliation).toEqual({ closures: [], recoveries: [], diagnostics: [] });
   });
 });

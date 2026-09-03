@@ -393,8 +393,65 @@ Being precise about what was actually exercised, rather than merely written:
 | **Claude Code CLI** | ✅ **Genuinely verified end to end.** Live implementation and correction rounds exercised `stream-json` parsing, tool-use evidence, a failed verification followed by *Retry verification*, and resume of the same Claude session. The diagnostic reports the installed CLI and authenticated profile without exposing credentials. A process-level contract suite additionally drives the adapter through the real process runner against a fake CLI: argv, the prompt on stdin, the working directory, split and packed stdout chunks, the stdout/stderr boundary, exit codes, denials, resume, timeout and cancellation. |
 | **GitHub CLI** | ⚠️ **Live diagnostics verified; remote publish mutations not yet exercised through Agent Relay.** The running app resolved `gh`, reported its version and authenticated account, and the parser and owner/repository validation remain unit-tested. Creating a repository, pushing a task branch, and opening a pull request through Agent Relay still require a dedicated live acceptance run. |
 
-Test suite: **803 tests, 27 files, all passing.** No test contacts Codex,
+Test suite: **1063 tests, 34 files, all passing.** No test contacts Codex,
 Claude, or GitHub.
+
+---
+
+## The Operations workflow (read-only)
+
+Separate from the development workflow above, and deliberately so. The
+development workflow *changes* a repository: it writes files, commits, and can
+reach GitHub. The Operations workflow only **looks** at something, and in this
+phase it cannot do anything else.
+
+You register **targets**. A target names an environment (`local`, `staging` or
+`production`), says which kind of adapter can read it, and carries that
+adapter's small, versioned configuration. The only adapter in this phase is
+**local SQLite**, whose entire configuration is one absolute path to a database
+file.
+
+Against a target you can run one of exactly two **registered probes**:
+
+| Probe | What it answers |
+|---|---|
+| `connection_health` | Can this be opened read-only? What does the file and the driver say — size, modification time, SQLite version? |
+| `schema_summary` | Which user tables and columns exist, of what declared type, nullable or not, part of the primary key or not? |
+
+What this deliberately does not do:
+
+* **No row of a user table is read, and none is counted.** A probe returns
+  metadata about a schema, never anything from inside it — not a sample, not a
+  default value, not a `CREATE` statement, and no trigger or index definition,
+  all of which can quote real data. It does count *schema entries* — how many
+  tables exist, how many columns a table declares — which is what lets it say
+  honestly how much it left out. That is a different thing from counting data.
+* **The size of what it reads is bounded by SQLite, not afterwards.** The two
+  statements that could return many rows carry a `LIMIT`, so a file with an
+  enormous schema is never loaded into memory and then trimmed.
+* **The database is opened read-only.** The probe opens it with SQLite's
+  read-only flag, so writes are refused at the file level and no `-wal` or
+  `-shm` is created beside it. `query_only` is then set *and queried*, and
+  whatever SQLite answers is what the result reports — that one is read back,
+  rather than assumed.
+* **You cannot send a query.** A probe is *named* from a fixed list. There is no
+  field anywhere — in the UI to come, in IPC, in the database — through which a
+  statement, a command or a path to execute can reach an adapter.
+* **Credentials stay outside.** A target may carry a `credentialRef`, which is an
+  identifier in your own credential manager. It is never the secret, and a value
+  that merely looks like one is refused. A local SQLite target accepts no
+  reference at all, because a file is opened by path.
+* **Nothing is mutated and nothing is deployed.** There is no write path, no
+  migration runner, no deployment step, and no approval flow — because there is
+  nothing here to approve.
+
+Every run is recorded, whether it succeeded or not, and a run that was
+interrupted by the application stopping is closed on the next start with its
+outcome recorded as *unknown* rather than as a failure of the target.
+
+**There is no user interface for this yet.** Phase 7C-A is the backend: the
+domain, the storage, the registry, the probe adapter and the IPC contract. The
+screens arrive in 7C-B.
 
 ---
 
@@ -461,7 +518,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              803 tests; no network, no real agents
+├─ tests/              1063 tests; no network, no real agents
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

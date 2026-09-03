@@ -22,10 +22,13 @@ import { CodexSdkAdapter } from './adapters/codex/codex-adapter';
 import { CodexAppServerModelCatalog } from './adapters/codex/codex-model-catalog';
 import { CliGitAdapter } from './adapters/git/git-adapter';
 import { GhGitHubAdapter } from './adapters/github/github-adapter';
+import { LocalSqliteProbeAdapter } from './adapters/operations/local-sqlite-adapter';
 import { ExecaProcessRunner, type ProcessRunner } from './adapters/process/process-runner';
 import { closeDatabase, openDatabase, type Db } from './db/database';
 import { SqliteTransactionRunner } from './db/transaction-runner';
 import { SqliteApprovalRepository } from './db/repositories/approval-repository';
+import { SqliteOperationDiagnosticRepository } from './db/repositories/operation-diagnostic-repository';
+import { SqliteOperationTargetRepository } from './db/repositories/operation-target-repository';
 import { SqliteProjectRepository } from './db/repositories/project-repository';
 import { SqliteRunEventRepository } from './db/repositories/run-event-repository';
 import { SqliteRunRepository } from './db/repositories/run-repository';
@@ -35,6 +38,8 @@ import { SystemClock, UuidGenerator } from './infra/clock';
 import type {
   ApprovalRepository,
   ClaudeAdapter,
+  OperationDiagnosticRepository,
+  OperationTargetRepository,
   Clock,
   CodexAdapter,
   CodexModelCatalog,
@@ -50,6 +55,8 @@ import type {
   TaskRepository
 } from './ports';
 import { ToolDiagnosticsService } from './services/diagnostics-service';
+import { OperationsDiagnosticsService } from './services/operations-diagnostics-service';
+import { OperationsRegistry } from './services/operations-registry';
 import { Orchestrator } from './services/orchestrator';
 import { ProjectService } from './services/project-service';
 import { reconcileInterruptedWork, type ReconciliationPlan } from './services/startup-reconciliation';
@@ -92,11 +99,16 @@ export interface Application {
   readonly runs: RunRepository;
   readonly runEvents: RunEventRepository;
   readonly approvals: ApprovalRepository;
+  readonly operationTargets: OperationTargetRepository;
+  readonly operationDiagnosticRuns: OperationDiagnosticRepository;
   readonly projectService: ProjectService;
   readonly taskService: TaskService;
   readonly orchestrator: Orchestrator;
   readonly publishService: PublishService;
   readonly diagnostics: ToolDiagnosticsService;
+  /** The Operations registry. Read-only: it can inspect, never change. */
+  readonly operations: OperationsRegistry;
+  readonly operationDiagnostics: OperationsDiagnosticsService;
   readonly codexModels: CodexModelCatalog;
   /**
    * What startup reconciliation corrected, if anything.
@@ -212,6 +224,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   const runs = new SqliteRunRepository(db);
   const runEvents = new SqliteRunEventRepository(db);
   const approvals = new SqliteApprovalRepository(db);
+  const operationTargets = new SqliteOperationTargetRepository(db, clock);
+  const operationDiagnosticRuns = new SqliteOperationDiagnosticRepository(db);
 
   // Before anything else can act on the database: an abrupt exit leaves runs
   // marked running and tasks stuck in a busy status, and nothing later clears
@@ -221,7 +235,11 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     tasks,
     runs,
     clock,
-    transactions: new SqliteTransactionRunner(db)
+    transactions: new SqliteTransactionRunner(db),
+    // A read-only diagnostic interrupted by the same exit is closed here
+    // too, for the same reason: the row saying it is running is the only
+    // trace left, and nothing else will ever clear it.
+    operationDiagnostics: operationDiagnosticRuns
   });
 
   const adapters = lateBound(adapterFactories(settings, runner));
@@ -286,6 +304,22 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     { getConfiguredPath: () => settings.get().codexExecutablePath }
   );
 
+  // Adapters are keyed by the same enum the registry stores, so a target can
+  // only ever resolve to an implementation this build compiled in.
+  const operations = new OperationsRegistry({
+    targets: operationTargets,
+    diagnostics: operationDiagnosticRuns,
+    ids,
+    adapters: { local_sqlite: new LocalSqliteProbeAdapter(runner) }
+  });
+
+  const operationDiagnostics = new OperationsDiagnosticsService({
+    registry: operations,
+    diagnostics: operationDiagnosticRuns,
+    clock,
+    ids
+  });
+
   const diagnostics = new ToolDiagnosticsService({
     codex: adapters.codex,
     claude: adapters.claude,
@@ -302,11 +336,15 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     runs,
     runEvents,
     approvals,
+    operationTargets,
+    operationDiagnosticRuns,
     projectService,
     taskService,
     orchestrator,
     publishService,
     diagnostics,
+    operations,
+    operationDiagnostics,
     codexModels,
     reconciliation,
     close: () => closeDatabase(db)
