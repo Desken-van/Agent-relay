@@ -135,6 +135,26 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     'publish:prepare': (input) => app.publishService.prepare(input),
     'publish:execute': (input) => app.publishService.execute(input),
 
+    /* ---------------------------------------------------------------------- */
+    /* Operations — read-only                                                  */
+    /* ---------------------------------------------------------------------- */
+
+    'operations:listTargets': () => app.operations.list(),
+    'operations:getTarget': (input) => app.operations.get(input.targetId),
+    'operations:createTarget': (input) => app.operations.create(input),
+    'operations:updateTarget': (input) => app.operations.update(input.targetId, input.patch),
+    'operations:deleteTarget': (input) => app.operations.delete(input.targetId),
+    'operations:listDiagnostics': (input) =>
+      app.operations.listDiagnostics(input.targetId, input.limit),
+    // The probe id is already an enum by the time it arrives; the service checks
+    // it again against the same enum before a target is even loaded.
+    'operations:runDiagnostic': (input) =>
+      app.operationDiagnostics.run({
+        targetId: input.targetId,
+        probeId: input.probeId,
+        ...(input.options ? { options: input.options } : {})
+      }),
+
     'shell:openExternal': async (input) => {
       let url: URL;
       try {

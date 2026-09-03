@@ -1,12 +1,38 @@
+import { copyFileSync, mkdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import react from '@vitejs/plugin-react';
+import type { Plugin } from 'vite';
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
 
 const root = import.meta.dirname;
 
+/**
+ * Put the SQLite probe script next to the built main bundle.
+ *
+ * It is deliberately not bundled: it is the entry point of a *separate*
+ * process, spawned so a synchronous SQLite query can be killed on a timeout.
+ * The adapter looks for it beside its own module, which is the source
+ * directory in development and `out/main` in a build — so this copy is what
+ * makes the same lookup correct in both, with no environment check anywhere.
+ */
+function copySqliteProbe(): Plugin {
+  const name = 'sqlite-probe.mjs';
+  return {
+    name: 'agent-relay:copy-sqlite-probe',
+    closeBundle() {
+      const destination = resolve(root, 'out/main');
+      mkdirSync(destination, { recursive: true });
+      copyFileSync(
+        resolve(root, 'src/main/adapters/operations', name),
+        resolve(destination, name)
+      );
+    }
+  };
+}
+
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()],
+    plugins: [externalizeDepsPlugin(), copySqliteProbe()],
     resolve: {
       alias: {
         '@shared': resolve(root, 'src/shared'),

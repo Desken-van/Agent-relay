@@ -429,9 +429,195 @@ names only; `--show-token` is never used.
 
 ---
 
+## 7b. The Operations workflow — read-only
+
+A second workflow, deliberately kept apart from the development one. The
+development workflow changes a repository; this one only looks at something.
+Phase 7C-A is its backend, and it has no user interface yet.
+
+```
+OperationsRegistry ──selects by enum──> OperationProbeAdapter
+        │                                      │
+        │                              LocalSqliteProbeAdapter
+        │                                      │
+OperationsDiagnosticsService            ExecaProcessRunner
+        │                                      │
+operation_diagnostic_runs               sqlite-probe.mjs (child process)
+```
+
+### The target
+
+`OperationTarget` names an environment, an adapter kind, and that adapter's
+**versioned** configuration. Three rules carry most of the weight:
+
+* `adapterType` is an **enum**, and the implementation is chosen from a
+  `Record` keyed on it. No stored value, IPC payload or model output can name a
+  module, a path or a command to load.
+* Configuration is validated **per adapter type and per version**. A row written
+  by a newer build fails to parse rather than being half-understood by an older
+  one, and the same is true of a stored probe result.
+* `credentialRef` is a **reference**, never a value. A string shaped like a
+  credential — the same shapes `redactSecrets` knows — is refused, and a
+  `local_sqlite` target accepts no reference at all, in the domain schema *and*
+  in a table `CHECK`.
+
+`id` and `adapterType` are identity and are not patchable: a diagnostic run
+refers to a target by id and was produced by one kind of adapter, so moving
+either would leave an audit row describing something that no longer exists.
+The environment is stated by the operator and never inferred from a name or a
+path.
+
+### Probes
+
+Two, both registered in code: `connection_health` and `schema_summary`. A probe
+is *named*; the statements it runs are written into the probe script and are
+not assembled from anything. Neither probe reads a row **of a user table**, and
+neither counts one; every `FROM` in the vocabulary names `sqlite_schema` or
+`pragma_table_info`, and a test checks that. Counting schema entries is allowed
+and is what keeps the omission numbers honest. Neither returns a default value,
+a `CREATE` statement, an index or a trigger — every one of which can carry a
+literal out of the data.
+
+**The two listing statements are bounded by SQLite, not by a slice afterwards.**
+Both carry `LIMIT ?`, with the limit bound as a parameter. A bound applied in
+JavaScript still lets SQLite materialise the whole schema first, so a file with
+a hundred thousand tables would be fully loaded into the probe process before a
+single row was discarded. Alongside each listing sits a fixed `COUNT(*)` over
+the same metadata, which is how the result reports `omittedTables` and
+`omittedColumns` exactly without ever holding the rows it is counting. A table
+whose columns the budget cannot afford issues no listing query at all, and
+still reports how many it declared.
+
+Every bound has a default, a floor and a ceiling: timeout, retained output
+bytes, tables, columns per table, total columns, string length. A caller may
+choose a value inside the range and nothing outside it, and there is no value
+meaning "no limit".
+
+Out of range is a **refusal, not a clamp**, and `resolveDiagnosticLimits` is the
+one place that decides — it parses its input through the same schema the IPC
+layer uses, so there is a single answer whichever door a request came through.
+Clamping would be the more dangerous half: an operator who asked for a million
+tables and silently received five hundred reads the result as complete. The
+service turns the parse failure into `VALIDATION_FAILED` before it looks up the
+target, writes a run, chooses an adapter or spawns anything.
+
+### Why the probe runs in a child process
+
+`node:sqlite` is synchronous. A query against a large or damaged file blocks the
+thread that issued it, and no `Promise.race`, `AbortSignal` or timer can take
+that thread back — a timeout would only be noticed once the query had already
+finished. So the work runs in `sqlite-probe.mjs`, a separate process driven
+through the same boundary the Claude adapter uses: no shell, scrubbed
+environment, request on stdin, one versioned envelope on stdout, stderr as
+diagnostics only, and a kill that the operating system enforces.
+
+The protocol out of that process is **exactly one non-empty line on stdout**.
+Not "the last line that looks like JSON": with that rule a probe that printed a
+warning first, emitted two envelopes, or appended anything after its answer
+still produced a result, so a process that had partly gone wrong could still be
+believed. Anything other than one line is `malformed`, and stderr is never a
+result.
+
+The script is not bundled — it is the entry point of another process — so
+`electron.vite.config.ts` copies it beside the built main bundle. The adapter
+looks for it next to its own module, which is the source directory in
+development and `out/main` in a build, so one lookup is correct in both with no
+environment check anywhere.
+
+### Running one
+
+The order is the contract: validate the target and the probe, refuse a disabled
+target, refuse a second concurrent diagnostic, **write the run as `running`
+before anything is spawned**, run the adapter, then — before anything is
+stored — check the answer, redact it, re-check the bounds, close the run, and
+return what was persisted. Nothing retries, nothing falls back to another
+target, and no approval is involved: there is no mutation to approve.
+
+Three checks stand between an adapter's answer and the database.
+
+**It must answer the question that was asked.** The probe echoes the target id,
+its environment, its adapter type and the probe id back verbatim, and all four
+must match the request exactly, along with the result version. An adapter is
+trusted to *run* a probe, not to say which probe it ran — a result about
+something else, filed against this run, would read as though it described it.
+Because these are compared exactly, they are the one kind of string the probe
+never shortens: `maxStringLength` governs foreign text — table names, declared
+types, warnings — and a truncated identity would fail the comparison while
+looking healthy.
+
+**Redaction happens before measurement**, because the object that is measured
+has to be the object that is stored, and redaction can change a string's length
+(`PASSWORD=x` becomes `PASSWORD=[redacted]`).
+
+**The bounds are re-checked here**, against the limits *this run* resolved:
+tables, columns per table, columns in total, the length of every piece of
+foreign text, and the byte size of the finished object. The child process
+applies them too, but it is the thing being bounded, and a limit enforced only
+by the code it constrains is not a limit. A breach is not trimmed to fit —
+storing a smaller copy would record a partial answer as a whole one, with
+counts inside it that no longer described anything.
+
+A failure is recorded as one, with the kind that produced it (`error`,
+`timeout`, `cancelled`, `malformed`) and **no result**. A run that proved
+nothing must stay visibly empty.
+
+### Three shapes, and no others
+
+A stored diagnostic run may take exactly three forms, and every column is
+pinned in each:
+
+| status | `finished_at` | `structured_result` | `failure_kind` | `error_message` |
+|---|---|---|---|---|
+| `running` | NULL | NULL | NULL | NULL |
+| `succeeded` | set | set | NULL | NULL |
+| `failed` | set | NULL | set | set |
+
+Stated as one table `CHECK` rather than several narrow ones, because the wrong
+combinations are the ones nobody thinks to forbid: a failure still carrying the
+result of an earlier attempt, a success with an error message beside it, a
+running row with a verdict already filled in. The same three shapes are a
+discriminated union in `DiagnosticOutcome`, re-checked at runtime by the
+repository — a union is a promise to the compiler, and a caller can reach for
+`as never` — and re-checked once more by the row mapper on the way out, which
+also requires a stored result to name the same target and probe as the run
+holding it. A row that fails any of it is refused rather than half-read.
+
+### Once, and only once
+
+A run is closed by an `UPDATE` that matches only a row still marked `running`,
+and a zero-row update is reported rather than passed off as success. A second
+`finish` — a retry, a race, a caller that lost track — cannot turn a recorded
+success into a failure or overwrite the evidence of one. The repository also
+refuses to store a result whose target or probe disagrees with the run it would
+be attached to, so the service's check has a floor underneath it.
+
+At most one diagnostic per target is in flight, and that is a **database**
+invariant: a partial `UNIQUE` index over `target_id WHERE status = 'running'`.
+The service checks first because it can explain itself; the index is what holds
+when two writers race or when a row arrives by some other route.
+
+### Fail-closed versions
+
+This build reads and writes exactly version 1 of both shapes, and says so in
+three places: the table `CHECK`s pin `config_version` and `version` to 1 rather
+than accepting anything at or above it; the row mappers refuse a version they do
+not know, refuse a row whose typed `config_version` or `adapter_type` column
+disagrees with the JSON beside it, and check every enum-valued column instead of
+casting it. A cast is a claim the compiler cannot verify and the data may not
+honour.
+
+### Deleting a target
+
+Refused while a diagnostic is running, and refused while any history exists. The
+foreign key is `ON DELETE RESTRICT`, so a diagnostic run — an audit record of
+what was inspected and when — cannot be erased by tidying up. Disable the target
+instead.
+
+---
+
 ## 8. Testing strategy
 
-803 tests, none of which contact Codex, Claude, or GitHub.
+1063 tests, none of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|
@@ -446,6 +632,10 @@ names only; `--show-token` is never used.
 | `adapters/claude-cli-process-contract` | **The Claude adapter against a real child process** — see below |
 | `adapters/interactive-runner` | **A real duplex child process**: stdin staying open, input budgets, framing, tree kill |
 | `security/redaction-and-process` | Credential redaction, environment compartmentalisation, argv-not-shell execution |
+| `domain/operations-targets` · `domain/operations-diagnostics` · `domain/operations-ipc-contract` | The target and probe contracts: what they refuse — an adapter outside the enum, a config version this build cannot read, a credential value, a statement anywhere a probe id belongs |
+| `db/operations-repositories` | Migration 3 on a fresh database *and* on one that already has 1 and 2, CRUD, uniqueness, the `RESTRICT` audit policy, close/reopen on disk |
+| `adapters/local-sqlite-probe` | **The probe against real SQLite files in a real child process**: read-only proven by hash, size, mtime and the absence of a `-wal`, truncation counts, timeout, cancellation, stdout/stderr separation |
+| `services/operations-diagnostics` · `services/operations-startup-recovery` | The order of events around a probe, the one-at-a-time rule, redaction before persistence, and recovery of a diagnostic an abrupt exit left open |
 
 ### The process-level contract suite
 

@@ -18,6 +18,7 @@ import {
 let dir: string;
 let echoScript: string;
 let noisyScript: string;
+let burstScript: string;
 let ignoreScript: string;
 let secretScript: string;
 let envScript: string;
@@ -56,6 +57,22 @@ beforeAll(() => {
       'process.stderr.write("warning: something\\n");',
       'process.stdout.write("out-1\\n");',
       'process.stderr.write("warning: again\\n");',
+      'process.stdout.write("out-2\\n");',
+      'process.stdin.resume();',
+      'process.stdin.on("end", () => process.exit(0));'
+    ].join('\n')
+  );
+
+  // Both warnings in a **single** write, so they are in the pipe together
+  // before anything reads either of them. `noisyScript` writes them in two
+  // syscalls, which is right for observing interleaving but makes "was the
+  // second one still drained after the first killed the session?" a race.
+  burstScript = join(dir, 'burst.mjs');
+  writeFileSync(
+    burstScript,
+    [
+      'process.stderr.write("warning: something\\nwarning: again\\n");',
+      'process.stdout.write("out-1\\n");',
       'process.stdout.write("out-2\\n");',
       'process.stdin.resume();',
       'process.stdin.on("end", () => process.exit(0));'
@@ -313,9 +330,14 @@ describe('interactive process runner', () => {
     // The same contract as the streaming path: the failure ends the session,
     // but the stderr reader keeps going. Dropping it would leave the child free
     // to block on a full pipe, which is the failure mode draining exists for.
+    //
+    // `burstScript`, not `noisyScript`: both warnings leave the child in one
+    // write, so the second is already in the pipe when the first one's callback
+    // throws and kills the session. That makes "was it still drained?" a fact
+    // about the reader rather than a race against the kill.
     const diagnostics: string[] = [];
 
-    const result = await runner.runInteractive(process.execPath, [noisyScript], {
+    const result = await runner.runInteractive(process.execPath, [burstScript], {
       timeoutMs: 20_000,
       onStdoutLine(line, controller) {
         if (line === 'out-2') controller.closeInput();
@@ -326,8 +348,9 @@ describe('interactive process runner', () => {
       }
     });
 
-    // Called once, then skipped — and the warning after it was still retained.
+    // Called once and then skipped: the guard stops the callback, not the loop.
     expect(diagnostics).toEqual(['warning: something']);
+    // And the line that was already in the pipe was still read and kept.
     expect(result.stderr).toContain('again');
     expect(result.failed).toBe(true);
     expect(result.timedOut).toBe(false);

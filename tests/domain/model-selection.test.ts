@@ -44,7 +44,10 @@ describe('migration v2 — task-model-selection', () => {
 
   it('is registered as version 2 and applied on top of version 1', () => {
     const versions = MIGRATIONS.map((m) => m.version);
-    expect(versions).toEqual([1, 2]);
+    // Forward-only: later migrations may be appended, but 1 and 2 keep their
+    // places and their names.
+    expect(versions.slice(0, 2)).toEqual([1, 2]);
+    expect(versions).toEqual([...versions].sort((a, b) => a - b));
     expect(MIGRATIONS[1]?.name).toBe('task-model-selection');
   });
 
@@ -81,7 +84,7 @@ describe('migration v2 — task-model-selection', () => {
   it('is idempotent when run again', () => {
     expect(runMigrations(db)).toBe(0);
     const applied = db.prepare('SELECT version FROM schema_migrations ORDER BY version').all();
-    expect(applied).toHaveLength(2);
+    expect(applied).toHaveLength(MIGRATIONS.length);
   });
 });
 

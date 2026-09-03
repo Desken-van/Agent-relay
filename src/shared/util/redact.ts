@@ -55,6 +55,26 @@ export function redactSecrets(input: string): string {
   return output;
 }
 
+/**
+ * True when `input` contains something shaped like a credential.
+ *
+ * The same patterns {@link redactSecrets} replaces, asked as a question instead.
+ * It exists so a field that must only ever hold a *reference* to a secret can
+ * refuse the secret itself — and so that check cannot drift from the redactor by
+ * being written out a second time somewhere else.
+ */
+export function containsSecretShape(input: string): boolean {
+  if (input.length === 0) return false;
+
+  for (const { re } of PATTERNS) {
+    re.lastIndex = 0;
+    if (re.test(input)) return true;
+  }
+
+  SENSITIVE_ENV_NAMES.lastIndex = 0;
+  return SENSITIVE_ENV_NAMES.test(input);
+}
+
 /** Redact and clamp a string to `maxLength`, noting how much was dropped. */
 export function redactAndTruncate(input: string, maxLength: number): string {
   const redacted = redactSecrets(input);

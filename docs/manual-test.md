@@ -394,6 +394,27 @@ each approval was recorded.
 
 ---
 
+## 11. Operational targets are read-only *(no UI yet)*
+
+Phase 7C-A is backend only: the registry, the probe adapter and the IPC
+contract exist, but no screen does. There is nothing to click yet, and nothing
+in this section touches a production system.
+
+What the automated suite already proves, so this document does not repeat it:
+the database is opened read-only, the file is byte-identical afterwards, no
+`-wal` or `-shm` appears beside it, no row is read, a probe id cannot be a
+statement, and a timeout genuinely kills the child process.
+
+If you want to satisfy yourself by hand before the UI arrives, point a target at
+a **copy** of a database — never a live one — and confirm afterwards that the
+copy's size and modification time are unchanged and that no sidecar files
+appeared next to it.
+
+✅ Pass if you can register a target, run both probes, and find the file exactly
+as you left it.
+
+---
+
 ## Cleanup
 
 ```powershell

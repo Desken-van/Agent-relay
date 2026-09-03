@@ -111,6 +111,107 @@ export const MIGRATIONS: readonly Migration[] = [
         ALTER TABLE tasks ADD COLUMN claude_model TEXT;
       `);
     }
+  },
+  {
+    version: 3,
+    name: 'operations-targets',
+    up(db) {
+      // The Operations registry. Separate tables rather than columns on an
+      // existing one: a target is not a project and a diagnostic is not a run,
+      // and folding them together would make every task query carry rows it has
+      // no business seeing.
+      //
+      // Two things are deliberately absent from `operation_targets`: any column
+      // that could hold a secret, and any column naming an adapter module or
+      // executable. `adapter_type` is checked against the enum the code knows,
+      // so a hand-edited row cannot name an implementation to load.
+      db.exec(`
+        CREATE TABLE operation_targets (
+          id             TEXT PRIMARY KEY,
+          name           TEXT NOT NULL,
+          environment    TEXT NOT NULL CHECK (environment IN ('local','staging','production')),
+          adapter_type   TEXT NOT NULL CHECK (adapter_type IN ('local_sqlite')),
+          -- Pinned to the one version this build writes and reads. Accepting
+          -- any version at or above 1 would let in a row from a future build
+          -- that this one cannot understand, which is the opposite of failing
+          -- closed.
+          config_version INTEGER NOT NULL CHECK (config_version = 1),
+          config_json    TEXT NOT NULL,
+          credential_ref TEXT,
+          enabled        INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+          created_at     TEXT NOT NULL,
+          updated_at     TEXT NOT NULL,
+          -- One registration per name within an environment. The same file may
+          -- legitimately be registered twice under different names (a read-only
+          -- copy, say), so the path is not unique; the label an operator reads is.
+          UNIQUE (environment, name),
+          -- A local SQLite file is opened by path and has no account to name.
+          CHECK (adapter_type <> 'local_sqlite' OR credential_ref IS NULL)
+        );
+        CREATE INDEX idx_operation_targets_env ON operation_targets(environment, name);
+
+        CREATE TABLE operation_diagnostic_runs (
+          id                TEXT PRIMARY KEY,
+          -- RESTRICT, not CASCADE: a diagnostic run is an audit record of what
+          -- was looked at and when. Deleting a target must not quietly erase the
+          -- history of it; the registry refuses such a delete and says why.
+          target_id         TEXT NOT NULL REFERENCES operation_targets(id) ON DELETE RESTRICT,
+          probe_id          TEXT NOT NULL CHECK (probe_id IN ('connection_health','schema_summary')),
+          status            TEXT NOT NULL CHECK (status IN ('running','succeeded','failed')),
+          started_at        TEXT NOT NULL,
+          finished_at       TEXT,
+          structured_result TEXT,
+          failure_kind      TEXT CHECK (failure_kind IN ('error','timeout','cancelled','malformed')),
+          error_message     TEXT,
+          version           INTEGER NOT NULL CHECK (version = 1),
+          -- A run may take exactly three shapes, and every column is pinned in
+          -- each of them. Stating it as one constraint rather than several
+          -- narrow ones is deliberate: the combinations that are wrong are the
+          -- ones nobody thought to forbid — a failure still carrying the result
+          -- of an earlier attempt, a success with an error message beside it, a
+          -- running row with a verdict already filled in. A half-written row
+          -- cannot survive a crash looking whole.
+          CHECK (
+            (status = 'running'
+              AND finished_at       IS NULL
+              AND structured_result IS NULL
+              AND failure_kind      IS NULL
+              AND error_message     IS NULL)
+            OR
+            (status = 'succeeded'
+              AND finished_at       IS NOT NULL
+              AND structured_result IS NOT NULL
+              AND failure_kind      IS NULL
+              AND error_message     IS NULL)
+            OR
+            (status = 'failed'
+              AND finished_at       IS NOT NULL
+              AND structured_result IS NULL
+              AND failure_kind      IS NOT NULL
+              -- Present *and* saying something. A blank message is the same
+              -- silence as no message at all, and an operator reading the audit
+              -- trail later has no way to tell one from the other.
+              AND error_message     IS NOT NULL
+              AND trim(error_message) <> '')
+          )
+        );
+        CREATE INDEX idx_operation_diagnostics_target
+          ON operation_diagnostic_runs(target_id, started_at DESC);
+        -- Serves "what is still running?", in a stable order, for startup
+        -- reconciliation.
+        CREATE INDEX idx_operation_diagnostics_running
+          ON operation_diagnostic_runs(status, started_at)
+          WHERE status = 'running';
+        -- At most one diagnostic in flight per target, enforced by the database
+        -- rather than only by the service that usually checks first. The service
+        -- pre-check stays, because it produces a message an operator can act on;
+        -- this is what holds when two writers race, or when a row is inserted by
+        -- something that never asked.
+        CREATE UNIQUE INDEX idx_operation_diagnostics_one_running
+          ON operation_diagnostic_runs(target_id)
+          WHERE status = 'running';
+      `);
+    }
   }
 ];
 

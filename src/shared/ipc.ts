@@ -29,6 +29,16 @@ import {
   type Task,
   settingsSchema
 } from './domain/models';
+import {
+  newOperationTargetSchema,
+  operationTargetPatchSchema,
+  type OperationTarget
+} from './domain/operations';
+import {
+  diagnosticOptionsSchema,
+  diagnosticProbeIdSchema,
+  type OperationDiagnosticRun
+} from './domain/operations-diagnostics';
 import type { CodexReviewResult, TaskSpecification } from './schemas/codex';
 
 /* -------------------------------------------------------------------------- */
@@ -87,6 +97,7 @@ export type AppEvent =
 
 const empty = z.object({}).strict();
 const byTask = z.object({ taskId: z.string().min(1) }).strict();
+const byOperationTarget = z.object({ targetId: z.string().min(1) }).strict();
 
 export const ipcInputSchemas = {
   'settings:get': empty,
@@ -206,7 +217,34 @@ export const ipcInputSchemas = {
     .strict(),
 
   'shell:openExternal': z.object({ url: z.string().url().max(2000) }).strict(),
-  'shell:revealPath': z.object({ path: z.string().min(1) }).strict()
+  'shell:revealPath': z.object({ path: z.string().min(1) }).strict(),
+
+  /* ---------------------------------------------------------------------- */
+  /* Operations — read-only                                                  */
+  /* ---------------------------------------------------------------------- */
+  //
+  // Every one of these is either a lookup or a change to the *registry*.
+  // `operations:runDiagnostic` names a probe from a fixed enum; there is no
+  // field anywhere below through which a statement, a command or an
+  // executable path can be sent, and the limits a caller may choose from are
+  // bounded by the schema rather than trusted.
+  'operations:listTargets': empty,
+  'operations:getTarget': byOperationTarget,
+  'operations:createTarget': newOperationTargetSchema,
+  'operations:updateTarget': z
+    .object({ targetId: z.string().min(1), patch: operationTargetPatchSchema })
+    .strict(),
+  'operations:deleteTarget': byOperationTarget,
+  'operations:listDiagnostics': z
+    .object({ targetId: z.string().min(1), limit: z.number().int().min(1).max(500).optional() })
+    .strict(),
+  'operations:runDiagnostic': z
+    .object({
+      targetId: z.string().min(1),
+      probeId: diagnosticProbeIdSchema,
+      options: diagnosticOptionsSchema.optional()
+    })
+    .strict()
 } as const;
 
 export type IpcChannel = keyof typeof ipcInputSchemas;
@@ -255,6 +293,14 @@ export interface IpcResponseMap {
 
   'shell:openExternal': { opened: boolean };
   'shell:revealPath': { opened: boolean };
+
+  'operations:listTargets': OperationTarget[];
+  'operations:getTarget': OperationTarget;
+  'operations:createTarget': OperationTarget;
+  'operations:updateTarget': OperationTarget;
+  'operations:deleteTarget': { removed: true };
+  'operations:listDiagnostics': OperationDiagnosticRun[];
+  'operations:runDiagnostic': OperationDiagnosticRun;
 }
 
 export const IPC_CHANNELS = Object.keys(ipcInputSchemas) as IpcChannel[];
