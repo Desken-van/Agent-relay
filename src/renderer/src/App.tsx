@@ -52,7 +52,17 @@ export function App(): React.JSX.Element {
         </header>
 
         <div className="content">
-          {loading ? (
+          {/*
+            Operations is checked before the bootstrap gate, not after it.
+            It keeps its own state and needs neither a project nor a task, so
+            a development-store load that never settles — a wedged bridge,
+            say — must not be able to hold the one screen an operator would
+            open to look at a database. An ordinary error resolves the
+            bootstrap and opens the gate anyway; a hang does not.
+          */}
+          {section === 'operations' ? (
+            <OperationsView />
+          ) : loading ? (
             <div className="empty">Loading…</div>
           ) : section === 'projects' ? (
             <ProjectsView />
@@ -60,8 +70,6 @@ export function App(): React.JSX.Element {
             <TasksView />
           ) : section === 'run' ? (
             <RunView />
-          ) : section === 'operations' ? (
-            <OperationsView />
           ) : (
             <SettingsView />
           )}

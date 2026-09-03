@@ -621,6 +621,13 @@ target is not owned by a repository, and requiring one to be selected would
 imply a relationship that does not exist. The header shows no project name for
 the same reason.
 
+It is also ungated by the development store's own start-up. `App` checks for the
+Operations section *before* the bootstrap gate, because the store clears that
+gate only once `projects:list` and `settings:get` have both settled. An ordinary
+error settles them and the gate opens; a request that never answers does not, and
+that used to hold the one screen an operator would open to look at a database
+while the rest of the application was unwell.
+
 Its state lives in `OperationsProvider`, a second context deliberately separate
 from the main store. Two properties come out of that choice.
 
@@ -696,6 +703,17 @@ Omission triggers one search to the channel's ceiling; if that cannot account fo
 the run either, the block stands and the operator is given an explicit way to stop
 tracking it, because a target locked for the life of the window is its own defect.
 
+**A request, the wait for it, and the read that follows are three things.** The
+renderer's patience expiring is a fact about the screen, not about the request:
+nothing cancels a probe, so an expired wait leaves it outstanding and its answer
+still to come. That answer is applied exactly once, by whichever path reaches it
+first, and independently of whatever the history read is doing — using the
+in-flight flag as evidence that the wait had not expired threw away replies that
+arrived while the history was still loading. Nothing a read says can release an
+outstanding request either: an empty history is as consistent with "still
+running" as with "finished", so only the request's own answer ends it, whether
+that answer is a result, a refusal or a transport failure.
+
 **An unknown outcome holds its claim until something confirms it.** The claim used
 to be released on the way into the very read meant to confirm it, which let a
 second write start against a target whose state nobody knew. Reads never take the
@@ -722,7 +740,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1126 tests, none of which contact Codex, Claude, or GitHub.
+1140 tests, none of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|
@@ -744,6 +762,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 | `renderer/operations-view` | **The Operations screen, driven through its real buttons and fields** against a fake preload bridge: reachability without a project, disabled Save, exact IPC payloads, no automatic runs, double clicks, late answers, and the absence of a false success |
 | `renderer/operations-async` | **The screen's asynchronous state**: a failed load asked once and retried only on request, per-target history, answers arriving out of order, a stale list that must not undo a confirmed write, one action per target at a time, and a write whose outcome nobody knows |
 | `renderer/operations-backend-state` | **What the screen knows about work it did not start**: a run the backend is executing, a bounded page that has scrolled past it, a claim held across the read meant to confirm it, and a first list response a write overtook |
+| `renderer/operations-recovery` | **Recovery, and what must not depend on anything else**: Operations reachable through a development bootstrap that never finishes, a manual re-read held until every read it needs has answered, an unconfirmed registration resolved against the registry, a probe request that goes unanswered, and one deep search per run |
 
 ### Renderer tests
 

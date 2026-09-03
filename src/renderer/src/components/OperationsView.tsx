@@ -57,6 +57,11 @@ export function OperationsView(): React.JSX.Element {
     selectTarget
   } = useOperations();
 
+  // A refresh of a list that is already on screen. The first load has its own
+  // branch below; this is the case that showed nothing at all, so a slow read
+  // looked like a missed click and invited another one on top of it.
+  const refreshing = targetsPhase === 'loading' && targets.length > 0;
+
   // The one automatic call on this screen, and it only lists registrations —
   // nothing here opens a database. It fires on `idle` and on nothing else:
   // "no data and not loading" is also true after a *failed* load, so an effect
@@ -72,13 +77,22 @@ export function OperationsView(): React.JSX.Element {
           title={`Targets${targets ? ` (${targets.length})` : ''}`}
           flush
           actions={
-            <button
-              type="button"
-              className="btn btn--sm btn--ghost"
-              onClick={() => void loadTargets()}
-            >
-              Refresh
-            </button>
+            <span className="row">
+              {/*
+                The spinner sits beside the list rather than in place of it:
+                replacing what is already on screen in order to say "working"
+                throws away the thing the operator was reading.
+              */}
+              {refreshing ? <Spinner /> : null}
+              <button
+                type="button"
+                className="btn btn--sm btn--ghost"
+                disabled={refreshing}
+                onClick={() => void loadTargets()}
+              >
+                {refreshing ? 'Refreshing…' : 'Refresh'}
+              </button>
+            </span>
           }
         >
           {targetsPhase === 'loading' && targets.length === 0 ? (
@@ -219,6 +233,7 @@ function RegisterForm(): React.JSX.Element {
     createDraft,
     setCreateDraft,
     createUnconfirmed,
+    createResolution,
     targetsComplete,
     rereadRegistry
   } = useOperations();
@@ -348,6 +363,24 @@ function RegisterForm(): React.JSX.Element {
             </button>
           </div>
         </div>
+      ) : createResolution?.kind === 'registered' ? (
+        <Notice tone="info">
+          <strong>It was registered after all.</strong> The reply was lost, but
+          re-reading the registry found the target, so there is nothing to submit
+          again.
+        </Notice>
+      ) : createResolution?.kind === 'conflict' ? (
+        <Notice tone="warn">
+          <strong>It was not registered.</strong> A different target already uses
+          that name in that environment, so the registry would refuse it. Change the
+          name and submit again.
+        </Notice>
+      ) : createResolution?.kind === 'not-applied' ? (
+        <Notice tone="warn">
+          <strong>It was not registered.</strong> The reply was lost, but the
+          registry has been read in full and does not contain it. Your entry has
+          been kept; submit it again when you are ready.
+        </Notice>
       ) : null}
       {error ? <WriteErrorNotice error={error} /> : null}
 
