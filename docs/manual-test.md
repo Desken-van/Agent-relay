@@ -1,8 +1,11 @@
 # Manual end-to-end test
 
-The automated suite covers the orchestration logic against fakes. This document
-covers the parts that can only be checked by driving the real application
-against real tools.
+The automated suite covers the orchestration logic against fakes, and one suite
+drives the Claude adapter through a **real child process** against a fake CLI —
+argv, the prompt on stdin, split stdout chunks, the stdout/stderr boundary, exit
+codes, denials, resume, and the fact that a timeout or a cancellation leaves no
+process behind. This document covers what is left: the parts that can only be
+checked by driving the real application against the real tools.
 
 **Nothing here pushes to GitHub.** Sections 1–8 are entirely local. Section 9
 is the only one that touches a remote, and it is clearly marked.
@@ -381,7 +384,9 @@ each approval was recorded.
 |---|---|
 | Log out of Codex (`codex logout`) and press *Generate specification* | A clear "Codex is not authenticated" error with `codex login` as the remediation; the task returns to *Draft* and can be retried |
 | Point *Claude Code path* at a nonexistent file and press *Send to Claude* | "The Claude Code path configured in Settings does not point at an existing file"; the task stays retryable |
-| Set *Process timeout* to 1 minute and start a long task | The run ends as *timed out* with advice to raise the timeout |
+| Set *Process timeout* to 1 minute and start a long task | The run ends as *timed out* with advice to raise the timeout, and no `claude.exe` is left running (check Task Manager, or `Get-Process claude -ErrorAction SilentlyContinue`) |
+| Press *Stop* while Claude is mid-round | The run ends as *cancelled*, the task returns to a retryable status, and again no `claude.exe` survives |
+| Watch the timeline during a round where the CLI prints warnings | Diagnostics from the CLI never appear as session, tool-use, denial or result entries — stderr is not protocol |
 | Delete the worktree folder from disk, then press *Send corrections* | A rejected-path or Git error rather than a crash |
 | Set the worktrees root to a path, then edit a task's worktree to sit outside it | The operation is refused with an unsafe-path error |
 

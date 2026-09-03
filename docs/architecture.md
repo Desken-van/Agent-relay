@@ -240,9 +240,27 @@ Every child process in the application is created in exactly one place:
 * `shell: false`, always. Arguments are passed as an **array**, so a prompt
   containing `&& rm -rf /` is one argv entry, not two commands.
 * Output is redacted (`redactSecrets`) before it is returned, because callers
-  persist it to SQLite and render it in the UI.
-* Retained output is bounded; a runaway agent cannot fill the disk.
-* Cancellation is an `AbortSignal`; timeouts are enforced per run.
+  persist it to SQLite and render it in the UI. Redaction happens **per line, as
+  the line arrives** — before the bound below can cut it — so a secret straddling
+  the truncation point cannot survive as an unrecognisable fragment.
+* Retained output is bounded; a runaway agent cannot fill the disk. The bound is
+  counted in **UTF-8 bytes**, a cut never lands inside a character, and what is
+  kept is always a contiguous prefix — the buffer seals itself on its first
+  dropped byte, so nothing after an omission can reappear before it.
+* Cancellation is an `AbortSignal`; timeouts are enforced per run. A throw from
+  the caller's own line callback is a third way to end a run: the child is killed
+  first and the caller's error is reported as the cause, rather than letting the
+  process live on until the timeout and be reported as one.
+* **stdout and stderr are never merged.** A caller that streams (`onLine`) is
+  parsing a protocol, and stderr is where a CLI puts warnings and crash traces.
+  Both are drained concurrently — an unread stderr pipe eventually blocks the
+  child — but stderr reaches only `onStderrLine` and `ProcessResult.stderr`.
+* **`run` is one-shot, and its child's stdin always ends.** With `input`, the
+  text is written in full and stdin is then closed. Without it, stdin is
+  `/dev/null` — never the parent's — so a child that reads before it works sees
+  EOF at once. Left inheriting, such a child waits on a handle nobody will ever
+  write to, and the run ends as a timeout with no output and nothing to explain
+  it. `runInteractive` is the only API that may keep stdin open.
 
 One narrow exception to "run once, collect output": `InteractiveProcessRunner`,
 implemented by the same class, keeps stdin open so a line-oriented protocol can
@@ -259,6 +277,14 @@ configured path → `PATH` (honouring `PATHEXT`) → well-known Windows location
 This matters because on Windows a missing command surfaces as `exit code 1` from
 `cmd.exe` rather than `ENOENT`, so "is it installed?" cannot be answered by
 trying to spawn it.
+
+What is found is not always a program. `launchFor()` turns a located path into
+something spawnable without a shell: a native binary is spawned directly, while a
+`.js` / `.mjs` / `.cjs` entry point — what an npm install of Claude Code leaves
+behind, next to a shim this application will not run — goes through the runtime
+the app is already using, with `ELECTRON_RUN_AS_NODE` set so a packaged build
+starts Node rather than a second copy of Agent Relay. The tool's own arguments
+follow unchanged either way.
 
 ---
 
@@ -405,7 +431,7 @@ names only; `--show-token` is never used.
 
 ## 8. Testing strategy
 
-760 tests, none of which contact Codex, Claude, or GitHub.
+803 tests, none of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|
@@ -417,4 +443,37 @@ names only; `--show-token` is never used.
 | `db/repositories` | Round-trips, cascades, ordering, settings validation, on-disk durability |
 | `adapters/git-adapter` | **Real `git` against real temporary repositories** |
 | `adapters/adapters` | Claude stream parsing, `gh auth status` parsing, prompt construction, executable discovery |
+| `adapters/claude-cli-process-contract` | **The Claude adapter against a real child process** — see below |
+| `adapters/interactive-runner` | **A real duplex child process**: stdin staying open, input budgets, framing, tree kill |
 | `security/redaction-and-process` | Credential redaction, environment compartmentalisation, argv-not-shell execution |
+
+### The process-level contract suite
+
+Every other adapter test hands `ClaudeCliAdapter` a `ProcessRunner` that returns
+a canned string. That proves the adapter calls the interface correctly and
+nothing at all about the boundary the interface stands for. So one suite runs the
+real `ExecaProcessRunner` against
+[`tests/fixtures/fake-claude-cli.mjs`](../tests/fixtures/fake-claude-cli.mjs) — a
+plain Node script, no shell, spawned as an ordinary child.
+
+The fake takes its behaviour from `fake-claude-scenario.json` **in the working
+directory** and records how it was invoked into `fake-claude-invocation.json`
+beside it. Reading its instructions only from `cwd` is what makes the
+working-directory claim testable: a run started elsewhere finds no scenario and
+says so. Environment variables are recorded by **name and presence only**, never
+by value, so a real credential on the machine running the suite cannot reach a
+report or an assertion message.
+
+What this proves that a fake runner cannot: the exact argv the operating system
+receives (including all 54 deny rules, each permission rule as its own entry, and
+the absence of `--dangerously-skip-permissions`); that the prompt travels on
+stdin byte for byte and appears in neither argv nor the command label; that a
+JSON line split across two writes is reassembled and several packed into one are
+not; CRLF and LF alike; that stderr is not protocol; exit codes, including the
+authentication and model-failure shapes; exit 0 with no final envelope;
+permission denials surviving a successful exit; evidence arriving out of order;
+malformed lines; the byte-accurate output bound and the contiguous prefix it
+retains; that a one-shot run's stdin ends at once when there is no input and
+carries the whole of it when there is; resume; how a located path is turned into
+a spawn; and that a timeout, a cancellation or a throw from the caller's own
+callback actually leaves no child process behind — checked by pid, not assumed.

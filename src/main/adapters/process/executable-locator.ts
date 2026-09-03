@@ -207,6 +207,49 @@ export function locateExecutable(command: string, options: LocateOptions = {}): 
   return null;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Launching what was located                                                  */
+/* -------------------------------------------------------------------------- */
+
+export interface ExecutableLaunch {
+  /** The program to spawn. */
+  readonly file: string;
+  /** Arguments that must precede the tool's own, or empty. */
+  readonly prefixArgs: readonly string[];
+  /** Environment the launch itself needs, merged over the scrubbed parent env. */
+  readonly env: Readonly<Record<string, string>>;
+}
+
+/** Extensions that name a JavaScript entry point rather than a program. */
+const JAVASCRIPT_ENTRY_POINT = /\.[cm]?js$/i;
+
+/**
+ * How to spawn a located path, given that Agent Relay never uses a shell.
+ *
+ * Most tools resolve to a native binary and are spawned directly. Some resolve
+ * to a JavaScript entry point instead: an npm install of Claude Code puts
+ * `cli.js` on disk and only a `.cmd`/shell shim next to it, and running that
+ * shim would require the shell this application refuses to use. A `.js`, `.mjs`
+ * or `.cjs` file is not executable on its own, so it is run through the runtime
+ * the application is already using.
+ *
+ * `ELECTRON_RUN_AS_NODE` is what makes that safe in a packaged build, where
+ * `process.execPath` is the Electron binary: without it, spawning `execPath`
+ * would start a second copy of Agent Relay rather than run the script. Plain
+ * Node ignores the variable, so one code path covers both.
+ */
+export function launchFor(executablePath: string): ExecutableLaunch {
+  if (!JAVASCRIPT_ENTRY_POINT.test(executablePath)) {
+    return { file: executablePath, prefixArgs: [], env: {} };
+  }
+
+  return {
+    file: process.execPath,
+    prefixArgs: [executablePath],
+    env: { ELECTRON_RUN_AS_NODE: '1' }
+  };
+}
+
 /** True when a configured path was supplied but does not point at a real file. */
 export function configuredPathIsBroken(configuredPath: string | null | undefined): boolean {
   const configured = configuredPath?.trim();

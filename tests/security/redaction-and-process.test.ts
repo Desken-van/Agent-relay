@@ -163,17 +163,23 @@ describe('process runner', () => {
     expect(result.cancelled).toBe(true);
   });
 
-  it('streams stdout and stderr lines in order', async () => {
+  it('streams stdout lines only, keeping diagnostics off the protocol channel', async () => {
+    // A streaming caller is parsing a protocol. Handing it stderr as well —
+    // which iterating execa's combined `all` stream did — let a diagnostic be
+    // read as a protocol record. stderr is retained, separately.
     const lines: string[] = [];
-    await runner.run(
+    const diagnostics: string[] = [];
+
+    const result = await runner.run(
       process.execPath,
       ['-e', 'console.log("one");console.error("two");console.log("three")'],
-      { onLine: (line) => lines.push(line) }
+      { onLine: (line) => lines.push(line), onStderrLine: (line) => diagnostics.push(line) }
     );
 
-    expect(lines).toContain('one');
-    expect(lines).toContain('two');
-    expect(lines).toContain('three');
+    expect(lines).toEqual(['one', 'three']);
+    expect(diagnostics).toEqual(['two']);
+    expect(result.stdout).not.toContain('two');
+    expect(result.stderr).toContain('two');
   });
 
   it('redacts secrets that appear in child output', async () => {
