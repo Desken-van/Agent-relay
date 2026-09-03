@@ -36,8 +36,16 @@ export interface ProcessRunOptions {
   readonly input?: string;
   /** Cap on retained stdout/stderr. Excess is dropped, not buffered. */
   readonly maxOutputBytes?: number;
-  /** When set, output is streamed line-by-line as it arrives. */
+  /**
+   * When set, **stdout** is streamed line-by-line as it arrives.
+   *
+   * stdout only. A caller that streams is parsing a protocol, and stderr is
+   * where a CLI puts warnings, progress bars and crash traces — text that
+   * happens to be adjacent, not part of the protocol.
+   */
   readonly onLine?: (line: string) => void;
+  /** Diagnostics from stderr, kept out of {@link onLine}. Streaming runs only. */
+  readonly onStderrLine?: (line: string) => void;
   /** Allow resolving executables from the app's own `node_modules/.bin`. */
   readonly preferLocal?: boolean;
 }
@@ -112,34 +120,92 @@ const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 2_000_000;
 const DEFAULT_MAX_INPUT_MESSAGES = 100;
 const DEFAULT_MAX_INPUT_BYTES = 256 * 1024;
+/**
+ * How long a failing path will wait for the stderr reader before giving up.
+ *
+ * That reader only ends when the child does, and on a failure path the child
+ * may already be gone — so this is a courtesy, never a dependency.
+ */
+const STDERR_GRACE_MS = 250;
 
-/** Accumulates text up to a byte budget, then silently drops the remainder. */
+/**
+ * The longest prefix of `text` that fits in `limit` UTF-8 bytes.
+ *
+ * Iterated by code point, so the cut never lands inside a multi-byte character
+ * or between the halves of a surrogate pair. Splitting one would turn a
+ * truncated line into mojibake — and, worse, into a string that no longer
+ * matches the pattern that would have redacted it.
+ */
+function sliceToByteLimit(text: string, limit: number): string {
+  if (limit <= 0) return '';
+
+  let bytes = 0;
+  let end = 0;
+  for (const character of text) {
+    const size = Buffer.byteLength(character, 'utf8');
+    if (bytes + size > limit) break;
+    bytes += size;
+    end += character.length;
+  }
+  return text.slice(0, end);
+}
+
+/**
+ * Accumulates text up to a byte budget, then silently drops the remainder.
+ *
+ * The budget is counted in **UTF-8 bytes**, because that is what the option is
+ * called and what the memory actually costs. Counting JavaScript characters
+ * instead let a stream of three-byte characters retain three times the agreed
+ * ceiling — the exact case where a bound is supposed to hold.
+ *
+ * What is retained is always a **contiguous prefix** of what was pushed. That
+ * is what makes the "…[n more bytes omitted]" note true: it says everything
+ * after this point is missing, so nothing after this point may reappear. The
+ * buffer therefore seals itself the moment it drops its first byte, rather than
+ * comparing size against the limit on each push. Those are not the same test:
+ * a three-byte character that does not fit in two bytes of remaining room is
+ * dropped whole, leaving the buffer under its limit and — before the seal —
+ * willing to accept the next short line, which then appeared in the output
+ * after data that had already been discarded.
+ */
 class BoundedBuffer {
   private parts: string[] = [];
   private size = 0;
   private dropped = 0;
+  private sealed = false;
 
   constructor(private readonly limit: number) {}
 
   push(text: string): void {
-    if (this.size >= this.limit) {
-      this.dropped += text.length;
+    const bytes = Buffer.byteLength(text, 'utf8');
+
+    if (this.sealed) {
+      this.dropped += bytes;
       return;
     }
+
     const room = this.limit - this.size;
-    if (text.length <= room) {
+    if (bytes <= room) {
       this.parts.push(text);
-      this.size += text.length;
-    } else {
-      this.parts.push(text.slice(0, room));
-      this.size = this.limit;
-      this.dropped += text.length - room;
+      this.size += bytes;
+      return;
     }
+
+    // The first loss. Keep as much of this chunk as fits — cut on a code point,
+    // never inside one — and refuse everything from here on.
+    const kept = sliceToByteLimit(text, room);
+    const keptBytes = Buffer.byteLength(kept, 'utf8');
+    if (keptBytes > 0) {
+      this.parts.push(kept);
+      this.size += keptBytes;
+    }
+    this.dropped += bytes - keptBytes;
+    this.sealed = true;
   }
 
   toString(): string {
     const body = this.parts.join('');
-    return this.dropped > 0 ? `${body}\n…[${this.dropped} more characters omitted]` : body;
+    return this.dropped > 0 ? `${body}\n…[${this.dropped} more bytes omitted]` : body;
   }
 }
 
@@ -200,6 +266,24 @@ function commandLabelFor(file: string, args: readonly string[]): string {
 }
 
 export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunner {
+  /**
+   * Run a child once and collect what it produced.
+   *
+   * **`run` is one-shot, and its child's stdin always ends.** With `input`, the
+   * text is written in full and stdin is then closed; without it, stdin is
+   * `/dev/null` (`NUL` on Windows) and the child sees EOF the moment it looks.
+   * It is never the parent's stdin.
+   *
+   * That is a contract, not a detail. A CLI that reads stdin before doing its
+   * work — and plenty do, if only to notice there is nothing there — would
+   * otherwise wait on a handle nobody is ever going to write to, and the run
+   * would end as a timeout minutes later with no output and nothing to explain
+   * it. Inheriting is worse still: the child would be reading the *application's*
+   * stdin, and consuming bytes that were not addressed to it.
+   *
+   * {@link runInteractive} is the only API allowed to keep stdin open, because
+   * keeping it open is the entire reason it exists.
+   */
   async run(
     file: string,
     args: readonly string[],
@@ -212,7 +296,12 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
 
     const execaOptions: Options = {
       ...baseExecaOptions(options),
-      ...(options.input === undefined ? {} : { input: options.input })
+      // Set here rather than in `baseExecaOptions`, which is shared with the
+      // interactive path: a default of "no stdin" there would close the very
+      // channel that path is built around.
+      ...(options.input === undefined
+        ? { stdin: 'ignore' as const }
+        : { input: options.input })
     };
 
     const commandLabel = commandLabelFor(file, args);
@@ -221,6 +310,7 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
       return this.runStreaming(file, args, execaOptions, {
         maxBytes,
         onLine: options.onLine,
+        onStderrLine: options.onStderrLine,
         startedAt,
         commandLabel
       });
@@ -256,45 +346,144 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
     }
   }
 
+  /**
+   * Stream a child's stdout line by line, with stderr kept strictly apart.
+   *
+   * The separation is the contract, not an implementation detail. The only
+   * caller that streams is the Claude adapter, and what it does with each line
+   * is parse it as a `stream-json` protocol event: a session id, a tool call, a
+   * permission denial, the final result envelope. Merging the two streams — as
+   * this did, by iterating execa's combined `all` — meant anything the CLI, a
+   * hook, or a wrapper script printed to stderr was offered to that parser as
+   * protocol. A single JSON-shaped diagnostic line on stderr could therefore
+   * open a session, fabricate a tool execution, or announce a result the CLI
+   * never produced. stderr is a diagnostic channel; it is retained, and it is
+   * never protocol.
+   */
   private async runStreaming(
     file: string,
     args: readonly string[],
     execaOptions: Options,
-    ctx: { maxBytes: number; onLine: (line: string) => void; startedAt: number; commandLabel: string }
+    ctx: {
+      maxBytes: number;
+      onLine: (line: string) => void;
+      onStderrLine?: (line: string) => void;
+      startedAt: number;
+      commandLabel: string;
+    }
   ): Promise<ProcessResult> {
-    const combined = new BoundedBuffer(ctx.maxBytes);
+    const stdoutBuffer = new BoundedBuffer(ctx.maxBytes);
+    const stderrBuffer = new BoundedBuffer(ctx.maxBytes);
     let subprocess: ResultPromise | undefined;
+    let drainStderr: Promise<void> = Promise.resolve();
+
+    /**
+     * The first callback throw, whichever stream raised it.
+     *
+     * Kept out here so the catch below can report the caller's own error as the
+     * cause rather than whatever execa says about the child we just killed.
+     */
+    let callbackError: unknown = null;
+
+    /** Kill the tree. Safe to call more than once, and on a dead child. */
+    const terminate = (): void => {
+      // `forceKillAfterDelay` escalates to the whole tree if it ignores this.
+      subprocess?.kill();
+    };
+
+    /** Let the stderr reader finish, but never wait on it indefinitely. */
+    const settleStderr = (): Promise<unknown> =>
+      Promise.race([drainStderr, new Promise((resolve) => setTimeout(resolve, STDERR_GRACE_MS))]);
 
     try {
       subprocess = execa(file, [...args], {
         ...execaOptions,
-        all: true,
         buffer: false
       });
 
-      for await (const rawLine of subprocess.iterable({ from: 'all' })) {
+      const child = subprocess;
+      // Marks the process promise as observed. Every path below either awaits
+      // it or abandons it after a kill, and an abandoned rejection would
+      // otherwise surface as an unhandled one in the host process.
+      child.catch(() => undefined);
+
+      // Drained in parallel: a child that fills its stderr pipe while nobody
+      // reads it blocks, and a blocked child never reaches its final envelope.
+      drainStderr = (async () => {
+        try {
+          for await (const raw of child.iterable({ from: 'stderr' })) {
+            const line = redactSecrets(String(raw));
+            stderrBuffer.push(`${line}\n`);
+
+            // Draining continues after a failed diagnostic callback, and only
+            // the callback stops being called. Abandoning the reader instead
+            // would leave the child free to block on a full stderr pipe — the
+            // one thing this loop exists to prevent.
+            if (callbackError !== null) continue;
+            try {
+              ctx.onStderrLine?.(line);
+            } catch (error) {
+              callbackError = error;
+              terminate();
+            }
+          }
+        } catch {
+          // The process ending mid-read is normal; the exit path reports it.
+        }
+      })();
+
+      for await (const rawLine of child.iterable({ from: 'stdout' })) {
         const line = redactSecrets(String(rawLine));
-        combined.push(`${line}\n`);
-        ctx.onLine(line);
+        stdoutBuffer.push(`${line}\n`);
+
+        try {
+          ctx.onLine(line);
+        } catch (error) {
+          // Kill *before* unwinding the iterator. Letting the throw escape the
+          // loop first makes execa's cleanup wait on a child that is still
+          // running, which turns an instant failure into a full timeout.
+          if (callbackError === null) callbackError = error;
+          terminate();
+          break;
+        }
       }
 
+      if (callbackError !== null) throw callbackError;
+
       const result = await subprocess;
-      const text = combined.toString();
+      await drainStderr;
+      // A diagnostic callback can fail after the stdout loop has already ended.
+      // `drainStderr` only settles once stderr is at EOF, so by here that has
+      // either happened or it never will.
+      if (callbackError !== null) throw callbackError;
 
       return {
         command: ctx.commandLabel,
         exitCode: result.exitCode ?? null,
-        stdout: text,
-        stderr: '',
+        stdout: stdoutBuffer.toString(),
+        stderr: stderrBuffer.toString(),
         timedOut: Boolean(result.timedOut),
         cancelled: Boolean(result.isCanceled),
         durationMs: Date.now() - ctx.startedAt,
         failed: Boolean(result.failed)
       };
     } catch (error) {
-      const failure = toFailureResult(error, ctx);
-      // Preserve whatever we managed to stream before the failure.
-      return { ...failure, stdout: combined.toString() || failure.stdout };
+      // Whatever the cause, the child must not outlive this function — and must
+      // not be left to the timeout, which would stall an immediate failure for
+      // the full duration and report it as one.
+      terminate();
+      await settleStderr();
+
+      // A caller's own error is the cause; execa's account of the kill that
+      // followed it is not.
+      const failure = toFailureResult(callbackError ?? error, ctx);
+      // Preserve whatever we managed to stream before the failure. Each stream
+      // keeps its own text, so a diagnostic still cannot arrive as stdout.
+      return {
+        ...failure,
+        stdout: stdoutBuffer.toString() || failure.stdout,
+        stderr: stderrBuffer.toString() || failure.stderr
+      };
     }
   }
 
@@ -398,6 +587,9 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
       subprocess.kill();
     };
 
+    /** The first callback throw, from either stream. See `runStreaming`. */
+    let callbackError: unknown = null;
+
     // stderr is drained in parallel and never offered to the line handler:
     // a warning on stderr must not be mistaken for a protocol response.
     const drainStderr = (async () => {
@@ -405,7 +597,17 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
         for await (const raw of subprocess.iterable({ from: 'stderr' })) {
           const line = redactSecrets(String(raw));
           stderrBuffer.push(`${line}\n`);
-          options.onStderrLine?.(line);
+
+          // Same contract as `runStreaming`: a failed diagnostic callback ends
+          // the session, but never the draining. Abandoning the reader would
+          // leave the child free to block on a full stderr pipe.
+          if (callbackError !== null) continue;
+          try {
+            options.onStderrLine?.(line);
+          } catch (error) {
+            callbackError = error;
+            terminate();
+          }
         }
       } catch {
         // The process ending mid-read is normal; the exit path reports it.
@@ -414,8 +616,6 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
 
     try {
       await options.onStart?.(controller);
-
-      let callbackError: unknown = null;
 
       for await (const raw of subprocess.iterable({ from: 'stdout' })) {
         const line = redactSecrets(String(raw));
@@ -427,7 +627,7 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
           // Kill *before* unwinding the iterator. Letting the throw escape the
           // loop first makes execa's cleanup wait on a child that is still
           // running, which turns an instant failure into a full timeout.
-          callbackError = error;
+          if (callbackError === null) callbackError = error;
           terminate();
           break;
         }
@@ -437,6 +637,7 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
 
       const result = await subprocess;
       await drainStderr;
+      if (callbackError !== null) throw callbackError;
 
       return {
         command: commandLabel,
@@ -453,7 +654,7 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
       // the child must not outlive this function — and must not be left to the
       // timeout, which would stall an immediate failure for the full duration.
       terminate();
-      const failure = toFailureResult(error, ctx);
+      const failure = toFailureResult(callbackError ?? error, ctx);
       return {
         ...failure,
         stdout: stdoutBuffer.toString() || failure.stdout,
@@ -466,7 +667,7 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
       // only ends when the child does, and the child may already be gone.
       await Promise.race([
         drainStderr.catch(() => undefined),
-        new Promise((resolve) => setTimeout(resolve, 250))
+        new Promise((resolve) => setTimeout(resolve, STDERR_GRACE_MS))
       ]);
     }
   }

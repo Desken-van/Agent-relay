@@ -53,7 +53,7 @@ import type {
   ClaudeImplementationRequest,
   ClaudeImplementationResult
 } from '../../ports';
-import { locateExecutable, configuredPathIsBroken } from '../process/executable-locator';
+import { launchFor, locateExecutable, configuredPathIsBroken } from '../process/executable-locator';
 import type { ProcessRunner } from '../process/process-runner';
 import { consumeLine, createStreamState, finalizeState } from './stream-parser';
 
@@ -165,7 +165,11 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       };
     }
 
-    const version = await this.runner.run(path, ['--version'], { timeoutMs: 30_000 });
+    const launch = launchFor(path);
+    const version = await this.runner.run(launch.file, [...launch.prefixArgs, '--version'], {
+      timeoutMs: 30_000,
+      env: launch.env
+    });
     if (version.exitCode !== 0) {
       const output = version.stderr || version.stdout;
       return {
@@ -201,10 +205,15 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
     request: ClaudeImplementationRequest,
     context: AgentRunContext
   ): Promise<ClaudeImplementationResult> {
-    const executable = this.claudePath();
+    // A located path is not always a program: an npm install of Claude Code
+    // leaves a `cli.js`, which has to go through the Node runtime because this
+    // application never spawns a shell. Whatever comes back, the tool's own
+    // arguments follow unchanged.
+    const launch = launchFor(this.claudePath());
     const state = createStreamState();
 
     const args: string[] = [
+      ...launch.prefixArgs,
       '--print',
       '--output-format',
       'stream-json',
@@ -254,11 +263,12 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       data: { branch: request.branchName, worktree: request.worktreePath }
     });
 
-    const result = await this.runner.run(executable, args, {
+    const result = await this.runner.run(launch.file, args, {
       cwd: request.worktreePath,
       timeoutMs: context.timeoutMs,
       signal: context.signal,
       passthroughEnvNames: CLAUDE_ENV_PASSTHROUGH,
+      env: launch.env,
       // The prompt goes down stdin — never onto the command line.
       input: request.prompt,
       onLine: (line) => {

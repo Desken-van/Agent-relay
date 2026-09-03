@@ -115,11 +115,48 @@ Every child process is created in one place, `ExecaProcessRunner`:
   argument and verifies they arrive as literal text.
 * Non-string arguments are rejected rather than coerced.
 * Every run has a timeout and an `AbortSignal`.
-* Retained output is bounded, so a runaway agent cannot exhaust the disk.
+* Retained output is bounded, so a runaway agent cannot exhaust the disk. The
+  bound is counted in UTF-8 bytes, and what is kept is always a contiguous
+  prefix: once anything has been dropped, nothing later is retained. Redaction
+  runs per line as the line arrives, before the bound can cut it, so a secret
+  straddling the truncation point cannot survive as a fragment.
+
+### stdout is protocol; stderr never is
+
+The Claude Code run is the one place where a child's output is *parsed* rather
+than merely stored. Its stdout carries `stream-json`, and each line becomes a
+session id, a tool call, a permission denial or the final result envelope — the
+same evidence the round policy and the publishing gate are decided from.
+
+So the two streams are read separately and are never merged:
+
+* **Only stdout reaches the parser.** stderr cannot open a session, invent a
+  tool execution, manufacture or suppress a denial, or announce a result. A
+  wrapper script, a hook, or a CLI diagnostic that happens to print a
+  JSON-shaped line has no way to speak protocol.
+* **stderr is still read, in full and in parallel.** It is kept only as a
+  diagnostic — bounded and redacted like stdout — and surfaces in error detail.
+  Draining it is not optional: a child writing into a stderr pipe nobody reads
+  eventually blocks, and a blocked agent looks exactly like a slow one.
+* **Both are redacted before anything is retained, shown or persisted.**
+* **The prompt travels only on stdin.** It never appears in argv, in the command
+  label that gets logged, or in any progress event.
+* **A one-shot run's stdin always ends, and is never the parent's.** `run()`
+  writes `input` in full and then closes it; given no input it hands the child
+  `/dev/null`. So a tool can neither read bytes addressed to Agent Relay itself
+  nor sit waiting on a handle that will never be written to — which presents as
+  a timeout with no output, and is indistinguishable from a hung agent. Only
+  `runInteractive()` keeps stdin open, and only until the caller closes it.
 
 Executables are resolved explicitly (configured path → `PATH` → well-known
 Windows locations) rather than by attempting a spawn, because on Windows a
 missing command surfaces as `exit code 1` from `cmd.exe`, not `ENOENT`.
+
+What is found is not always a program. A `.js`, `.mjs` or `.cjs` entry point —
+what an npm install of Claude Code leaves on disk — is run through the runtime
+the application is already using, never through a shell and never through the
+`.cmd` shim beside it. No other extension is treated this way: anything else is
+spawned directly, or fails to spawn.
 
 The well-known list includes two WinGet locations, since its `PATH` change only
 reaches processes started after the install: the `WinGet\Links` shim directory,

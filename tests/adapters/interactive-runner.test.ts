@@ -126,6 +126,33 @@ describe('interactive process runner', () => {
     expect(seen.map((line) => JSON.parse(line).echo)).toEqual(['first', 'second', 'third']);
   });
 
+  it('never closes stdin behind the caller: EOF only follows closeInput', async () => {
+    // The one-shot `run()` closes a child's stdin immediately. This path must
+    // not: the whole point is a conversation, and an early EOF would end it
+    // before the first reply. `echoScript` writes "bye" only when its stdin
+    // ends, so where that marker appears is the whole assertion.
+    const seen: string[] = [];
+
+    const result = await runner.runInteractive(process.execPath, [echoScript], {
+      timeoutMs: 20_000,
+      onStart(controller) {
+        controller.writeLine('first');
+      },
+      onStdoutLine(line, controller) {
+        seen.push(line);
+        if (line === 'bye') return;
+        // Still no EOF, two exchanges in.
+        expect(seen).not.toContain('bye');
+        if (seen.length === 1) controller.writeLine('second');
+        else controller.closeInput();
+      }
+    });
+
+    expect(seen.slice(0, 2).map((line) => JSON.parse(line).echo)).toEqual(['first', 'second']);
+    expect(seen[seen.length - 1]).toBe('bye');
+    expect(result.exitCode).toBe(0);
+  });
+
   it('closing stdin ends the child', async () => {
     const result = await runner.runInteractive(process.execPath, [echoScript], {
       timeoutMs: 20_000,
@@ -282,6 +309,30 @@ describe('interactive process runner', () => {
     expect((error as Error)?.message).toMatch(/at most 32 bytes/);
   });
 
+  it('ends the session when a diagnostic callback throws, without abandoning the drain', async () => {
+    // The same contract as the streaming path: the failure ends the session,
+    // but the stderr reader keeps going. Dropping it would leave the child free
+    // to block on a full pipe, which is the failure mode draining exists for.
+    const diagnostics: string[] = [];
+
+    const result = await runner.runInteractive(process.execPath, [noisyScript], {
+      timeoutMs: 20_000,
+      onStdoutLine(line, controller) {
+        if (line === 'out-2') controller.closeInput();
+      },
+      onStderrLine(line) {
+        diagnostics.push(line);
+        throw new Error('diagnostic handler exploded');
+      }
+    });
+
+    // Called once, then skipped — and the warning after it was still retained.
+    expect(diagnostics).toEqual(['warning: something']);
+    expect(result.stderr).toContain('again');
+    expect(result.failed).toBe(true);
+    expect(result.timedOut).toBe(false);
+  });
+
   it('turns a callback throw into a controlled failure, leaving no child behind', async () => {
     const result = await runner.runInteractive(process.execPath, [echoScript], {
       timeoutMs: 20_000,
@@ -310,7 +361,7 @@ describe('interactive process runner', () => {
       }
     });
 
-    expect(result.stdout).toContain('more characters omitted');
+    expect(result.stdout).toContain('more bytes omitted');
     expect(result.stdout.length).toBeLessThan(200);
   });
 
