@@ -394,11 +394,11 @@ each approval was recorded.
 
 ---
 
-## 11. Operational targets are read-only *(no UI yet)*
+## 11. Operational targets are read-only *(covered by automated tests)*
 
-Phase 7C-A is backend only: the registry, the probe adapter and the IPC
-contract exist, but no screen does. There is nothing to click yet, and nothing
-in this section touches a production system.
+The registry, the probe adapter and the IPC contract are covered by automated
+tests, and the screen by renderer tests that drive its real buttons. Nothing in
+this section touches a production system.
 
 What the automated suite already proves, so this document does not repeat it:
 the database is opened read-only, the file is byte-identical afterwards, no
@@ -412,6 +412,52 @@ appeared next to it.
 
 ✅ Pass if you can register a target, run both probes, and find the file exactly
 as you left it.
+
+---
+
+## 12. Operations UI — live acceptance *(Phase 7C-C, not yet performed)*
+
+The Operations screen has never been exercised against a real database in a
+running window. This is the checklist for doing that, and it has not been run.
+
+**Prepare, and do not skip this.** Point nothing at a database you care about.
+
+```powershell
+# An isolated profile, outside the repository.
+$env:AGENT_RELAY_DATA_DIR = "$env:TEMP\agent-relay-7cc"
+
+# A throwaway database, created for this test and nothing else.
+$db = "$env:TEMP\agent-relay-7cc\fixture.sqlite"
+New-Item -ItemType Directory -Force (Split-Path $db) | Out-Null
+node -e "const {DatabaseSync}=require('node:sqlite');const d=new DatabaseSync(process.argv[1]);d.exec('CREATE TABLE invoices (id INTEGER PRIMARY KEY, customer TEXT NOT NULL, total REAL)');d.exec('CREATE TABLE payments (id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL)');d.exec(\"INSERT INTO invoices (customer,total) VALUES ('ACME Ltd',99.5)\");d.close()" $db
+
+# Record what the file looks like before anything opens it.
+Get-FileHash $db; (Get-Item $db).Length; (Get-Item $db).LastWriteTimeUtc
+```
+
+| Do this | Expect |
+|---|---|
+| Open the app with no project selected and click **Operations** | The section opens; no project name appears in the header |
+| Register a target: a name, environment **local**, the fixture path | Save is disabled until the environment is chosen and the path is absolute; the target appears in the list |
+| Try a relative path such as `fixture.sqlite` | Save stays disabled, with the reason shown |
+| Select the target and read the run panel | Name, environment, path, probe and the read-only note are all shown *before* anything runs |
+| Run **connection_health** | `opened`, `readOnly` and `queryOnly` all yes; a real SQLite version; the file size and modification time match what you recorded |
+| Run **schema_summary** | `invoices` and `payments` with their columns and types; no row values anywhere — in particular no `ACME Ltd` and no `99.5` |
+| Re-check the file | Hash, size and modification time **unchanged**; no `-wal` or `-shm` beside it |
+| Press **Refresh** on History, and reopen the section | The recorded runs are still there; nothing ran again |
+| Disable the target, then try to run | Run is disabled and says the target is disabled |
+| Try to remove the registration | Refused, with the registry's reason and its suggestion to disable instead |
+| Point a second target at a path that does not exist and run `connection_health` | `fileExists: no`, `opened: no`, and a warning — not a crash |
+| Point a third target at a text file renamed `.sqlite` and run both probes | `connection_health` reports it could not be opened; `schema_summary` fails with a reason, and claims no schema |
+
+✅ Pass if every probe reports what is actually there, the fixture file is
+byte-identical afterwards, and nothing ran that you did not click.
+
+```powershell
+# Afterwards
+Remove-Item -Recurse -Force "$env:TEMP\agent-relay-7cc"
+Remove-Item Env:\AGENT_RELAY_DATA_DIR
+```
 
 ---
 

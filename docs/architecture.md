@@ -433,7 +433,8 @@ names only; `--show-token` is never used.
 
 A second workflow, deliberately kept apart from the development one. The
 development workflow changes a repository; this one only looks at something.
-Phase 7C-A is its backend, and it has no user interface yet.
+Phase 7C-A built its backend; 7C-B added the screen. Live acceptance against a
+real database in a running window (7C-C) has not been done.
 
 ```
 OperationsRegistry ──selects by enum──> OperationProbeAdapter
@@ -613,11 +614,115 @@ foreign key is `ON DELETE RESTRICT`, so a diagnostic run — an audit record of
 what was inspected and when — cannot be erased by tidying up. Disable the target
 instead.
 
+### The screen
+
+`OperationsView` is a section of its own, ungated by any project or task: a
+target is not owned by a repository, and requiring one to be selected would
+imply a relationship that does not exist. The header shows no project name for
+the same reason.
+
+Its state lives in `OperationsProvider`, a second context deliberately separate
+from the main store. Two properties come out of that choice.
+
+**Isolation.** Nothing here writes into the development workflow's state, so a
+failed target load or a probe that never answers cannot leave Projects, Tasks,
+Run or Settings in a bad way. Errors are narrower still: each panel keeps its
+own, because a shared slot put a refused delete under the registration form,
+where it read as a reason the *new* target could not be saved.
+
+**Survival.** The provider is mounted above the router, so a diagnostic that is
+in flight is still in flight after the user visits another section and returns.
+Had it lived inside the screen, navigating away would have forgotten the request
+and let a second one start on top of the first.
+
+Everything that can arrive late is keyed by **target id** rather than by "the
+current screen", so an answer for target A writes A's slot and can never be
+painted under target B. A double click is stopped by a ref rather than by the
+disabled attribute: two clicks in one tick see the same React state, and "the
+button looked disabled" is a rendering fact, not a guarantee.
+
+Seven rules govern the asynchronous state, and each of them replaced something
+that looked right and was not.
+
+**A load has a phase, not a pair of booleans.** `idle → loading → loaded |
+error`, where `error` is a resting state. "No data and not loading" is true both
+before the first attempt and after a failed one, so an effect keyed on it fires
+again on the render its own failure caused — hammering a backend that has just
+said no, and clearing the error the operator was meant to read. Only `idle`
+starts a request; only an explicit Retry or Refresh leaves `error`. The target
+list and each target's history have their own phase, so one target's failure
+says nothing about another's.
+
+**A read is stale if a write finished while it was in the air.** Sequence numbers
+alone are not enough: a `listTargets` that started before a Disable was confirmed
+carries an older truth, and it is still the newest *list* request there is.
+A write epoch, compared across the call, is what stops a slow Refresh putting
+`Enabled` back after a confirmed Disable. A response overtaken by a newer read is
+discarded silently — never by handing the phase back to `idle`, which the mount
+effect would read as a fresh screen and answer with a third request.
+
+**A list is complete, or it is known not to be.** A first response discarded
+because a write overtook it leaves only what that write added; announcing that as
+the registry hides every existing registration behind a list that looks whole.
+Completeness is tracked separately from the phase, and registration waits for the
+registry to have been read once — which is also what makes the race unreachable,
+since a create is the only write that can overtake the very first read.
+
+**One action per target, claimed synchronously.** A probe and a registry write may
+not touch the same target at once, in either order: a probe reading a target that
+is being re-pointed would report on something other than what the finished run
+claims it looked at. The claim lives in a ref, and it lives in the provider, so it
+survives the panel being unmounted and remounted by navigation.
+
+Because a guard is a ref and the screen is a store, the two can disagree, and a
+reducer cannot reach a ref. So **nothing clears a guard from inside the reducer**:
+every change goes through a setter that writes both halves in the same turn. The
+failure this prevents is worse than a stuck button — the store cleared, the ref
+kept, and an *enabled* Run that silently reached no channel at all.
+
+**A read decides nothing once it has been overtaken.** The deep search for a run
+that has scrolled off the page is slow enough for a later refresh to answer the
+same question first, so it re-checks that it is still the current read — after its
+await, before it writes anything — and otherwise stops with no conclusion. A
+superseded search re-blocking a target that newer evidence has just released is
+worse than never having searched.
+
+**Local request lifetime is not backend execution state.** A run the backend
+reports as `running` blocks its target although nothing is in flight here — the
+schema permits one running run per target, so that row is authoritative. It is
+tracked by run id: a later page still calling an already-finished run `running` is
+stale, and a bounded page that has simply scrolled past it proves nothing at all.
+Omission triggers one search to the channel's ceiling; if that cannot account for
+the run either, the block stands and the operator is given an explicit way to stop
+tracking it, because a target locked for the life of the window is its own defect.
+
+**An unknown outcome holds its claim until something confirms it.** The claim used
+to be released on the way into the very read meant to confirm it, which let a
+second write start against a target whose state nobody knew. Reads never take the
+claim, so holding it across reconciliation costs nothing. The bridge has no
+timeout, so the read has one: on expiry the target stays blocked — nothing was
+confirmed — but the block becomes a stated uncertainty with a re-read attached,
+rather than a spinner with no end.
+
+**A refusal and an unknown outcome are different things.** A backend that answers
+"no" is a fact about the request. A call that fell over in transport is not:
+whether the write was applied is genuinely unknown, and the screen says so, keeps
+the draft — in the provider, so it survives a remount — re-reads the registry, and
+never repeats the write. Whether that re-read actually succeeded is reported as
+itself: "the registry has been re-read" is only ever printed when it has.
+
+The renderer owns no validation rules. Save is enabled by the same
+`newOperationTargetSchema` the IPC layer parses against, so the button cannot be
+live for something the main process is about to refuse. Every result on screen
+is a persisted `OperationDiagnosticRun` read back from the database — never an
+object the UI assembled — and truncation, warnings and unknown values are shown
+as themselves rather than folded into a green tick or defaulted to `0`.
+
 ---
 
 ## 8. Testing strategy
 
-1063 tests, none of which contact Codex, Claude, or GitHub.
+1126 tests, none of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|
@@ -636,6 +741,34 @@ instead.
 | `db/operations-repositories` | Migration 3 on a fresh database *and* on one that already has 1 and 2, CRUD, uniqueness, the `RESTRICT` audit policy, close/reopen on disk |
 | `adapters/local-sqlite-probe` | **The probe against real SQLite files in a real child process**: read-only proven by hash, size, mtime and the absence of a `-wal`, truncation counts, timeout, cancellation, stdout/stderr separation |
 | `services/operations-diagnostics` · `services/operations-startup-recovery` | The order of events around a probe, the one-at-a-time rule, redaction before persistence, and recovery of a diagnostic an abrupt exit left open |
+| `renderer/operations-view` | **The Operations screen, driven through its real buttons and fields** against a fake preload bridge: reachability without a project, disabled Save, exact IPC payloads, no automatic runs, double clicks, late answers, and the absence of a false success |
+| `renderer/operations-async` | **The screen's asynchronous state**: a failed load asked once and retried only on request, per-target history, answers arriving out of order, a stale list that must not undo a confirmed write, one action per target at a time, and a write whose outcome nobody knows |
+| `renderer/operations-backend-state` | **What the screen knows about work it did not start**: a run the backend is executing, a bounded page that has scrolled past it, a claim held across the read meant to confirm it, and a first list response a write overtook |
+
+### Renderer tests
+
+The renderer suite renders real components and clicks real buttons. A helper
+test that never mounts JSX proves the helper; it does not prove that a button is
+wired to it, that Save is disabled when it should be, or that a late answer
+cannot overwrite the screen — which is most of what can go wrong in a UI.
+
+The whole of the renderer's view of the outside world is
+`window.agentRelay.invoke`, so replacing that one function is enough to drive
+every screen with no main process, database or child process anywhere. Races are
+driven by **deferred promises**, never by sleeps: a test that decides when each
+answer arrives is a test whose result does not depend on how loaded the machine
+is.
+
+A double click has to be fired as one: `fireEvent` is wrapped in `act`, so two
+consecutive calls re-render in between and the second lands on a button that is
+already disabled — which tests the attribute, not the guard behind it. The
+harness's `burstClick` nests the clicks inside a single `act` so nothing is
+flushed between them.
+
+Only these files run in `jsdom`, opted into per file with an
+`@vitest-environment` docblock. Everything else — the process, SQLite and Git
+suites — keeps running in a real Node environment, which is the point of putting
+the choice next to the tests that need it rather than in a glob nobody reads.
 
 ### The process-level contract suite
 
