@@ -53,9 +53,21 @@ export function OperationsView(): React.JSX.Element {
     targetsUncertain,
     targetsComplete,
     selectedTarget,
+    writeResolution,
     loadTargets,
     selectTarget
   } = useOperations();
+
+  /*
+    A removal that took effect leaves no target, and so no target panel to say
+    so in. The outcome still has to be reported somewhere, so it is reported
+    here — against the list the operator is looking at.
+  */
+  const settledRemovals = Object.entries(writeResolution).filter(
+    ([id, resolution]) =>
+      resolution.kind === 'matches-request' &&
+      !targets.some((target) => target.id === id)
+  );
 
   // A refresh of a list that is already on screen. The first load has its own
   // branch below; this is the case that showed nothing at all, so a slow read
@@ -122,10 +134,21 @@ export function OperationsView(): React.JSX.Element {
               </button>
             </div>
           ) : targets.length === 0 && targetsComplete ? (
-            <Empty
-              title="No targets registered"
-              hint="Register a local SQLite database to inspect it."
-            />
+            <div>
+              {settledRemovals.length > 0 ? (
+                <div style={{ padding: '12px 16px 0' }}>
+                  <Notice tone="info">
+                    <strong>The registry now matches the requested state.</strong> The
+                    registration is no longer listed. That is what the re-read found;
+                    it is not proof that this request is what removed it.
+                  </Notice>
+                </div>
+              ) : null}
+              <Empty
+                title="No targets registered"
+                hint="Register a local SQLite database to inspect it."
+              />
+            </div>
           ) : (
             <div className="list">
               {/*
@@ -142,6 +165,15 @@ export function OperationsView(): React.JSX.Element {
                   </Notice>
                 </div>
               )}
+              {settledRemovals.length > 0 ? (
+                <div style={{ padding: '12px 16px' }}>
+                  <Notice tone="info">
+                    <strong>The registry now matches the requested state.</strong> The
+                    registration is no longer listed. That is what the re-read found;
+                    it is not proof that this request is what removed it.
+                  </Notice>
+                </div>
+              ) : null}
               {targets.map((target) => (
                 <button
                   key={target.id}
@@ -235,6 +267,8 @@ function RegisterForm(): React.JSX.Element {
     createUnconfirmed,
     createResolution,
     createReconciling,
+    createLateError,
+    registryBusy,
     targetsComplete,
     rereadRegistry
   } = useOperations();
@@ -262,6 +296,9 @@ function RegisterForm(): React.JSX.Element {
     !saving &&
     !creating &&
     createUnconfirmed === null &&
+    // One registry mutation at a time: an edit or a removal in flight can decide
+    // whether this name is free, and neither request knows about the other.
+    !registryBusy &&
     targetsComplete;
 
   return (
@@ -276,11 +313,14 @@ function RegisterForm(): React.JSX.Element {
         void (async () => {
           const outcome = await createTarget(validation.value);
           setSaving(false);
-          // The draft survives anything but a confirmed success — including an
-          // outcome nobody knows, where clearing the form would suggest the
+          // Deliberately does NOT clear the form on success. The provider does
+          // that, and only while the draft still holds exactly what was
+          // submitted — clearing it here as well threw away a second
+          // registration the operator had begun typing while the first was
+          // still in the air. The draft survives everything else too, including
+          // an outcome nobody knows, where an empty form would suggest the
           // target had been registered.
-          if (outcome.ok) setCreateDraft(null);
-          else setError(outcome.error);
+          if (!outcome.ok) setError(outcome.error);
         })();
       }}
     >
@@ -400,6 +440,20 @@ function RegisterForm(): React.JSX.Element {
           registry has been read in full and does not contain it. Your entry has
           been kept; submit it again when you are ready.
         </Notice>
+      ) : null}
+      {createLateError ? (
+        <div>
+          {/*
+            An answer that arrived after the form had been told the outcome was
+            unknown. There is no return value left to carry it, so it is shown
+            here instead of being dropped.
+          */}
+          <Notice tone="warn">
+            <strong>The registration was answered after all, and refused.</strong>{' '}
+            Nothing was registered, and nothing was sent again.
+          </Notice>
+          <WriteErrorNotice error={createLateError} />
+        </div>
       ) : null}
       {error ? <WriteErrorNotice error={error} /> : null}
 
@@ -522,7 +576,15 @@ function TargetPanel({ target }: { target: OperationTarget }): React.JSX.Element
 }
 
 function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Element {
-  const { updateTarget, deleteTarget, isBusy, lateWriteError, unconfirmed } = useOperations();
+  const {
+    updateTarget,
+    deleteTarget,
+    isBusy,
+    lateWriteError,
+    writeResolution,
+    registryBusy,
+    unconfirmed
+  } = useOperations();
   // This panel's own error, for the same reason the registration form keeps
   // its own: a refusal here must not appear anywhere else on the screen.
   // Carried with the fact of whether it described an *unknown* outcome, because
@@ -579,7 +641,65 @@ function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Elemen
     draft.databasePath !== original.databasePath;
 
   const validation = validateDraft(draft);
-  const canSave = editing && dirty && validation.ok && !saving && !busy;
+  // `registryBusy` as well as this target's own state: a registration in flight
+  // can decide this edit's outcome through the name it claims, so the two are
+  // applied one at a time rather than raced.
+  const canSave = editing && dirty && validation.ok && !saving && !busy && !registryBusy;
+  const held = busy || registryBusy;
+
+  const settlement = writeResolution[target.id];
+  const lateRefusal = lateWriteError[target.id];
+
+  /**
+   * What the confirming read established, and nothing more.
+   *
+   * Worded as a statement about the registry rather than about the request:
+   * a read can say what is stored now, never which request stored it.
+   */
+  const settlementNotice =
+    settlement === undefined ? null : settlement.kind === 'matches-request' ? (
+      <Notice tone="info">
+        <strong>The registry now matches the requested state.</strong> That is what
+        the re-read found; it is not proof that this request is what applied it.
+      </Notice>
+    ) : settlement.kind === 'unchanged' ? (
+      <Notice tone="warn">
+        <strong>The change did not take effect.</strong> The registry was re-read in
+        full and still holds exactly what it held before. Nothing was sent again.
+      </Notice>
+    ) : settlement.kind === 'conflicting' ? (
+      <Notice tone="warn">
+        <strong>The registry holds something else.</strong> It matches neither the
+        change that was requested nor the state before it. Read it again before
+        deciding what to do.
+      </Notice>
+    ) : (
+      <Notice tone="warn">
+        <strong>The registry could not be read back in full.</strong> Whether the
+        change took effect is still unknown.
+      </Notice>
+    );
+
+  /*
+    Rendered above the edit/read split, so a late answer is visible whether or
+    not the editor happens to be open — it used to be shown only in the
+    read-only branch, which hid the backend's actual reason from the person who
+    had just been told the outcome was unknown. One place, so never twice.
+  */
+  const answerNotices = (
+    <>
+      {lateRefusal ? (
+        <div style={{ marginTop: 12 }}>
+          <Notice tone="warn">
+            <strong>The change was answered after all, and refused.</strong> Nothing
+            was applied, and nothing was sent again.
+          </Notice>
+          <WriteErrorNotice error={lateRefusal} />
+        </div>
+      ) : null}
+      {settlementNotice ? <div style={{ marginTop: 12 }}>{settlementNotice}</div> : null}
+    </>
+  );
 
   return (
     <Card
@@ -588,6 +708,8 @@ function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Elemen
         <span className="tag">{target.enabled ? 'Enabled' : 'Disabled'}</span>
       }
     >
+      {answerNotices}
+
       {editing ? (
         <form
           className="stack stack--tight"
@@ -715,26 +837,11 @@ function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Elemen
             </div>
           ) : null}
 
-          {lateWriteError[target.id] ? (
-            <div style={{ marginTop: 12 }}>
-              {/*
-                An answer that arrived after the screen had given up waiting.
-                The call that asked for it returned an unknown outcome long ago,
-                so this is the only place left to say what the registry decided.
-              */}
-              <Notice tone="warn">
-                <strong>The change was answered after all, and refused.</strong> Nothing
-                was applied, and nothing was sent again.
-              </Notice>
-              <WriteErrorNotice error={lateWriteError[target.id]!} />
-            </div>
-          ) : null}
-
           <div className="row" style={{ marginTop: 14 }}>
             <button
               type="button"
               className="btn btn--sm"
-              disabled={busy}
+              disabled={held}
               onClick={() => {
                 clearWriteError();
                 setDraft(original);
@@ -747,7 +854,7 @@ function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Elemen
             <button
               type="button"
               className="btn btn--sm"
-              disabled={busy}
+              disabled={held}
               onClick={() => {
                 clearWriteError();
                 void (async () => {
@@ -763,7 +870,7 @@ function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Elemen
               <button
                 type="button"
                 className="btn btn--sm btn--danger"
-                disabled={busy}
+                disabled={held}
                 onClick={() => {
                   clearWriteError();
                   setConfirmingDelete(true);
@@ -785,7 +892,7 @@ function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Elemen
                 <button
                   type="button"
                   className="btn btn--sm btn--danger"
-                  disabled={busy}
+                  disabled={held}
                   onClick={() => {
                     void (async () => {
                       const outcome = await deleteTarget(target.id);

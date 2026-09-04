@@ -694,6 +694,27 @@ every change goes through a setter that writes both halves in the same turn. The
 failure this prevents is worse than a stuck button — the store cleared, the ref
 kept, and an *enabled* Run that silently reached no channel at all.
 
+**A read that was overtaken is not evidence, and neither is a flag.** A list
+read reports what it actually established — accepted, superseded, overtaken,
+failed or timed out — and only `accepted` carries rows. It used to answer with a
+boolean that, once superseded, fell back to a flag meaning *a complete list
+existed at some point*; reconciliation read that as its own confirmation and
+cleared a doubt on the strength of a read that had proved nothing. Each
+reconciliation also carries a generation, so an older one cannot write its
+verdict over a newer one's, nor report the newer one as finished.
+
+**A read-back says what the registry holds, never who put it there.** After an
+unknown update or delete, a read that merely *succeeded* is not settlement. The
+target as it stood before the request is kept, and the completed read is compared
+against both it and what was asked for, giving four different things to say: the
+registry now matches the requested state, the registry is unchanged so the change
+did not take effect, the registry holds neither, or there is no complete current
+read and the outcome is still unknown. Only the first three release the block,
+and the first is worded as what it is — a statement about the registry, not a
+claim that this request is what applied it. Clearing the doubt on `read
+succeeded` alone was how a mutation that never applied left the operator with no
+notice at all, because the error notice was cleared along with it.
+
 **A read decides nothing once it has been overtaken.** The deep search for a run
 that has scrolled off the page is slow enough for a later refresh to answer the
 same question first, so it re-checks that it is still the current read — after its
@@ -729,15 +750,47 @@ timeout, so the read has one: on expiry the target stays blocked — nothing was
 confirmed — but the block becomes a stated uncertainty with a re-read attached,
 rather than a spinner with no end.
 
-**A registry write is waited for, not waited on for ever.** The write has the
-same bound as a probe, and for the same reason: the bridge cannot be cancelled,
-so a request that never settles used to hold the claim — and the `finally` that
-releases it — for the life of the window. Expiry is this screen's patience
-running out and nothing else. The target stays blocked, the write is never sent
-again, and the answer, when it comes, is applied exactly once by whichever path
-reaches it first. An answer that arrives after the caller has been handed an
-uncertain outcome has nowhere to be returned to, so a late refusal is recorded
-against the target and shown there rather than dropped.
+**Every call is waited for, and none is waited on for ever.** One helper does
+it: it bounds the wait, applies the answer exactly once from whichever path
+reaches it first, and tells that path whether the wait had already expired. Every
+write (30s) and every read (10s) goes through it. This was not always true, and
+the exception mattered: registration had no bound at all, so a bridge that never
+answered left `Saving…` on screen, the draft stuck and no uncertain outcome to
+recover from, for the life of the window. Reads had none either — an unanswered
+list read meant `Loading targets…` with no retry, and an unanswered 500-row
+search for a run meant a target blocked with its release never offered, the very
+lock-up that search exists to prevent.
+
+Expiry is this screen's patience running out and nothing else. The request is not
+cancelled, it is never sent again, the target stays blocked, and a timeout is
+never treated as an answer — least of all as evidence that anything reached a
+terminal state. An answer that arrives after the caller has been handed an
+uncertain outcome has nowhere to be returned to, so it is recorded where the
+screen can still show it: a late refusal appears against its target whether or
+not the editor happens to be open, and exactly once. An answer that arrives while
+the confirming read is still running outranks that read, and is returned to the
+caller rather than reported as an unknown outcome.
+
+**One registry mutation at a time.** Registration, edit and removal are
+serialised through a single synchronous claim. They are not independent of each
+other: the registry holds one target per `(environment, name)`, so a create in
+flight can decide an edit's outcome and neither request knows about the other.
+Diagnostics are unaffected — they are per target and read-only.
+
+The claim is held until the backend request has actually **answered**, not until
+this renderer stops waiting for it. Releasing it on expiry looked reasonable and
+was not: nothing cancels the request, so a timed-out registration is still on its
+way to the registry, and an edit started on top of it is exactly the concurrent
+pair the claim exists to prevent. The answer releases it — success, refusal or
+transport failure alike — exactly once, and a ticket makes that safe: a late
+answer may release only the claim it was itself given, never one a newer request
+now holds. A confirming read does not release it either.
+
+The cost is real and is the intended trade: while a request is outstanding, no
+registry mutation can start anywhere. The target in doubt is blocked regardless;
+this extends that to the registry for as long as a write it does not control may
+still land. What it does not extend to is reading — a diagnostic on another
+target is unaffected.
 
 **A row that matches a registration is not proof that this request made it.**
 The registry allows one target per name and environment, so an identical target
@@ -796,7 +849,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1152 tests, none of which contact Codex, Claude, or GitHub.
+1176 tests, none of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|
@@ -819,6 +872,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 | `renderer/operations-async` | **The screen's asynchronous state**: a failed load asked once and retried only on request, per-target history, answers arriving out of order, a stale list that must not undo a confirmed write, one action per target at a time, and a write whose outcome nobody knows |
 | `renderer/operations-backend-state` | **What the screen knows about work it did not start**: a run the backend is executing, a bounded page that has scrolled past it, a claim held across the read meant to confirm it, and a first list response a write overtook |
 | `renderer/operations-recovery` | **Recovery, and what must not depend on anything else**: Operations reachable through a development bootstrap that never finishes, a manual re-read held until every read it needs has answered, an unconfirmed registration resolved against the registry, a probe request that goes unanswered, and one deep search per run |
+| `renderer/operations-evidence` | **What counts as evidence, what a wait means, and who may write**: a superseded list read, two overlapping recoveries, a list, a deep search and a registration that never answer, a late registration answer, a draft replaced while a create was in flight, a create racing an edit in one tick, an answer that beats its own read-back, a refusal arriving with the editor open, and what an unknown update or delete may be said to prove |
 | `renderer/operations-outcomes` | **Which request an outcome belongs to, and what the screen says before it knows**: a matching row that predates the request, a draft and a normalised path that are the same path, a confirming read still in flight, a refresh that says it is working, a registry write that never answers, and coming back to the screen without running anything |
 
 ### Renderer tests

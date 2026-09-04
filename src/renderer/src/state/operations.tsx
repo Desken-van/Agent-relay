@@ -110,6 +110,18 @@ export const DIAGNOSTIC_TIMEOUT_MS = 60_000;
 export const WRITE_TIMEOUT_MS = 30_000;
 
 /**
+ * How long any single read may go unanswered.
+ *
+ * Reads had no bound at all, which is how a bridge that never answered could
+ * leave `Loading targets…` on screen for the life of the window, and how a
+ * 500-row search for one run could hold a target blocked with no way out — the
+ * very lock-up the deep search exists to prevent. Expiry is this screen's
+ * patience running out and nothing more: it is not an answer, it proves no
+ * terminal state, and it always leaves an explicit way to ask again.
+ */
+export const READ_TIMEOUT_MS = 10_000;
+
+/**
  * Where a load has got to.
  *
  * `error` is a resting state: it does not decay back into `idle`, so nothing
@@ -200,6 +212,53 @@ interface ListRead {
   readonly targets: OperationTarget[];
 }
 
+/**
+ * What one list read actually established — never a boolean.
+ *
+ * A boolean cannot tell "this read succeeded" from "a complete list existed at
+ * some point", and conflating the two is how a *superseded* read came to stand
+ * as the confirmation of an unknown write: the branch returned the global
+ * completeness flag, and reconciliation read it as its own evidence. Only
+ * `accepted` is evidence, and it carries the stamp of the read that produced
+ * it, so a caller can tell whether it is looking at its own answer.
+ */
+type ListEvidence =
+  /** This read answered, was still current, and its rows are on screen. */
+  | { readonly kind: "accepted"; readonly stamp: number; readonly targets: OperationTarget[] }
+  /** A newer read owns the phase. This one concludes nothing. */
+  | { readonly kind: "superseded" }
+  /** A write landed while this was in the air; its rows are older than the screen. */
+  | { readonly kind: "overtaken" }
+  /** The backend refused, or the call fell over. */
+  | { readonly kind: "failed" }
+  /** The wait ran out. The request may still answer; this read proves nothing. */
+  | { readonly kind: "timeout" };
+
+/** The same, for the pair of reads a target's reconciliation needs. */
+interface ReconcileEvidence {
+  readonly list: ListEvidence;
+  /** Whether the target's history read also answered. Absent when not asked for. */
+  readonly historyRead: boolean;
+}
+
+/**
+ * What a completed read-back proves about an unknown update or delete.
+ *
+ * Deliberately not a boolean either. "The read succeeded" says nothing about
+ * whether the change took effect, and treating it as though it did let the
+ * screen drop the doubt — and, with it, the error notice — over a mutation
+ * that never applied. Each of these is a different thing to tell an operator.
+ */
+export type WriteResolution =
+  /** The registry now holds what was asked for. Not proof THIS request did it. */
+  | { readonly kind: "matches-request" }
+  /** The target is still exactly as it was before the request. */
+  | { readonly kind: "unchanged" }
+  /** Present, but matching neither the request nor the state before it. */
+  | { readonly kind: "conflicting" }
+  /** No complete current read, so the registry's state is still unknown. */
+  | { readonly kind: "inconclusive" };
+
 /** The registration form's fields, held here while a create is unresolved. */
 export interface RegistrationDraft {
   readonly name: string;
@@ -256,9 +315,22 @@ interface OperationsState {
    * "nobody knows" for a request the backend had in fact answered, and said no to.
    */
   readonly lateWriteError: Readonly<Record<string, SerializedError>>;
+  /**
+   * What the confirming read-back established about an unknown write.
+   *
+   * Kept per target and stated in its own words, because "the read worked" is
+   * not "the change took effect": the registry can come back holding the
+   * requested state, holding exactly what it held before, or holding something
+   * that is neither.
+   */
+  readonly writeResolution: Readonly<Record<string, WriteResolution>>;
+  /** True while any registry mutation is in flight, anywhere. */
+  readonly registryBusy: boolean;
 
   /** Survives a remount, so an unresolved registration is not retyped. */
   readonly createDraft: RegistrationDraft | null;
+  /** A registration refusal that arrived after the screen stopped waiting. */
+  readonly createLateError: SerializedError | null;
   readonly createUnconfirmed: Unconfirmed | null;
   /** What the confirming read established about it. Null until it has run. */
   readonly createResolution: CreateResolution | null;
@@ -300,6 +372,9 @@ type Action =
       targetId: string;
       error: SerializedError | null;
     }
+  | { type: "write-resolution"; targetId: string; value: WriteResolution | null }
+  | { type: "registry-busy"; value: boolean }
+  | { type: "create-late-error"; error: SerializedError | null }
   | { type: "create-draft"; draft: RegistrationDraft | null }
   | { type: "create-unconfirmed"; value: Unconfirmed | null }
   | { type: "create-resolution"; value: CreateResolution | null }
@@ -326,7 +401,10 @@ const initialState: OperationsState = {
   uncertain: {},
   runError: {},
   lateWriteError: {},
+  writeResolution: {},
+  registryBusy: false,
   createDraft: null,
+  createLateError: null,
   createUnconfirmed: null,
   createResolution: null,
   createReconciling: false,
@@ -357,6 +435,49 @@ function draftMatches(
     // changed nothing that the form was theirs to keep, and left a stale entry
     // in front of a target that had in fact been registered.
     normalizeTargetPath(draft.databasePath) === input.config.databasePath
+  );
+}
+
+/**
+ * Does this target already hold everything the patch asked for?
+ *
+ * Only the keys the patch actually carried are compared: a patch that changed
+ * one field says nothing about the others, and demanding they match too would
+ * report a successful edit as a conflict.
+ */
+function matchesPatch(
+  target: OperationTarget,
+  patch: OperationTargetPatch,
+): boolean {
+  if (patch.name !== undefined && target.name !== patch.name) return false;
+  if (patch.environment !== undefined && target.environment !== patch.environment) {
+    return false;
+  }
+  if (patch.enabled !== undefined && target.enabled !== patch.enabled) return false;
+  if (
+    patch.credentialRef !== undefined &&
+    target.credentialRef !== patch.credentialRef
+  ) {
+    return false;
+  }
+  if (patch.config !== undefined) {
+    if (target.config.adapterType !== patch.config.adapterType) return false;
+    if (target.config.version !== patch.config.version) return false;
+    if (target.config.databasePath !== patch.config.databasePath) return false;
+  }
+  return true;
+}
+
+/** Is this the same registration, field for field, as the one recorded before? */
+function sameRegistration(a: OperationTarget, b: OperationTarget): boolean {
+  return (
+    a.id === b.id &&
+    a.name === b.name &&
+    a.environment === b.environment &&
+    a.enabled === b.enabled &&
+    a.credentialRef === b.credentialRef &&
+    a.config.adapterType === b.config.adapterType &&
+    a.config.databasePath === b.config.databasePath
   );
 }
 
@@ -459,6 +580,7 @@ function reducer(state: OperationsState, action: Action): OperationsState {
         historyPhase: withoutKey(state.historyPhase, action.targetId),
         lastRun: withoutKey(state.lastRun, action.targetId),
         lateWriteError: withoutKey(state.lateWriteError, action.targetId),
+        writeResolution: withoutKey(state.writeResolution, action.targetId),
         // `backendRuns` is deliberately NOT cleared here. It is mirrored in a
         // ref that the synchronous guards read, and a reducer cannot reach that
         // ref — clearing one without the other is exactly how the screen and the
@@ -583,6 +705,21 @@ function reducer(state: OperationsState, action: Action): OperationsState {
     case "create-unconfirmed":
       return { ...state, createUnconfirmed: action.value };
 
+    case "write-resolution":
+      return {
+        ...state,
+        writeResolution:
+          action.value === null
+            ? withoutKey(state.writeResolution, action.targetId)
+            : { ...state.writeResolution, [action.targetId]: action.value },
+      };
+
+    case "registry-busy":
+      return { ...state, registryBusy: action.value };
+
+    case "create-late-error":
+      return { ...state, createLateError: action.error };
+
     case "create-resolution":
       return { ...state, createResolution: action.value };
 
@@ -650,6 +787,38 @@ async function withTimeout<T>(
   }
 }
 
+/**
+ * Wait for a request, but not for ever, and apply its answer exactly once.
+ *
+ * The one mechanism behind every bounded call on this screen — reads and writes
+ * alike — so that there is a single place where "the wait ended" is kept apart
+ * from "the work ended". `onAnswer` runs once, from whichever path reaches the
+ * answer first, and is told whether the wait had already expired: a late answer
+ * has no caller left to return to, so it has to write what it learned somewhere
+ * the screen can show. The request is never cancelled and never repeated.
+ */
+async function runBounded<T>(
+  request: Promise<T>,
+  ms: number,
+  onAnswer: (value: T, afterExpiry: boolean) => void,
+): Promise<{ readonly expired: boolean }> {
+  let expired = false;
+  let answered = false;
+
+  void request.then((value) => {
+    if (answered) return;
+    answered = true;
+    onAnswer(value, expired);
+  });
+
+  expired = await withTimeout(
+    request.then(() => false),
+    ms,
+    () => true,
+  );
+  return { expired };
+}
+
 const UNCERTAIN_MESSAGE =
   "The request did not come back, so whether it was applied is unknown.";
 
@@ -660,8 +829,21 @@ const UNCERTAIN_MESSAGE =
  * fell over and is over; here it is still in flight, and the difference decides
  * whether a subsequent read is allowed to settle the question.
  */
+const LIST_TIMEOUT_MESSAGE =
+  "The registry did not answer in time. It was not cancelled, so what is registered is still unknown.";
+
+const HISTORY_TIMEOUT_MESSAGE =
+  "The recorded history did not answer in time, so nothing here is evidence about the runs on this target.";
+
 const WRITE_TIMEOUT_MESSAGE =
   "The change was not answered in time. It has not been cancelled, so whether it was applied is unknown.";
+
+const REGISTRY_BUSY: SerializedError = {
+  code: "VALIDATION_FAILED",
+  message: "Another change to the registry is still in progress.",
+  remediation:
+    "Registrations, edits and removals are applied one at a time. Wait for the current one to finish, then try again.",
+};
 
 const BLOCKED: SerializedError = {
   code: "VALIDATION_FAILED",
@@ -783,6 +965,31 @@ export function OperationsProvider({
   const runSeq = useRef<Record<string, number>>({});
   /** The same for registry writes, so a late answer knows if it is stale. */
   const writeSeq = useRef<Record<string, number>>({});
+  /** The same, for the registration, which has no target id to be keyed by. */
+  const createSeq = useRef(0);
+  /**
+   * Which reconciliation currently owns a target, and which owns the create.
+   *
+   * A generation, not a boolean, because two recoveries can overlap: a manual
+   * re-read started while an automatic one is still in the air. Without this
+   * the older one wrote its conclusion over the newer one's, and its finaliser
+   * cleared the newer one's in-progress flag — reopening a target while the
+   * newer read, and possibly the original write, were both still outstanding.
+   */
+  const reconcileSeq = useRef<Record<string, number>>({});
+  const createReconcileSeq = useRef(0);
+  /**
+   * The one registry mutation allowed to be in flight, whatever its shape.
+   *
+   * Create had no arbitration with update and delete at all: it checked only
+   * its own flag, so a registration could be sent while an edit or a removal
+   * of the same `(environment, name)` was still in the air, and which of them
+   * the registry saw first decided the outcome. A synchronous ref rather than a
+   * disabled button, because two clicks in one tick see the same rendered state.
+   */
+  const registryWriteRef = useRef<number | null>(null);
+  /** Ticket numbers for that slot, so a late answer can prove it still owns it. */
+  const registryTicket = useRef(0);
   /** A create re-read in flight, so a second click does not start another. */
   const createRereadRef = useRef(false);
   /** What the unresolved create actually submitted. */
@@ -974,6 +1181,40 @@ export function OperationsProvider({
     [],
   );
 
+  /**
+   * Take the single registry-mutation slot, or refuse.
+   *
+   * Held until the backend request it belongs to has actually ANSWERED — not
+   * merely until this renderer stops waiting for it. Releasing on expiry looked
+   * reasonable and was not: nothing cancels the request, so a timed-out create
+   * is still on its way to the registry, and letting an edit or a removal start
+   * on top of it is exactly the concurrent pair the slot exists to prevent.
+   *
+   * The ticket is what makes releasing safe. A late answer from a request that
+   * has long since been superseded must not hand away a slot somebody else now
+   * holds, so it may only release the ticket it was given.
+   */
+  const claimRegistry = useCallback((): number | null => {
+    if (registryWriteRef.current !== null) return null;
+    const ticket = ++registryTicket.current;
+    registryWriteRef.current = ticket;
+    dispatch({ type: "registry-busy", value: true });
+    return ticket;
+  }, []);
+
+  /** Release the slot, but only for the request that still holds it, once. */
+  const releaseRegistry = useCallback((ticket: number): void => {
+    if (registryWriteRef.current !== ticket) return;
+    registryWriteRef.current = null;
+    dispatch({ type: "registry-busy", value: false });
+  }, []);
+
+  /** Mirror the registration's doubt into its ref as it is written. */
+  const setCreateUnconfirmed = useCallback((value: Unconfirmed | null): void => {
+    createUnconfirmedRef.current = value;
+    dispatch({ type: "create-unconfirmed", value });
+  }, []);
+
   /* ------------------------------------------------------------------ reads */
 
   /**
@@ -985,52 +1226,79 @@ export function OperationsProvider({
    * rather than from an effect, so a read error can never become a retry loop.
    * Returns whether a complete list is now on screen.
    */
-  const loadTargets = useCallback(async (retries = 1): Promise<boolean> => {
-    // Named inner function so the bounded re-read below can call itself; the
-    // memoised const cannot legally refer to itself.
-    const readOnce = async (remaining: number): Promise<boolean> => {
-      const seq = ++listSeq.current;
-      const epoch = writeEpoch.current;
-      dispatch({ type: "targets-loading" });
-
-      const outcome = await attempt("operations:listTargets", {});
-
-      // A newer list request has already been made and owns the phase. Returning
-      // the phase to `idle` here would be read by the mount effect as "never
-      // loaded" and start a third request on top of the second.
-      if (listSeq.current !== seq) return completeRef.current;
-
-      // A write finished while this was in the air. What is on screen came from
-      // that write and is newer than anything this response can say.
-      if (writeEpoch.current !== epoch) {
-        // Before the first complete read, "what is on screen" is only what that
-        // write added — announcing it as the registry would hide every existing
-        // registration. One bounded re-read, then say plainly that it is partial.
-        if (!completeRef.current && remaining > 0)
-          return readOnce(remaining - 1);
-        dispatch({ type: "targets-overtaken" });
-        return completeRef.current;
-      }
-
-      if (outcome.kind === "ok") {
+  const loadTargets = useCallback(
+    async (retries = 1): Promise<ListEvidence> => {
+      /** Take a complete answer as the registry, and hand it back as evidence. */
+      const accept = (targets: OperationTarget[]): ListEvidence => {
         completeRef.current = true;
         listStamp.current += 1;
-        lastList.current = {
-          stamp: listStamp.current,
-          targets: outcome.data,
-        };
-        dispatch({ type: "targets", targets: outcome.data });
-        return true;
-      }
+        lastList.current = { stamp: listStamp.current, targets };
+        dispatch({ type: "targets", targets });
+        return { kind: "accepted", stamp: listStamp.current, targets };
+      };
 
-      if (outcome.kind === "refused")
-        dispatch({ type: "targets-error", error: outcome.error });
-      else dispatch({ type: "targets-uncertain", message: outcome.message });
-      return false;
-    };
+      // Named inner function so the bounded re-read below can call itself; the
+      // memoised const cannot legally refer to itself.
+      const readOnce = async (remaining: number): Promise<ListEvidence> => {
+        const seq = ++listSeq.current;
+        const epoch = writeEpoch.current;
+        dispatch({ type: "targets-loading" });
 
-    return readOnce(retries);
-  }, []);
+        const request = attempt("operations:listTargets", {});
+
+        // The wait is bounded; the request is not. An answer arriving after this
+        // call has given up is still true data and is still applied — but it can
+        // never be handed back as THIS call's evidence, because by then the
+        // caller has already been told the read did not answer.
+        const { expired } = await runBounded(
+          request,
+          READ_TIMEOUT_MS,
+          (outcome, afterExpiry) => {
+            if (!afterExpiry) return;
+            if (listSeq.current !== seq) return;
+            if (writeEpoch.current !== epoch) return;
+            if (outcome.kind === "ok") accept(outcome.data);
+          },
+        );
+
+        if (expired) {
+          // Not `idle`: the mount effect reads that as "never loaded" and would
+          // start a third request. An explicit uncertainty with a Retry instead.
+          if (listSeq.current !== seq) return { kind: "superseded" };
+          dispatch({ type: "targets-uncertain", message: LIST_TIMEOUT_MESSAGE });
+          return { kind: "timeout" };
+        }
+
+        const outcome = await request;
+
+        // A newer list request owns the phase. This one establishes nothing —
+        // and must not answer with what some earlier read happened to prove.
+        if (listSeq.current !== seq) return { kind: "superseded" };
+
+        // A write finished while this was in the air. What is on screen came
+        // from that write and is newer than anything this response can say.
+        if (writeEpoch.current !== epoch) {
+          // Before the first complete read, "what is on screen" is only what
+          // that write added — announcing it as the registry would hide every
+          // existing registration. One bounded re-read, then say it is partial.
+          if (!completeRef.current && remaining > 0)
+            return readOnce(remaining - 1);
+          dispatch({ type: "targets-overtaken" });
+          return { kind: "overtaken" };
+        }
+
+        if (outcome.kind === "ok") return accept(outcome.data);
+
+        if (outcome.kind === "refused")
+          dispatch({ type: "targets-error", error: outcome.error });
+        else dispatch({ type: "targets-uncertain", message: outcome.message });
+        return { kind: "failed" };
+      };
+
+      return readOnce(retries);
+    },
+    [],
+  );
 
   /**
    * Decide what a history page says about a run the backend was executing.
@@ -1086,10 +1354,23 @@ export function OperationsProvider({
 
         let deep: Attempt<OperationDiagnosticRun[]>;
         try {
-          deep = await attempt("operations:listDiagnostics", {
-            targetId,
-            limit: HISTORY_DEEP_LIMIT,
-          });
+          // Bounded, because the operator's only way out depends on this read:
+          // while it hangs, `searchedDeeply` is never set, the release is never
+          // offered, and the target stays blocked for the life of the window —
+          // the exact lock-up this search exists to prevent. A timeout is not an
+          // answer, so it falls through to the same branch as a failed search:
+          // the block stands, and the explicit release appears.
+          deep = await withTimeout(
+            attempt("operations:listDiagnostics", {
+              targetId,
+              limit: HISTORY_DEEP_LIMIT,
+            }),
+            READ_TIMEOUT_MS,
+            (): Attempt<OperationDiagnosticRun[]> => ({
+              kind: "unknown",
+              message: HISTORY_TIMEOUT_MESSAGE,
+            }),
+          );
         } finally {
           if (deepReadRef.current[targetId] === tracked.runId) {
             delete deepReadRef.current[targetId];
@@ -1136,10 +1417,21 @@ export function OperationsProvider({
       historySeq.current[targetId] = seq;
 
       dispatch({ type: "history-loading", targetId });
-      const outcome = await attempt("operations:listDiagnostics", {
-        targetId,
-        limit: HISTORY_LIMIT,
-      });
+      // Bounded for the same reason as the list: a read that never answers must
+      // not leave a spinner with nothing past it. A timeout is reported as an
+      // unknown outcome, never as an answer, so nothing below treats it as
+      // evidence about a tracked run.
+      const outcome = await withTimeout(
+        attempt("operations:listDiagnostics", {
+          targetId,
+          limit: HISTORY_LIMIT,
+        }),
+        READ_TIMEOUT_MS,
+        (): Attempt<OperationDiagnosticRun[]> => ({
+          kind: "unknown",
+          message: HISTORY_TIMEOUT_MESSAGE,
+        }),
+      );
 
       // Superseded: the newer request owns this target's phase (see above).
       if (historySeq.current[targetId] !== seq) return false;
@@ -1187,26 +1479,29 @@ export function OperationsProvider({
    * repeating a write is not — and reports honestly whether the read worked.
    */
   const reconcile = useCallback(
-    async (targetId?: string): Promise<boolean> => {
+    async (targetId?: string): Promise<ReconcileEvidence> => {
       try {
-        const listed = await loadTargets();
-        if (targetId === undefined) return listed;
-        const read = await loadHistory(targetId);
-        return listed && read;
+        const list = await loadTargets();
+        if (targetId === undefined) return { list, historyRead: false };
+        const historyRead = await loadHistory(targetId);
+        return { list, historyRead };
       } catch {
         // `attempt` swallows rejections, so this is unreachable in practice.
         // It exists so that no path out of a guarded region can skip the
         // release below by throwing.
-        return false;
+        return { list: { kind: "failed" }, historyRead: false };
       }
     },
     [loadTargets, loadHistory],
   );
 
-  /** Reconcile, but stop calling the screen busy if the read never settles. */
+  /** Reconcile, but stop calling the screen busy if the reads never settle. */
   const boundedReconcile = useCallback(
-    async (targetId?: string): Promise<boolean> =>
-      withTimeout(reconcile(targetId), RECONCILE_TIMEOUT_MS, () => false),
+    async (targetId?: string): Promise<ReconcileEvidence> =>
+      withTimeout(reconcile(targetId), RECONCILE_TIMEOUT_MS, () => ({
+        list: { kind: "timeout" as const },
+        historyRead: false,
+      })),
     [reconcile],
   );
 
@@ -1217,11 +1512,22 @@ export function OperationsProvider({
       input: NewOperationTargetInput,
     ): Promise<WriteOutcome<OperationTarget>> => {
       if (creatingRef.current) return { ok: false, error: BLOCKED };
-      if (state.createUnconfirmed !== null) {
-        return { ok: false, error: unconfirmedError(state.createUnconfirmed) };
+      // Read into a local rather than testing the ref in place: narrowing the
+      // ref itself here would follow it down the whole function and make the
+      // live re-read below look impossible.
+      const openDoubt: Unconfirmed | null = createUnconfirmedRef.current;
+      if (openDoubt !== null) {
+        return { ok: false, error: unconfirmedError(openDoubt) };
       }
+      // The same single registry slot every edit and removal takes. Registration
+      // used to check only its own flag, so it could be sent while an edit or a
+      // removal of the same `(environment, name)` was still in the air.
+      const ticket = claimRegistry();
+      if (ticket === null) return { ok: false, error: REGISTRY_BUSY };
+
       creatingRef.current = true;
       dispatch({ type: "creating", value: true });
+      dispatch({ type: "create-late-error", error: null });
 
       // What was selected when Save was pressed. If the user has moved on by the
       // time this lands, the target is still registered — it simply does not
@@ -1233,65 +1539,179 @@ export function OperationsProvider({
       // whatever the create did, which is precisely the question being asked.
       const before = lastList.current;
       createBeforeRef.current = before;
+      createInputRef.current = input;
 
-      try {
-        const result = await attempt("operations:createTarget", input);
+      const seq = ++createSeq.current;
+      // A box rather than a bare `let`: the answer is written from a callback
+      // and read from straight-line code below, and only the indirection keeps
+      // the two seeing the same declared type.
+      const answer: { current: Attempt<OperationTarget> | null } = {
+        current: null,
+      };
+      let returned = false;
 
-        if (result.kind === "ok") {
-          writeEpoch.current += 1;
-          notePersistedTarget(result.data);
-          dispatch({ type: "target-upserted", target: result.data });
+      /**
+       * Clear the form, but only while it still holds what was submitted.
+       *
+       * The success path used to clear it unconditionally, which threw away a
+       * second registration the operator had begun typing while the first was
+       * still in the air — work this request never asked about.
+       */
+      const clearSubmittedDraft = (): void => {
+        if (draftMatches(createDraftRef.current, input)) {
           dispatch({ type: "create-draft", draft: null });
+        }
+      };
+
+      /** Apply the request's own answer, exactly once, early or late. */
+      const applyAnswer = (outcome: Attempt<OperationTarget>): void => {
+        // First, and before any staleness check: the registry slot belongs to
+        // this request, and the request has now answered. Whatever it says, and
+        // whoever is still interested, the next mutation may go ahead.
+        releaseRegistry(ticket);
+
+        if (createSeq.current !== seq) return;
+        answer.current = outcome;
+
+        if (outcome.kind === "ok") {
+          writeEpoch.current += 1;
+          notePersistedTarget(outcome.data);
+          dispatch({ type: "target-upserted", target: outcome.data });
+          clearSubmittedDraft();
           if (selectedRef.current === selectionAtStart) {
-            dispatch({ type: "select", targetId: result.data.id });
+            dispatch({ type: "select", targetId: outcome.data.id });
           }
-          return { ok: true, data: result.data };
+          setCreateUnconfirmed(null);
+          dispatch({
+            type: "create-resolution",
+            value: { kind: "registered", targetId: outcome.data.id },
+          });
+          return;
         }
 
-        if (result.kind === "refused")
-          return { ok: false, error: result.error };
+        if (outcome.kind === "refused") {
+          // Recorded only once nobody is waiting: while the caller is still
+          // here it gets the refusal as its return value, and printing it in
+          // both places would be two notices for one answer.
+          if (returned) {
+            dispatch({ type: "create-late-error", error: outcome.error });
+          }
+          setCreateUnconfirmed(null);
+          return;
+        }
 
-        // Unknown: it may well have been registered. The claim is held across
-        // the confirming read, so a second Save cannot start meanwhile — not
-        // even after the form has been unmounted and remounted.
+        // A transport failure ends the request without saying what it did, so
+        // a read may settle this one — which an outstanding request's may not.
+        // The wording changes with it: "did not answer in time" stops being
+        // true the moment the request answers, even to say it fell over.
+        const doubt = createUnconfirmedRef.current;
+        if (doubt?.outstanding === true) {
+          setCreateUnconfirmed({
+            ...doubt,
+            outstanding: false,
+            message: UNCERTAIN_MESSAGE,
+          });
+        }
+      };
+
+      try {
+        const request = attempt("operations:createTarget", input);
+
+        // The bound update and delete already had, and registration did not: a
+        // bridge that never answered left Saving on screen, the draft stuck and
+        // no uncertain outcome to recover from, for the life of the window.
+        const { expired } = await runBounded(
+          request,
+          WRITE_TIMEOUT_MS,
+          applyAnswer,
+        );
+
+        if (!expired) {
+          const outcome = await request;
+          if (outcome.kind === "ok") return { ok: true, data: outcome.data };
+          if (outcome.kind === "refused")
+            return { ok: false, error: outcome.error };
+        }
+
+        // Either the call fell over or the wait ran out with the request still
+        // in flight. The registration is never sent again in either case.
         writeEpoch.current += 1;
-        createInputRef.current = input;
         const since = listStamp.current;
-        const pending: Unconfirmed = {
-          action: "create",
-          message: UNCERTAIN_MESSAGE,
-          listRefreshed: false,
-        };
-        dispatch({ type: "create-unconfirmed", value: pending });
+        const pending: Unconfirmed = expired
+          ? {
+              action: "create",
+              message: WRITE_TIMEOUT_MESSAGE,
+              listRefreshed: false,
+              outstanding: true,
+            }
+          : {
+              action: "create",
+              message: UNCERTAIN_MESSAGE,
+              listRefreshed: false,
+            };
+        setCreateUnconfirmed(pending);
         dispatch({ type: "create-resolution", value: null });
 
         // Said before the read, cleared after it, so nothing on screen can
         // report the read as having failed while it is still running.
+        const generation = ++createReconcileSeq.current;
         dispatch({ type: "create-reconciling", value: true });
-        let refreshed: boolean;
+        let evidence: ReconcileEvidence;
         try {
-          refreshed = await boundedReconcile();
+          evidence = await boundedReconcile();
         } finally {
-          dispatch({ type: "create-reconciling", value: false });
+          if (createReconcileSeq.current === generation) {
+            dispatch({ type: "create-reconciling", value: false });
+          }
         }
-        const settled: Unconfirmed = { ...pending, listRefreshed: refreshed };
-        const resolution = resolveCreate(input, since, before);
+
+        // A newer recovery owns the registration now; this one says nothing.
+        if (createReconcileSeq.current !== generation) {
+          return {
+            ok: false,
+            uncertain: true,
+            error: unconfirmedError(pending),
+          };
+        }
+
+        // Only an accepted list is evidence. A superseded or timed-out read
+        // leaves the outcome exactly as unknown as it was.
+        const accepted = evidence.list.kind === "accepted";
+        const resolution: CreateResolution = accepted
+          ? resolveCreate(input, since, before)
+          : { kind: "unconfirmed" };
         dispatch({ type: "create-resolution", value: resolution });
 
-        // The doubt is lifted only by an answer, never by the read merely
-        // having happened. The create itself is never sent again.
-        if (resolution.kind === "unconfirmed") {
-          dispatch({ type: "create-unconfirmed", value: settled });
-        } else {
-          dispatch({ type: "create-unconfirmed", value: null });
+        // An exact answer that arrived while the read was running outranks
+        // anything the read could conclude, and the caller is still here.
+        const late = answer.current;
+        if (late !== null) {
+          if (late.kind === "ok") return { ok: true, data: late.data };
+          if (late.kind === "refused") return { ok: false, error: late.error };
+        }
+
+        // The doubt as it stands NOW, not the one this call started with. The
+        // request may have answered while the read was running — `applyAnswer`
+        // then cleared `outstanding` — and rebuilding the state from the
+        // captured `pending` put that flag straight back, leaving the form
+        // disabled over a request that had already finished.
+        const live = createUnconfirmedRef.current;
+        const settled: Unconfirmed = {
+          ...(live ?? pending),
+          listRefreshed: accepted,
+        };
+
+        if (live !== null) {
+          if (resolution.kind === "unconfirmed" || live.outstanding === true) {
+            // A request still in flight is not ended by a read, however complete.
+            setCreateUnconfirmed(settled);
+          } else {
+            setCreateUnconfirmed(null);
+          }
         }
 
         if (resolution.kind === "registered") {
-          // Clear the form only if it still holds what was submitted. Anything
-          // typed since is the operator's work, and this did not ask for it.
-          if (draftMatches(createDraftRef.current, input)) {
-            dispatch({ type: "create-draft", draft: null });
-          }
+          clearSubmittedDraft();
           if (selectedRef.current === selectionAtStart) {
             dispatch({ type: "select", targetId: resolution.targetId });
           }
@@ -1299,11 +1719,22 @@ export function OperationsProvider({
 
         return { ok: false, uncertain: true, error: unconfirmedError(settled) };
       } finally {
+        returned = true;
         creatingRef.current = false;
         dispatch({ type: "creating", value: false });
+        // Deliberately NOT released here. This renderer has stopped waiting;
+        // the request has not stopped running, and only its answer frees the
+        // slot — `applyAnswer` does it, whenever that answer arrives.
       }
     },
-    [boundedReconcile, resolveCreate, notePersistedTarget, state.createUnconfirmed],
+    [
+      boundedReconcile,
+      resolveCreate,
+      notePersistedTarget,
+      claimRegistry,
+      releaseRegistry,
+      setCreateUnconfirmed,
+    ],
   );
 
   /**
@@ -1321,6 +1752,18 @@ export function OperationsProvider({
       kind: WriteKind,
       perform: () => Promise<Attempt<T>>,
       apply: (data: T) => void,
+      /**
+       * What a complete, current read-back proves about this request.
+       *
+       * Passed in because only the caller knows what was asked for. "The read
+       * succeeded" is not "the change took effect", and the screen used to
+       * treat them as the same thing — dropping the doubt, and with it the
+       * error notice, over a mutation that had never applied.
+       */
+      classify: (
+        targets: OperationTarget[],
+        before: OperationTarget | undefined,
+      ) => WriteResolution,
     ): Promise<WriteOutcome<T>> => {
       if (!claim(targetId)) {
         const pending = unconfirmedRef.current[targetId];
@@ -1329,14 +1772,37 @@ export function OperationsProvider({
           error: pending ? unconfirmedError(pending) : BLOCKED,
         };
       }
+      // One registry mutation at a time, whatever its shape. A registration in
+      // flight can decide this one's outcome through `(environment, name)`, and
+      // neither knows about the other, so they are serialised rather than raced.
+      const ticket = claimRegistry();
+      if (ticket === null) return { ok: false, error: REGISTRY_BUSY };
       writeRef.current[targetId] = kind;
       dispatch({ type: "pending-write", targetId, kind });
-      // A refusal recorded after a previous attempt had been given up on is
-      // about that attempt, not this one.
+      // A refusal or a resolution recorded for a previous attempt is about that
+      // attempt, not this one.
       dispatch({ type: "late-write-error", targetId, error: null });
+      dispatch({ type: "write-resolution", targetId, value: null });
 
       const seq = (writeSeq.current[targetId] ?? 0) + 1;
       writeSeq.current[targetId] = seq;
+
+      /** The registration as it stood before this request was sent. */
+      const beforeTarget = lastList.current?.targets.find(
+        (entry) => entry.id === targetId,
+      );
+
+      /**
+       * The request's own answer, once it has one, and whether the caller has
+       * already been given a return value.
+       *
+       * Declared out here because both the wait and the confirming read need
+       * them: an exact answer that arrives while the read-back is still running
+       * outranks anything that read can conclude, and must be returned rather
+       * than reported as an unknown outcome.
+       */
+      let settledAnswer: Attempt<T> | null = null;
+      let returned = false;
 
       /**
        * Read the registry back after an outcome nobody knows.
@@ -1349,30 +1815,87 @@ export function OperationsProvider({
       const reconcileAfterDoubt = async (
         pending: Unconfirmed,
       ): Promise<WriteOutcome<T>> => {
+        const generation = (reconcileSeq.current[targetId] ?? 0) + 1;
+        reconcileSeq.current[targetId] = generation;
         dispatch({ type: "reconciling", targetId, value: true });
         try {
-          const refreshed = await boundedReconcile(targetId);
-          const settled: Unconfirmed = { ...pending, listRefreshed: refreshed };
+          const evidence = await boundedReconcile(targetId);
+
+          // A newer reconciliation owns this target now. This one concludes
+          // nothing: writing its verdict here would overwrite what the newer
+          // read is about to establish, and reopening the target on the
+          // strength of an older look is how a second write starts against a
+          // state the newer read has not finished checking.
+          if (reconcileSeq.current[targetId] !== generation) {
+            return {
+              ok: false,
+              uncertain: true,
+              error: unconfirmedError(pending),
+            };
+          }
+
+          // Only a list this read actually accepted counts, and only together
+          // with the history read the same recovery needed. A superseded read,
+          // an overtaken one and a timeout each prove nothing at all.
+          const accepted =
+            evidence.list.kind === "accepted" ? evidence.list : null;
+          const complete = accepted !== null && evidence.historyRead;
+
+          const resolution: WriteResolution = complete
+            ? classify(accepted.targets, beforeTarget)
+            : { kind: "inconclusive" };
+          dispatch({ type: "write-resolution", targetId, value: resolution });
+
+          // Built from the doubt as it stands now, for the same reason as the
+          // registration's: the request may have answered while this read ran.
           const current = unconfirmedRef.current[targetId];
+          const settled: Unconfirmed = {
+            ...(current ?? pending),
+            listRefreshed: complete,
+          };
           if (current !== undefined && current.action === kind) {
             if (current.outstanding === true) {
               // A request that has not answered has not finished, and no read
               // can say otherwise: an empty page is as consistent with "still
               // being applied" as with "never applied".
-              setUnconfirmed(targetId, { ...current, listRefreshed: refreshed });
-            } else if (refreshed) {
-              setUnconfirmed(targetId, null);
+              setUnconfirmed(targetId, { ...current, listRefreshed: complete });
+            } else if (resolution.kind === "inconclusive") {
+              // The request is over but the registry's state is still unknown,
+              // which is exactly the case a bare `refreshed === true` used to
+              // hide by clearing the doubt anyway.
+              setUnconfirmed(targetId, { ...current, listRefreshed: false });
             } else {
-              setUnconfirmed(targetId, settled);
+              // The request is over and a complete current read says what the
+              // registry holds. That is enough to stop blocking the target —
+              // and the resolution above says which of the three it is, so a
+              // change that never took effect is not passed off as settled.
+              setUnconfirmed(targetId, null);
             }
           }
+
+          // An exact answer that arrived while this read was running is the
+          // better evidence, and the caller is still here to be given it.
+          if (settledAnswer !== null) {
+            if (settledAnswer.kind === "ok") {
+              return { ok: true, data: settledAnswer.data };
+            }
+            if (settledAnswer.kind === "refused") {
+              return { ok: false, error: settledAnswer.error };
+            }
+          }
+
           return {
             ok: false,
             uncertain: true,
             error: unconfirmedError(settled),
           };
         } finally {
-          dispatch({ type: "reconciling", targetId, value: false });
+          // Only the reconciliation that still owns this target may say it has
+          // stopped; an older one clearing the flag would leave the screen
+          // claiming nothing is in progress while the newer read runs.
+          if (reconcileSeq.current[targetId] === generation) {
+            dispatch({ type: "reconciling", targetId, value: false });
+          }
         }
       };
 
@@ -1388,24 +1911,27 @@ export function OperationsProvider({
          * what the registry holds, never whether THIS request is what put it
          * there, so nothing a read concludes may stand in for an answer.
          */
-        let expired = false;
-        let answered = false;
         const applyAnswer = (outcome: Attempt<T>): void => {
-          if (answered) return;
-          answered = true;
+          // First, and before any staleness check: the slot belongs to this
+          // request and the request has answered, so the next mutation may go.
+          releaseRegistry(ticket);
 
           // A newer write owns this target: this answer describes a request
           // nobody is waiting on any more.
           if (writeSeq.current[targetId] !== seq) return;
+          settledAnswer = outcome;
 
           if (outcome.kind === "ok") {
             writeEpoch.current += 1;
             apply(outcome.data);
-          } else if (outcome.kind === "refused" && expired) {
-            // The caller was handed an uncertain outcome long ago, so there is
-            // no return value left to carry this. Dropping it would leave
-            // "nobody knows" standing over a request the backend had answered.
+            dispatch({ type: "write-resolution", targetId, value: null });
+          } else if (outcome.kind === "refused" && returned) {
+            // Nobody is waiting any more, so the refusal has to be recorded
+            // where the screen can still show it. While the caller IS still
+            // waiting it gets the refusal as its return value instead — writing
+            // it in both places would be two notices for one answer.
             dispatch({ type: "late-write-error", targetId, error: outcome.error });
+            dispatch({ type: "write-resolution", targetId, value: null });
           }
 
           // Whatever it said, the request has come back. A doubt that still
@@ -1418,21 +1944,22 @@ export function OperationsProvider({
             setUnconfirmed(
               targetId,
               outcome.kind === "unknown"
-                ? { ...doubt, outstanding: false }
+                ? // Answered, even if only to say it fell over: "did not answer
+                  // in time" has stopped being true and the wording follows.
+                  { ...doubt, outstanding: false, message: UNCERTAIN_MESSAGE }
                 : null,
             );
           }
         };
 
-        void request.then(applyAnswer);
-
         // This renderer's patience, and nothing more. Expiry is a fact about
         // how long the screen was prepared to wait — never a fact about the
-        // request, which was not cancelled and may still be applied.
-        expired = await withTimeout(
-          request.then(() => false),
+        // request, which was not cancelled and may still be applied. The shared
+        // helper is what guarantees the answer is applied exactly once.
+        const { expired } = await runBounded(
+          request,
           WRITE_TIMEOUT_MS,
-          () => true,
+          applyAnswer,
         );
 
         if (!expired) {
@@ -1467,14 +1994,18 @@ export function OperationsProvider({
         setUnconfirmed(targetId, pending);
         return reconcileAfterDoubt(pending);
       } finally {
+        // From here on, an answer has no caller to be returned to.
+        returned = true;
         // Released only here — after any confirming read has settled or timed
         // out — and unconditionally, so no path out of this region can leave
         // the target claimed for the life of the window.
         delete writeRef.current[targetId];
         dispatch({ type: "pending-write", targetId, kind: null });
+        // Deliberately NOT released here — see `applyAnswer`. The wait is over;
+        // the request may not be.
       }
     },
-    [claim, boundedReconcile, setUnconfirmed],
+    [claim, boundedReconcile, setUnconfirmed, claimRegistry, releaseRegistry],
   );
 
   const updateTarget = useCallback(
@@ -1489,6 +2020,17 @@ export function OperationsProvider({
         (target) => {
           notePersistedTarget(target);
           dispatch({ type: "target-upserted", target });
+        },
+        (targets, before) => {
+          const now = targets.find((entry) => entry.id === targetId);
+          // Gone altogether: neither the state that was asked for nor the one
+          // that was there. Whatever happened, it was not this edit.
+          if (now === undefined) return { kind: "conflicting" };
+          if (matchesPatch(now, patch)) return { kind: "matches-request" };
+          if (before !== undefined && sameRegistration(now, before)) {
+            return { kind: "unchanged" };
+          }
+          return { kind: "conflicting" };
         },
       ),
     [write, notePersistedTarget],
@@ -1509,6 +2051,15 @@ export function OperationsProvider({
           setBackendRun(targetId, null);
           noteRemovedTarget(targetId);
           dispatch({ type: "target-removed", targetId });
+        },
+        (targets, before) => {
+          const now = targets.find((entry) => entry.id === targetId);
+          // Absent from a complete current read is what a removal looks like.
+          if (now === undefined) return { kind: "matches-request" };
+          if (before !== undefined && sameRegistration(now, before)) {
+            return { kind: "unchanged" };
+          }
+          return { kind: "conflicting" };
         },
       ),
     [write, setBackendRun, noteRemovedTarget],
@@ -1687,10 +2238,25 @@ export function OperationsProvider({
 
       const since = listStamp.current;
 
-      try {
-        const refreshed = await boundedReconcile(targetId);
+      // This recovery's own generation, so an older one still in the air cannot
+      // write its conclusion over what this one is about to establish, and
+      // cannot clear the in-progress flag this one owns.
+      const generation =
+        targetId === undefined ? 0 : (reconcileSeq.current[targetId] ?? 0) + 1;
+      if (targetId !== undefined) reconcileSeq.current[targetId] = generation;
+      const createGeneration = forCreate ? ++createReconcileSeq.current : 0;
 
-        if (targetId !== undefined) {
+      try {
+        const evidence = await boundedReconcile(targetId);
+
+        // Only an accepted list is evidence, and only with the history read the
+        // same recovery needed. A superseded or timed-out read proves nothing.
+        const accepted =
+          evidence.list.kind === "accepted" ? evidence.list : null;
+        const complete =
+          accepted !== null && (targetId === undefined || evidence.historyRead);
+
+        if (targetId !== undefined && reconcileSeq.current[targetId] === generation) {
           const pending = unconfirmedRef.current[targetId];
           if (pending !== undefined) {
             if (pending.outstanding === true) {
@@ -1700,11 +2266,14 @@ export function OperationsProvider({
               // a refresh clear this would permit a second one on top of it.
               setUnconfirmed(targetId, {
                 ...pending,
-                listRefreshed: refreshed,
+                listRefreshed: complete,
               });
-            } else if (refreshed) {
-              // Every read this recovery needed has succeeded, and the request
-              // is over, so what the registry now says is the answer.
+            } else if (complete) {
+              // Every read this recovery needed has succeeded and the request is
+              // over, so the registry's current state is known and the block can
+              // go. What this path does NOT know is what was asked for — the
+              // write that raised the doubt owns that comparison — so it settles
+              // the block without claiming anything about the request.
               setUnconfirmed(targetId, null);
             } else {
               setUnconfirmed(targetId, { ...pending, listRefreshed: false });
@@ -1712,20 +2281,24 @@ export function OperationsProvider({
           }
         }
 
-        if (createUnconfirmedRef.current !== null) {
-          const resolution = resolveCreate(
-            createInputRef.current,
-            since,
-            createBeforeRef.current,
-          );
+        if (
+          createUnconfirmedRef.current !== null &&
+          createReconcileSeq.current === createGeneration
+        ) {
+          const resolution: CreateResolution = accepted
+            ? resolveCreate(
+                createInputRef.current,
+                since,
+                createBeforeRef.current,
+              )
+            : { kind: "unconfirmed" };
           dispatch({ type: "create-resolution", value: resolution });
-          dispatch({
-            type: "create-unconfirmed",
-            value:
-              resolution.kind === "unconfirmed"
-                ? { ...createUnconfirmedRef.current, listRefreshed: false }
-                : null,
-          });
+          const doubt = createUnconfirmedRef.current;
+          setCreateUnconfirmed(
+            resolution.kind === "unconfirmed" || doubt.outstanding === true
+              ? { ...doubt, listRefreshed: accepted !== null }
+              : null,
+          );
           // Only a registration this request actually made clears the form, and
           // only while the form still holds what was submitted. A target that
           // was already there is somebody else's, and anything typed since is
@@ -1740,15 +2313,19 @@ export function OperationsProvider({
       } finally {
         if (targetId !== undefined) {
           delete rereadRef.current[targetId];
-          dispatch({ type: "reconciling", targetId, value: false });
+          if (reconcileSeq.current[targetId] === generation) {
+            dispatch({ type: "reconciling", targetId, value: false });
+          }
         }
         if (forCreate) {
           createRereadRef.current = false;
-          dispatch({ type: "create-reconciling", value: false });
+          if (createReconcileSeq.current === createGeneration) {
+            dispatch({ type: "create-reconciling", value: false });
+          }
         }
       }
     },
-    [boundedReconcile, setUnconfirmed, resolveCreate],
+    [boundedReconcile, setUnconfirmed, resolveCreate, setCreateUnconfirmed],
   );
 
   /**
