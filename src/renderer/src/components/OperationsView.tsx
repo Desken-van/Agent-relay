@@ -17,7 +17,7 @@
  *    UI assembled from what it hoped had happened.
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { SerializedError } from '@shared/domain/errors';
 import {
   OPERATION_ENVIRONMENTS,
@@ -234,6 +234,7 @@ function RegisterForm(): React.JSX.Element {
     setCreateDraft,
     createUnconfirmed,
     createResolution,
+    createReconciling,
     targetsComplete,
     rereadRegistry
   } = useOperations();
@@ -349,18 +350,28 @@ function RegisterForm(): React.JSX.Element {
         <div className="stack stack--tight">
           <Notice tone="warn">
             <strong>The last registration was not confirmed.</strong> Whether it was
-            applied is unknown, and the registry could not be re-read. Your entry has
-            been kept. Nothing was submitted again.
+            applied is unknown.{' '}
+            {/*
+              A read that is still running has not failed. Saying it could not be
+              re-read while its first answer is still on the way announces an
+              outcome nobody has, and invites a second read to find out.
+            */}
+            {createReconciling
+              ? 'The registry is being re-read now.'
+              : 'The registry could not be re-read, so the current state is still unknown.'}{' '}
+            Your entry has been kept. Nothing was submitted again.
           </Notice>
-          <div>
+          <div className="row">
             {/* The safe half of the operation, and only that half. */}
             <button
               type="button"
               className="btn btn--sm"
+              disabled={createReconciling}
               onClick={() => void rereadRegistry()}
             >
-              Re-read the registry
+              {createReconciling ? 'Re-reading the registry…' : 'Re-read the registry'}
             </button>
+            {createReconciling ? <Spinner /> : null}
           </div>
         </div>
       ) : createResolution?.kind === 'registered' ? (
@@ -368,6 +379,14 @@ function RegisterForm(): React.JSX.Element {
           <strong>It was registered after all.</strong> The reply was lost, but
           re-reading the registry found the target, so there is nothing to submit
           again.
+        </Notice>
+      ) : createResolution?.kind === 'already-existed' ? (
+        <Notice tone="warn">
+          <strong>It was not registered by this submission.</strong> An identical
+          target — same name, environment and database — was already in the registry
+          before you pressed Register, and the registry allows only one target per
+          name and environment, so this submission was refused. Nothing new was
+          created and your entry has been kept.
         </Notice>
       ) : createResolution?.kind === 'conflict' ? (
         <Notice tone="warn">
@@ -503,11 +522,39 @@ function TargetPanel({ target }: { target: OperationTarget }): React.JSX.Element
 }
 
 function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Element {
-  const { updateTarget, deleteTarget, isBusy } = useOperations();
+  const { updateTarget, deleteTarget, isBusy, lateWriteError, unconfirmed } = useOperations();
   // This panel's own error, for the same reason the registration form keeps
   // its own: a refusal here must not appear anywhere else on the screen.
-  const [writeError, setWriteError] = useState<SerializedError | null>(null);
+  // Carried with the fact of whether it described an *unknown* outcome, because
+  // the two age differently: a refusal is settled and stands until the operator
+  // does something else, while "nobody knows" stops being true the moment
+  // somebody does.
+  const [writeError, setWriteError] = useState<{
+    readonly error: SerializedError;
+    readonly uncertain: boolean;
+  } | null>(null);
   const clearWriteError = (): void => setWriteError(null);
+  const recordWriteOutcome = (outcome: {
+    error: SerializedError;
+    uncertain?: boolean;
+  }): void => setWriteError({ error: outcome.error, uncertain: outcome.uncertain === true });
+
+  // A doubt this panel raised, and then saw resolved: the request answered
+  // late, or a read settled it. Tracked rather than derived from "there is no
+  // doubt now", because the common case is a doubt that is already gone by the
+  // time the call returns, and clearing on that would erase the message before
+  // it had been read.
+  const doubt = unconfirmed[target.id];
+  const hadDoubt = useRef(false);
+  useEffect(() => {
+    if (doubt !== undefined) {
+      hadDoubt.current = true;
+      return;
+    }
+    if (!hadDoubt.current) return;
+    hadDoubt.current = false;
+    setWriteError((current) => (current?.uncertain === true ? null : current));
+  }, [doubt]);
 
   const original: Draft = useMemo(
     () => ({
@@ -570,7 +617,7 @@ function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Elemen
               // Only a success closes the editor; a refusal keeps the draft
               // exactly as the operator left it.
               if (outcome.ok) setEditing(false);
-              else setWriteError(outcome.error);
+              else recordWriteOutcome(outcome);
             })();
           }}
         >
@@ -622,7 +669,7 @@ function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Elemen
           </Field>
 
           {dirty && !validation.ok ? <Notice tone="warn">{validation.message}</Notice> : null}
-          {writeError ? <WriteErrorNotice error={writeError} /> : null}
+          {writeError ? <WriteErrorNotice error={writeError.error} /> : null}
 
           <div className="row">
             <button type="submit" className="btn btn--primary" disabled={!canSave}>
@@ -664,7 +711,22 @@ function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Elemen
                 Restating the advice here would be a second copy of a sentence
                 the registry already owns, and the two would eventually disagree.
               */}
-              <WriteErrorNotice error={writeError} />
+              <WriteErrorNotice error={writeError.error} />
+            </div>
+          ) : null}
+
+          {lateWriteError[target.id] ? (
+            <div style={{ marginTop: 12 }}>
+              {/*
+                An answer that arrived after the screen had given up waiting.
+                The call that asked for it returned an unknown outcome long ago,
+                so this is the only place left to say what the registry decided.
+              */}
+              <Notice tone="warn">
+                <strong>The change was answered after all, and refused.</strong> Nothing
+                was applied, and nothing was sent again.
+              </Notice>
+              <WriteErrorNotice error={lateWriteError[target.id]!} />
             </div>
           ) : null}
 
@@ -690,7 +752,7 @@ function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Elemen
                 clearWriteError();
                 void (async () => {
                   const outcome = await updateTarget(target.id, { enabled: !target.enabled });
-                  if (!outcome.ok) setWriteError(outcome.error);
+                  if (!outcome.ok) recordWriteOutcome(outcome);
                 })();
               }}
             >
@@ -730,7 +792,7 @@ function TargetEditor({ target }: { target: OperationTarget }): React.JSX.Elemen
                       // A refusal leaves the panel exactly as it was, with the
                       // backend's reason on screen.
                       if (outcome.ok) setConfirmingDelete(false);
-                      else setWriteError(outcome.error);
+                      else recordWriteOutcome(outcome);
                     })();
                   }}
                 >
@@ -1047,6 +1109,11 @@ function HistoryPanel({ target }: { target: OperationTarget }): React.JSX.Elemen
     if (phase === 'idle') void loadHistory(target.id);
   }, [phase, loadHistory, target.id]);
 
+  // A read that is already running, with rows still on screen. The button used
+  // to look untouched while it worked, so a slow read read as a click that had
+  // been ignored — and clicking again only asked the same question twice.
+  const refreshing = phase === 'loading' && runs !== undefined;
+
   return (
     <Card
       title="History"
@@ -1054,12 +1121,20 @@ function HistoryPanel({ target }: { target: OperationTarget }): React.JSX.Elemen
         <button
           type="button"
           className="btn btn--sm btn--ghost"
+          disabled={phase === 'loading'}
           onClick={() => void loadHistory(target.id)}
         >
-          Refresh
+          {phase === 'loading' ? 'Refreshing…' : 'Refresh'}
         </button>
       }
     >
+      {refreshing ? (
+        <div style={{ marginBottom: 10 }}>
+          {/* What is below is the previous read, and stays legible while this one runs. */}
+          <Spinner /> <span className="faint">Re-reading the recorded history…</span>
+        </div>
+      ) : null}
+
       {phase === 'loading' && runs === undefined ? (
         <div>
           <Spinner /> <span className="faint">Loading history…</span>

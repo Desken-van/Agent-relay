@@ -722,6 +722,55 @@ timeout, so the read has one: on expiry the target stays blocked — nothing was
 confirmed — but the block becomes a stated uncertainty with a re-read attached,
 rather than a spinner with no end.
 
+**A registry write is waited for, not waited on for ever.** The write has the
+same bound as a probe, and for the same reason: the bridge cannot be cancelled,
+so a request that never settles used to hold the claim — and the `finally` that
+releases it — for the life of the window. Expiry is this screen's patience
+running out and nothing else. The target stays blocked, the write is never sent
+again, and the answer, when it comes, is applied exactly once by whichever path
+reaches it first. An answer that arrives after the caller has been handed an
+uncertain outcome has nowhere to be returned to, so a late refusal is recorded
+against the target and shown there rather than dropped.
+
+**A row that matches a registration is not proof that this request made it.**
+The registry allows one target per name and environment, so an identical target
+registered earlier is precisely what makes it REFUSE a second one — and the row
+found afterwards is that earlier target. Attribution is therefore by identity
+against the registry as it was known *before* the request was sent: a row whose
+id was already there predates the request and settles it as refused, and only a
+row that was absent before and points where the request asked is reported as
+registered. Without such a picture there is no attribution to make, and the
+screen says the outcome is unknown instead of guessing.
+
+What is *known* is not only what a read returned. A write the backend confirmed
+changed the registry too, and folding those in is what makes the picture true a
+second time: register a target, register it again without refreshing in between,
+and lose the second reply, and a picture built from reads alone would not contain
+the target from the first registration — so finding it in the read-back looked
+exactly like the second request having created it. Confirmed creates, updates and
+removals are folded in as they happen. What is deliberately *not* folded in is
+the read stamp: it answers whether a READ has happened since the outcome now in
+doubt, and letting a write advance it would let one request's success stand in
+for the confirmation of another request nobody has answered.
+
+**A read that is running has not failed.** The registration form used to state,
+as settled fact, that the registry could not be re-read while the first
+confirming read was still outstanding — which both misinformed the operator and
+invited a second read to find out. The same applies to the recorded history: a
+refresh that shows nothing looks like a click that went nowhere, so it says what
+it is doing and is held while it does it, and what is already on screen stays
+legible underneath. The registration's own re-read is held by a synchronous
+guard as well, because a button that has not re-rendered yet is not a guard.
+
+**A draft is compared with the schema's own spelling of it.** What the operator
+typed and what the schema made of it are the same path written twice —
+`C:\data\reports.sqlite\` and `C:\data\reports.sqlite` — and comparing the raw
+strings told somebody who had changed nothing that the form was theirs to keep,
+leaving a stale entry in front of a target that had in fact been registered. Both
+sides go through `normalizeTargetPath` before the comparison decides whether the
+form still holds what was submitted. Anything genuinely typed since is still the
+operator's work and is still kept.
+
 **A refusal and an unknown outcome are different things.** A backend that answers
 "no" is a fact about the request. A call that fell over in transport is not:
 whether the write was applied is genuinely unknown, and the screen says so, keeps
@@ -740,7 +789,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1140 tests, none of which contact Codex, Claude, or GitHub.
+1152 tests, none of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|
@@ -763,6 +812,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 | `renderer/operations-async` | **The screen's asynchronous state**: a failed load asked once and retried only on request, per-target history, answers arriving out of order, a stale list that must not undo a confirmed write, one action per target at a time, and a write whose outcome nobody knows |
 | `renderer/operations-backend-state` | **What the screen knows about work it did not start**: a run the backend is executing, a bounded page that has scrolled past it, a claim held across the read meant to confirm it, and a first list response a write overtook |
 | `renderer/operations-recovery` | **Recovery, and what must not depend on anything else**: Operations reachable through a development bootstrap that never finishes, a manual re-read held until every read it needs has answered, an unconfirmed registration resolved against the registry, a probe request that goes unanswered, and one deep search per run |
+| `renderer/operations-outcomes` | **Which request an outcome belongs to, and what the screen says before it knows**: a matching row that predates the request, a draft and a normalised path that are the same path, a confirming read still in flight, a refresh that says it is working, a registry write that never answers, and coming back to the screen without running anything |
 
 ### Renderer tests
 

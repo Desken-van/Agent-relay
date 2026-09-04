@@ -422,17 +422,40 @@ running window. This is the checklist for doing that, and it has not been run.
 
 **Prepare, and do not skip this.** Point nothing at a database you care about.
 
+The cleanup at the end of this section deletes a directory recursively. That is
+only safe if the directory is one this run created and nothing else has ever
+used, so the preparation below makes a **new** directory per run and refuses to
+continue if the name is somehow already taken. Do not replace it with a fixed
+path: an interrupted earlier run, or anything else that happened to choose the
+same name, would have its files deleted by the block at the end.
+
 ```powershell
-# An isolated profile, outside the repository.
-$env:AGENT_RELAY_DATA_DIR = "$env:TEMP\agent-relay-7cc"
+# Remember whatever profile was already configured. The cleanup restores it
+# rather than deleting a setting this checklist did not create.
+$previousDataDir = if (Test-Path Env:\AGENT_RELAY_DATA_DIR) { $env:AGENT_RELAY_DATA_DIR } else { $null }
+
+# A directory for THIS run and no other. New-Item fails rather than reusing one,
+# which is the behaviour we want: a name that already exists means somebody
+# else's files, and the cleanup below must never be pointed at those.
+$runId = [guid]::NewGuid().ToString('N').Substring(0, 8)
+$root  = Join-Path $env:TEMP "agent-relay-7cc-$runId"
+if (Test-Path -LiteralPath $root) { throw "$root already exists. Run this block again for a fresh name." }
+# .FullName is the resolved absolute path, which is what the cleanup checks against.
+$root = (New-Item -ItemType Directory -Path $root -ErrorAction Stop).FullName
+
+# An isolated profile, outside the repository, inside this run's own directory.
+$env:AGENT_RELAY_DATA_DIR = $root
 
 # A throwaway database, created for this test and nothing else.
-$db = "$env:TEMP\agent-relay-7cc\fixture.sqlite"
-New-Item -ItemType Directory -Force (Split-Path $db) | Out-Null
+$db = Join-Path $root 'fixture.sqlite'
 node -e "const {DatabaseSync}=require('node:sqlite');const d=new DatabaseSync(process.argv[1]);d.exec('CREATE TABLE invoices (id INTEGER PRIMARY KEY, customer TEXT NOT NULL, total REAL)');d.exec('CREATE TABLE payments (id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL)');d.exec(\"INSERT INTO invoices (customer,total) VALUES ('ACME Ltd',99.5)\");d.close()" $db
 
 # Record what the file looks like before anything opens it.
 Get-FileHash $db; (Get-Item $db).Length; (Get-Item $db).LastWriteTimeUtc
+
+# Keep $root and $previousDataDir in this shell: the cleanup needs both, and
+# refuses to run without them.
+$root; $previousDataDir
 ```
 
 | Do this | Expect |
@@ -454,9 +477,21 @@ Get-FileHash $db; (Get-Item $db).Length; (Get-Item $db).LastWriteTimeUtc
 byte-identical afterwards, and nothing ran that you did not click.
 
 ```powershell
-# Afterwards
-Remove-Item -Recurse -Force "$env:TEMP\agent-relay-7cc"
-Remove-Item Env:\AGENT_RELAY_DATA_DIR
+# Afterwards. Run this in the SAME shell as the preparation: it deletes only the
+# directory that block created, identified by its exact absolute path, and stops
+# rather than guessing if that variable is gone.
+if ([string]::IsNullOrWhiteSpace($root)) { throw 'No $root in this shell. Delete the run directory by hand, and check what it is first.' }
+
+$expected = [IO.Path]::GetFullPath($root)
+$prefix   = [IO.Path]::GetFullPath((Join-Path $env:TEMP 'agent-relay-7cc-'))
+if (-not $expected.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+  throw "Refusing to delete $expected — it is not a directory this checklist created."
+}
+if (Test-Path -LiteralPath $expected) { Remove-Item -LiteralPath $expected -Recurse -Force }
+
+# Put the previous profile back exactly as it was, including "there wasn't one".
+if ($null -eq $previousDataDir) { Remove-Item Env:\AGENT_RELAY_DATA_DIR -ErrorAction SilentlyContinue }
+else { $env:AGENT_RELAY_DATA_DIR = $previousDataDir }
 ```
 
 ---

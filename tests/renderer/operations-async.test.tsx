@@ -252,14 +252,25 @@ describe('two reads answering out of order', () => {
       return attempt === 2 ? older.promise : newer.promise;
     });
 
+    bridge.set('operations:runDiagnostic', () =>
+      ok<'operations:runDiagnostic'>(makeRun({ id: 'diag-newer', probeId: 'schema_summary' }))
+    );
+
     renderOperations(<OperationsView />);
     fireEvent.click(await within(targetList()).findByText('Reporting snapshot'));
     await screen.findByText('No diagnostics recorded');
 
-    const refresh = within(historyCard()).getByRole('button', { name: 'Refresh' });
-    fireEvent.click(refresh);
-    fireEvent.click(refresh);
-    expect(bridge.callsTo('operations:listDiagnostics')).toHaveLength(3);
+    // A Refresh the operator asked for, still in the air.
+    fireEvent.click(within(historyCard()).getByRole('button', { name: 'Refresh' }));
+    expect(bridge.callsTo('operations:listDiagnostics')).toHaveLength(2);
+
+    // The second, overtaking read comes from a diagnostic's own read-back
+    // rather than from a second click: the Refresh control is held while its
+    // read runs, so two operator-initiated reads for one target can no longer
+    // be started at all. What is under test is unchanged — an older answer
+    // landing last must not overwrite a newer one.
+    fireEvent.click(within(runPanel()).getByRole('button', { name: /Run diagnostic/ }));
+    await waitFor(() => expect(bridge.callsTo('operations:listDiagnostics')).toHaveLength(3));
 
     await deliver(
       newer,

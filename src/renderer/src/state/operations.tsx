@@ -47,6 +47,7 @@ import {
   type ReactNode,
 } from "react";
 import type { SerializedError } from "@shared/domain/errors";
+import { normalizeTargetPath } from "@shared/domain/operations";
 import type {
   NewOperationTargetInput,
   OperationEnvironment,
@@ -95,6 +96,18 @@ export const RECONCILE_TIMEOUT_MS = 10_000;
  * outcome becomes unknown rather than failed, and the target stays blocked.
  */
 export const DIAGNOSTIC_TIMEOUT_MS = 60_000;
+
+/**
+ * How long a registry write may go unanswered.
+ *
+ * The registry write is a synchronous SQLite call behind one IPC hop, so this
+ * is generous rather than tight. It bounds only how long the SCREEN waits: the
+ * bridge cannot be cancelled, so on expiry the request is still out there, the
+ * target stays blocked, and the write is never sent again. Without it, a bridge
+ * that never answered held the claim — and the `finally` that releases it — for
+ * the life of the window.
+ */
+export const WRITE_TIMEOUT_MS = 30_000;
 
 /**
  * Where a load has got to.
@@ -159,12 +172,33 @@ export interface Unconfirmed {
 export type CreateResolution =
   /** The read failed too, so the outcome is still nobody's knowledge. */
   | { readonly kind: "unconfirmed" }
-  /** A target matching the draft is there: the create was applied. */
+  /** A target matching the draft appeared where there was none: it was applied. */
   | { readonly kind: "registered"; readonly targetId: string }
   /** That name is taken in that environment by a different target. */
   | { readonly kind: "conflict"; readonly targetId: string }
+  /**
+   * The identical registration was already there before the request was sent.
+   *
+   * Distinct from `registered`, and the distinction is the whole point: a row
+   * that predates the request is not evidence the request created it. The
+   * registry refuses a second `(environment, name)`, so what actually happened
+   * is that this submission was refused and the reply was lost.
+   */
+  | { readonly kind: "already-existed"; readonly targetId: string }
   /** A complete list without it: the create never happened. */
   | { readonly kind: "not-applied" };
+
+/**
+ * A complete list response, and when it was accepted.
+ *
+ * Kept as a pair because both halves are needed to reason about a write: the
+ * stamp says whether a read is newer than the request, and the rows say what
+ * the registry held before it.
+ */
+interface ListRead {
+  readonly stamp: number;
+  readonly targets: OperationTarget[];
+}
 
 /** The registration form's fields, held here while a create is unresolved. */
 export interface RegistrationDraft {
@@ -214,12 +248,29 @@ interface OperationsState {
    */
   readonly uncertain: Readonly<Record<string, string>>;
   readonly runError: Readonly<Record<string, SerializedError>>;
+  /**
+   * A refusal that arrived after this screen had stopped waiting for it.
+   *
+   * The caller has long since been handed an uncertain outcome, so there is no
+   * return value left to put this in. Dropping it would leave the operator with
+   * "nobody knows" for a request the backend had in fact answered, and said no to.
+   */
+  readonly lateWriteError: Readonly<Record<string, SerializedError>>;
 
   /** Survives a remount, so an unresolved registration is not retyped. */
   readonly createDraft: RegistrationDraft | null;
   readonly createUnconfirmed: Unconfirmed | null;
   /** What the confirming read established about it. Null until it has run. */
   readonly createResolution: CreateResolution | null;
+  /**
+   * A confirming read for the registration is in flight.
+   *
+   * Its own flag rather than a corner of `createUnconfirmed`, because "the
+   * registry could not be re-read" and "the registry is being re-read" are
+   * different things to tell somebody, and the form used to say the first while
+   * the first read was still outstanding.
+   */
+  readonly createReconciling: boolean;
 }
 
 type Action =
@@ -244,9 +295,15 @@ type Action =
   | { type: "unconfirmed"; targetId: string; value: Unconfirmed | null }
   | { type: "uncertain"; targetId: string; message: string | null }
   | { type: "run-error"; targetId: string; error: SerializedError | null }
+  | {
+      type: "late-write-error";
+      targetId: string;
+      error: SerializedError | null;
+    }
   | { type: "create-draft"; draft: RegistrationDraft | null }
   | { type: "create-unconfirmed"; value: Unconfirmed | null }
-  | { type: "create-resolution"; value: CreateResolution | null };
+  | { type: "create-resolution"; value: CreateResolution | null }
+  | { type: "create-reconciling"; value: boolean };
 
 const initialState: OperationsState = {
   targetsPhase: "idle",
@@ -268,9 +325,11 @@ const initialState: OperationsState = {
   unconfirmed: {},
   uncertain: {},
   runError: {},
+  lateWriteError: {},
   createDraft: null,
   createUnconfirmed: null,
   createResolution: null,
+  createReconciling: false,
 };
 
 function withoutKey<T>(
@@ -291,7 +350,13 @@ function draftMatches(
   return (
     draft.name.trim() === input.name &&
     draft.environment === input.environment &&
-    draft.databasePath === input.config.databasePath
+    // Both sides through the same normalisation the schema applied on the way
+    // out. The draft holds what was typed; `input` holds what the schema made
+    // of it, and `C:\data\reports.sqlite\` and `C:\data\reports.sqlite` are one
+    // path spelled twice. Comparing the two spellings told an operator who had
+    // changed nothing that the form was theirs to keep, and left a stale entry
+    // in front of a target that had in fact been registered.
+    normalizeTargetPath(draft.databasePath) === input.config.databasePath
   );
 }
 
@@ -393,6 +458,7 @@ function reducer(state: OperationsState, action: Action): OperationsState {
         history: withoutKey(state.history, action.targetId),
         historyPhase: withoutKey(state.historyPhase, action.targetId),
         lastRun: withoutKey(state.lastRun, action.targetId),
+        lateWriteError: withoutKey(state.lateWriteError, action.targetId),
         // `backendRuns` is deliberately NOT cleared here. It is mirrored in a
         // ref that the synchronous guards read, and a reducer cannot reach that
         // ref — clearing one without the other is exactly how the screen and the
@@ -484,6 +550,15 @@ function reducer(state: OperationsState, action: Action): OperationsState {
             : { ...state.runError, [action.targetId]: action.error },
       };
 
+    case "late-write-error":
+      return {
+        ...state,
+        lateWriteError:
+          action.error === null
+            ? withoutKey(state.lateWriteError, action.targetId)
+            : { ...state.lateWriteError, [action.targetId]: action.error },
+      };
+
     case "unconfirmed":
       return {
         ...state,
@@ -510,6 +585,9 @@ function reducer(state: OperationsState, action: Action): OperationsState {
 
     case "create-resolution":
       return { ...state, createResolution: action.value };
+
+    case "create-reconciling":
+      return { ...state, createReconciling: action.value };
 
     default:
       return state;
@@ -574,6 +652,16 @@ async function withTimeout<T>(
 
 const UNCERTAIN_MESSAGE =
   "The request did not come back, so whether it was applied is unknown.";
+
+/**
+ * A write this screen stopped waiting for, which is not a write that stopped.
+ *
+ * Worded apart from `UNCERTAIN_MESSAGE` on purpose: there, the call itself
+ * fell over and is over; here it is still in flight, and the difference decides
+ * whether a subsequent read is allowed to settle the question.
+ */
+const WRITE_TIMEOUT_MESSAGE =
+  "The change was not answered in time. It has not been cancelled, so whether it was applied is unknown.";
 
 const BLOCKED: SerializedError = {
   code: "VALIDATION_FAILED",
@@ -693,6 +781,10 @@ export function OperationsProvider({
   const createDraftRef = useRef<RegistrationDraft | null>(null);
   /** One counter per target, so a late diagnostic answer knows if it is stale. */
   const runSeq = useRef<Record<string, number>>({});
+  /** The same for registry writes, so a late answer knows if it is stale. */
+  const writeSeq = useRef<Record<string, number>>({});
+  /** A create re-read in flight, so a second click does not start another. */
+  const createRereadRef = useRef(false);
   /** What the unresolved create actually submitted. */
   const createInputRef = useRef<NewOperationTargetInput | null>(null);
   /** Mirror of the unresolved create, readable after an await. */
@@ -705,10 +797,17 @@ export function OperationsProvider({
    * against an older list would answer confidently with stale evidence.
    */
   const listStamp = useRef(0);
-  const lastList = useRef<{
-    readonly stamp: number;
-    readonly targets: OperationTarget[];
-  } | null>(null);
+  const lastList = useRef<ListRead | null>(null);
+  /**
+   * The registry as it stood before the unresolved create was sent.
+   *
+   * Without it, a row that matches the draft proves only that such a row
+   * exists — not that this request is what put it there. An identical target
+   * registered earlier makes the registry refuse a second one, so finding it
+   * afterwards is evidence the submission FAILED, and reporting that as success
+   * is how an operator is told a registration went through that never did.
+   */
+  const createBeforeRef = useRef<ListRead | null>(null);
   const creatingRef = useRef(false);
   const completeRef = useRef(false);
 
@@ -733,11 +832,21 @@ export function OperationsProvider({
    * newer than that cannot speak about a create that came after it.
    */
   const resolveCreate = useCallback(
-    (input: NewOperationTargetInput | null, since: number): CreateResolution => {
+    (
+      input: NewOperationTargetInput | null,
+      since: number,
+      before: ListRead | null,
+    ): CreateResolution => {
       const read = lastList.current;
       if (input === null || read === null || read.stamp <= since) {
         return { kind: "unconfirmed" };
       }
+
+      // No picture of the registry from before the request, so a matching row
+      // cannot be attributed to it either way. Say so rather than guess: an
+      // unresolved create the operator is told about is recoverable, and a
+      // wrong answer is not.
+      if (before === null) return { kind: "unconfirmed" };
 
       const match = read.targets.find(
         (target) =>
@@ -748,16 +857,79 @@ export function OperationsProvider({
       // happened. The draft stays, and the operator may submit it themselves.
       if (match === undefined) return { kind: "not-applied" };
 
-      // Same name and environment AND the same database: this is the
-      // registration that was being attempted. A different path means the name
-      // was already taken by something else, so the create was refused rather
-      // than applied — a different fact, and the operator needs to know which.
-      return match.config.databasePath === input.config.databasePath
+      // Same name and environment AND the same database: this is the shape the
+      // request asked for. A different path means the name is taken by
+      // something else, so the create was refused rather than applied — a
+      // different fact, and the operator needs to know which.
+      const samePath = match.config.databasePath === input.config.databasePath;
+
+      // Identity, not resemblance. A row carrying an id the pre-request list
+      // already held is a row that predates the request, whatever it looks
+      // like, so this request did not create it — and since the registry holds
+      // one target per (environment, name), nothing new could have been created
+      // under that name either.
+      if (before.targets.some((target) => target.id === match.id)) {
+        return samePath
+          ? { kind: "already-existed", targetId: match.id }
+          : { kind: "conflict", targetId: match.id };
+      }
+
+      // Absent before, present now, and pointing where the request asked: this
+      // is the registration that was being attempted.
+      return samePath
         ? { kind: "registered", targetId: match.id }
         : { kind: "conflict", targetId: match.id };
     },
     [],
   );
+
+  /* ------------------------------------------ what is known of the registry */
+
+  /**
+   * Fold a registry change the backend confirmed into what is known of it.
+   *
+   * `lastList` is the evidence an unresolved create is attributed against, and
+   * a read is not the only thing that establishes what the registry holds: a
+   * write the backend answered is a fact about it too. Leaving those out meant
+   * a target registered a moment ago was missing from the "before" picture of
+   * the *next* request, so finding it in the read-back looked exactly like that
+   * request having created it — register something, register it again without
+   * refreshing in between, lose the second reply, and the screen announced a
+   * registration the registry had in fact refused.
+   *
+   * The stamp is deliberately NOT advanced. It answers a different question —
+   * has a READ happened since the outcome now in doubt — and a write is not a
+   * read. Advancing it here would let a confirmed write stand in for the
+   * confirmation of a request nobody has answered, which is the protection
+   * against stale evidence that the stamp exists to provide.
+   *
+   * Before any complete read there is nothing to fold into, and nothing is
+   * invented: `resolveCreate` then has no picture to attribute against and says
+   * the outcome is unknown, which is the honest answer.
+   */
+  const notePersistedTarget = useCallback((target: OperationTarget): void => {
+    const known = lastList.current;
+    if (known === null) return;
+    const exists = known.targets.some((entry) => entry.id === target.id);
+    lastList.current = {
+      stamp: known.stamp,
+      targets: exists
+        ? known.targets.map((entry) =>
+            entry.id === target.id ? target : entry,
+          )
+        : [...known.targets, target],
+    };
+  }, []);
+
+  /** The same, for a registration the backend confirmed it had removed. */
+  const noteRemovedTarget = useCallback((targetId: string): void => {
+    const known = lastList.current;
+    if (known === null) return;
+    lastList.current = {
+      stamp: known.stamp,
+      targets: known.targets.filter((entry) => entry.id !== targetId),
+    };
+  }, []);
 
   /* ------------------------------------------- guarded state, ref and store */
 
@@ -1056,11 +1228,18 @@ export function OperationsProvider({
       // yank them away from what they are now looking at.
       const selectionAtStart = selectedRef.current;
 
+      // Taken here, before the request exists, and not after it: a list read
+      // that lands while the create is in the air would already contain
+      // whatever the create did, which is precisely the question being asked.
+      const before = lastList.current;
+      createBeforeRef.current = before;
+
       try {
         const result = await attempt("operations:createTarget", input);
 
         if (result.kind === "ok") {
           writeEpoch.current += 1;
+          notePersistedTarget(result.data);
           dispatch({ type: "target-upserted", target: result.data });
           dispatch({ type: "create-draft", draft: null });
           if (selectedRef.current === selectionAtStart) {
@@ -1086,9 +1265,17 @@ export function OperationsProvider({
         dispatch({ type: "create-unconfirmed", value: pending });
         dispatch({ type: "create-resolution", value: null });
 
-        const refreshed = await boundedReconcile();
+        // Said before the read, cleared after it, so nothing on screen can
+        // report the read as having failed while it is still running.
+        dispatch({ type: "create-reconciling", value: true });
+        let refreshed: boolean;
+        try {
+          refreshed = await boundedReconcile();
+        } finally {
+          dispatch({ type: "create-reconciling", value: false });
+        }
         const settled: Unconfirmed = { ...pending, listRefreshed: refreshed };
-        const resolution = resolveCreate(input, since);
+        const resolution = resolveCreate(input, since, before);
         dispatch({ type: "create-resolution", value: resolution });
 
         // The doubt is lifted only by an answer, never by the read merely
@@ -1116,7 +1303,7 @@ export function OperationsProvider({
         dispatch({ type: "creating", value: false });
       }
     },
-    [boundedReconcile, resolveCreate, state.createUnconfirmed],
+    [boundedReconcile, resolveCreate, notePersistedTarget, state.createUnconfirmed],
   );
 
   /**
@@ -1144,32 +1331,41 @@ export function OperationsProvider({
       }
       writeRef.current[targetId] = kind;
       dispatch({ type: "pending-write", targetId, kind });
+      // A refusal recorded after a previous attempt had been given up on is
+      // about that attempt, not this one.
+      dispatch({ type: "late-write-error", targetId, error: null });
 
-      try {
-        const outcome = await perform();
+      const seq = (writeSeq.current[targetId] ?? 0) + 1;
+      writeSeq.current[targetId] = seq;
 
-        if (outcome.kind === "ok") {
-          writeEpoch.current += 1;
-          apply(outcome.data);
-          return { ok: true, data: outcome.data };
-        }
-
-        if (outcome.kind === "refused")
-          return { ok: false, error: outcome.error };
-
-        writeEpoch.current += 1;
-        const pending: Unconfirmed = {
-          action: kind,
-          message: UNCERTAIN_MESSAGE,
-          listRefreshed: false,
-        };
-        setUnconfirmed(targetId, pending);
+      /**
+       * Read the registry back after an outcome nobody knows.
+       *
+       * Reads only — repeating the write is what must never happen here. What
+       * the read establishes is checked against the doubt as it stands *now*,
+       * not against the one this call started with: the request's own answer
+       * may have arrived in the meantime, and an answer outranks a read.
+       */
+      const reconcileAfterDoubt = async (
+        pending: Unconfirmed,
+      ): Promise<WriteOutcome<T>> => {
         dispatch({ type: "reconciling", targetId, value: true });
         try {
           const refreshed = await boundedReconcile(targetId);
           const settled: Unconfirmed = { ...pending, listRefreshed: refreshed };
-          if (refreshed) setUnconfirmed(targetId, null);
-          else setUnconfirmed(targetId, settled);
+          const current = unconfirmedRef.current[targetId];
+          if (current !== undefined && current.action === kind) {
+            if (current.outstanding === true) {
+              // A request that has not answered has not finished, and no read
+              // can say otherwise: an empty page is as consistent with "still
+              // being applied" as with "never applied".
+              setUnconfirmed(targetId, { ...current, listRefreshed: refreshed });
+            } else if (refreshed) {
+              setUnconfirmed(targetId, null);
+            } else {
+              setUnconfirmed(targetId, settled);
+            }
+          }
           return {
             ok: false,
             uncertain: true,
@@ -1178,6 +1374,98 @@ export function OperationsProvider({
         } finally {
           dispatch({ type: "reconciling", targetId, value: false });
         }
+      };
+
+      try {
+        const request = perform();
+
+        /**
+         * Apply the request's own answer, exactly once.
+         *
+         * Two paths can reach it — the wait below, or the late continuation
+         * after that wait has given up — and whichever arrives first does the
+         * work. Deliberately independent of the confirming read: a read says
+         * what the registry holds, never whether THIS request is what put it
+         * there, so nothing a read concludes may stand in for an answer.
+         */
+        let expired = false;
+        let answered = false;
+        const applyAnswer = (outcome: Attempt<T>): void => {
+          if (answered) return;
+          answered = true;
+
+          // A newer write owns this target: this answer describes a request
+          // nobody is waiting on any more.
+          if (writeSeq.current[targetId] !== seq) return;
+
+          if (outcome.kind === "ok") {
+            writeEpoch.current += 1;
+            apply(outcome.data);
+          } else if (outcome.kind === "refused" && expired) {
+            // The caller was handed an uncertain outcome long ago, so there is
+            // no return value left to carry this. Dropping it would leave
+            // "nobody knows" standing over a request the backend had answered.
+            dispatch({ type: "late-write-error", targetId, error: outcome.error });
+          }
+
+          // Whatever it said, the request has come back. A doubt that still
+          // called it outstanding would hold this target on a question that has
+          // just been answered — but a transport failure only ends the request,
+          // it does not say what happened, so that one stays a doubt a read can
+          // settle rather than being cleared outright.
+          const doubt = unconfirmedRef.current[targetId];
+          if (doubt?.action === kind && doubt.outstanding === true) {
+            setUnconfirmed(
+              targetId,
+              outcome.kind === "unknown"
+                ? { ...doubt, outstanding: false }
+                : null,
+            );
+          }
+        };
+
+        void request.then(applyAnswer);
+
+        // This renderer's patience, and nothing more. Expiry is a fact about
+        // how long the screen was prepared to wait — never a fact about the
+        // request, which was not cancelled and may still be applied.
+        expired = await withTimeout(
+          request.then(() => false),
+          WRITE_TIMEOUT_MS,
+          () => true,
+        );
+
+        if (!expired) {
+          const outcome = await request;
+
+          if (outcome.kind === "ok") return { ok: true, data: outcome.data };
+          if (outcome.kind === "refused")
+            return { ok: false, error: outcome.error };
+
+          // The call fell over. Whether it was applied is unknown, but the
+          // request itself is over, so the confirming read can settle this one.
+          writeEpoch.current += 1;
+          const pending: Unconfirmed = {
+            action: kind,
+            message: UNCERTAIN_MESSAGE,
+            listRefreshed: false,
+          };
+          setUnconfirmed(targetId, pending);
+          return reconcileAfterDoubt(pending);
+        }
+
+        // The wait ran out with the request still in flight. The target stays
+        // blocked — a second write against a state nobody knows is exactly what
+        // this prevents — and the write is never sent again.
+        writeEpoch.current += 1;
+        const pending: Unconfirmed = {
+          action: kind,
+          message: WRITE_TIMEOUT_MESSAGE,
+          listRefreshed: false,
+          outstanding: true,
+        };
+        setUnconfirmed(targetId, pending);
+        return reconcileAfterDoubt(pending);
       } finally {
         // Released only here — after any confirming read has settled or timed
         // out — and unconditionally, so no path out of this region can leave
@@ -1198,9 +1486,12 @@ export function OperationsProvider({
         targetId,
         "update",
         () => attempt("operations:updateTarget", { targetId, patch }),
-        (target) => dispatch({ type: "target-upserted", target }),
+        (target) => {
+          notePersistedTarget(target);
+          dispatch({ type: "target-upserted", target });
+        },
       ),
-    [write],
+    [write, notePersistedTarget],
   );
 
   const deleteTarget = useCallback(
@@ -1216,10 +1507,11 @@ export function OperationsProvider({
           // The ref first, then the store: a registration that no longer exists
           // must not leave a guard entry behind under its id.
           setBackendRun(targetId, null);
+          noteRemovedTarget(targetId);
           dispatch({ type: "target-removed", targetId });
         },
       ),
-    [write, setBackendRun],
+    [write, setBackendRun, noteRemovedTarget],
   );
 
   /* ------------------------------------------------------------ diagnostics */
@@ -1377,6 +1669,22 @@ export function OperationsProvider({
         dispatch({ type: "reconciling", targetId, value: true });
       }
 
+      // The registration's own recovery needs the same protection, and had
+      // none: the button could be clicked as fast as a hand allows, and each
+      // click started another list read for one question.
+      const forCreate = createUnconfirmedRef.current !== null;
+      if (forCreate) {
+        if (createRereadRef.current) {
+          if (targetId !== undefined) {
+            delete rereadRef.current[targetId];
+            dispatch({ type: "reconciling", targetId, value: false });
+          }
+          return;
+        }
+        createRereadRef.current = true;
+        dispatch({ type: "create-reconciling", value: true });
+      }
+
       const since = listStamp.current;
 
       try {
@@ -1405,7 +1713,11 @@ export function OperationsProvider({
         }
 
         if (createUnconfirmedRef.current !== null) {
-          const resolution = resolveCreate(createInputRef.current, since);
+          const resolution = resolveCreate(
+            createInputRef.current,
+            since,
+            createBeforeRef.current,
+          );
           dispatch({ type: "create-resolution", value: resolution });
           dispatch({
             type: "create-unconfirmed",
@@ -1414,6 +1726,10 @@ export function OperationsProvider({
                 ? { ...createUnconfirmedRef.current, listRefreshed: false }
                 : null,
           });
+          // Only a registration this request actually made clears the form, and
+          // only while the form still holds what was submitted. A target that
+          // was already there is somebody else's, and anything typed since is
+          // the operator's own work.
           if (
             resolution.kind === "registered" &&
             draftMatches(createDraftRef.current, createInputRef.current)
@@ -1425,6 +1741,10 @@ export function OperationsProvider({
         if (targetId !== undefined) {
           delete rereadRef.current[targetId];
           dispatch({ type: "reconciling", targetId, value: false });
+        }
+        if (forCreate) {
+          createRereadRef.current = false;
+          dispatch({ type: "create-reconciling", value: false });
         }
       }
     },
@@ -1495,7 +1815,9 @@ export function OperationsProvider({
       const pending = state.unconfirmed[targetId];
       if (pending !== undefined) {
         if (pending.outstanding === true) {
-          return "The diagnostic request has not answered. It was not cancelled, so it may still be running — starting another would be a second run.";
+          return pending.action === "diagnostic"
+            ? "The diagnostic request has not answered. It was not cancelled, so it may still be running — starting another would be a second run."
+            : "The change has not been answered. It was not cancelled, so it may still be applied — sending it again would act on a state nobody has confirmed.";
         }
         return pending.listRefreshed
           ? `${pending.message} The registry has been re-read.`
