@@ -434,7 +434,7 @@ names only; `--show-token` is never used.
 A second workflow, deliberately kept apart from the development one. The
 development workflow changes a repository; this one only looks at something.
 Phase 7C-A built its backend; 7C-B added the screen. Live acceptance against a
-real database in a running window (7C-C) has not been done.
+synthetic database in a running Windows application (7C-C) passed on 2026-09-04.
 
 ```
 OperationsRegistry ──selects by enum──> OperationProbeAdapter
@@ -561,6 +561,13 @@ counts inside it that no longer described anything.
 A failure is recorded as one, with the kind that produced it (`error`,
 `timeout`, `cancelled`, `malformed`) and **no result**. A run that proved
 nothing must stay visibly empty.
+
+The environment is part of a successful result because it is evidence about
+what that probe actually inspected. Version 1 does not duplicate it in the run
+row. Consequently a failed run, which must have no result, also has no historical
+environment snapshot and the screen says `environment not recorded`. Reading
+the target's environment *now* would be a tempting shortcut and an audit error:
+the target may have been edited since the run.
 
 ### Three shapes, and no others
 

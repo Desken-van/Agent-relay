@@ -415,10 +415,11 @@ as you left it.
 
 ---
 
-## 12. Operations UI — live acceptance *(Phase 7C-C, not yet performed)*
+## 12. Operations UI — live acceptance *(Phase 7C-C, passed 2026-09-04)*
 
-The Operations screen has never been exercised against a real database in a
-running window. This is the checklist for doing that, and it has not been run.
+This checklist was exercised end to end in a running Windows application against
+fresh synthetic SQLite files and an isolated Agent Relay profile. Keep using the
+steps below for later acceptance runs; the recorded result follows the checklist.
 
 **Prepare, and do not skip this.** Point nothing at a database you care about.
 
@@ -446,9 +447,22 @@ $root = (New-Item -ItemType Directory -Path $root -ErrorAction Stop).FullName
 # An isolated profile, outside the repository, inside this run's own directory.
 $env:AGENT_RELAY_DATA_DIR = $root
 
-# A throwaway database, created for this test and nothing else.
+# A throwaway database, created for this test and nothing else. Use a script file
+# rather than node -e: Windows PowerShell 5.1 may re-quote the SQL before Node
+# receives it.
 $db = Join-Path $root 'fixture.sqlite'
-node -e "const {DatabaseSync}=require('node:sqlite');const d=new DatabaseSync(process.argv[1]);d.exec('CREATE TABLE invoices (id INTEGER PRIMARY KEY, customer TEXT NOT NULL, total REAL)');d.exec('CREATE TABLE payments (id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL)');d.exec(\"INSERT INTO invoices (customer,total) VALUES ('ACME Ltd',99.5)\");d.close()" $db
+$fixtureScript = Join-Path $root 'create-fixture.cjs'
+@'
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(process.argv[2]);
+db.exec('CREATE TABLE invoices (id INTEGER PRIMARY KEY, customer TEXT NOT NULL, total REAL)');
+db.exec('CREATE TABLE payments (id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL)');
+db.exec("INSERT INTO invoices (customer,total) VALUES ('ACME Ltd',99.5)");
+db.close();
+'@ | Set-Content -LiteralPath $fixtureScript -Encoding utf8
+node $fixtureScript $db
+if ($LASTEXITCODE -ne 0) { throw "Fixture creation failed with exit code $LASTEXITCODE" }
+Remove-Item -LiteralPath $fixtureScript
 
 # Record what the file looks like before anything opens it.
 Get-FileHash $db; (Get-Item $db).Length; (Get-Item $db).LastWriteTimeUtc
@@ -475,6 +489,32 @@ $root; $previousDataDir
 
 ✅ Pass if every probe reports what is actually there, the fixture file is
 byte-identical afterwards, and nothing ran that you did not click.
+
+### Recorded Phase 7C-C evidence
+
+The 2026-09-04 run passed every row above. The application used a new temporary
+profile with no project selected and registered three local targets: the real
+fixture, a missing path, and a text file carrying a `.sqlite` suffix. Exactly
+five diagnostics were persisted — two successful fixture probes, one successful
+health report for the missing path, one successful health report for the invalid
+file, and one failed schema probe for that invalid file. Opening Operations,
+refreshing History, and navigating away and back created no runs.
+
+The fixture's SHA-256 (`5E0AB6E43E756D98261ED689AA9BDBE5B0BE19B1833F6AE801290855D9F1FD84`),
+12,288-byte size and modification time were unchanged, and no `-wal` or `-shm`
+appeared. `connection_health` reported a real SQLite version with `opened`,
+`readOnly`, and `queryOnly` true. `schema_summary` reported the two expected
+tables and their columns without exposing either seeded row value or the unique
+canary added for the run. Disabling prevented a probe, and removing the target
+with history was refused with the instruction to disable it instead. The missing
+path and invalid-file results described what was actually present and never
+claimed a schema.
+
+One presentation limitation was observed, without affecting the result: a failed
+run has no structured result, and version 1 of the audit row stores no separate
+environment snapshot. History therefore says `environment not recorded` for
+that run. It deliberately does not borrow the target's current environment,
+which could have changed after the diagnostic.
 
 ```powershell
 # Afterwards. Run this in the SAME shell as the preparation: it deletes only the

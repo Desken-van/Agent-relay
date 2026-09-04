@@ -467,15 +467,22 @@ registration goes: the SQLite file is not touched, moved or deleted. A target
 with history cannot be removed, and the screen shows the registry's own reason
 and its suggestion to disable it instead.
 
-> **Live acceptance has not been performed.** The UI is covered by renderer
-> tests that drive the real buttons against a fake IPC bridge; it has not yet
-> been exercised against a real database in a running window. That is Phase
-> 7C-C, and `docs/manual-test.md` §12 is its checklist.
+> **Live acceptance passed.** Phase 7C-C exercised the running Windows app with
+> an isolated profile and synthetic SQLite files: both probes reported the real
+> fixture accurately without changing it or exposing row values, refresh and
+> navigation caused no implicit runs, disabled and history-bearing targets were
+> guarded, and missing or invalid files failed honestly. The recorded evidence
+> and reusable checklist are in `docs/manual-test.md` §12.
 
 ---
 
 ## Known limitations
 
+* **A failed Operations diagnostic has no historical environment snapshot in
+  version 1.** Successful results carry the environment they actually inspected;
+  a failure carries no structured result, so History displays `environment not
+  recorded`. It does not substitute the target's current environment, because
+  editing the target later must not relabel an older audit record.
 * **Agent Relay's GitHub mutation path is not yet live-verified.** Live `gh`
   discovery and authentication diagnostics passed, but create-repository,
   push-branch, and open-pull-request were deliberately not exercised through
