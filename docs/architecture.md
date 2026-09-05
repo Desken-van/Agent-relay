@@ -294,6 +294,36 @@ or exits unsuccessfully. INT-A deliberately stops at this boundary: no real
 provider is contacted, no Coai session enters the task FSM, and no credentials
 or shared-rule repository is loaded.
 
+### Rule evidence boundary
+
+`RuleEvidenceService` captures instructions as evidence before any model sees
+them. A project source discovers only `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`,
+`.github/copilot-instructions.md`, and Markdown rule files below
+`.claude/rules` and `.cursor/rules`. A conventions source has no implicit local
+location and no broad discovery: its root and selected relative files are
+explicit inputs.
+
+`FilesystemRuleSourceReader` accepts canonical source-relative POSIX paths,
+refuses traversal and symlinks in every path component, never follows a linked
+rule directory, and reads a file whole or omits it — never truncates it into a
+different instruction. Discovery, per-file bytes, total bytes, source count and
+file count all have hard ceilings. Missing, non-file, linked, oversized,
+invalid-UTF-8, unreadable and budget-excluded entries remain visible as typed
+omissions.
+
+Every source is inspected as a Git repository before and after reading. A
+conventions source can require both a full expected object id and a clean
+checkout; drift fails closed. A project worktree may intentionally be dirty,
+and that fact is recorded rather than refused. The resulting versioned snapshot
+contains full text, source-relative paths, per-file SHA-256, revisions,
+cleanliness and omissions. Its canonical hash excludes only capture time and
+absolute checkout paths. A runtime schema validates the object before it is
+rendered as an unambiguous JSON prompt envelope.
+
+INT-B stops there: no task currently persists or consumes this envelope. INT-C
+will bind one exact snapshot to planning and review rather than re-reading rules
+at different moments.
+
 Executable discovery is explicit
 ([`executable-locator.ts`](../src/main/adapters/process/executable-locator.ts)):
 configured path → `PATH` (honouring `PATHEXT`) → well-known Windows locations.
@@ -879,7 +909,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1198 deterministic tests plus one automated Electron acceptance journey, none
+1232 deterministic tests plus one automated Electron acceptance journey, none
 of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
@@ -895,6 +925,7 @@ of which contact Codex, Claude, or GitHub.
 | `adapters/claude-cli-process-contract` | **The Claude adapter against a real child process** — see below |
 | `adapters/interactive-runner` | **A real duplex child process**: stdin staying open, input budgets, framing, tree kill |
 | `adapters/stdio-mcp-client` | **The generic MCP boundary against a real fake-server process**: initialization, paginated exact-tool discovery, calls and refusal-as-data, stdout/stderr separation, message/content bounds, malformed protocol, unsuccessful exit, timeout and cancellation |
+| `adapters/filesystem-rule-source` · `services/rule-evidence` | **Whole-file project and convention evidence**: fixed discovery, traversal/symlink refusal, omission and byte budgets, deterministic ordering and hashes, runtime schema agreement, plus exact revision and dirty-state behaviour through real Git repositories |
 | `security/redaction-and-process` | Credential redaction, environment compartmentalisation, argv-not-shell execution |
 | `domain/operations-targets` · `domain/operations-diagnostics` · `domain/operations-ipc-contract` | The target and probe contracts: what they refuse — an adapter outside the enum, a config version this build cannot read, a credential value, a statement anywhere a probe id belongs |
 | `db/operations-repositories` | Migration 3 on a fresh database *and* on one that already has 1 and 2, CRUD, uniqueness, the `RESTRICT` audit policy, close/reopen on disk |

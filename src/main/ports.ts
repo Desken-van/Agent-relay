@@ -37,6 +37,7 @@ import type {
   DiagnosticResult,
   OperationDiagnosticRun
 } from '../shared/domain/operations-diagnostics';
+import type { RuleOmissionReason, RuleSourceKind } from '../shared/domain/rule-evidence';
 import type { PublishConfirmation } from '../shared/ipc';
 import type { CodexReviewResult, TaskSpecification } from '../shared/schemas/codex';
 
@@ -526,6 +527,46 @@ export interface ExternalMcpClient {
     args: Readonly<Record<string, unknown>>,
     signal?: AbortSignal
   ): Promise<ExternalMcpCallResult>;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Rule evidence                                                              */
+/* -------------------------------------------------------------------------- */
+
+export interface RuleSourceListing {
+  readonly paths: readonly string[];
+  readonly omitted: readonly { path: string; reason: RuleOmissionReason }[];
+}
+
+export type RuleSourceReadResult =
+  | { readonly ok: true; readonly path: string; readonly bytes: Uint8Array }
+  | { readonly ok: false; readonly path: string; readonly reason: RuleOmissionReason };
+
+export interface RuleSourceReader {
+  /** Discover the fixed project-memory files and bounded rule directories. */
+  discoverProject(rootPath: string, maxEntries: number): RuleSourceListing;
+  /** Read exactly one source-relative file without following symlinks. */
+  read(rootPath: string, relativePath: string, maxBytes: number): RuleSourceReadResult;
+}
+
+export interface RuleEvidenceSourceRequest {
+  readonly id: string;
+  readonly kind: RuleSourceKind;
+  readonly rootPath: string;
+  /** When set, a different HEAD fails closed. */
+  readonly expectedRevision?: string;
+  /** Required for external conventions; project worktrees may intentionally be dirty. */
+  readonly requireClean: boolean;
+  /** Required for conventions; project sources use fixed discovery instead. */
+  readonly paths?: readonly string[];
+}
+
+export interface RuleEvidenceLimits {
+  readonly maxSources: number;
+  readonly maxFiles: number;
+  readonly maxDiscoveryEntries: number;
+  readonly maxFileBytes: number;
+  readonly maxTotalBytes: number;
 }
 
 /* -------------------------------------------------------------------------- */
