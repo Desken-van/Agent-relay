@@ -1,6 +1,7 @@
 /** Build a deterministic, bounded snapshot of rule files and their provenance. */
 
 import { createHash } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { AgentRelayError } from '../../shared/domain/errors';
 import {
   RULE_EVIDENCE_VERSION,
@@ -132,6 +133,23 @@ function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/**
+ * Git for Windows can expand an 8.3 path (for example RUNNER~1) while Node
+ * keeps the spelling supplied by os.tmpdir(). Both names identify the same
+ * directory, so compare their native real paths after Git has proved that the
+ * source exists and is a repository.
+ */
+function isSameRepositoryRoot(inspectedRoot: string, requestedRoot: string): boolean {
+  try {
+    return isSamePath(realpathSync.native(inspectedRoot), realpathSync.native(requestedRoot));
+  } catch {
+    // Port-level unit tests use synthetic absolute paths. Keep the pure path
+    // comparison as a conservative fallback; real repositories take the
+    // canonical branch above.
+    return isSamePath(inspectedRoot, requestedRoot);
+  }
+}
+
 function isSorted<T>(items: readonly T[], key: (item: T) => string): boolean {
   return items.every((item, index) => index === 0 || compareText(key(items[index - 1]!), key(item)) <= 0);
 }
@@ -215,7 +233,7 @@ export class RuleEvidenceService {
       if (!before.isRepository || before.root === null || before.headCommit === null) {
         throw new AgentRelayError('VALIDATION_FAILED', `Rule source "${source.id}" is not a Git repository.`);
       }
-      if (!isSamePath(before.root, source.rootPath)) {
+      if (!isSameRepositoryRoot(before.root, source.rootPath)) {
         throw new AgentRelayError(
           'UNSAFE_PATH',
           `Rule source "${source.id}" must name the repository root exactly.`
@@ -282,7 +300,7 @@ export class RuleEvidenceService {
         !after.isRepository ||
         after.headCommit !== before.headCommit ||
         after.root === null ||
-        !isSamePath(after.root, source.rootPath) ||
+        !isSameRepositoryRoot(after.root, source.rootPath) ||
         (source.requireClean && !after.isClean)
       ) {
         throw new AgentRelayError(

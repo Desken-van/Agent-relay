@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -66,6 +66,33 @@ afterEach(() => {
 });
 
 describe('rule evidence through real Git and filesystem adapters', () => {
+  it('accepts an alternate filesystem spelling of the exact repository root', async () => {
+    const aliasParent = mkdtempSync(join(tmpdir(), 'agent-relay-rule-alias-'));
+    roots.push(aliasParent);
+    const alias = join(aliasParent, 'repository');
+    symlinkSync(repository, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const service = new RuleEvidenceService(git, reader, clock);
+
+    const snapshot = await service.capture({
+      sources: [
+        {
+          id: 'shared-conventions',
+          kind: 'conventions',
+          rootPath: alias,
+          expectedRevision: revision,
+          requireClean: true,
+          paths: ['common/style.md']
+        }
+      ],
+      limits
+    });
+
+    expect(snapshot.sources).toEqual([
+      { id: 'shared-conventions', kind: 'conventions', revision, clean: true }
+    ]);
+    expect(snapshot.files[0]?.content).toBe('Prefer explicit evidence.\n');
+  });
+
   it('binds selected conventions bytes to the exact clean Git revision', async () => {
     const service = new RuleEvidenceService(git, reader, clock);
 
