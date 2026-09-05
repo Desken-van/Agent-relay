@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { correctionAction, latestClaudeRoundResult } from '@shared/domain/claude-assessment';
 import type { GitChangeSet } from '@shared/domain/git';
-import type { ApprovalAction } from '@shared/domain/models';
+import type { ApprovalAction, Task } from '@shared/domain/models';
+import type { PlanReviewDecision } from '@shared/domain/plan-review';
 import { isBusy } from '@shared/domain/workflow';
-import type { PublishConfirmation } from '@shared/ipc';
+import type { PlanReviewDetail, PublishConfirmation } from '@shared/ipc';
 import type { CodexReviewResult, FindingSeverity, TaskSpecification } from '@shared/schemas/codex';
 import { ApiError, call, expect } from '../lib/api';
 import { formatDateTime, pluralize } from '../lib/format';
@@ -15,7 +16,7 @@ import { RelayTimeline } from './RelayTimeline';
 
 export function RunView(): React.JSX.Element {
   const store = useStore();
-  const { selectedTaskId, detail, refreshDetail, perform, notify, busy, codexModels } = store;
+  const { selectedTaskId, detail, refreshDetail, perform, notify, busy, codexModels, settings } = store;
 
   const [changes, setChanges] = useState<GitChangeSet | null>(null);
 
@@ -203,6 +204,13 @@ export function RunView(): React.JSX.Element {
           />
         ) : null}
 
+        <PlanReviewPanel
+          key={task.id}
+          task={task}
+          integrationEnabled={settings?.externalPlanReviewEnabled ?? false}
+          onChanged={() => refreshDetail(task.id)}
+        />
+
         {lastReview ? <ReviewPanel review={lastReview} /> : null}
 
         <Card title="Relay timeline" flush>
@@ -366,6 +374,270 @@ export function RunView(): React.JSX.Element {
         <ChangesPanel changes={changes} loading={loadingChanges} onRefresh={() => void loadChanges()} />
       </div>
     </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+
+type DecisionDraft = { action: '' | 'accept' | 'reject'; reason: string };
+
+export function PlanReviewPanel({
+  task,
+  integrationEnabled,
+  onChanged
+}: {
+  task: Task;
+  integrationEnabled: boolean;
+  onChanged: () => Promise<void>;
+}): React.JSX.Element | null {
+  const [detail, setDetail] = useState<PlanReviewDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [dirtyPrompt, setDirtyPrompt] = useState(false);
+  const [decisions, setDecisions] = useState<Record<number, DecisionDraft>>({});
+
+  useEffect(() => {
+    let active = true;
+    void call('planReview:get', { taskId: task.id }).then((result) => {
+      if (!active) return;
+      if (result.ok) {
+        setDetail(result.data);
+        setError(null);
+      } else {
+        setError(result.error.message);
+      }
+      setLoading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, [task.id]);
+
+  const act = async (
+    key: string,
+    operation: () => Promise<PlanReviewDetail>
+  ): Promise<void> => {
+    setBusy(key);
+    setError(null);
+    try {
+      const next = await operation();
+      setDetail(next);
+      setDirtyPrompt(false);
+      await onChanged();
+    } catch (caught) {
+      if (caught instanceof ApiError && caught.code === 'GIT_DIRTY' && key === 'prepare') {
+        setDirtyPrompt(true);
+      } else {
+        setError(caught instanceof Error ? caught.message : String(caught));
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  if (!integrationEnabled && !detail?.ruleEvidence) return null;
+
+  const gate = detail?.gate ?? null;
+  const findings = detail?.findings ?? [];
+  const allDecided = findings.every((_, index) => {
+    const decision = decisions[index];
+    return decision?.action === 'accept' ||
+      (decision?.action === 'reject' && decision.reason.trim().length > 0);
+  });
+  const inFlight = gate && ['opening', 'reviewing', 'resolving'].includes(gate.status);
+
+  return (
+    <Card
+      title="External plan review"
+      actions={gate ? <span className={`tag ${gate.status === 'proceeded' ? 'tag--ok' : gate.status === 'failed' ? 'tag--danger' : 'tag--warn'}`}>{gate.status.replace(/_/g, ' ')}</span> : undefined}
+    >
+      <div className="stack">
+        {loading ? <div className="muted">Loading rule and review evidence…</div> : null}
+        {!integrationEnabled ? (
+          <Notice tone="warn">This task is bound to external review evidence. Re-enable the integration in Settings to continue it.</Notice>
+        ) : null}
+        {error ? <Notice tone="error">{error}</Notice> : null}
+
+        {!detail?.ruleEvidence ? (
+          <>
+            <div className="muted">
+              Capture the project&apos;s current rule files and the configured conventions before
+              generating the specification. The resulting bytes and Git identity are immutable.
+            </div>
+            <button
+              type="button"
+              className="btn btn--wide"
+              disabled={!integrationEnabled || busy !== null || task.status !== 'DRAFT'}
+              onClick={() => void act('bind', () => expect('planReview:bindRules', { taskId: task.id }))}
+            >
+              {busy === 'bind' ? <Spinner /> : <Scope kind="read" />} Capture and bind rules
+            </button>
+            {task.status !== 'DRAFT' ? (
+              <Notice tone="info">This existing task did not opt in before specification generation. Its normal workflow remains unchanged.</Notice>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <div className="kv">
+              <span className="kv__k">Evidence</span>
+              <span className="kv__v mono selectable">{detail.ruleEvidence.snapshotSha256}</span>
+              <span className="kv__k">Sources</span>
+              <span className="kv__v">{detail.ruleEvidence.sources.length}</span>
+              <span className="kv__k">Files</span>
+              <span className="kv__v">{detail.ruleEvidence.files.length}</span>
+              <span className="kv__k">Bytes</span>
+              <span className="kv__v">{detail.ruleEvidence.totalBytes.toLocaleString()}</span>
+            </div>
+            <details>
+              <summary className="faint" style={{ cursor: 'pointer' }}>Captured files and omissions</summary>
+              <div className="stack stack--tight" style={{ marginTop: 8 }}>
+                {detail.ruleEvidence.files.map((file) => (
+                  <div className="filerow" key={`${file.sourceId}:${file.path}`}>
+                    <span className="tag">{file.sourceId}</span>
+                    <span className="filerow__path mono selectable">{file.path}</span>
+                    <span className="filerow__stat faint">{file.bytes} B</span>
+                  </div>
+                ))}
+                {detail.ruleEvidence.omitted.map((item) => (
+                  <div className="filerow" key={`${item.sourceId}:${item.path}:${item.reason}`}>
+                    <span className="tag tag--warn">omitted</span>
+                    <span className="filerow__path mono selectable">{item.sourceId}: {item.path}</span>
+                    <span className="filerow__stat faint">{item.reason}</span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          </>
+        )}
+
+        {detail?.ruleEvidence && task.status === 'READY_FOR_IMPLEMENTATION' && gate === null ? (
+          <button
+            type="button"
+            className="btn btn--wide"
+            disabled={!integrationEnabled || busy !== null}
+            onClick={() => void act('prepare', () => expect('planReview:prepare', { taskId: task.id }))}
+          >
+            {busy === 'prepare' ? <Spinner /> : <Scope kind="local" />} Prepare isolated review branch
+          </button>
+        ) : null}
+
+        {dirtyPrompt ? (
+          <Notice tone="warn">
+            The project checkout is dirty. The isolated task branch can still be based on its
+            current HEAD, but uncommitted project changes are not copied.
+            <button
+              type="button"
+              className="btn btn--sm"
+              style={{ marginTop: 8 }}
+              disabled={busy !== null}
+              onClick={() => void act('prepare', () => expect('planReview:prepare', {
+                taskId: task.id,
+                acceptDirtyWorkingTree: true
+              }))}
+            >
+              Continue with current HEAD
+            </button>
+          </Notice>
+        ) : null}
+
+        {gate && ['prepared', 'changes_requested'].includes(gate.status) ? (
+          <button
+            type="button"
+            className="btn btn--wide"
+            disabled={!integrationEnabled || busy !== null}
+            onClick={() => void act('review', () => expect('planReview:review', { taskId: task.id }))}
+          >
+            {busy === 'review' ? <Spinner /> : <Scope kind="read" />}
+            {gate.status === 'changes_requested' ? 'Run next plan-review round' : 'Run external plan review'}
+          </button>
+        ) : null}
+
+        {inFlight ? (
+          <Notice tone="warn">
+            The external call was recorded as {gate?.status.replace(/_/g, ' ')}. Agent Relay will
+            not repeat it because the previous outcome may be unknown.
+          </Notice>
+        ) : null}
+        {gate?.lastError ? <Notice tone="error">{gate.lastError}</Notice> : null}
+
+        {gate?.status === 'awaiting_resolve' ? (
+          <div className="stack">
+            <Notice tone="warn">
+              The verdict does not approve the plan. Decide every finding, then resolve the
+              external round. Rejecting a finding requires a written reason.
+            </Notice>
+            <div className="kv">
+              <span className="kv__k">Verdict</span><span className="kv__v">{gate.verdict}</span>
+              <span className="kv__k">Gating</span><span className="kv__v">{gate.gatingCount} / threshold {gate.threshold}</span>
+              <span className="kv__k">Reviewers</span><span className="kv__v selectable">{gate.reviewers}</span>
+            </div>
+            {findings.map((finding, index) => {
+              const decision = decisions[index] ?? { action: '', reason: '' };
+              return (
+                <div className="finding" key={`${index}:${finding.title}`}>
+                  <div className="finding__head">
+                    <span className={`tag ${finding.severity === 'blocking' || finding.severity === 'major' ? 'tag--danger' : 'tag--warn'}`}>{finding.severity}</span>
+                    <span className="finding__title selectable">{finding.title}</span>
+                    <span className="finding__where selectable">{finding.category}{finding.file ? ` · ${finding.file}${finding.line ? `:${finding.line}` : ''}` : ''}</span>
+                  </div>
+                  <div className="finding__desc selectable">{finding.why}</div>
+                  <div className="muted selectable" style={{ marginTop: 6 }}>Suggested: {finding.fix}</div>
+                  <div className="grid-2" style={{ marginTop: 10 }}>
+                    <Field label="Decision">
+                      <select
+                        className="select"
+                        value={decision.action}
+                        onChange={(event) => setDecisions((current) => ({
+                          ...current,
+                          [index]: { ...decision, action: event.target.value as DecisionDraft['action'] }
+                        }))}
+                      >
+                        <option value="">Choose…</option>
+                        <option value="accept">Accept and address</option>
+                        <option value="reject">Reject with reason</option>
+                      </select>
+                    </Field>
+                    <Field label="Reason" hint={decision.action === 'reject' ? 'Required' : 'Optional audit note'}>
+                      <input
+                        className="input"
+                        value={decision.reason}
+                        onChange={(event) => setDecisions((current) => ({
+                          ...current,
+                          [index]: { ...decision, reason: event.target.value }
+                        }))}
+                      />
+                    </Field>
+                  </div>
+                </div>
+              );
+            })}
+            <button
+              type="button"
+              className="btn btn--primary btn--wide"
+              disabled={!integrationEnabled || busy !== null || !allDecided}
+              onClick={() => {
+                const payload: PlanReviewDecision[] = findings.map((_, index) => ({
+                  finding: index,
+                  action: decisions[index]!.action as 'accept' | 'reject',
+                  reason: decisions[index]!.reason.trim()
+                }));
+                void act('resolve', () => expect('planReview:resolve', {
+                  taskId: task.id,
+                  decisions: payload
+                }));
+              }}
+            >
+              {busy === 'resolve' ? <Spinner /> : <Scope kind="read" />} Resolve all findings
+            </button>
+          </div>
+        ) : null}
+
+        {gate?.status === 'proceeded' ? (
+          <Notice tone="info">The exact specification and rule snapshot passed resolution. You may now approve the specification.</Notice>
+        ) : null}
+      </div>
+    </Card>
   );
 }
 

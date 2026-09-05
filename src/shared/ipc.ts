@@ -40,6 +40,15 @@ import {
   type OperationDiagnosticRun
 } from './domain/operations-diagnostics';
 import type { CodexReviewResult, TaskSpecification } from './schemas/codex';
+import {
+  planReviewDecisionSchema,
+  type PlanReviewFinding,
+  type PlanReviewGate
+} from './domain/plan-review';
+import type {
+  RuleEvidenceOmission,
+  RuleEvidenceSource
+} from './domain/rule-evidence';
 
 /* -------------------------------------------------------------------------- */
 /* Envelope                                                                    */
@@ -80,6 +89,24 @@ export interface PublishOutcome {
   readonly performed: boolean;
   readonly message: string;
   readonly url: string | null;
+}
+
+export interface PlanReviewDetail {
+  readonly ruleEvidence: {
+    readonly snapshotSha256: string;
+    readonly boundAt: string;
+    readonly sources: readonly RuleEvidenceSource[];
+    readonly files: readonly {
+      readonly sourceId: string;
+      readonly path: string;
+      readonly bytes: number;
+      readonly sha256: string;
+    }[];
+    readonly omitted: readonly RuleEvidenceOmission[];
+    readonly totalBytes: number;
+  } | null;
+  readonly gate: PlanReviewGate | null;
+  readonly findings: readonly PlanReviewFinding[];
 }
 
 /** Push payload delivered on the `agent-relay:event` channel. */
@@ -188,6 +215,19 @@ export const ipcInputSchemas = {
   'workflow:stop': byTask,
   'workflow:approveForPublishing': byTask,
 
+  'planReview:get': byTask,
+  'planReview:bindRules': byTask,
+  'planReview:prepare': z
+    .object({ taskId: z.string().min(1), acceptDirtyWorkingTree: z.boolean().optional() })
+    .strict(),
+  'planReview:review': byTask,
+  'planReview:resolve': z
+    .object({
+      taskId: z.string().min(1),
+      decisions: z.array(planReviewDecisionSchema).max(256)
+    })
+    .strict(),
+
   'git:changes': z.object({ taskId: z.string().min(1), refresh: z.boolean().optional() }).strict(),
   'git:repositoryInfo': z.object({ projectId: z.string().min(1) }).strict(),
 
@@ -284,6 +324,12 @@ export interface IpcResponseMap {
   'workflow:sendCorrections': Task;
   'workflow:stop': Task;
   'workflow:approveForPublishing': Task;
+
+  'planReview:get': PlanReviewDetail;
+  'planReview:bindRules': PlanReviewDetail;
+  'planReview:prepare': PlanReviewDetail;
+  'planReview:review': PlanReviewDetail;
+  'planReview:resolve': PlanReviewDetail;
 
   'git:changes': GitChangeSet;
   'git:repositoryInfo': RepositoryInfo;

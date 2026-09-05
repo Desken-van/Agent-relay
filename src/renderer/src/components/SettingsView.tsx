@@ -12,6 +12,7 @@ import {
   settingsSaveState,
   type Settings
 } from '@shared/domain/models';
+import { containsSecretShape } from '@shared/util/redact';
 import { call, expect } from '../lib/api';
 import { formatDateTime } from '../lib/format';
 import { useStore } from '../state/store';
@@ -38,6 +39,8 @@ export function SettingsView(): React.JSX.Element {
   // typed lines survive; null means "show whatever the draft holds".
   const [rulesText, setRulesText] = useState<string | null>(null);
   const [verificationText, setVerificationText] = useState<string | null>(null);
+  const [mcpArgumentsText, setMcpArgumentsText] = useState<string | null>(null);
+  const [conventionPathsText, setConventionPathsText] = useState<string | null>(null);
 
   const tools: ToolDiagnostic[] = diagnostics
     ? [diagnostics.codex, diagnostics.claude, diagnostics.git, diagnostics.github]
@@ -74,6 +77,74 @@ export function SettingsView(): React.JSX.Element {
       }
       return `${problem.rule ?? 'A rule'} ${VERIFICATION_RULE_PROBLEMS[problem.detail ?? 'syntax']}`;
     });
+  }, [draft]);
+
+  const externalReviewProblems = useMemo<string[]>(() => {
+    if (!draft) return [];
+    const problems: string[] = [];
+    const absolute = (value: string): boolean => /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(value);
+    // eslint-disable-next-line no-control-regex
+    const hasControl = (value: string): boolean => /[\u0000-\u001f\u007f]/.test(value);
+    if (
+      draft.coaiMcpExecutablePath !== null &&
+      (!absolute(draft.coaiMcpExecutablePath) || hasControl(draft.coaiMcpExecutablePath))
+    ) {
+      problems.push('The MCP executable must be an absolute path without control characters.');
+    } else if (draft.externalPlanReviewEnabled && draft.coaiMcpExecutablePath === null) {
+      problems.push('Enabled external plan review requires an absolute MCP executable path.');
+    }
+    if (
+      draft.coaiMcpArguments.some(
+        (argument) =>
+          hasControl(argument) ||
+          /^--?(?:[^=]*[-_])?(?:token|password|passwd|secret|api[-_]?key|credential)(?:=|$)/i.test(
+            argument
+          )
+      ) ||
+      containsSecretShape(JSON.stringify(draft.coaiMcpArguments))
+    ) {
+      problems.push('MCP arguments cannot contain control characters or credential material.');
+    }
+    if (
+      draft.coaiMcpWorkingDirectory !== null &&
+      (!absolute(draft.coaiMcpWorkingDirectory) || hasControl(draft.coaiMcpWorkingDirectory))
+    ) {
+      problems.push('The MCP working directory must be an absolute path without control characters.');
+    }
+    if (
+      draft.conventionsRepositoryPath !== null &&
+      (!absolute(draft.conventionsRepositoryPath) || hasControl(draft.conventionsRepositoryPath))
+    ) {
+      problems.push('The conventions repository must be an absolute path without control characters.');
+    }
+    const conventionParts = [
+      draft.conventionsRepositoryPath !== null,
+      draft.conventionsExpectedRevision !== null,
+      draft.conventionsRulePaths.length > 0
+    ];
+    if (conventionParts.some(Boolean) && !conventionParts.every(Boolean)) {
+      problems.push('Conventions need a repository path, exact full revision, and selected files.');
+    }
+    if (
+      draft.conventionsExpectedRevision !== null &&
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(draft.conventionsExpectedRevision)
+    ) {
+      problems.push('The conventions revision must be a full lowercase 40- or 64-character Git SHA.');
+    }
+    if (
+      draft.conventionsRulePaths.some((path) => {
+        const segments = path.split('/');
+        return (
+          path.includes('\\') ||
+          path.includes(':') ||
+          path.startsWith('/') ||
+          segments.some((segment) => segment === '' || segment === '.' || segment === '..')
+        );
+      })
+    ) {
+      problems.push('Convention files must use clean repository-relative POSIX paths.');
+    }
+    return problems;
   }, [draft]);
 
   /**
@@ -115,6 +186,8 @@ export function SettingsView(): React.JSX.Element {
     setEdits(cleared.draft);
     setRulesText(cleared.allowedText);
     setVerificationText(cleared.verificationText);
+    setMcpArgumentsText(null);
+    setConventionPathsText(null);
   };
 
   /**
@@ -129,7 +202,7 @@ export function SettingsView(): React.JSX.Element {
   const saveState = settingsSaveState({
     saved: settings,
     draft,
-    blockingProblems: verificationProblems.length
+    blockingProblems: verificationProblems.length + externalReviewProblems.length
   });
 
   return (
@@ -238,6 +311,97 @@ export function SettingsView(): React.JSX.Element {
                     onChange={(e) => set('worktreesRoot', e.target.value)}
                   />
                 </Field>
+              </div>
+            </Card>
+
+            <Card title="External plan review">
+              <div className="stack">
+                <label className="row" style={{ alignItems: 'flex-start' }}>
+                  <input
+                    type="checkbox"
+                    checked={draft.externalPlanReviewEnabled}
+                    onChange={(event) => set('externalPlanReviewEnabled', event.target.checked)}
+                  />
+                  <span>
+                    <strong>Enable task-level rule binding and external plan review</strong>
+                    <span className="muted" style={{ display: 'block', marginTop: 3 }}>
+                      Each task opts in permanently when you capture its rules. No existing task is changed.
+                    </span>
+                  </span>
+                </label>
+
+                <Field label="MCP executable" hint="Absolute path only. Authentication remains owned by the MCP server.">
+                  <input
+                    className="input input--mono"
+                    value={draft.coaiMcpExecutablePath ?? ''}
+                    placeholder="(required when enabled)"
+                    onChange={(event) => set('coaiMcpExecutablePath', event.target.value.trim() || null)}
+                  />
+                </Field>
+                <Field label="MCP arguments" hint="One fixed argument per line. Never put a token or password here.">
+                  <textarea
+                    className="input input--mono"
+                    rows={3}
+                    spellCheck={false}
+                    value={mcpArgumentsText ?? draft.coaiMcpArguments.join('\n')}
+                    onChange={(event) => {
+                      setMcpArgumentsText(event.target.value);
+                      set(
+                        'coaiMcpArguments',
+                        event.target.value.split('\n').map((line) => line.trim()).filter(Boolean)
+                      );
+                    }}
+                  />
+                </Field>
+                <Field label="MCP working directory" hint="Optional absolute directory.">
+                  <input
+                    className="input input--mono"
+                    value={draft.coaiMcpWorkingDirectory ?? ''}
+                    onChange={(event) => set('coaiMcpWorkingDirectory', event.target.value.trim() || null)}
+                  />
+                </Field>
+
+                <Field label="Conventions repository" hint="Optional. Project rules are always captured; add a clean conventions repository here.">
+                  <input
+                    className="input input--mono"
+                    value={draft.conventionsRepositoryPath ?? ''}
+                    onChange={(event) => set('conventionsRepositoryPath', event.target.value.trim() || null)}
+                  />
+                </Field>
+                <Field label="Conventions revision" hint="Exact full Git SHA; moving branch names are refused.">
+                  <input
+                    className="input input--mono"
+                    value={draft.conventionsExpectedRevision ?? ''}
+                    onChange={(event) => set('conventionsExpectedRevision', event.target.value.trim() || null)}
+                  />
+                </Field>
+                <Field label="Selected convention files" hint="One repository-relative POSIX path per line.">
+                  <textarea
+                    className="input input--mono"
+                    rows={4}
+                    spellCheck={false}
+                    value={conventionPathsText ?? draft.conventionsRulePaths.join('\n')}
+                    onChange={(event) => {
+                      setConventionPathsText(event.target.value);
+                      set(
+                        'conventionsRulePaths',
+                        event.target.value.split('\n').map((line) => line.trim()).filter(Boolean)
+                      );
+                    }}
+                  />
+                </Field>
+
+                {externalReviewProblems.length > 0 ? (
+                  <Notice tone="error">
+                    <ul style={{ margin: 0, paddingLeft: 18 }}>
+                      {externalReviewProblems.map((problem) => <li key={problem}>{problem}</li>)}
+                    </ul>
+                  </Notice>
+                ) : null}
+                <Notice tone="info">
+                  Captured rule bytes and their Git identity are frozen on the task. Changing these
+                  settings later does not rewrite evidence already bound to a task.
+                </Notice>
               </div>
             </Card>
 
