@@ -212,6 +212,52 @@ export const MIGRATIONS: readonly Migration[] = [
           WHERE status = 'running';
       `);
     }
+  },
+  {
+    version: 4,
+    name: 'plan-review-gate',
+    up(db) {
+      db.exec(`
+        CREATE TABLE task_rule_evidence (
+          task_id          TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+          snapshot_sha256  TEXT NOT NULL CHECK (length(snapshot_sha256) = 64),
+          snapshot_json    TEXT NOT NULL,
+          bound_at         TEXT NOT NULL
+        );
+
+        CREATE TABLE plan_review_gates (
+          id                       TEXT PRIMARY KEY,
+          task_id                  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          specification_sha256     TEXT NOT NULL CHECK (length(specification_sha256) = 64),
+          rule_evidence_sha256     TEXT NOT NULL CHECK (length(rule_evidence_sha256) = 64),
+          session_id               TEXT,
+          server_name              TEXT,
+          server_version           TEXT,
+          status                   TEXT NOT NULL CHECK (status IN (
+                                     'prepared','opening','reviewing','awaiting_resolve','resolving',
+                                     'changes_requested','proceeded','failed')),
+          verdict                  TEXT CHECK (verdict IN (
+                                     'proceed','revise','continue_anyway','good_enough',
+                                     'call_human','escalated')),
+          findings_json            TEXT,
+          decisions_json           TEXT,
+          reviewers                TEXT,
+          gating_count             INTEGER CHECK (gating_count IS NULL OR gating_count >= 0),
+          threshold                INTEGER CHECK (threshold IS NULL OR threshold >= 0),
+          last_error               TEXT,
+          created_at               TEXT NOT NULL,
+          updated_at               TEXT NOT NULL,
+          CHECK (status <> 'awaiting_resolve' OR (
+            session_id IS NOT NULL AND server_name IS NOT NULL AND server_version IS NOT NULL
+            AND verdict IS NOT NULL AND findings_json IS NOT NULL
+            AND gating_count IS NOT NULL AND threshold IS NOT NULL
+          )),
+          CHECK (status NOT IN ('changes_requested','proceeded') OR decisions_json IS NOT NULL)
+        );
+        CREATE INDEX idx_plan_review_gates_task ON plan_review_gates(task_id, created_at DESC);
+        CREATE INDEX idx_plan_review_gates_status ON plan_review_gates(status, updated_at);
+      `);
+    }
   }
 ];
 

@@ -58,10 +58,12 @@ import type {
   GitAdapter,
   IdGenerator,
   ProjectRepository,
+  PlanReviewGateRepository,
   RunEventRepository,
   RunRepository,
   SettingsRepository,
-  TaskRepository
+  TaskRepository,
+  TaskRuleEvidenceRepository
 } from '../ports';
 import { assertSafeWorktreePath, isSamePath } from './path-safety';
 import { assessClaudeRound } from './claude-round-policy';
@@ -72,6 +74,11 @@ import {
   toAssessmentRecord
 } from './claude-round-report';
 import { RunRecorder } from './run-recorder';
+import {
+  assertPlanReviewAllowsApproval,
+  readBoundRuleEvidence
+} from './plan-review-gate';
+import { renderRuleEvidence } from './rule-evidence';
 import { join } from 'node:path';
 
 export interface OrchestratorDeps {
@@ -86,6 +93,8 @@ export interface OrchestratorDeps {
   readonly clock: Clock;
   readonly ids: IdGenerator;
   readonly events: EventPublisher;
+  readonly ruleEvidence: TaskRuleEvidenceRepository;
+  readonly planReviews: PlanReviewGateRepository;
 }
 
 export class Orchestrator {
@@ -119,6 +128,11 @@ export class Orchestrator {
       this.deps.events,
       settings.maxStoredLogBytes
     );
+  }
+
+  private ruleEvidenceText(taskId: string): string | undefined {
+    const snapshot = readBoundRuleEvidence(taskId, this.deps.ruleEvidence);
+    return snapshot === null ? undefined : renderRuleEvidence(snapshot);
   }
 
   private applyEvent(task: Task, event: WorkflowEvent, patch: Partial<Task> = {}): Task {
@@ -206,6 +220,7 @@ export class Orchestrator {
           projectPath: project.localPath,
           taskTitle: task.title,
           originalRequest: task.originalRequest,
+          ruleEvidence: this.ruleEvidenceText(task.id),
           threadId: task.codexThreadId,
           // Snapshotted on the task: a regenerated spec keeps the same model.
           model: task.codexModel
@@ -260,7 +275,34 @@ export class Orchestrator {
       );
     }
 
+    assertPlanReviewAllowsApproval({
+      task,
+      ruleEvidence: this.deps.ruleEvidence,
+      gates: this.deps.planReviews
+    });
+
     return this.patchTask(taskId, { specificationApprovedAt: this.deps.clock.nowIso() });
+  }
+
+  /** Allocate the unique task branch used as the external review-session key. */
+  async preparePlanReviewWorktree(
+    taskId: string,
+    options: { acceptDirtyWorkingTree?: boolean } = {}
+  ): Promise<Task> {
+    const task = this.requireTask(taskId);
+    if (task.status !== 'READY_FOR_IMPLEMENTATION') {
+      throw new InvalidTransitionError(task.status, 'prepare_plan_review');
+    }
+    const project = this.requireProject(task.projectId);
+    const settings = this.deps.settings.get();
+    this.beginExclusive(taskId);
+    try {
+      return await this.ensureWorktree(task, project, settings, {
+        acceptDirtyWorkingTree: options.acceptDirtyWorkingTree ?? false
+      });
+    } finally {
+      this.endExclusive(taskId);
+    }
   }
 
   /* ------------------------------------------------------------------ */
@@ -403,6 +445,11 @@ export class Orchestrator {
         { remediation: 'Review the specification and choose "Approve specification" first.' }
       );
     }
+    assertPlanReviewAllowsApproval({
+      task,
+      ruleEvidence: this.deps.ruleEvidence,
+      gates: this.deps.planReviews
+    });
 
     const specification = readSpecification(task);
 
@@ -434,7 +481,8 @@ export class Orchestrator {
         specification,
         worktreePath,
         branchName,
-        originalRequest: task.originalRequest
+        originalRequest: task.originalRequest,
+        ruleEvidence: this.ruleEvidenceText(task.id)
       });
 
       return await this.runClaude(task, controller, prompt, {
@@ -510,13 +558,15 @@ export class Orchestrator {
         ? buildVerificationRetryPrompt({
             reason: this.describeBlockedRound(task.id),
             round: nextRound,
-            maxRounds: task.maxRounds
+            maxRounds: task.maxRounds,
+            ruleEvidence: this.ruleEvidenceText(task.id)
           })
         : buildCorrectionPrompt({
             // Checked above for the non-recovery path.
             review: review as NonNullable<typeof review>,
             round: nextRound,
-            maxRounds: task.maxRounds
+            maxRounds: task.maxRounds,
+            ruleEvidence: this.ruleEvidenceText(task.id)
           });
 
       return await this.runClaude(task, controller, prompt, {
@@ -770,6 +820,7 @@ export class Orchestrator {
           worktreePath,
           threadId: task.codexThreadId,
           specification,
+          ruleEvidence: this.ruleEvidenceText(task.id),
           changes,
           claudeReport,
           testOutput: extractTestOutput(claudeReport),

@@ -299,7 +299,8 @@ export class CodexSdkAdapter implements CodexAdapter {
     const prompt = buildSpecificationPrompt({
       projectPath: request.projectPath,
       taskTitle: request.taskTitle,
-      originalRequest: request.originalRequest
+      originalRequest: request.originalRequest,
+      ruleEvidence: request.ruleEvidence
     });
 
     const outcome = await this.runTurn(
@@ -344,7 +345,8 @@ export class CodexSdkAdapter implements CodexAdapter {
       claudeReport: request.claudeReport,
       testOutput: request.testOutput,
       round: request.round,
-      maxRounds: request.maxRounds
+      maxRounds: request.maxRounds,
+      ruleEvidence: request.ruleEvidence
     });
 
     const outcome = await this.runTurn(
