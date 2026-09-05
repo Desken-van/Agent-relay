@@ -856,7 +856,8 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1177 tests, none of which contact Codex, Claude, or GitHub.
+1177 deterministic tests plus one automated Electron acceptance journey, none
+of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|
@@ -881,6 +882,11 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 | `renderer/operations-recovery` | **Recovery, and what must not depend on anything else**: Operations reachable through a development bootstrap that never finishes, a manual re-read held until every read it needs has answered, an unconfirmed registration resolved against the registry, a probe request that goes unanswered, and one deep search per run |
 | `renderer/operations-evidence` | **What counts as evidence, what a wait means, and who may write**: a superseded list read, two overlapping recoveries, a list, a deep search and a registration that never answer, a late registration answer, a draft replaced while a create was in flight, a create racing an edit in one tick, an answer that beats its own read-back, a refusal arriving with the editor open, and what an unknown update or delete may be said to prove |
 | `renderer/operations-outcomes` | **Which request an outcome belongs to, and what the screen says before it knows**: a matching row that predates the request, a draft and a normalised path that are the same path, a confirming read still in flight, a refresh that says it is working, a registry write that never answers, and coming back to the screen without running anything |
+| `e2e/operations-electron` | **The built Electron application through its real renderer, preload, IPC, repositories and probe process**: an isolated profile, three synthetic targets, exactly five diagnostics, fixture immutability and no row-value disclosure, disabled/removal guards, invalid inputs, and persistence across restart |
+
+The deterministic suites run before the build. The Electron journey runs after
+it, through `npm run test:e2e`, so it always exercises the bundles produced by
+the same `npm run verify` invocation rather than a stale development server.
 
 ### Renderer tests
 
