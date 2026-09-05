@@ -188,6 +188,7 @@ describe('registering a target', () => {
     renderOperations(<OperationsView />);
     await screen.findByText('No targets registered');
 
+    const form = screen.getByText('Register a target').closest('.card') as HTMLElement;
     fillForm({ name: '  Reports  ', environment: 'staging', path: 'C:\\data\\reports.sqlite' });
     fireEvent.click(saveButton());
 
@@ -207,6 +208,12 @@ describe('registering a target', () => {
     const payload = bridge.callsTo('operations:createTarget')[0]?.input as Record<string, unknown>;
     expect(payload).not.toHaveProperty('credentialRef');
     expect(JSON.stringify(payload)).not.toMatch(/password|token|connectionString/i);
+
+    await waitFor(() =>
+      expect((within(form).getByLabelText('Name') as HTMLInputElement).value).toBe('')
+    );
+    expect(screen.queryByText(/It was registered after all/)).toBeNull();
+    expect(screen.queryByText(/The reply was lost/)).toBeNull();
   });
 
   it('keeps the draft when the backend refuses', async () => {

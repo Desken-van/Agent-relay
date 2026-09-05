@@ -1582,10 +1582,10 @@ export function OperationsProvider({
             dispatch({ type: "select", targetId: outcome.data.id });
           }
           setCreateUnconfirmed(null);
-          dispatch({
-            type: "create-resolution",
-            value: { kind: "registered", targetId: outcome.data.id },
-          });
+          // A direct backend answer is ordinary success. The `registered`
+          // resolution is reserved for recovery that proves a lost reply by
+          // reading the target back from the registry.
+          dispatch({ type: "create-resolution", value: null });
           return;
         }
 
