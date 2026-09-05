@@ -481,6 +481,38 @@ describe('an update that answers while the read-back is running', () => {
       // The change is on screen, and the screen does not also claim nobody knows.
       expect(screen.getByRole('button', { name: /^Enable$/ })).toBeTruthy();
       expect(screen.queryByText(/was not answered in time/)).toBeNull();
+      expect(screen.queryByText(/now matches the requested state/)).toBeNull();
+      expect(bridge.callsTo('operations:updateTarget')).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('a read-back while an update is still outstanding', () => {
+  it('does not claim the change failed before the request has answered', async () => {
+    vi.useFakeTimers();
+    const update = deferred<unknown>();
+    try {
+      bridge.set('operations:listTargets', () =>
+        ok<'operations:listTargets'>([makeTarget()])
+      );
+      bridge.set('operations:listDiagnostics', () => ok<'operations:listDiagnostics'>([]));
+      bridge.set('operations:updateTarget', () => update.promise);
+
+      renderOperations(<OperationsView />);
+      await tick();
+      fireEvent.click(within(targetList()).getByText('Reporting snapshot'));
+      await tick();
+      fireEvent.click(screen.getByRole('button', { name: /^Disable$/ }));
+      await tick(30_000);
+      await tick();
+
+      // The accepted read saw the old state, but the mutation is still alive.
+      // It cannot yet prove either that the mutation failed or that it landed.
+      expect(screen.getByText(/has not been answered/)).toBeTruthy();
+      expect(screen.queryByText(/The change did not take effect/)).toBeNull();
+      expect(screen.queryByText(/now matches the requested state/)).toBeNull();
       expect(bridge.callsTo('operations:updateTarget')).toHaveLength(1);
     } finally {
       vi.useRealTimers();

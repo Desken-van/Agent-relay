@@ -393,7 +393,7 @@ Being precise about what was actually exercised, rather than merely written:
 | **Claude Code CLI** | ✅ **Genuinely verified end to end.** Live implementation and correction rounds exercised `stream-json` parsing, tool-use evidence, a failed verification followed by *Retry verification*, and resume of the same Claude session. The diagnostic reports the installed CLI and authenticated profile without exposing credentials. A process-level contract suite additionally drives the adapter through the real process runner against a fake CLI: argv, the prompt on stdin, the working directory, split and packed stdout chunks, the stdout/stderr boundary, exit codes, denials, resume, timeout and cancellation. |
 | **GitHub CLI** | ⚠️ **Live diagnostics verified; remote publish mutations not yet exercised through Agent Relay.** The running app resolved `gh`, reported its version and authenticated account, and the parser and owner/repository validation remain unit-tested. Creating a repository, pushing a task branch, and opening a pull request through Agent Relay still require a dedicated live acceptance run. |
 
-Test suite: **1176 tests, 40 files, all passing.** No test contacts Codex,
+Test suite: **1177 tests, 40 files, all passing.** No test contacts Codex,
 Claude, or GitHub.
 
 ---
@@ -544,7 +544,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1176 tests; no network, no real agents
+├─ tests/              1177 tests; no network, no real agents
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

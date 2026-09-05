@@ -771,6 +771,13 @@ not the editor happens to be open, and exactly once. An answer that arrives whil
 the confirming read is still running outranks that read, and is returned to the
 caller rather than reported as an unknown outcome.
 
+A confirming read may refresh the registry shown on screen while the mutation is
+still outstanding, but it cannot publish a settlement for that mutation. The
+state it sees can still be changed by the unanswered request, so calling the
+change applied, unchanged or conflicting at that point would put a conclusion
+beside the simultaneous warning that the request has not answered. Classification
+waits until the request itself is over; a precise late answer outranks the read.
+
 **One registry mutation at a time.** Registration, edit and removal are
 serialised through a single synchronous claim. They are not independent of each
 other: the registry holds one target per `(environment, name)`, so a create in
@@ -849,7 +856,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1176 tests, none of which contact Codex, Claude, or GitHub.
+1177 tests, none of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|

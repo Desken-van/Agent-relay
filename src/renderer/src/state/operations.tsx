@@ -1841,14 +1841,44 @@ export function OperationsProvider({
             evidence.list.kind === "accepted" ? evidence.list : null;
           const complete = accepted !== null && evidence.historyRead;
 
-          const resolution: WriteResolution = complete
-            ? classify(accepted.targets, beforeTarget)
-            : { kind: "inconclusive" };
-          dispatch({ type: "write-resolution", targetId, value: resolution });
+          // An exact answer that arrived while this read was running outranks
+          // anything the read could infer. In particular, do not let a stale
+          // snapshot put a settlement notice back after `applyAnswer` cleared
+          // it for a successful or refused request.
+          if (settledAnswer !== null) {
+            if (settledAnswer.kind === "ok") {
+              dispatch({ type: "write-resolution", targetId, value: null });
+              return { ok: true, data: settledAnswer.data };
+            }
+            if (settledAnswer.kind === "refused") {
+              dispatch({ type: "write-resolution", targetId, value: null });
+              return { ok: false, error: settledAnswer.error };
+            }
+          }
 
           // Built from the doubt as it stands now, for the same reason as the
           // registration's: the request may have answered while this read ran.
           const current = unconfirmedRef.current[targetId];
+          const stillOutstanding =
+            current !== undefined &&
+            current.action === kind &&
+            current.outstanding === true;
+          const resolution: WriteResolution = complete
+            ? classify(accepted.targets, beforeTarget)
+            : { kind: "inconclusive" };
+
+          // A read can describe what the registry holds at one instant; while
+          // the mutation is still running it cannot say what the registry will
+          // hold when that mutation answers. Publishing `unchanged`,
+          // `conflicting` or even `matches-request` here produced two mutually
+          // exclusive notices: "the request has not answered" and "the change
+          // did not take effect". Keep the outcome blank until the request ends.
+          dispatch({
+            type: "write-resolution",
+            targetId,
+            value: stillOutstanding ? null : resolution,
+          });
+
           const settled: Unconfirmed = {
             ...(current ?? pending),
             listRefreshed: complete,
@@ -1870,17 +1900,6 @@ export function OperationsProvider({
               // and the resolution above says which of the three it is, so a
               // change that never took effect is not passed off as settled.
               setUnconfirmed(targetId, null);
-            }
-          }
-
-          // An exact answer that arrived while this read was running is the
-          // better evidence, and the caller is still here to be given it.
-          if (settledAnswer !== null) {
-            if (settledAnswer.kind === "ok") {
-              return { ok: true, data: settledAnswer.data };
-            }
-            if (settledAnswer.kind === "refused") {
-              return { ok: false, error: settledAnswer.error };
             }
           }
 
