@@ -6,6 +6,9 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "types": ["vite/client"],
+    // Renderer tests render real components, so they type-check against the
+    // DOM library this project already uses. They are `.tsx`, which the Node
+    // project does not include, so the two never overlap.
 
     "jsx": "react-jsx",
 
@@ -31,5 +34,10 @@
       "@renderer/*": ["src/renderer/src/*"]
     }
   },
-  "include": ["src/renderer/src/**/*.ts", "src/renderer/src/**/*.tsx", "src/shared/**/*.ts"]
+  "include": [
+    "src/renderer/src/**/*.ts",
+    "src/renderer/src/**/*.tsx",
+    "src/shared/**/*.ts",
+    "tests/renderer/**/*.tsx"
+  ]
 }

@@ -394,11 +394,11 @@ each approval was recorded.
 
 ---
 
-## 11. Operational targets are read-only *(no UI yet)*
+## 11. Operational targets are read-only *(covered by automated tests)*
 
-Phase 7C-A is backend only: the registry, the probe adapter and the IPC
-contract exist, but no screen does. There is nothing to click yet, and nothing
-in this section touches a production system.
+The registry, the probe adapter and the IPC contract are covered by automated
+tests, and the screen by renderer tests that drive its real buttons. Nothing in
+this section touches a production system.
 
 What the automated suite already proves, so this document does not repeat it:
 the database is opened read-only, the file is byte-identical afterwards, no
@@ -412,6 +412,127 @@ appeared next to it.
 
 ✅ Pass if you can register a target, run both probes, and find the file exactly
 as you left it.
+
+---
+
+## 12. Operations UI — live acceptance *(Phase 7C-C, passed 2026-09-04)*
+
+This checklist was exercised end to end in a running Windows application against
+fresh synthetic SQLite files and an isolated Agent Relay profile. Keep using the
+steps below for later acceptance runs; the recorded result follows the checklist.
+
+**Prepare, and do not skip this.** Point nothing at a database you care about.
+
+The cleanup at the end of this section deletes a directory recursively. That is
+only safe if the directory is one this run created and nothing else has ever
+used, so the preparation below makes a **new** directory per run and refuses to
+continue if the name is somehow already taken. Do not replace it with a fixed
+path: an interrupted earlier run, or anything else that happened to choose the
+same name, would have its files deleted by the block at the end.
+
+```powershell
+# Remember whatever profile was already configured. The cleanup restores it
+# rather than deleting a setting this checklist did not create.
+$previousDataDir = if (Test-Path Env:\AGENT_RELAY_DATA_DIR) { $env:AGENT_RELAY_DATA_DIR } else { $null }
+
+# A directory for THIS run and no other. New-Item fails rather than reusing one,
+# which is the behaviour we want: a name that already exists means somebody
+# else's files, and the cleanup below must never be pointed at those.
+$runId = [guid]::NewGuid().ToString('N').Substring(0, 8)
+$root  = Join-Path $env:TEMP "agent-relay-7cc-$runId"
+if (Test-Path -LiteralPath $root) { throw "$root already exists. Run this block again for a fresh name." }
+# .FullName is the resolved absolute path, which is what the cleanup checks against.
+$root = (New-Item -ItemType Directory -Path $root -ErrorAction Stop).FullName
+
+# An isolated profile, outside the repository, inside this run's own directory.
+$env:AGENT_RELAY_DATA_DIR = $root
+
+# A throwaway database, created for this test and nothing else. Use a script file
+# rather than node -e: Windows PowerShell 5.1 may re-quote the SQL before Node
+# receives it.
+$db = Join-Path $root 'fixture.sqlite'
+$fixtureScript = Join-Path $root 'create-fixture.cjs'
+@'
+const { DatabaseSync } = require('node:sqlite');
+const db = new DatabaseSync(process.argv[2]);
+db.exec('CREATE TABLE invoices (id INTEGER PRIMARY KEY, customer TEXT NOT NULL, total REAL)');
+db.exec('CREATE TABLE payments (id INTEGER PRIMARY KEY, invoice_id INTEGER NOT NULL)');
+db.exec("INSERT INTO invoices (customer,total) VALUES ('ACME Ltd',99.5)");
+db.close();
+'@ | Set-Content -LiteralPath $fixtureScript -Encoding utf8
+node $fixtureScript $db
+if ($LASTEXITCODE -ne 0) { throw "Fixture creation failed with exit code $LASTEXITCODE" }
+Remove-Item -LiteralPath $fixtureScript
+
+# Record what the file looks like before anything opens it.
+Get-FileHash $db; (Get-Item $db).Length; (Get-Item $db).LastWriteTimeUtc
+
+# Keep $root and $previousDataDir in this shell: the cleanup needs both, and
+# refuses to run without them.
+$root; $previousDataDir
+```
+
+| Do this | Expect |
+|---|---|
+| Open the app with no project selected and click **Operations** | The section opens; no project name appears in the header |
+| Register a target: a name, environment **local**, the fixture path | Save is disabled until the environment is chosen and the path is absolute; the target appears in the list |
+| Try a relative path such as `fixture.sqlite` | Save stays disabled, with the reason shown |
+| Select the target and read the run panel | Name, environment, path, probe and the read-only note are all shown *before* anything runs |
+| Run **connection_health** | `opened`, `readOnly` and `queryOnly` all yes; a real SQLite version; the file size and modification time match what you recorded |
+| Run **schema_summary** | `invoices` and `payments` with their columns and types; no row values anywhere — in particular no `ACME Ltd` and no `99.5` |
+| Re-check the file | Hash, size and modification time **unchanged**; no `-wal` or `-shm` beside it |
+| Press **Refresh** on History, and reopen the section | The recorded runs are still there; nothing ran again |
+| Disable the target, then try to run | Run is disabled and says the target is disabled |
+| Try to remove the registration | Refused, with the registry's reason and its suggestion to disable instead |
+| Point a second target at a path that does not exist and run `connection_health` | `fileExists: no`, `opened: no`, and a warning — not a crash |
+| Point a third target at a text file renamed `.sqlite` and run both probes | `connection_health` reports it could not be opened; `schema_summary` fails with a reason, and claims no schema |
+
+✅ Pass if every probe reports what is actually there, the fixture file is
+byte-identical afterwards, and nothing ran that you did not click.
+
+### Recorded Phase 7C-C evidence
+
+The 2026-09-04 run passed every row above. The application used a new temporary
+profile with no project selected and registered three local targets: the real
+fixture, a missing path, and a text file carrying a `.sqlite` suffix. Exactly
+five diagnostics were persisted — two successful fixture probes, one successful
+health report for the missing path, one successful health report for the invalid
+file, and one failed schema probe for that invalid file. Opening Operations,
+refreshing History, and navigating away and back created no runs.
+
+The fixture's SHA-256 (`5E0AB6E43E756D98261ED689AA9BDBE5B0BE19B1833F6AE801290855D9F1FD84`),
+12,288-byte size and modification time were unchanged, and no `-wal` or `-shm`
+appeared. `connection_health` reported a real SQLite version with `opened`,
+`readOnly`, and `queryOnly` true. `schema_summary` reported the two expected
+tables and their columns without exposing either seeded row value or the unique
+canary added for the run. Disabling prevented a probe, and removing the target
+with history was refused with the instruction to disable it instead. The missing
+path and invalid-file results described what was actually present and never
+claimed a schema.
+
+One presentation limitation was observed, without affecting the result: a failed
+run has no structured result, and version 1 of the audit row stores no separate
+environment snapshot. History therefore says `environment not recorded` for
+that run. It deliberately does not borrow the target's current environment,
+which could have changed after the diagnostic.
+
+```powershell
+# Afterwards. Run this in the SAME shell as the preparation: it deletes only the
+# directory that block created, identified by its exact absolute path, and stops
+# rather than guessing if that variable is gone.
+if ([string]::IsNullOrWhiteSpace($root)) { throw 'No $root in this shell. Delete the run directory by hand, and check what it is first.' }
+
+$expected = [IO.Path]::GetFullPath($root)
+$prefix   = [IO.Path]::GetFullPath((Join-Path $env:TEMP 'agent-relay-7cc-'))
+if (-not $expected.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+  throw "Refusing to delete $expected — it is not a directory this checklist created."
+}
+if (Test-Path -LiteralPath $expected) { Remove-Item -LiteralPath $expected -Recurse -Force }
+
+# Put the previous profile back exactly as it was, including "there wasn't one".
+if ($null -eq $previousDataDir) { Remove-Item Env:\AGENT_RELAY_DATA_DIR -ErrorAction SilentlyContinue }
+else { $env:AGENT_RELAY_DATA_DIR = $previousDataDir }
+```
 
 ---
 
