@@ -271,6 +271,29 @@ bounded by message count and bytes, embedded newlines are refused (framing is
 one record per line), and every security flag comes from the same shared options
 builder as the other two paths.
 
+`StdioMcpClient` is the second consumer of that narrow interactive boundary. It
+implements only the MCP operations Agent Relay needs to establish a trustworthy
+process contract: `initialize`, `notifications/initialized`, paginated
+`tools/list`, and one `tools/call`. It does not use an SDK-owned launcher,
+because a second launcher would bypass the no-shell, scrubbed-environment,
+bounded-output and process-tree-kill invariants above.
+
+An MCP server configuration names an explicit absolute executable, fixed argv,
+optional absolute working directory, enabled state, wall-time and byte/block
+budgets, and the exact tool names accepted from that server. Discovery fails
+closed if a tool is missing, duplicated or newly advertised. A call outside the
+allowlist is rejected before a process starts. The client accepts text content
+only in this first phase and distinguishes JSON-RPC failure, process failure,
+timeout, cancellation, a completed result with `isError`, and a successful text
+result whose provider-specific body happens to encode a refusal. Tool
+annotations are evidence; they never grant permission or bypass workflow state.
+
+Each discovery or call owns one bounded process and closes stdin when the result
+is complete. A response is not accepted if that process subsequently times out
+or exits unsuccessfully. INT-A deliberately stops at this boundary: no real
+provider is contacted, no Coai session enters the task FSM, and no credentials
+or shared-rule repository is loaded.
+
 Executable discovery is explicit
 ([`executable-locator.ts`](../src/main/adapters/process/executable-locator.ts)):
 configured path → `PATH` (honouring `PATHEXT`) → well-known Windows locations.
@@ -856,7 +879,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1177 deterministic tests plus one automated Electron acceptance journey, none
+1198 deterministic tests plus one automated Electron acceptance journey, none
 of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
@@ -871,6 +894,7 @@ of which contact Codex, Claude, or GitHub.
 | `adapters/adapters` | Claude stream parsing, `gh auth status` parsing, prompt construction, executable discovery |
 | `adapters/claude-cli-process-contract` | **The Claude adapter against a real child process** — see below |
 | `adapters/interactive-runner` | **A real duplex child process**: stdin staying open, input budgets, framing, tree kill |
+| `adapters/stdio-mcp-client` | **The generic MCP boundary against a real fake-server process**: initialization, paginated exact-tool discovery, calls and refusal-as-data, stdout/stderr separation, message/content bounds, malformed protocol, unsuccessful exit, timeout and cancellation |
 | `security/redaction-and-process` | Credential redaction, environment compartmentalisation, argv-not-shell execution |
 | `domain/operations-targets` · `domain/operations-diagnostics` · `domain/operations-ipc-contract` | The target and probe contracts: what they refuse — an adapter outside the enum, a config version this build cannot read, a credential value, a statement anywhere a probe id belongs |
 | `db/operations-repositories` | Migration 3 on a fresh database *and* on one that already has 1 and 2, CRUD, uniqueness, the `RESTRICT` audit policy, close/reopen on disk |
