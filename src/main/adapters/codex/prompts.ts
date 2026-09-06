@@ -17,6 +17,7 @@ export interface SpecificationPromptInput {
   readonly projectPath: string;
   readonly taskTitle: string;
   readonly originalRequest: string;
+  readonly ruleEvidence?: string;
 }
 
 export function buildSpecificationPrompt(input: SpecificationPromptInput): string {
@@ -34,6 +35,8 @@ ${input.taskTitle}
 
 USER'S REQUEST (verbatim)
 ${input.originalRequest}
+
+${input.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${input.ruleEvidence}\n` : ''}
 
 Produce a single JSON object matching the required schema, with these rules:
 
@@ -67,6 +70,7 @@ export interface ReviewPromptInput {
   readonly testOutput: string;
   readonly round: number;
   readonly maxRounds: number;
+  readonly ruleEvidence?: string;
 }
 
 export function buildReviewPrompt(input: ReviewPromptInput): string {
@@ -94,6 +98,8 @@ modify, create, or delete any file, and you must not run commands that change st
 Your entire output is a single JSON object matching the required schema.
 
 This is review round ${input.round} of at most ${input.maxRounds}.
+
+${input.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${input.ruleEvidence}\n` : ''}
 
 === THE ACCEPTED SPECIFICATION ===
 Title: ${specification.title}
@@ -173,6 +179,7 @@ export interface ImplementationPromptInput {
   readonly worktreePath: string;
   readonly branchName: string;
   readonly originalRequest: string;
+  readonly ruleEvidence?: string;
 }
 
 export function buildImplementationPrompt(input: ImplementationPromptInput): string {
@@ -185,6 +192,8 @@ WORKTREE (this is your working directory, and the only place you may edit)
 
 BRANCH (already checked out for you)
   ${input.branchName}
+
+${input.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${input.ruleEvidence}\n` : ''}
 
 === WHAT THE USER ORIGINALLY ASKED FOR ===
 ${input.originalRequest}
@@ -246,6 +255,7 @@ export interface CorrectionPromptInput {
   readonly review: CodexReviewResult;
   readonly round: number;
   readonly maxRounds: number;
+  readonly ruleEvidence?: string;
 }
 
 /**
@@ -260,10 +270,13 @@ export function buildVerificationRetryPrompt(input: {
   readonly reason: string;
   readonly round: number;
   readonly maxRounds: number;
+  readonly ruleEvidence?: string;
 }): string {
   return `Your implementation was reviewed and approved, but it cannot be published yet.
 
 This is round ${input.round} of at most ${input.maxRounds}.
+
+${input.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${input.ruleEvidence}\n` : ''}
 
 === WHY ===
 ${input.reason}
@@ -304,6 +317,8 @@ export function buildCorrectionPrompt(input: CorrectionPromptInput): string {
 
   return `A reviewing agent examined your implementation and requested changes.
 This is correction round ${input.round} of at most ${input.maxRounds}.
+
+${input.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${input.ruleEvidence}\n` : ''}
 
 === REVIEW SUMMARY ===
 ${review.summary}

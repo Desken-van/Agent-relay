@@ -22,18 +22,23 @@ import { CodexSdkAdapter } from './adapters/codex/codex-adapter';
 import { CodexAppServerModelCatalog } from './adapters/codex/codex-model-catalog';
 import { CliGitAdapter } from './adapters/git/git-adapter';
 import { GhGitHubAdapter } from './adapters/github/github-adapter';
+import { CoaiPlanReviewer } from './adapters/mcp/coai-plan-reviewer';
+import { StdioMcpClient } from './adapters/mcp/stdio-mcp-client';
 import { LocalSqliteProbeAdapter } from './adapters/operations/local-sqlite-adapter';
 import { ExecaProcessRunner, type ProcessRunner } from './adapters/process/process-runner';
+import { FilesystemRuleSourceReader } from './adapters/rules/filesystem-rule-source';
 import { closeDatabase, openDatabase, type Db } from './db/database';
 import { SqliteTransactionRunner } from './db/transaction-runner';
 import { SqliteApprovalRepository } from './db/repositories/approval-repository';
 import { SqliteOperationDiagnosticRepository } from './db/repositories/operation-diagnostic-repository';
 import { SqliteOperationTargetRepository } from './db/repositories/operation-target-repository';
+import { SqlitePlanReviewGateRepository } from './db/repositories/plan-review-gate-repository';
 import { SqliteProjectRepository } from './db/repositories/project-repository';
 import { SqliteRunEventRepository } from './db/repositories/run-event-repository';
 import { SqliteRunRepository } from './db/repositories/run-repository';
 import { SqliteSettingsRepository } from './db/repositories/settings-repository';
 import { SqliteTaskRepository } from './db/repositories/task-repository';
+import { SqliteTaskRuleEvidenceRepository } from './db/repositories/task-rule-evidence-repository';
 import { SystemClock, UuidGenerator } from './infra/clock';
 import type {
   ApprovalRepository,
@@ -45,14 +50,17 @@ import type {
   CodexModelCatalog,
   ConfirmationService,
   EventPublisher,
+  ExternalMcpServerConfig,
   GitAdapter,
   GitHubAdapter,
   IdGenerator,
+  PlanReviewGateRepository,
   ProjectRepository,
   RunEventRepository,
   RunRepository,
   SettingsRepository,
-  TaskRepository
+  TaskRepository,
+  TaskRuleEvidenceRepository
 } from './ports';
 import { ToolDiagnosticsService } from './services/diagnostics-service';
 import { OperationsDiagnosticsService } from './services/operations-diagnostics-service';
@@ -62,6 +70,8 @@ import { ProjectService } from './services/project-service';
 import { reconcileInterruptedWork, type ReconciliationPlan } from './services/startup-reconciliation';
 import { PublishService } from './services/publish-service';
 import { TaskService } from './services/task-service';
+import { PlanReviewGateService } from './services/plan-review-gate';
+import { RuleEvidenceService } from './services/rule-evidence';
 
 export interface ApplicationPaths {
   /** Directory holding the SQLite database and worktrees. */
@@ -99,6 +109,8 @@ export interface Application {
   readonly runs: RunRepository;
   readonly runEvents: RunEventRepository;
   readonly approvals: ApprovalRepository;
+  readonly taskRuleEvidence: TaskRuleEvidenceRepository;
+  readonly planReviewGates: PlanReviewGateRepository;
   readonly operationTargets: OperationTargetRepository;
   readonly operationDiagnosticRuns: OperationDiagnosticRepository;
   readonly projectService: ProjectService;
@@ -110,6 +122,8 @@ export interface Application {
   readonly operations: OperationsRegistry;
   readonly operationDiagnostics: OperationsDiagnosticsService;
   readonly codexModels: CodexModelCatalog;
+  readonly ruleEvidenceCollector: RuleEvidenceService;
+  createPlanReviewGate(config: ExternalMcpServerConfig): PlanReviewGateService;
   /**
    * What startup reconciliation corrected, if anything.
    *
@@ -224,6 +238,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   const runs = new SqliteRunRepository(db);
   const runEvents = new SqliteRunEventRepository(db);
   const approvals = new SqliteApprovalRepository(db);
+  const taskRuleEvidence = new SqliteTaskRuleEvidenceRepository(db);
+  const planReviewGates = new SqlitePlanReviewGateRepository(db, clock);
   const operationTargets = new SqliteOperationTargetRepository(db, clock);
   const operationDiagnosticRuns = new SqliteOperationDiagnosticRepository(db);
 
@@ -276,7 +292,9 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     git: adapters.git,
     clock,
     ids,
-    events: options.events
+    events: options.events,
+    ruleEvidence: taskRuleEvidence,
+    planReviews: planReviewGates
   });
 
   const publishService = new PublishService({
@@ -328,6 +346,12 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     events: options.events
   });
 
+  const ruleEvidenceCollector = new RuleEvidenceService(
+    adapters.git,
+    new FilesystemRuleSourceReader(),
+    clock
+  );
+
   return {
     db,
     settings,
@@ -336,6 +360,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     runs,
     runEvents,
     approvals,
+    taskRuleEvidence,
+    planReviewGates,
     operationTargets,
     operationDiagnosticRuns,
     projectService,
@@ -346,6 +372,22 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     operations,
     operationDiagnostics,
     codexModels,
+    ruleEvidenceCollector,
+    createPlanReviewGate: (config) =>
+      new PlanReviewGateService({
+        tasks,
+        projects,
+        ruleEvidence: taskRuleEvidence,
+        gates: planReviewGates,
+        reviewer: new CoaiPlanReviewer(
+          new StdioMcpClient(
+            runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner()
+          ),
+          config
+        ),
+        clock,
+        ids
+      }),
     reconciliation,
     close: () => closeDatabase(db)
   };

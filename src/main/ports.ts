@@ -39,6 +39,13 @@ import type {
 } from '../shared/domain/operations-diagnostics';
 import type { RuleOmissionReason, RuleSourceKind } from '../shared/domain/rule-evidence';
 import type { PublishConfirmation } from '../shared/ipc';
+import type {
+  PlanReviewDecision,
+  PlanReviewFinding,
+  PlanReviewGate,
+  PlanReviewVerdict,
+  TaskRuleEvidenceBinding
+} from '../shared/domain/plan-review';
 import type { CodexReviewResult, TaskSpecification } from '../shared/schemas/codex';
 
 /* -------------------------------------------------------------------------- */
@@ -170,6 +177,8 @@ export interface CodexSpecificationRequest {
   readonly projectPath: string;
   readonly taskTitle: string;
   readonly originalRequest: string;
+  /** Immutable, validated project/convention evidence bound to this task. */
+  readonly ruleEvidence?: string;
   /** Existing thread to continue, or null to start a new one. */
   readonly threadId: string | null;
   /**
@@ -192,6 +201,8 @@ export interface CodexReviewRequest {
   readonly worktreePath: string;
   readonly threadId: string | null;
   readonly specification: TaskSpecification;
+  /** The same immutable evidence used during specification and implementation. */
+  readonly ruleEvidence?: string;
   readonly changes: GitChangeSet;
   readonly claudeReport: string;
   readonly testOutput: string;
@@ -467,6 +478,22 @@ export interface ClaudeAdapter {
   diagnose(): Promise<ToolDiagnostic>;
 }
 
+export interface TaskRuleEvidenceRepository {
+  findByTask(taskId: string): TaskRuleEvidenceBinding | null;
+  create(binding: TaskRuleEvidenceBinding): TaskRuleEvidenceBinding;
+}
+
+export type NewPlanReviewGate = Omit<PlanReviewGate, 'createdAt' | 'updatedAt'>;
+export type PlanReviewGatePatch = Partial<
+  Omit<PlanReviewGate, 'id' | 'taskId' | 'specificationSha256' | 'ruleEvidenceSha256' | 'createdAt' | 'updatedAt'>
+>;
+
+export interface PlanReviewGateRepository {
+  findByTask(taskId: string): PlanReviewGate | null;
+  create(gate: NewPlanReviewGate): PlanReviewGate;
+  update(id: string, patch: PlanReviewGatePatch): PlanReviewGate;
+}
+
 /* -------------------------------------------------------------------------- */
 /* External MCP                                                               */
 /* -------------------------------------------------------------------------- */
@@ -527,6 +554,54 @@ export interface ExternalMcpClient {
     args: Readonly<Record<string, unknown>>,
     signal?: AbortSignal
   ): Promise<ExternalMcpCallResult>;
+}
+
+export interface ExternalPlanReviewSubject {
+  readonly repositoryPath: string;
+  readonly branch: string;
+}
+
+export interface ExternalPlanReviewSession {
+  readonly sessionId: string;
+  readonly stage: string;
+  readonly awaitingResolve: boolean;
+  readonly planProceeded: boolean;
+  readonly serverName: string;
+  readonly serverVersion: string;
+}
+
+export interface ExternalPlanReviewRound {
+  readonly verdict: PlanReviewVerdict;
+  readonly gatingCount: number;
+  readonly threshold: number;
+  readonly reviewers: string;
+  readonly findings: readonly PlanReviewFinding[];
+  readonly instruction: string;
+  readonly serverName: string;
+  readonly serverVersion: string;
+}
+
+export interface ExternalPlanReviewResolution {
+  readonly stage: string;
+  readonly awaitingResolve: boolean;
+  readonly recordedDecisions: number;
+  readonly instruction: string;
+  readonly serverName: string;
+  readonly serverVersion: string;
+}
+
+export interface ExternalPlanReviewer {
+  open(subject: ExternalPlanReviewSubject, signal?: AbortSignal): Promise<ExternalPlanReviewSession>;
+  reviewPlan(
+    subject: ExternalPlanReviewSubject,
+    planText: string,
+    signal?: AbortSignal
+  ): Promise<ExternalPlanReviewRound>;
+  resolve(
+    subject: ExternalPlanReviewSubject,
+    decisions: readonly PlanReviewDecision[],
+    signal?: AbortSignal
+  ): Promise<ExternalPlanReviewResolution>;
 }
 
 /* -------------------------------------------------------------------------- */

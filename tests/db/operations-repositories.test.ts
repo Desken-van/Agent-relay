@@ -116,7 +116,7 @@ describe('migration', () => {
   });
 
   it('is forward-only: earlier migrations are not rewritten', () => {
-    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3]);
+    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4]);
     expect(MIGRATIONS[0]?.name).toBe('initial-schema');
     expect(MIGRATIONS[1]?.name).toBe('task-model-selection');
     expect(MIGRATIONS[2]?.name).toBe('operations-targets');
@@ -155,7 +155,7 @@ describe('migration', () => {
         const applied = upgraded
           .prepare('SELECT version FROM schema_migrations ORDER BY version')
           .all() as { version: number }[];
-        expect(applied.map((row) => row.version)).toEqual([1, 2, 3]);
+        expect(applied.map((row) => row.version)).toEqual([1, 2, 3, 4]);
 
         // The pre-existing row survived the upgrade untouched.
         const project = upgraded.prepare('SELECT name FROM projects WHERE id = ?').get('p1');

@@ -9,10 +9,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SqliteApprovalRepository } from '../../src/main/db/repositories/approval-repository';
 import { SqliteProjectRepository } from '../../src/main/db/repositories/project-repository';
+import { SqlitePlanReviewGateRepository } from '../../src/main/db/repositories/plan-review-gate-repository';
 import { SqliteRunEventRepository } from '../../src/main/db/repositories/run-event-repository';
 import { SqliteRunRepository } from '../../src/main/db/repositories/run-repository';
 import { SqliteSettingsRepository } from '../../src/main/db/repositories/settings-repository';
 import { SqliteTaskRepository } from '../../src/main/db/repositories/task-repository';
+import { SqliteTaskRuleEvidenceRepository } from '../../src/main/db/repositories/task-rule-evidence-repository';
 import { closeDatabase, openDatabase, type Db } from '../../src/main/db/database';
 import { FixedClock, SequentialIdGenerator } from '../../src/main/infra/clock';
 import { InMemoryEventPublisher } from '../../src/main/services/event-bus';
@@ -42,6 +44,8 @@ export interface Harness {
   readonly confirmation: RecordingConfirmationService;
   readonly projects: SqliteProjectRepository;
   readonly tasks: SqliteTaskRepository;
+  readonly taskRuleEvidence: SqliteTaskRuleEvidenceRepository;
+  readonly planReviewGates: SqlitePlanReviewGateRepository;
   readonly runs: SqliteRunRepository;
   readonly runEvents: SqliteRunEventRepository;
   readonly approvals: SqliteApprovalRepository;
@@ -81,6 +85,8 @@ export function createHarness(
 
   const projects = new SqliteProjectRepository(db, clock);
   const tasks = new SqliteTaskRepository(db, clock);
+  const taskRuleEvidence = new SqliteTaskRuleEvidenceRepository(db);
+  const planReviewGates = new SqlitePlanReviewGateRepository(db, clock);
   const runs = new SqliteRunRepository(db);
   const runEvents = new SqliteRunEventRepository(db);
   const approvals = new SqliteApprovalRepository(db);
@@ -102,7 +108,9 @@ export function createHarness(
     git,
     clock,
     ids,
-    events
+    events,
+    ruleEvidence: taskRuleEvidence,
+    planReviews: planReviewGates
   });
 
   const publishService = new PublishService({
@@ -153,6 +161,8 @@ export function createHarness(
     confirmation,
     projects,
     tasks,
+    taskRuleEvidence,
+    planReviewGates,
     runs,
     runEvents,
     approvals,

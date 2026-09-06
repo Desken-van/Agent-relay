@@ -320,9 +320,40 @@ cleanliness and omissions. Its canonical hash excludes only capture time and
 absolute checkout paths. A runtime schema validates the object before it is
 rendered as an unambiguous JSON prompt envelope.
 
-INT-B stops there: no task currently persists or consumes this envelope. INT-C
-will bind one exact snapshot to planning and review rather than re-reading rules
-at different moments.
+INT-B stops at capture. INT-C adds an opt-in durable binding: once a task binds a
+snapshot, it cannot replace it or bind one after specification starts. The same
+validated envelope is passed to Codex specification, Claude implementation and
+corrections, and Codex final review rather than re-reading files at different
+moments.
+
+### External plan-review gate
+
+Migration 4 adds two separate records. `task_rule_evidence` owns the immutable
+task-to-snapshot binding. `plan_review_gates` is append-only across changed
+specifications and stores the specification hash, rules hash, external session,
+server identity, verdict, structured findings, decisions and durable status.
+No absolute repository path is stored in either table.
+
+`CoaiPlanReviewer` is provider-specific policy over the generic INT-A transport.
+It requires the exact audited seven-tool discovery set and itself calls only the
+fixed `open`, `review_plan` and `resolve` names with typed arguments. JSON inside
+the single MCP text block is parsed again; MCP `isError`, `{error: ...}` refusal,
+malformed output and workflow verdict remain different outcomes.
+
+`PlanReviewGateService` writes `reviewing` before the non-idempotent plan round
+and writes `resolving` plus all decisions before the non-idempotent resolve.
+A crash therefore leaves an unknown durable intent rather than inviting an
+automatic duplicate call. A `proceed` verdict still cannot approve the
+specification: every finding must receive exactly one accept/reject decision,
+and rejection requires a reason. Approval checks both the canonical
+specification hash and rule snapshot hash after resolve advances the provider to
+its code-review stage.
+
+The gate is optional: a task with no bound rule evidence follows the existing
+workflow. Once evidence is bound, the gate is mandatory and cannot be bypassed
+by the normal Approve or implementation entry points. The composition root
+offers an explicit plan-gate factory, but renderer configuration and live Coai
+acceptance are later work; this phase invokes no real provider.
 
 Executable discovery is explicit
 ([`executable-locator.ts`](../src/main/adapters/process/executable-locator.ts)):
@@ -909,7 +940,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1232 deterministic tests plus one automated Electron acceptance journey, none
+1255 deterministic tests plus one automated Electron acceptance journey, none
 of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
@@ -926,6 +957,7 @@ of which contact Codex, Claude, or GitHub.
 | `adapters/interactive-runner` | **A real duplex child process**: stdin staying open, input budgets, framing, tree kill |
 | `adapters/stdio-mcp-client` | **The generic MCP boundary against a real fake-server process**: initialization, paginated exact-tool discovery, calls and refusal-as-data, stdout/stderr separation, message/content bounds, malformed protocol, unsuccessful exit, timeout and cancellation |
 | `adapters/filesystem-rule-source` · `services/rule-evidence` | **Whole-file project and convention evidence**: fixed discovery, traversal/symlink refusal, omission and byte budgets, deterministic ordering and hashes, runtime schema agreement, plus exact revision and dirty-state behaviour through real Git repositories |
+| `adapters/coai-plan-reviewer` · `services/plan-review-gate` | **Typed external plan gate**: fixed tool names, refusal/error separation, immutable task evidence, durable pre-call intent, decision completeness, secret-shaped input refusal, stale-plan invalidation and approval enforcement |
 | `security/redaction-and-process` | Credential redaction, environment compartmentalisation, argv-not-shell execution |
 | `domain/operations-targets` · `domain/operations-diagnostics` · `domain/operations-ipc-contract` | The target and probe contracts: what they refuse — an adapter outside the enum, a config version this build cannot read, a credential value, a statement anywhere a probe id belongs |
 | `db/operations-repositories` | Migration 3 on a fresh database *and* on one that already has 1 and 2, CRUD, uniqueness, the `RESTRICT` audit policy, close/reopen on disk |
