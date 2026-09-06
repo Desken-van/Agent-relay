@@ -376,7 +376,7 @@ Git refuses and you are told, rather than losing it.
 | `npm run test:watch` | Vitest, watch mode |
 | `npm run lint` | ESLint over everything |
 | `npm run typecheck` | `tsc --noEmit` for both the Node and web projects |
-| `npm run verify` | lint → typecheck → test → build |
+| `npm run verify` | lint → typecheck → deterministic tests → build → Electron acceptance |
 
 ---
 
@@ -392,8 +392,9 @@ Being precise about what was actually exercised, rather than merely written:
 | **Electron app** | ✅ **Genuinely verified.** Launches on Windows 11, creates its database in WAL mode, renders the UI, and completes a full renderer→main→adapter→renderer diagnostics round-trip. The Operations acceptance journey is also automated against a fresh profile and synthetic SQLite files after every build. |
 | **Claude Code CLI** | ✅ **Genuinely verified end to end.** Live implementation and correction rounds exercised `stream-json` parsing, tool-use evidence, a failed verification followed by *Retry verification*, and resume of the same Claude session. The diagnostic reports the installed CLI and authenticated profile without exposing credentials. A process-level contract suite additionally drives the adapter through the real process runner against a fake CLI: argv, the prompt on stdin, the working directory, split and packed stdout chunks, the stdout/stderr boundary, exit codes, denials, resume, timeout and cancellation. |
 | **GitHub CLI** | ⚠️ **Live diagnostics verified; remote publish mutations not yet exercised through Agent Relay.** The running app resolved `gh`, reported its version and authenticated account, and the parser and owner/repository validation remain unit-tested. Creating a repository, pushing a task branch, and opening a pull request through Agent Relay still require a dedicated live acceptance run. |
+| **External MCP boundary** | 🧪 **Process contract verified against a fake stdio server; no real provider invoked yet.** The client performs initialization, capability and exact-allowlist discovery, paginated `tools/list`, bounded `tools/call`, and clean shutdown through Agent Relay's single no-shell process runner. Protocol failure, process failure, timeout, cancellation, tool `isError`, and a refusal encoded in successful text remain distinct. Coai workflow integration is a later phase. |
 
-Test suite: **1177 deterministic tests in 40 files, plus one automated Electron
+Test suite: **1198 deterministic tests in 41 files, plus one automated Electron
 acceptance journey, all passing.** No test contacts Codex, Claude, or GitHub.
 
 ---
@@ -483,6 +484,11 @@ deletes only the unique temporary profile it created.
 
 ## Known limitations
 
+* **The external MCP client is a boundary, not yet an Agent Relay workflow.** It
+  is not wired into the task state machine or renderer, does not persist Coai
+  sessions, and does not load credentials or conventions. INT-A proves a fake
+  server cannot escape the configured executable, limits or exact tool
+  allowlist; later phases decide which provider actions may occur and when.
 * **A failed Operations diagnostic has no historical environment snapshot in
   version 1.** Successful results carry the environment they actually inspected;
   a failure carries no structured result, so History displays `environment not
@@ -550,7 +556,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1177 deterministic tests + 1 Electron E2E; no network, no real agents
+├─ tests/              1198 deterministic tests + 1 Electron E2E; no network, no real agents
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

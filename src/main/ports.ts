@@ -467,6 +467,68 @@ export interface ClaudeAdapter {
 }
 
 /* -------------------------------------------------------------------------- */
+/* External MCP                                                               */
+/* -------------------------------------------------------------------------- */
+
+export interface ExternalMcpToolAnnotations {
+  readonly readOnly: boolean | null;
+  readonly destructive: boolean | null;
+  readonly idempotent: boolean | null;
+  readonly openWorld: boolean | null;
+}
+
+export interface ExternalMcpTool {
+  readonly name: string;
+  readonly title: string | null;
+  readonly description: string | null;
+  readonly inputSchema: Readonly<Record<string, unknown>>;
+  readonly annotations: ExternalMcpToolAnnotations;
+}
+
+export interface ExternalMcpServerIdentity {
+  readonly name: string;
+  readonly version: string;
+  readonly protocolVersion: string;
+}
+
+export interface ExternalMcpDiscovery {
+  readonly server: ExternalMcpServerIdentity;
+  readonly tools: readonly ExternalMcpTool[];
+}
+
+export interface ExternalMcpCallResult {
+  readonly server: ExternalMcpServerIdentity;
+  readonly tool: ExternalMcpTool;
+  readonly isError: boolean;
+  /** Text blocks only, already redacted and bounded by the process boundary. */
+  readonly content: readonly string[];
+}
+
+export interface ExternalMcpServerConfig {
+  readonly id: string;
+  readonly enabled: boolean;
+  readonly executablePath: string;
+  readonly args: readonly string[];
+  readonly cwd?: string;
+  /** The exact tool set this configuration accepts. Drift fails closed. */
+  readonly allowedTools: readonly string[];
+  readonly timeoutMs: number;
+  readonly maxMessageBytes: number;
+  readonly maxContentBytes: number;
+  readonly maxContentBlocks: number;
+}
+
+export interface ExternalMcpClient {
+  discover(config: ExternalMcpServerConfig, signal?: AbortSignal): Promise<ExternalMcpDiscovery>;
+  call(
+    config: ExternalMcpServerConfig,
+    tool: string,
+    args: Readonly<Record<string, unknown>>,
+    signal?: AbortSignal
+  ): Promise<ExternalMcpCallResult>;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Git & GitHub                                                                */
 /* -------------------------------------------------------------------------- */
 
