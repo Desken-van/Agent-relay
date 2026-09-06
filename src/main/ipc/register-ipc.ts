@@ -32,7 +32,10 @@ import type { Application } from '../container';
 import { assertKnownPath } from '../services/path-safety';
 import { parsePlanReviewFindings } from '../../shared/domain/plan-review';
 import { redactAndTruncate } from '../../shared/util/redact';
-import { readBoundRuleEvidence } from '../services/plan-review-gate';
+import {
+  planReviewGateIdentity,
+  readBoundRuleEvidence
+} from '../services/plan-review-gate';
 import {
   configuredRuleSources,
   externalPlanReviewConfig,
@@ -94,6 +97,7 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     const gate = app.planReviewGates.findByTask(taskId);
     return {
       ruleEvidenceProblem,
+      gateIdentity: planReviewGateIdentity({ task, gate, ruleEvidence: app.taskRuleEvidence }),
       ruleEvidence: binding === null || snapshot === null ? null : {
         snapshotSha256: binding.snapshotSha256,
         boundAt: binding.boundAt,
@@ -184,6 +188,11 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     },
     'planReview:prepare': async (input) => {
       const service = planReviewService();
+      // Read-only, and first: preparing creates a branch and a worktree, and a
+      // gate that turns out to be impossible afterwards would leave the task
+      // holding review infrastructure it can never use. Rule evidence binds
+      // only in DRAFT, so by then the obvious repair is already closed.
+      service.assertPreparable(input.taskId);
       await app.orchestrator.preparePlanReviewWorktree(input.taskId, {
         acceptDirtyWorkingTree: input.acceptDirtyWorkingTree ?? false
       });
@@ -199,7 +208,11 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       return planReviewDetail(input.taskId);
     },
     'planReview:resolve': async (input) => {
-      await planReviewService().resolve(input.taskId, input.decisions);
+      await planReviewService().resolve(input.taskId, {
+        gateId: input.gateId,
+        expectedRevision: input.expectedRevision,
+        decisions: input.decisions
+      });
       return planReviewDetail(input.taskId);
     },
 

@@ -9,7 +9,8 @@ import {
   planReviewDecisionSchema,
   taskRuleEvidenceBindingSchema,
   type PlanReviewDecision,
-  type PlanReviewGate
+  type PlanReviewGate,
+  type PlanReviewGateIdentity
 } from '../../shared/domain/plan-review';
 import type { RuleEvidenceSnapshot } from '../../shared/domain/rule-evidence';
 import { containsSecretShape, redactAndTruncate } from '../../shared/util/redact';
@@ -73,6 +74,29 @@ const SESSION_MISMATCH =
 
 const INCOHERENT_STATUS =
   'The provider answered, but the answer contradicts itself and cannot be used as evidence for anything. Nothing was changed, nothing was repeated, and no external call was made a second time.';
+
+/**
+ * Statuses that must not be superseded by a new specification identity.
+ *
+ * Each of them has something outstanding at the provider: a dispatched call
+ * whose outcome is unknown, or a finished round whose findings still await
+ * decisions. Creating a second gate row over one of these does not resolve it —
+ * it hides it, because the task's current gate is the most recent row, and the
+ * hidden round can then be doubled by a review started against the new one.
+ */
+const SUPERSEDE_BLOCKING = [
+  'opening',
+  'reviewing',
+  'awaiting_resolve',
+  'resolving',
+  'failed'
+] as const;
+
+const NO_TERMINAL_EVIDENCE =
+  'The provider records no plan round for this session, which is not proof that the round already dispatched from here was refused: an empty list is equally consistent with a request the provider has accepted and not yet recorded. Nothing was repeated and no new round may start. Resolve or close the round in the provider, or reconcile again once it appears.';
+
+const STALE_ROUND =
+  'These decisions were taken against a plan-review round that is no longer the current one, so nothing was sent to the provider. Re-read the round and decide its findings again.';
 
 const INTERRUPTED_ROUND =
   'The provider records a plan round that started and never finished. It produced no findings and nothing awaits decisions, so a new round may be started by hand. Nothing was repeated.';
@@ -190,6 +214,19 @@ function settledStatus(
   return null;
 }
 
+/**
+ * Decisions, and the exact round they were taken against.
+ *
+ * The identity is not decoration: `resolve` is not idempotent, and a caller
+ * that has been looking at a stale screen must be refused rather than have its
+ * answers applied to whatever round happens to be current now.
+ */
+export interface PlanReviewResolveRequest {
+  readonly gateId: string;
+  readonly expectedRevision: number;
+  readonly decisions: readonly PlanReviewDecision[];
+}
+
 export interface PlanReviewGateDeps {
   readonly tasks: TaskRepository;
   readonly projects: ProjectRepository;
@@ -253,6 +290,55 @@ export function readBoundRuleEvidence(
     throw new AgentRelayError('PARSE_FAILED', 'The stored rule-evidence binding does not match its snapshot.');
   }
   return snapshot;
+}
+
+/**
+ * Does the task's latest gate describe the specification it has right now?
+ *
+ * Answers with one of four states rather than a boolean, and the distinction
+ * that matters is between `obsolete` and `unknown`. `obsolete` is a claim: both
+ * identities were read and they differ, so the review really does belong to an
+ * earlier specification and preparing a new one is exactly the right next step.
+ * `unknown` is the absence of a claim: the binding or the specification could
+ * not be read, so nothing at all was compared. Reporting the second as the
+ * first tells an operator their review is stale on no evidence, and offers them
+ * a preparation that cannot succeed, because it needs the very evidence that
+ * could not be read.
+ *
+ * Computed here so no other layer has to. A renderer that recomputed these
+ * hashes would be a second implementation of the approval rule, free to drift
+ * from {@link assertPlanReviewAllowsApproval}, which is the one that decides.
+ */
+export function planReviewGateIdentity(input: {
+  readonly task: Task;
+  readonly gate: PlanReviewGate | null;
+  readonly ruleEvidence: TaskRuleEvidenceRepository;
+}): PlanReviewGateIdentity {
+  if (input.gate === null) return 'no_gate';
+
+  let snapshot: RuleEvidenceSnapshot | null;
+  try {
+    snapshot = readBoundRuleEvidence(input.task.id, input.ruleEvidence);
+  } catch {
+    // The binding exists but its bytes no longer parse or no longer match their
+    // hash. Nothing can be compared against it.
+    return 'unknown';
+  }
+  // A gate cannot be created without a binding, so its absence here is a state
+  // this application has no account of — which is not the same as staleness.
+  if (snapshot === null) return 'unknown';
+
+  let specificationSha256: string;
+  try {
+    specificationSha256 = specificationIdentity(input.task.specificationJson).sha256;
+  } catch {
+    return 'unknown';
+  }
+
+  return input.gate.specificationSha256 === specificationSha256 &&
+    input.gate.ruleEvidenceSha256 === snapshot.sha256
+    ? 'current'
+    : 'obsolete';
 }
 
 export function assertPlanReviewAllowsApproval(input: {
@@ -339,7 +425,23 @@ export class PlanReviewGateService {
     });
   }
 
-  prepare(taskId: string): PlanReviewGate {
+  /**
+   * Everything `prepare` needs, validated, with nothing written.
+   *
+   * Separated so the same refusals can be raised before any local Git mutation
+   * happens. Preparing a task creates a branch and a worktree, and discovering
+   * only afterwards that the rule evidence is missing or unreadable leaves a
+   * task carrying review infrastructure it can never use — rule evidence is
+   * bindable only in `DRAFT`, so the obvious repair is closed by then.
+   */
+  private preparable(taskId: string): {
+    task: Task;
+    snapshot: RuleEvidenceSnapshot;
+    specificationSha256: string;
+    latest: PlanReviewGate | null;
+    /** The existing gate, when it already describes this exact identity. */
+    reusable: PlanReviewGate | null;
+  } {
     const task = this.requireReadyTask(taskId);
     const snapshot = readBoundRuleEvidence(taskId, this.deps.ruleEvidence);
     if (snapshot === null) {
@@ -347,17 +449,60 @@ export class PlanReviewGateService {
     }
     const specification = specificationIdentity(task.specificationJson);
     const latest = this.deps.gates.findByTask(taskId);
-    if (
+    const reusable =
       latest !== null &&
       latest.specificationSha256 === specification.sha256 &&
       latest.ruleEvidenceSha256 === snapshot.sha256
+        ? latest
+        : null;
+
+    // A new specification identity would mean a new row, and the task's current
+    // gate is whichever row is newest. Refusing here is what keeps the older
+    // gate reachable: it stays the answer to `findByTask`, so the operator can
+    // still reconcile or resolve it.
+    //
+    // The statuses that are NOT blocking are the ones with nothing outstanding.
+    // `prepared` never dispatched anything. `proceeded` and `changes_requested`
+    // are settled — the round finished and its decisions are recorded here or in
+    // the provider. `interrupted` is settled too, in the only sense that
+    // matters: the provider's own record says the round produced no result and
+    // nothing awaits it. Superseding any of those repeats nothing and hides no
+    // pending outcome, and approval is unaffected either way because it is
+    // checked against the specification and rule hashes of the gate itself.
+    if (
+      reusable === null &&
+      latest !== null &&
+      SUPERSEDE_BLOCKING.includes(latest.status as (typeof SUPERSEDE_BLOCKING)[number])
     ) {
-      return latest;
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        `This task's plan-review gate is "${latest.status}", which has an outstanding external round. A new specification cannot open a second gate over it.`,
+        {
+          remediation:
+            'Reconcile the external state, or resolve the round that is awaiting decisions, before preparing a review for the regenerated specification.'
+        }
+      );
     }
+
+    return { task, snapshot, specificationSha256: specification.sha256, latest, reusable };
+  }
+
+  /**
+   * Refuse now, for the reasons `prepare` would refuse later — and write nothing.
+   *
+   * Called before the worktree is created so a refusal costs no local state.
+   */
+  assertPreparable(taskId: string): void {
+    this.preparable(taskId);
+  }
+
+  prepare(taskId: string): PlanReviewGate {
+    const { snapshot, specificationSha256, reusable } = this.preparable(taskId);
+    if (reusable !== null) return reusable;
     return this.deps.gates.create({
       id: this.deps.ids.next(),
       taskId,
-      specificationSha256: specification.sha256,
+      specificationSha256,
       ruleEvidenceSha256: snapshot.sha256,
       sessionId: null,
       serverName: null,
@@ -392,6 +537,12 @@ export class PlanReviewGateService {
     const snapshot = readBoundRuleEvidence(taskId, this.deps.ruleEvidence);
     if (snapshot === null) throw new AgentRelayError('VALIDATION_FAILED', 'No rule evidence is bound.');
     const specification = specificationIdentity(task.specificationJson);
+    // Resolved before `prepare`, not after. A task with no isolated branch
+    // cannot be reviewed at all, and discovering that after `prepare` has run
+    // leaves behind a durable `prepared` gate for a review that can never
+    // start — a row the screen then offers to run. Every refusal that costs
+    // nothing belongs in front of the first write.
+    const reviewSubject = subject(task, project.localPath);
     let gate = this.prepare(taskId);
     if (!STARTABLE_STATUSES.includes(gate.status as (typeof STARTABLE_STATUSES)[number])) {
       throw new AgentRelayError(
@@ -399,10 +550,9 @@ export class PlanReviewGateService {
         `Plan review cannot start while its durable status is "${gate.status}". ${RECONCILE_FIRST}`
       );
     }
-    const reviewSubject = subject(task, project.localPath);
-    // Built before anything is dispatched. A refusal here — an oversized plan,
-    // credential-shaped rule text, a task without a branch — leaves the gate
-    // exactly where it was, and provably without any external effect.
+    // Built before anything is dispatched. A refusal here — an oversized plan
+    // or credential-shaped rule text — leaves the gate exactly where it was,
+    // and provably without any external effect.
     const text = planText(specification.specification, snapshot);
 
     try {
@@ -526,6 +676,21 @@ export class PlanReviewGateService {
       return current ?? gate;
     };
 
+    // Classified before anything is taken from the answer, because "evidence of
+    // nothing" has to include the identity the answer claims to speak for. A
+    // self-contradictory reply that was allowed to write its `sessionId` into a
+    // gate that had none would name the session every later reply is checked
+    // against — so a malformed answer would decide which valid answers are
+    // rejected as mismatches. Only a bounded diagnostic is written here; the
+    // status, session, server identity, provenance and round evidence are all
+    // left exactly as they were.
+    const reading = readStatus(state);
+    if (reading.kind === 'incoherent') {
+      return settle({
+        lastError: redactAndTruncate(`${INCOHERENT_STATUS} (${reading.reason})`, 10_000)
+      });
+    }
+
     // A session this gate never recorded cannot speak for it. The identity is
     // adopted only where there was none — a gate stuck in `opening` never got
     // one — and the read-back is already scoped to this repository and branch.
@@ -537,18 +702,6 @@ export class PlanReviewGateService {
       serverName: state.serverName,
       serverVersion: state.serverVersion
     };
-
-    const reading = readStatus(state);
-
-    // An answer that contradicts itself is not weak evidence to be resolved
-    // generously; it is evidence of nothing. It settles no phase, permits no
-    // dispatch, and above all does not trigger a retry of the external call.
-    if (reading.kind === 'incoherent') {
-      return settle({
-        ...identity,
-        lastError: redactAndTruncate(`${INCOHERENT_STATUS} (${reading.reason})`, 10_000)
-      });
-    }
 
     // A round still executing settles nothing at all, and is the one state in
     // which starting another would double a call that has not finished. The
@@ -588,10 +741,27 @@ export class PlanReviewGateService {
         // can never be mistaken for an absent one.
         return settle({ ...identity, lastError: FINDINGS_UNRECOVERABLE });
       case 'no-rounds':
-        // Proven by the provider's own record, and cross-checked against every
-        // other field before it got this far: no plan round exists for this
-        // session, so dispatching one now repeats nothing.
-        return settle({ ...identity, status: 'prepared', lastError: null });
+        // What an empty round list proves depends entirely on what this gate
+        // had already dispatched, and only one phase makes it conclusive.
+        //
+        // From `opening` it is conclusive: `review_plan` is sent only after
+        // `open` returns, so a gate that never left `opening` never sent one.
+        // The single call that did go out is `open`, which the provider
+        // documents as idempotent per repository and branch — the same pair
+        // resumes the same session rather than starting a second one — so
+        // re-arming here repeats nothing that was not already repeatable.
+        //
+        // From `reviewing` it proves nothing of the kind. `review_plan` was
+        // dispatched, and an empty list is equally consistent with "the
+        // provider never accepted it" and "the provider accepted it and has
+        // not recorded it yet". Reading the second as the first is precisely
+        // how a non-idempotent call gets sent twice. `failed` cannot even be
+        // narrowed that far: it is a legacy row whose original phase was not
+        // recorded, so it may have been either.
+        if (gate.status === 'opening') {
+          return settle({ ...identity, status: 'prepared', lastError: null });
+        }
+        return settle({ ...identity, lastError: NO_TERMINAL_EVIDENCE });
       case 'proceeded':
         return settle({ ...identity, status: 'proceeded', reconciledAt, lastError: null });
       case 'revised':
@@ -613,12 +783,12 @@ export class PlanReviewGateService {
 
   async resolve(
     taskId: string,
-    decisionsValue: readonly PlanReviewDecision[],
+    request: PlanReviewResolveRequest,
     signal?: AbortSignal
   ): Promise<PlanReviewGate> {
     const release = this.deps.claims.acquire(taskId, 'resolve');
     try {
-      return await this.runResolve(taskId, decisionsValue, signal);
+      return await this.runResolve(taskId, request, signal);
     } finally {
       release();
     }
@@ -626,7 +796,7 @@ export class PlanReviewGateService {
 
   private async runResolve(
     taskId: string,
-    decisionsValue: readonly PlanReviewDecision[],
+    request: PlanReviewResolveRequest,
     signal?: AbortSignal
   ): Promise<PlanReviewGate> {
     const task = this.requireReadyTask(taskId);
@@ -636,8 +806,18 @@ export class PlanReviewGateService {
     if (gate === null || gate.status !== 'awaiting_resolve') {
       throw new AgentRelayError('VALIDATION_FAILED', 'No completed plan-review round awaits resolution.');
     }
+    // Decisions are answers to specific findings, and a finding is only
+    // identified by its index within one round. Two rounds of the same length
+    // therefore accept each other's decisions perfectly — the indices line up
+    // and the reasons are about the wrong findings. Naming the round the caller
+    // was actually looking at is the only thing that tells them apart.
+    if (gate.id !== request.gateId || gate.revision !== request.expectedRevision) {
+      throw new AgentRelayError('VALIDATION_FAILED', STALE_ROUND, {
+        remediation: 'Reload the plan review and decide the findings of the current round.'
+      });
+    }
     const findings = parsePlanReviewFindings(gate.findingsJson);
-    const decisions = z.array(planReviewDecisionSchema).max(256).parse(decisionsValue);
+    const decisions = z.array(planReviewDecisionSchema).max(256).parse(request.decisions);
     const decisionsJson = JSON.stringify(decisions);
     if (containsSecretShape(decisionsJson)) {
       throw new AgentRelayError(
@@ -656,11 +836,20 @@ export class PlanReviewGateService {
       );
     }
 
-    const resolving = this.deps.gates.update(gate.id, {
-      status: 'resolving',
-      decisionsJson,
-      lastError: null
-    });
+    // Conditional, and the last thing before the provider is touched. The
+    // check above is what gives the caller a clear reason; this is what closes
+    // the window between that check and the write, so no `resolve` can be
+    // dispatched for a round that stopped being current in between.
+    const resolving = this.deps.gates.updateIfUnchanged(
+      gate.id,
+      { status: 'resolving', decisionsJson, lastError: null },
+      request.expectedRevision
+    );
+    if (resolving === null) {
+      throw new AgentRelayError('VALIDATION_FAILED', STALE_ROUND, {
+        remediation: 'Reload the plan review and decide the findings of the current round.'
+      });
+    }
     try {
       const result = await this.deps.reviewer.resolve(
         subject(task, project.localPath),

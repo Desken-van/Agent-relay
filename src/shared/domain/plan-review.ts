@@ -126,6 +126,25 @@ export const planReviewGateSchema = z
   })
   .strict();
 export type PlanReviewGate = z.infer<typeof planReviewGateSchema>;
+
+/**
+ * Whether a task's latest gate still speaks for the specification it has now.
+ *
+ * Four states rather than a boolean, because "no" was doing two incompatible
+ * jobs: a gate PROVEN to belong to an earlier specification, and a gate whose
+ * identity could not be read at all. Only the first justifies telling an
+ * operator the review is out of date and offering to prepare a new one; the
+ * second is an admission that the question could not be answered, and the
+ * action it would suggest — prepare again — is the one thing certain to fail,
+ * because the evidence it needs is the evidence that could not be read.
+ *
+ * - `no_gate`  — the task has no gate to judge.
+ * - `current`  — both hashes were read and both match.
+ * - `obsolete` — both were read and at least one differs.
+ * - `unknown`  — the binding or the specification could not be read, so
+ *                neither answer is available. Never presented as staleness.
+ */
+export type PlanReviewGateIdentity = 'no_gate' | 'current' | 'obsolete' | 'unknown';
 export type PlanReviewStatus = (typeof PLAN_REVIEW_STATUSES)[number];
 export type PlanReviewVerdict = (typeof PLAN_REVIEW_VERDICTS)[number];
 

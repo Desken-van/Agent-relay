@@ -43,7 +43,8 @@ import type { CodexReviewResult, TaskSpecification } from './schemas/codex';
 import {
   planReviewDecisionSchema,
   type PlanReviewFinding,
-  type PlanReviewGate
+  type PlanReviewGate,
+  type PlanReviewGateIdentity
 } from './domain/plan-review';
 import type {
   RuleEvidenceOmission,
@@ -114,6 +115,22 @@ export interface PlanReviewDetail {
    */
   readonly ruleEvidenceProblem: string | null;
   readonly gate: PlanReviewGate | null;
+  /**
+   * Whether `gate` describes the task's CURRENT specification and rule binding.
+   *
+   * Computed in the main process, never in the renderer: a gate settled against
+   * an earlier specification is still the task's latest gate, so nothing about
+   * the row itself says it is stale, and the comparison that reveals it is the
+   * same one the approval rule makes. Recomputing it on the other side of the
+   * IPC boundary would be a second implementation of that rule, free to
+   * disagree with the one that decides.
+   *
+   * `obsolete` and `unknown` are kept apart deliberately: one is proof that the
+   * review belongs to an earlier specification, the other is the admission that
+   * nothing could be compared. They call for different words on screen and
+   * different actions.
+   */
+  readonly gateIdentity: PlanReviewGateIdentity;
   readonly findings: readonly PlanReviewFinding[];
 }
 
@@ -230,9 +247,16 @@ export const ipcInputSchemas = {
     .strict(),
   'planReview:review': byTask,
   'planReview:reconcile': byTask,
+  // `gateId` and `expectedRevision` name the round the decisions answer. A
+  // renderer that has been showing a round which has since been resolved and
+  // replaced would otherwise submit its answers against the current one — the
+  // finding indices line up whenever the two rounds are the same length, so
+  // nothing else in this payload could tell them apart.
   'planReview:resolve': z
     .object({
       taskId: z.string().min(1),
+      gateId: z.string().min(1),
+      expectedRevision: z.number().int().nonnegative(),
       decisions: z.array(planReviewDecisionSchema).max(256)
     })
     .strict(),

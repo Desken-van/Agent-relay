@@ -11,6 +11,27 @@ const PLAN_REVIEW_CHANNELS = [
 ] as const;
 
 describe('the external plan-review IPC contract', () => {
+  it('will not resolve without naming the round the decisions answer', () => {
+    const schema = ipcInputSchemas['planReview:resolve'];
+    const decisions = [{ finding: 0, action: 'accept' as const, reason: '' }];
+
+    // Decisions are indexed answers, so two rounds of the same length accept
+    // each other's silently. The round identity is the only thing that does not
+    // line up, which is why it is required rather than optional.
+    expect(schema.safeParse({ taskId: 'task-1', decisions }).success).toBe(false);
+    expect(schema.safeParse({ taskId: 'task-1', gateId: 'gate-1', decisions }).success).toBe(false);
+    expect(schema.safeParse({ taskId: 'task-1', expectedRevision: 1, decisions }).success).toBe(false);
+    expect(
+      schema.safeParse({ taskId: 'task-1', gateId: 'gate-1', expectedRevision: -1, decisions }).success
+    ).toBe(false);
+    expect(
+      schema.safeParse({ taskId: 'task-1', gateId: 'gate-1', expectedRevision: 1.5, decisions }).success
+    ).toBe(false);
+    expect(
+      schema.safeParse({ taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0, decisions }).success
+    ).toBe(true);
+  });
+
   it('accepts only a task id for the read-only reconciliation', () => {
     const schema = ipcInputSchemas['planReview:reconcile'];
     expect(schema.safeParse({ taskId: 'task-1' }).success).toBe(true);
@@ -55,7 +76,7 @@ describe('the external plan-review IPC contract', () => {
       for (const extra of smuggled) {
         const base =
           channel === 'planReview:resolve'
-            ? { taskId: 'task-1', decisions: [] }
+            ? { taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0, decisions: [] }
             : { taskId: 'task-1' };
         expect(ipcInputSchemas[channel].safeParse({ ...base, ...extra }).success).toBe(false);
       }
@@ -82,6 +103,8 @@ describe('the external plan-review IPC contract', () => {
     expect(
       schema.parse({
         taskId: 'task-1',
+        gateId: 'gate-1',
+        expectedRevision: 3,
         decisions: [{ finding: 0, action: 'reject', reason: 'The premise is contradicted by code.' }]
       }).decisions
     ).toHaveLength(1);
@@ -101,8 +124,12 @@ describe('the external plan-review IPC contract', () => {
     const schema = ipcInputSchemas['planReview:resolve'];
     const decision = { finding: 0, action: 'accept' as const, reason: '' };
     expect(
-      schema.safeParse({ taskId: 'task-1', decisions: Array.from({ length: 257 }, () => decision) })
-        .success
+      schema.safeParse({
+        taskId: 'task-1',
+        gateId: 'gate-1',
+        expectedRevision: 0,
+        decisions: Array.from({ length: 257 }, () => decision)
+      }).success
     ).toBe(false);
     expect(
       schema.safeParse({

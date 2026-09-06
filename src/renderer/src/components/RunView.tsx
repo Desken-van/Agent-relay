@@ -381,6 +381,15 @@ export function RunView(): React.JSX.Element {
 
 type DecisionDraft = { action: '' | 'accept' | 'reject'; reason: string };
 
+/** Decision drafts, tagged with the round they answer. */
+type DecisionDrafts = {
+  readonly roundKey: string | null;
+  readonly drafts: Record<number, DecisionDraft>;
+};
+
+/** Shared empty map, so a stale round renders no drafts and no new objects. */
+const NO_DRAFTS: Record<number, DecisionDraft> = {};
+
 export function PlanReviewPanel({
   task,
   integrationEnabled,
@@ -399,7 +408,29 @@ export function PlanReviewPanel({
   const inFlightRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [dirtyPrompt, setDirtyPrompt] = useState(false);
-  const [decisions, setDecisions] = useState<Record<number, DecisionDraft>>({});
+  // Drafts are stored WITH the round they were typed against, and read back
+  // only for that round. A decision is an answer to finding number N of one
+  // particular round, so it stops meaning anything the moment the round
+  // changes — and two rounds of the same length would accept each other's
+  // answers silently, indices and all.
+  //
+  // Derived during render rather than reset in an effect: there is no external
+  // system to synchronise with here, and clearing state from an effect renders
+  // the stale drafts once before removing them. The revision moves only when
+  // the main process writes the gate, never while the operator is typing, so
+  // editing within one round is untouched.
+  const [draftState, setDraftState] = useState<DecisionDrafts>({ roundKey: null, drafts: {} });
+  const roundKey = detail?.gate ? `${detail.gate.id}:${detail.gate.revision}` : null;
+  const decisions = draftState.roundKey === roundKey ? draftState.drafts : NO_DRAFTS;
+  const setDecisions = useCallback(
+    (update: (current: Record<number, DecisionDraft>) => Record<number, DecisionDraft>): void => {
+      setDraftState((current) => ({
+        roundKey,
+        drafts: update(current.roundKey === roundKey ? current.drafts : {})
+      }));
+    },
+    [roundKey]
+  );
 
   useEffect(() => {
     let active = true;
@@ -436,6 +467,26 @@ export function PlanReviewPanel({
         setDirtyPrompt(true);
       } else {
         setError(caught instanceof Error ? caught.message : String(caught));
+        // A failed `review` or `resolve` is the one case where the screen is now
+        // lying. Both write their durable phase before they dispatch, so a lost
+        // answer leaves the gate at `reviewing` or `resolving` in the main
+        // process while this panel still holds the `prepared` or
+        // `awaiting_resolve` it rendered before the click — offering the very
+        // button the service will now refuse, and hiding the reconciliation that
+        // is the actual way out. One read-only read-back fixes the display.
+        //
+        // Exactly one, and never the operation itself: `review` and `resolve`
+        // are not idempotent and may already have taken effect. If the read-back
+        // fails too, the original error stands and the stale detail stays as it
+        // is — a screen that admits it does not know beats one that invents an
+        // outcome.
+        if (key === 'review' || key === 'resolve') {
+          try {
+            setDetail(await expect('planReview:get', { taskId: task.id }));
+          } catch {
+            // Nothing to add: the operator already has the failure that matters.
+          }
+        }
       }
     } finally {
       inFlightRef.current = false;
@@ -457,6 +508,22 @@ export function PlanReviewPanel({
   // for a lost answer too, and those are exactly the ones needing a read-back.
   const unknownOutcome =
     gate !== null && ['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status);
+
+  // A gate settled against an earlier specification is still the newest row, so
+  // it keeps rendering as though it spoke for the specification on screen. The
+  // main process says which of the four states it is in; this side only asks,
+  // and above all does not fold `unknown` into `obsolete` — one is proof the
+  // review is stale, the other is proof of nothing.
+  const identity = detail?.gateIdentity ?? 'no_gate';
+  const obsolete = gate !== null && identity === 'obsolete';
+  // The same statuses the service refuses to supersede: each has a dispatched
+  // call whose outcome is unknown, or a finished round awaiting decisions.
+  // Being obsolete does not settle any of that, so it buys no way past them.
+  const obsoleteBlocking =
+    obsolete &&
+    ['opening', 'reviewing', 'awaiting_resolve', 'resolving', 'failed'].includes(gate.status);
+  const obsoleteSettled = obsolete && !obsoleteBlocking;
+  const identityUnknown = gate !== null && identity === 'unknown';
 
   return (
     <Card
@@ -541,6 +608,41 @@ export function PlanReviewPanel({
           </button>
         ) : null}
 
+        {obsoleteSettled ? (
+          <div className="stack stack--tight">
+            <Notice tone="warn">
+              This review settled against an earlier specification. The one on screen now has
+              not been reviewed, so it cannot be approved on the strength of that round.
+            </Notice>
+            <button
+              type="button"
+              className="btn btn--wide"
+              disabled={!integrationEnabled || busy !== null || task.status !== 'READY_FOR_IMPLEMENTATION'}
+              onClick={() => void act('prepare', () => expect('planReview:prepare', { taskId: task.id }))}
+            >
+              {busy === 'prepare' ? <Spinner /> : <Scope kind="local" />} Prepare review for current specification
+            </button>
+          </div>
+        ) : null}
+
+        {obsoleteBlocking ? (
+          <Notice tone="warn">
+            This review settled against an earlier specification, and its previous round is
+            still outstanding. Finish that round first — regenerating the specification does
+            not close it, and nothing here may start a second one over it.
+          </Notice>
+        ) : null}
+
+        {identityUnknown ? (
+          <Notice tone="warn">
+            Whether this review still matches the current specification could not be
+            established, because the bound evidence or the specification itself could not be
+            read. That is not the same as the review being out of date, and Agent Relay will
+            not say it is: nothing here is approved, and preparing a new review would need
+            the evidence that could not be read.
+          </Notice>
+        ) : null}
+
         {dirtyPrompt ? (
           <Notice tone="warn">
             The project checkout is dirty. The isolated task branch can still be based on its
@@ -560,7 +662,7 @@ export function PlanReviewPanel({
           </Notice>
         ) : null}
 
-        {gate?.status === 'interrupted' ? (
+        {gate?.status === 'interrupted' && identity === 'current' ? (
           <Notice tone="warn">
             A previous round was started in the provider and never finished. It produced no
             findings and nothing is waiting on decisions, so a new round can be started by
@@ -568,7 +670,14 @@ export function PlanReviewPanel({
           </Notice>
         ) : null}
 
-        {gate && ['prepared', 'changes_requested', 'interrupted'].includes(gate.status) ? (
+        {/*
+          Starting a round is offered only when the gate is PROVEN to describe the
+          specification on screen. `obsolete` would review the wrong document, and
+          `unknown` cannot say which document it would review — and a round is
+          non-idempotent, so an unverifiable one is not worth spending. Both get
+          their own message above instead of a button that means nothing.
+        */}
+        {gate && identity === 'current' && ['prepared', 'changes_requested', 'interrupted'].includes(gate.status) ? (
           <button
             type="button"
             className="btn btn--wide"
@@ -663,6 +772,10 @@ export function PlanReviewPanel({
                 }));
                 void act('resolve', () => expect('planReview:resolve', {
                   taskId: task.id,
+                  // The round these answers were written against, so the main
+                  // process can refuse them if it is no longer the current one.
+                  gateId: gate.id,
+                  expectedRevision: gate.revision,
                   decisions: payload
                 }));
               }}
@@ -672,7 +785,7 @@ export function PlanReviewPanel({
           </div>
         ) : null}
 
-        {gate?.status === 'proceeded' ? (
+        {gate?.status === 'proceeded' && identity === 'current' ? (
           <Notice tone="info">The exact specification and rule snapshot passed resolution. You may now approve the specification.</Notice>
         ) : null}
       </div>
