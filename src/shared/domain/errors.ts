@@ -19,6 +19,8 @@ export type AgentRelayErrorCode =
   | 'WORKTREE_CONFLICT'
   | 'WORKTREE_INVALID'
   | 'APPROVAL_REQUIRED'
+  /** Another operation already holds the exclusive claim on this subject. */
+  | 'BUSY'
   | 'CANCELLED'
   | 'TIMEOUT'
   | 'PARSE_FAILED'

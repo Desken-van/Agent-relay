@@ -314,6 +314,23 @@ export const settingsSchema = z.object({
   codexExecutablePath: z.string().nullable(),
   /** Absolute path to the GitHub CLI, or null to use PATH. */
   ghExecutablePath: z.string().nullable(),
+  /** Opt-in gate: when enabled, a task must bind rules and pass external plan review. */
+  externalPlanReviewEnabled: z.boolean(),
+  /** Explicit MCP server executable. Authentication remains owned by that server. */
+  coaiMcpExecutablePath: z.string().max(32_767).nullable(),
+  /** Fixed argv passed to the MCP executable; never interpreted through a shell. */
+  coaiMcpArguments: z.array(z.string().min(1).max(2_000)).max(32),
+  /** Optional absolute working directory for the MCP server. */
+  coaiMcpWorkingDirectory: z.string().max(32_767).nullable(),
+  /** Optional conventions repository included alongside the project rules. */
+  conventionsRepositoryPath: z.string().max(32_767).nullable(),
+  /** Exact clean conventions revision to bind. */
+  conventionsExpectedRevision: z
+    .string()
+    .regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/)
+    .nullable(),
+  /** Explicit repository-relative POSIX paths selected from the conventions repository. */
+  conventionsRulePaths: z.array(z.string().min(1).max(1_024)).max(64),
   /** Default GitHub owner used when creating repositories. */
   githubOwner: z.string().max(200),
   /** Where "new project" directories are created by default. */

@@ -7,6 +7,7 @@ import { AgentRelayError } from '../../../shared/domain/errors';
 import { settingsSchema, type Settings } from '../../../shared/domain/models';
 import type { SettingsRepository } from '../../ports';
 import type { Db } from '../database';
+import { assertExternalPlanReviewSettings } from '../../services/plan-review-configuration';
 
 /**
  * Settings live in a key/value table rather than a single JSON blob so that a
@@ -87,6 +88,8 @@ export class SqliteSettingsRepository implements SettingsRepository {
         }
       );
     }
+
+    assertExternalPlanReviewSettings(next.data);
 
     const upsert = this.db.prepare(
       `INSERT INTO settings (key, value) VALUES (?, ?)

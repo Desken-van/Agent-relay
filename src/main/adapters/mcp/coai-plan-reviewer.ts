@@ -18,6 +18,7 @@ import type {
   ExternalPlanReviewResolution,
   ExternalPlanReviewRound,
   ExternalPlanReviewSession,
+  ExternalPlanReviewStatus,
   ExternalPlanReviewSubject
 } from '../../ports';
 
@@ -81,6 +82,34 @@ const reviewSchema = z.object({
   findings: z.array(findingSchema).max(256),
   instruction: z.string().max(20_000)
 });
+
+/**
+ * The read-only status surface.
+ *
+ * Passthrough rather than strict: the provider is free to add fields, and this
+ * adapter must not fail a recovery because it learned something new. Only the
+ * fields below are ever read, and `rounds` is read for one purpose — proving
+ * whether a non-idempotent plan round has already run. Note what is absent:
+ * status carries no findings, so a completed round cannot be restored from it.
+ */
+const roundStatusSchema = z.enum(['running', 'done', 'interrupted']);
+
+const statusRoundSchema = z
+  .object({
+    stage: stageSchema,
+    status: roundStatusSchema
+  })
+  .passthrough();
+
+const statusSchema = z
+  .object({
+    sessionId: z.string().min(1).max(128),
+    stage: stageSchema,
+    awaitingResolve: z.boolean(),
+    planProceeded: z.boolean(),
+    rounds: z.array(statusRoundSchema).max(64)
+  })
+  .passthrough();
 
 const resolutionSchema = z.object({
   stage: stageSchema,
@@ -153,6 +182,38 @@ export class CoaiPlanReviewer implements ExternalPlanReviewer {
     const value = parseCall(result, sessionSchema);
     return {
       ...value,
+      serverName: result.server.name,
+      serverVersion: result.server.version
+    };
+  }
+
+  async status(
+    subject: ExternalPlanReviewSubject,
+    signal?: AbortSignal
+  ): Promise<ExternalPlanReviewStatus> {
+    const result = await this.client.call(
+      this.config,
+      'status',
+      { repoPath: subject.repositoryPath, branch: subject.branch },
+      signal
+    );
+    const value = parseCall(result, statusSchema);
+    // Required by the provider's contract, so a missing `sessionId` or a
+    // missing `rounds` is malformed evidence and fails above — never a default.
+    // An absent `rounds` defaulted to `[]` would read as "no round has ever
+    // run", which is the most dangerous sentence this recovery can say.
+    const plan = value.rounds.filter((round) => round.stage === 'PlanReview');
+    return {
+      sessionId: value.sessionId,
+      stage: value.stage,
+      awaitingResolve: value.awaitingResolve,
+      planProceeded: value.planProceeded,
+      planRounds: {
+        total: plan.length,
+        running: plan.filter((round) => round.status === 'running').length,
+        done: plan.filter((round) => round.status === 'done').length,
+        interrupted: plan.filter((round) => round.status === 'interrupted').length
+      },
       serverName: result.server.name,
       serverVersion: result.server.version
     };

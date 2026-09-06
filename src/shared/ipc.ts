@@ -40,6 +40,16 @@ import {
   type OperationDiagnosticRun
 } from './domain/operations-diagnostics';
 import type { CodexReviewResult, TaskSpecification } from './schemas/codex';
+import {
+  planReviewDecisionSchema,
+  type PlanReviewFinding,
+  type PlanReviewGate,
+  type PlanReviewGateIdentity
+} from './domain/plan-review';
+import type {
+  RuleEvidenceOmission,
+  RuleEvidenceSource
+} from './domain/rule-evidence';
 
 /* -------------------------------------------------------------------------- */
 /* Envelope                                                                    */
@@ -80,6 +90,48 @@ export interface PublishOutcome {
   readonly performed: boolean;
   readonly message: string;
   readonly url: string | null;
+}
+
+export interface PlanReviewDetail {
+  readonly ruleEvidence: {
+    readonly snapshotSha256: string;
+    readonly boundAt: string;
+    readonly sources: readonly RuleEvidenceSource[];
+    readonly files: readonly {
+      readonly sourceId: string;
+      readonly path: string;
+      readonly bytes: number;
+      readonly sha256: string;
+    }[];
+    readonly omitted: readonly RuleEvidenceOmission[];
+    readonly totalBytes: number;
+  } | null;
+  /**
+   * Set when a binding row exists but its snapshot cannot be read back.
+   *
+   * Distinct from `ruleEvidence: null`, which means no task ever bound rules.
+   * Collapsing the two made a corrupt binding look like an un-opted-in task and
+   * invited a re-bind that could not succeed.
+   */
+  readonly ruleEvidenceProblem: string | null;
+  readonly gate: PlanReviewGate | null;
+  /**
+   * Whether `gate` describes the task's CURRENT specification and rule binding.
+   *
+   * Computed in the main process, never in the renderer: a gate settled against
+   * an earlier specification is still the task's latest gate, so nothing about
+   * the row itself says it is stale, and the comparison that reveals it is the
+   * same one the approval rule makes. Recomputing it on the other side of the
+   * IPC boundary would be a second implementation of that rule, free to
+   * disagree with the one that decides.
+   *
+   * `obsolete` and `unknown` are kept apart deliberately: one is proof that the
+   * review belongs to an earlier specification, the other is the admission that
+   * nothing could be compared. They call for different words on screen and
+   * different actions.
+   */
+  readonly gateIdentity: PlanReviewGateIdentity;
+  readonly findings: readonly PlanReviewFinding[];
 }
 
 /** Push payload delivered on the `agent-relay:event` channel. */
@@ -188,6 +240,27 @@ export const ipcInputSchemas = {
   'workflow:stop': byTask,
   'workflow:approveForPublishing': byTask,
 
+  'planReview:get': byTask,
+  'planReview:bindRules': byTask,
+  'planReview:prepare': z
+    .object({ taskId: z.string().min(1), acceptDirtyWorkingTree: z.boolean().optional() })
+    .strict(),
+  'planReview:review': byTask,
+  'planReview:reconcile': byTask,
+  // `gateId` and `expectedRevision` name the round the decisions answer. A
+  // renderer that has been showing a round which has since been resolved and
+  // replaced would otherwise submit its answers against the current one — the
+  // finding indices line up whenever the two rounds are the same length, so
+  // nothing else in this payload could tell them apart.
+  'planReview:resolve': z
+    .object({
+      taskId: z.string().min(1),
+      gateId: z.string().min(1),
+      expectedRevision: z.number().int().nonnegative(),
+      decisions: z.array(planReviewDecisionSchema).max(256)
+    })
+    .strict(),
+
   'git:changes': z.object({ taskId: z.string().min(1), refresh: z.boolean().optional() }).strict(),
   'git:repositoryInfo': z.object({ projectId: z.string().min(1) }).strict(),
 
@@ -284,6 +357,13 @@ export interface IpcResponseMap {
   'workflow:sendCorrections': Task;
   'workflow:stop': Task;
   'workflow:approveForPublishing': Task;
+
+  'planReview:get': PlanReviewDetail;
+  'planReview:bindRules': PlanReviewDetail;
+  'planReview:prepare': PlanReviewDetail;
+  'planReview:review': PlanReviewDetail;
+  'planReview:reconcile': PlanReviewDetail;
+  'planReview:resolve': PlanReviewDetail;
 
   'git:changes': GitChangeSet;
   'git:repositoryInfo': RepositoryInfo;

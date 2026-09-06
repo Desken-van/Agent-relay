@@ -150,6 +150,115 @@ describe('Coai plan reviewer adapter', () => {
     ).rejects.toMatchObject({ code: 'TOOL_FAILED' });
   });
 
+  /* ---------------------------------------------------------------------- */
+  /* status: the only tool the recovery is allowed to call                    */
+  /* ---------------------------------------------------------------------- */
+
+  const statusValue = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    sessionId: 'abc123',
+    stage: 'PlanReview',
+    awaitingResolve: false,
+    planProceeded: false,
+    rounds: [],
+    ...overrides
+  });
+
+  it('asks for status with the repository and branch and nothing else', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('status', statusValue()));
+    await new CoaiPlanReviewer(client, config).status({
+      repositoryPath: 'C:\\repo',
+      branch: 'agent/task'
+    });
+
+    expect(client.calls).toEqual([
+      { tool: 'status', args: { repoPath: 'C:\\repo', branch: 'agent/task' } }
+    ]);
+  });
+
+  it('counts running, done and interrupted plan rounds apart', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('status', statusValue({
+      stage: 'PlanReview',
+      rounds: [
+        { stage: 'PlanReview', status: 'done', verdict: 'revise' },
+        { stage: 'PlanReview', status: 'interrupted' },
+        { stage: 'PlanReview', status: 'running' },
+        { stage: 'CodeReview', status: 'done' }
+      ]
+    })));
+
+    const answer = await new CoaiPlanReviewer(client, config).status({
+      repositoryPath: 'C:\\repo',
+      branch: 'agent/task'
+    });
+
+    // Four rounds recorded, three of them PlanReview, and each state kept as
+    // itself: an interrupted round is never added to the completed ones.
+    expect(answer.planRounds).toEqual({ total: 3, running: 1, done: 1, interrupted: 1 });
+    expect(answer.sessionId).toBe('abc123');
+  });
+
+  it('reads the informational fields of a round without demanding them', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('status', statusValue({
+      rounds: [{ stage: 'PlanReview', status: 'done', verdict: 'proceed', gatingCount: 0, note: 'x' }],
+      openedAt: '2026-09-06T00:00:00.000Z'
+    })));
+
+    const answer = await new CoaiPlanReviewer(client, config).status({
+      repositoryPath: 'C:\\repo',
+      branch: 'agent/task'
+    });
+
+    expect(answer.planRounds).toEqual({ total: 1, running: 0, done: 1, interrupted: 0 });
+  });
+
+  it('rejects a status answer with no session identity rather than inventing one', async () => {
+    const client = new FakeMcpClient();
+    const value = statusValue();
+    delete value.sessionId;
+    client.responses.push(result('status', value));
+
+    await expect(
+      new CoaiPlanReviewer(client, config).status({ repositoryPath: 'C:\\repo', branch: 'agent/task' })
+    ).rejects.toMatchObject({ code: 'PARSE_FAILED' });
+  });
+
+  it('rejects a status answer with no rounds rather than reading it as none', async () => {
+    const client = new FakeMcpClient();
+    const value = statusValue();
+    delete value.rounds;
+    client.responses.push(result('status', value));
+
+    // The dangerous default: an absent `rounds` silently becoming `[]` would
+    // assert that no non-idempotent round has ever run, which is the one thing
+    // this evidence exists to establish.
+    await expect(
+      new CoaiPlanReviewer(client, config).status({ repositoryPath: 'C:\\repo', branch: 'agent/task' })
+    ).rejects.toMatchObject({ code: 'PARSE_FAILED' });
+  });
+
+  it('rejects a round state it does not know how to classify', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('status', statusValue({
+      rounds: [{ stage: 'PlanReview', status: 'queued' }]
+    })));
+
+    await expect(
+      new CoaiPlanReviewer(client, config).status({ repositoryPath: 'C:\\repo', branch: 'agent/task' })
+    ).rejects.toMatchObject({ code: 'PARSE_FAILED' });
+  });
+
+  it('rejects a status answer whose shape is not an object at all', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('status', ['PlanReview']));
+
+    await expect(
+      new CoaiPlanReviewer(client, config).status({ repositoryPath: 'C:\\repo', branch: 'agent/task' })
+    ).rejects.toMatchObject({ code: 'PARSE_FAILED' });
+  });
+
   it('refuses a partial or expanded tool allowlist at construction', () => {
     expect(
       () => new CoaiPlanReviewer(new FakeMcpClient(), { ...config, allowedTools: ['open', 'review_plan'] })

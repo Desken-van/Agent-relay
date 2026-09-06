@@ -351,9 +351,20 @@ its code-review stage.
 
 The gate is optional: a task with no bound rule evidence follows the existing
 workflow. Once evidence is bound, the gate is mandatory and cannot be bypassed
-by the normal Approve or implementation entry points. The composition root
-offers an explicit plan-gate factory, but renderer configuration and live Coai
-acceptance are later work; this phase invokes no real provider.
+by the normal Approve or implementation entry points. Settings persist an
+explicit MCP executable, fixed argument vector, optional working directory and
+an exact clean conventions revision; authentication remains owned by the MCP
+server. The renderer can only name a task, acknowledge a dirty checkout, or
+submit typed finding decisions. It cannot supply executable paths, rule bytes,
+repository roots or prompts through the operational IPC channels.
+
+The Run screen captures and displays the immutable evidence, prepares the task's
+isolated branch, launches a plan round, and records an accept/reject decision for
+every finding before resolve. A rejected finding requires a reason in the UI,
+the IPC schema and the service. Durable `opening`, `reviewing` and `resolving`
+states are shown as unknown in-flight outcomes and never become automatic retry
+buttons. Live Coai acceptance remains the boundary between this tested contract
+and calling the integration production-ready.
 
 Executable discovery is explicit
 ([`executable-locator.ts`](../src/main/adapters/process/executable-locator.ts)):
@@ -940,7 +951,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1255 deterministic tests plus one automated Electron acceptance journey, none
+1345 deterministic tests plus one automated Electron acceptance journey, none
 of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
@@ -958,6 +969,8 @@ of which contact Codex, Claude, or GitHub.
 | `adapters/stdio-mcp-client` | **The generic MCP boundary against a real fake-server process**: initialization, paginated exact-tool discovery, calls and refusal-as-data, stdout/stderr separation, message/content bounds, malformed protocol, unsuccessful exit, timeout and cancellation |
 | `adapters/filesystem-rule-source` · `services/rule-evidence` | **Whole-file project and convention evidence**: fixed discovery, traversal/symlink refusal, omission and byte budgets, deterministic ordering and hashes, runtime schema agreement, plus exact revision and dirty-state behaviour through real Git repositories |
 | `adapters/coai-plan-reviewer` · `services/plan-review-gate` | **Typed external plan gate**: fixed tool names, refusal/error separation, immutable task evidence, durable pre-call intent, decision completeness, secret-shaped input refusal, stale-plan invalidation and approval enforcement |
+| `services/plan-review-configuration` · `domain/plan-review-ipc-contract` | **Saved integration boundary**: opt-in configuration, absolute shell-free process paths, no credential arguments, exact clean convention sources, and operational IPC with no executable, repository, prompt or rule-content fields |
+| `renderer/plan-review-view` · `renderer/plan-review-settings` | **The external plan-review UI against a fake preload bridge**: task-only rule capture, no retroactive opt-in, reasoned finding resolution, no retry affordance for an unknown in-flight call, and fixed process arguments/convention files that remain editable one line at a time |
 | `security/redaction-and-process` | Credential redaction, environment compartmentalisation, argv-not-shell execution |
 | `domain/operations-targets` · `domain/operations-diagnostics` · `domain/operations-ipc-contract` | The target and probe contracts: what they refuse — an adapter outside the enum, a config version this build cannot read, a credential value, a statement anywhere a probe id belongs |
 | `db/operations-repositories` | Migration 3 on a fresh database *and* on one that already has 1 and 2, CRUD, uniqueness, the `RESTRICT` audit policy, close/reopen on disk |

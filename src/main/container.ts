@@ -70,6 +70,7 @@ import { ProjectService } from './services/project-service';
 import { reconcileInterruptedWork, type ReconciliationPlan } from './services/startup-reconciliation';
 import { PublishService } from './services/publish-service';
 import { TaskService } from './services/task-service';
+import { PlanReviewClaims } from './services/plan-review-claims';
 import { PlanReviewGateService } from './services/plan-review-gate';
 import { RuleEvidenceService } from './services/rule-evidence';
 
@@ -85,6 +86,13 @@ export function defaultSettings(paths: ApplicationPaths): Settings {
     claudeExecutablePath: process.env.AGENT_RELAY_CLAUDE_PATH ?? null,
     codexExecutablePath: process.env.AGENT_RELAY_CODEX_PATH ?? null,
     ghExecutablePath: process.env.AGENT_RELAY_GH_PATH ?? null,
+    externalPlanReviewEnabled: false,
+    coaiMcpExecutablePath: null,
+    coaiMcpArguments: [],
+    coaiMcpWorkingDirectory: null,
+    conventionsRepositoryPath: null,
+    conventionsExpectedRevision: null,
+    conventionsRulePaths: [],
     githubOwner: 'Desken-van',
     projectsRoot: join(paths.documentsDir, 'AgentRelayProjects'),
     worktreesRoot: join(paths.dataDir, 'worktrees'),
@@ -240,6 +248,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   const approvals = new SqliteApprovalRepository(db);
   const taskRuleEvidence = new SqliteTaskRuleEvidenceRepository(db);
   const planReviewGates = new SqlitePlanReviewGateRepository(db, clock);
+  const planReviewClaims = new PlanReviewClaims();
   const operationTargets = new SqliteOperationTargetRepository(db, clock);
   const operationDiagnosticRuns = new SqliteOperationDiagnosticRepository(db);
 
@@ -373,12 +382,16 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     operationDiagnostics,
     codexModels,
     ruleEvidenceCollector,
+    // Built once, here, and closed over by every service the factory makes.
+    // A per-call instance would give each IPC invocation its own private map
+    // and arbitrate nothing, which is the whole failure this guards against.
     createPlanReviewGate: (config) =>
       new PlanReviewGateService({
         tasks,
         projects,
         ruleEvidence: taskRuleEvidence,
         gates: planReviewGates,
+        claims: planReviewClaims,
         reviewer: new CoaiPlanReviewer(
           new StdioMcpClient(
             runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner()

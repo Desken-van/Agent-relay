@@ -30,6 +30,17 @@ import {
 import { IPC_INVOKE_CHANNEL } from '../../shared/ipc-channels';
 import type { Application } from '../container';
 import { assertKnownPath } from '../services/path-safety';
+import { parsePlanReviewFindings } from '../../shared/domain/plan-review';
+import { redactAndTruncate } from '../../shared/util/redact';
+import {
+  planReviewGateIdentity,
+  readBoundRuleEvidence
+} from '../services/plan-review-gate';
+import {
+  configuredRuleSources,
+  externalPlanReviewConfig,
+  TASK_RULE_EVIDENCE_LIMITS
+} from '../services/plan-review-configuration';
 
 /** Hosts the app is allowed to open in the user's browser. */
 const ALLOWED_EXTERNAL_HOSTS = new Set([
@@ -61,6 +72,45 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       settings.projectsRoot,
       ...app.projects.list().map((project) => project.localPath)
     ];
+  };
+
+  const planReviewService = () => app.createPlanReviewGate(externalPlanReviewConfig(app.settings.get()));
+  const planReviewDetail = (taskId: string): IpcResponseMap['planReview:get'] => {
+    const task = app.tasks.findById(taskId);
+    if (task === null) throw new AgentRelayError('NOT_FOUND', 'No such task.');
+    const binding = app.taskRuleEvidence.findByTask(taskId);
+    // A binding that exists but cannot be read back is its own state. Letting
+    // the throw escape made the whole detail fail, and the screen then showed
+    // the "no rules bound yet" call to action for a task that is bound.
+    let snapshot: ReturnType<typeof readBoundRuleEvidence> = null;
+    let ruleEvidenceProblem: string | null = null;
+    if (binding !== null) {
+      try {
+        snapshot = readBoundRuleEvidence(taskId, app.taskRuleEvidence);
+      } catch (error) {
+        ruleEvidenceProblem = redactAndTruncate(
+          error instanceof Error ? error.message : String(error),
+          2_000
+        );
+      }
+    }
+    const gate = app.planReviewGates.findByTask(taskId);
+    return {
+      ruleEvidenceProblem,
+      gateIdentity: planReviewGateIdentity({ task, gate, ruleEvidence: app.taskRuleEvidence }),
+      ruleEvidence: binding === null || snapshot === null ? null : {
+        snapshotSha256: binding.snapshotSha256,
+        boundAt: binding.boundAt,
+        sources: snapshot.sources,
+        files: snapshot.files.map(({ sourceId, path, bytes, sha256 }) => ({
+          sourceId, path, bytes, sha256
+        })),
+        omitted: snapshot.omitted,
+        totalBytes: snapshot.totalBytes
+      },
+      gate,
+      findings: gate === null ? [] : parsePlanReviewFindings(gate.findingsJson)
+    };
   };
 
   return {
@@ -120,6 +170,51 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     'workflow:sendCorrections': (input) => app.orchestrator.sendCorrections(input.taskId),
     'workflow:stop': (input) => app.orchestrator.stop(input.taskId),
     'workflow:approveForPublishing': (input) => app.orchestrator.approveForPublishing(input.taskId),
+
+    'planReview:get': (input) => planReviewDetail(input.taskId),
+    'planReview:bindRules': async (input) => {
+      const settings = app.settings.get();
+      const service = planReviewService();
+      const task = app.tasks.findById(input.taskId);
+      if (task === null) throw new AgentRelayError('NOT_FOUND', 'No such task.');
+      const project = app.projects.findById(task.projectId);
+      if (project === null) throw new AgentRelayError('NOT_FOUND', 'No such project.');
+      const snapshot = await app.ruleEvidenceCollector.capture({
+        sources: configuredRuleSources(settings, project.localPath),
+        limits: TASK_RULE_EVIDENCE_LIMITS
+      });
+      service.bindRules(task.id, snapshot);
+      return planReviewDetail(task.id);
+    },
+    'planReview:prepare': async (input) => {
+      const service = planReviewService();
+      // Read-only, and first: preparing creates a branch and a worktree, and a
+      // gate that turns out to be impossible afterwards would leave the task
+      // holding review infrastructure it can never use. Rule evidence binds
+      // only in DRAFT, so by then the obvious repair is already closed.
+      service.assertPreparable(input.taskId);
+      await app.orchestrator.preparePlanReviewWorktree(input.taskId, {
+        acceptDirtyWorkingTree: input.acceptDirtyWorkingTree ?? false
+      });
+      service.prepare(input.taskId);
+      return planReviewDetail(input.taskId);
+    },
+    'planReview:review': async (input) => {
+      await planReviewService().review(input.taskId);
+      return planReviewDetail(input.taskId);
+    },
+    'planReview:reconcile': async (input) => {
+      await planReviewService().reconcile(input.taskId);
+      return planReviewDetail(input.taskId);
+    },
+    'planReview:resolve': async (input) => {
+      await planReviewService().resolve(input.taskId, {
+        gateId: input.gateId,
+        expectedRevision: input.expectedRevision,
+        decisions: input.decisions
+      });
+      return planReviewDetail(input.taskId);
+    },
 
     'git:changes': (input) => app.orchestrator.collectChanges(input.taskId),
     'git:repositoryInfo': async (input) => {
