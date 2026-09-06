@@ -6,6 +6,7 @@ const SECTIONS: ReadonlyArray<{ id: Section; label: string; glyph: string }> = [
   { id: 'projects', label: 'Projects', glyph: '▤' },
   { id: 'tasks', label: 'Tasks', glyph: '◈' },
   { id: 'run', label: 'Run', glyph: '⟳' },
+  { id: 'operations', label: 'Operations', glyph: '◎' },
   { id: 'settings', label: 'Settings', glyph: '⚙' }
 ];
 

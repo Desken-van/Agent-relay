@@ -1465,3 +1465,33 @@ pre,
   font-weight: 640;
   margin-bottom: 6px;
 }
+
+/* ------------------------------------------------------------------ */
+/* Operations                                                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The history list uses <details> so a run can be opened without navigating.
+ * `summary` needs the flex treatment `.card__head` normally gets, and the
+ * default disclosure marker has to go or it lands in the middle of the row.
+ */
+details.card > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  list-style: none;
+}
+
+details.card > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.card > summary::before {
+  content: '▸';
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+details.card[open] > summary::before {
+  content: '▾';
+}

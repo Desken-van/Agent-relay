@@ -393,7 +393,7 @@ Being precise about what was actually exercised, rather than merely written:
 | **Claude Code CLI** | ✅ **Genuinely verified end to end.** Live implementation and correction rounds exercised `stream-json` parsing, tool-use evidence, a failed verification followed by *Retry verification*, and resume of the same Claude session. The diagnostic reports the installed CLI and authenticated profile without exposing credentials. A process-level contract suite additionally drives the adapter through the real process runner against a fake CLI: argv, the prompt on stdin, the working directory, split and packed stdout chunks, the stdout/stderr boundary, exit codes, denials, resume, timeout and cancellation. |
 | **GitHub CLI** | ⚠️ **Live diagnostics verified; remote publish mutations not yet exercised through Agent Relay.** The running app resolved `gh`, reported its version and authenticated account, and the parser and owner/repository validation remain unit-tested. Creating a repository, pushing a task branch, and opening a pull request through Agent Relay still require a dedicated live acceptance run. |
 
-Test suite: **1063 tests, 34 files, all passing.** No test contacts Codex,
+Test suite: **1177 tests, 40 files, all passing.** No test contacts Codex,
 Claude, or GitHub.
 
 ---
@@ -449,14 +449,40 @@ Every run is recorded, whether it succeeded or not, and a run that was
 interrupted by the application stopping is closed on the next start with its
 outcome recorded as *unknown* rather than as a failure of the target.
 
-**There is no user interface for this yet.** Phase 7C-A is the backend: the
-domain, the storage, the registry, the probe adapter and the IPC contract. The
-screens arrive in 7C-B.
+### The screen
+
+**Operations** is its own section in the sidebar, and it is reachable with no
+project and no task selected — a target has nothing to do with a repository, so
+nothing about the development workflow gates it, and no project name appears in
+its header.
+
+From there you can register a target, edit it, enable or disable it, remove the
+registration, run either probe, and read the recorded result and history. The
+path is typed in; there is no file picker yet. A probe starts on a click and on
+nothing else — not on opening the screen, not on selecting a target, not on a
+refresh, and not on coming back to it.
+
+Removing a registration asks for confirmation and says plainly that only the
+registration goes: the SQLite file is not touched, moved or deleted. A target
+with history cannot be removed, and the screen shows the registry's own reason
+and its suggestion to disable it instead.
+
+> **Live acceptance passed.** Phase 7C-C exercised the running Windows app with
+> an isolated profile and synthetic SQLite files: both probes reported the real
+> fixture accurately without changing it or exposing row values, refresh and
+> navigation caused no implicit runs, disabled and history-bearing targets were
+> guarded, and missing or invalid files failed honestly. The recorded evidence
+> and reusable checklist are in `docs/manual-test.md` §12.
 
 ---
 
 ## Known limitations
 
+* **A failed Operations diagnostic has no historical environment snapshot in
+  version 1.** Successful results carry the environment they actually inspected;
+  a failure carries no structured result, so History displays `environment not
+  recorded`. It does not substitute the target's current environment, because
+  editing the target later must not relabel an older audit record.
 * **Agent Relay's GitHub mutation path is not yet live-verified.** Live `gh`
   discovery and authentication diagnostics passed, but create-repository,
   push-branch, and open-pull-request were deliberately not exercised through
@@ -518,7 +544,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1063 tests; no network, no real agents
+├─ tests/              1177 tests; no network, no real agents
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

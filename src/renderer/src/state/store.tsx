@@ -28,7 +28,15 @@ import type { Project, Run, RunEvent, Settings, Task } from '@shared/domain/mode
 import type { AppEvent, TaskDetail } from '@shared/ipc';
 import { call, describeError, expect } from '../lib/api';
 
-export type Section = 'projects' | 'tasks' | 'run' | 'settings';
+/**
+ * `operations` is deliberately not gated on a project or a task.
+ *
+ * An operational target has nothing to do with the development workflow: it is
+ * something outside Agent Relay that somebody wants to look at, and requiring a
+ * repository to be selected first would imply a relationship that does not
+ * exist. Its state lives in its own provider, not in this store.
+ */
+export type Section = 'projects' | 'tasks' | 'run' | 'operations' | 'settings';
 
 export interface Toast {
   readonly id: number;

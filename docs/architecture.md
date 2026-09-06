@@ -433,7 +433,8 @@ names only; `--show-token` is never used.
 
 A second workflow, deliberately kept apart from the development one. The
 development workflow changes a repository; this one only looks at something.
-Phase 7C-A is its backend, and it has no user interface yet.
+Phase 7C-A built its backend; 7C-B added the screen. Live acceptance against a
+synthetic database in a running Windows application (7C-C) passed on 2026-09-04.
 
 ```
 OperationsRegistry ──selects by enum──> OperationProbeAdapter
@@ -561,6 +562,13 @@ A failure is recorded as one, with the kind that produced it (`error`,
 `timeout`, `cancelled`, `malformed`) and **no result**. A run that proved
 nothing must stay visibly empty.
 
+The environment is part of a successful result because it is evidence about
+what that probe actually inspected. Version 1 does not duplicate it in the run
+row. Consequently a failed run, which must have no result, also has no historical
+environment snapshot and the screen says `environment not recorded`. Reading
+the target's environment *now* would be a tempting shortcut and an audit error:
+the target may have been edited since the run.
+
 ### Three shapes, and no others
 
 A stored diagnostic run may take exactly three forms, and every column is
@@ -613,11 +621,242 @@ foreign key is `ON DELETE RESTRICT`, so a diagnostic run — an audit record of
 what was inspected and when — cannot be erased by tidying up. Disable the target
 instead.
 
+### The screen
+
+`OperationsView` is a section of its own, ungated by any project or task: a
+target is not owned by a repository, and requiring one to be selected would
+imply a relationship that does not exist. The header shows no project name for
+the same reason.
+
+It is also ungated by the development store's own start-up. `App` checks for the
+Operations section *before* the bootstrap gate, because the store clears that
+gate only once `projects:list` and `settings:get` have both settled. An ordinary
+error settles them and the gate opens; a request that never answers does not, and
+that used to hold the one screen an operator would open to look at a database
+while the rest of the application was unwell.
+
+Its state lives in `OperationsProvider`, a second context deliberately separate
+from the main store. Two properties come out of that choice.
+
+**Isolation.** Nothing here writes into the development workflow's state, so a
+failed target load or a probe that never answers cannot leave Projects, Tasks,
+Run or Settings in a bad way. Errors are narrower still: each panel keeps its
+own, because a shared slot put a refused delete under the registration form,
+where it read as a reason the *new* target could not be saved.
+
+**Survival.** The provider is mounted above the router, so a diagnostic that is
+in flight is still in flight after the user visits another section and returns.
+Had it lived inside the screen, navigating away would have forgotten the request
+and let a second one start on top of the first.
+
+Everything that can arrive late is keyed by **target id** rather than by "the
+current screen", so an answer for target A writes A's slot and can never be
+painted under target B. A double click is stopped by a ref rather than by the
+disabled attribute: two clicks in one tick see the same React state, and "the
+button looked disabled" is a rendering fact, not a guarantee.
+
+Seven rules govern the asynchronous state, and each of them replaced something
+that looked right and was not.
+
+**A load has a phase, not a pair of booleans.** `idle → loading → loaded |
+error`, where `error` is a resting state. "No data and not loading" is true both
+before the first attempt and after a failed one, so an effect keyed on it fires
+again on the render its own failure caused — hammering a backend that has just
+said no, and clearing the error the operator was meant to read. Only `idle`
+starts a request; only an explicit Retry or Refresh leaves `error`. The target
+list and each target's history have their own phase, so one target's failure
+says nothing about another's.
+
+**A read is stale if a write finished while it was in the air.** Sequence numbers
+alone are not enough: a `listTargets` that started before a Disable was confirmed
+carries an older truth, and it is still the newest *list* request there is.
+A write epoch, compared across the call, is what stops a slow Refresh putting
+`Enabled` back after a confirmed Disable. A response overtaken by a newer read is
+discarded silently — never by handing the phase back to `idle`, which the mount
+effect would read as a fresh screen and answer with a third request.
+
+**A list is complete, or it is known not to be.** A first response discarded
+because a write overtook it leaves only what that write added; announcing that as
+the registry hides every existing registration behind a list that looks whole.
+Completeness is tracked separately from the phase, and registration waits for the
+registry to have been read once — which is also what makes the race unreachable,
+since a create is the only write that can overtake the very first read.
+
+**One action per target, claimed synchronously.** A probe and a registry write may
+not touch the same target at once, in either order: a probe reading a target that
+is being re-pointed would report on something other than what the finished run
+claims it looked at. The claim lives in a ref, and it lives in the provider, so it
+survives the panel being unmounted and remounted by navigation.
+
+Because a guard is a ref and the screen is a store, the two can disagree, and a
+reducer cannot reach a ref. So **nothing clears a guard from inside the reducer**:
+every change goes through a setter that writes both halves in the same turn. The
+failure this prevents is worse than a stuck button — the store cleared, the ref
+kept, and an *enabled* Run that silently reached no channel at all.
+
+**A read that was overtaken is not evidence, and neither is a flag.** A list
+read reports what it actually established — accepted, superseded, overtaken,
+failed or timed out — and only `accepted` carries rows. It used to answer with a
+boolean that, once superseded, fell back to a flag meaning *a complete list
+existed at some point*; reconciliation read that as its own confirmation and
+cleared a doubt on the strength of a read that had proved nothing. Each
+reconciliation also carries a generation, so an older one cannot write its
+verdict over a newer one's, nor report the newer one as finished.
+
+**A read-back says what the registry holds, never who put it there.** After an
+unknown update or delete, a read that merely *succeeded* is not settlement. The
+target as it stood before the request is kept, and the completed read is compared
+against both it and what was asked for, giving four different things to say: the
+registry now matches the requested state, the registry is unchanged so the change
+did not take effect, the registry holds neither, or there is no complete current
+read and the outcome is still unknown. Only the first three release the block,
+and the first is worded as what it is — a statement about the registry, not a
+claim that this request is what applied it. Clearing the doubt on `read
+succeeded` alone was how a mutation that never applied left the operator with no
+notice at all, because the error notice was cleared along with it.
+
+**A read decides nothing once it has been overtaken.** The deep search for a run
+that has scrolled off the page is slow enough for a later refresh to answer the
+same question first, so it re-checks that it is still the current read — after its
+await, before it writes anything — and otherwise stops with no conclusion. A
+superseded search re-blocking a target that newer evidence has just released is
+worse than never having searched.
+
+**Local request lifetime is not backend execution state.** A run the backend
+reports as `running` blocks its target although nothing is in flight here — the
+schema permits one running run per target, so that row is authoritative. It is
+tracked by run id: a later page still calling an already-finished run `running` is
+stale, and a bounded page that has simply scrolled past it proves nothing at all.
+Omission triggers one search to the channel's ceiling; if that cannot account for
+the run either, the block stands and the operator is given an explicit way to stop
+tracking it, because a target locked for the life of the window is its own defect.
+
+**A request, the wait for it, and the read that follows are three things.** The
+renderer's patience expiring is a fact about the screen, not about the request:
+nothing cancels a probe, so an expired wait leaves it outstanding and its answer
+still to come. That answer is applied exactly once, by whichever path reaches it
+first, and independently of whatever the history read is doing — using the
+in-flight flag as evidence that the wait had not expired threw away replies that
+arrived while the history was still loading. Nothing a read says can release an
+outstanding request either: an empty history is as consistent with "still
+running" as with "finished", so only the request's own answer ends it, whether
+that answer is a result, a refusal or a transport failure.
+
+**An unknown outcome holds its claim until something confirms it.** The claim used
+to be released on the way into the very read meant to confirm it, which let a
+second write start against a target whose state nobody knew. Reads never take the
+claim, so holding it across reconciliation costs nothing. The bridge has no
+timeout, so the read has one: on expiry the target stays blocked — nothing was
+confirmed — but the block becomes a stated uncertainty with a re-read attached,
+rather than a spinner with no end.
+
+**Every call is waited for, and none is waited on for ever.** One helper does
+it: it bounds the wait, applies the answer exactly once from whichever path
+reaches it first, and tells that path whether the wait had already expired. Every
+write (30s) and every read (10s) goes through it. This was not always true, and
+the exception mattered: registration had no bound at all, so a bridge that never
+answered left `Saving…` on screen, the draft stuck and no uncertain outcome to
+recover from, for the life of the window. Reads had none either — an unanswered
+list read meant `Loading targets…` with no retry, and an unanswered 500-row
+search for a run meant a target blocked with its release never offered, the very
+lock-up that search exists to prevent.
+
+Expiry is this screen's patience running out and nothing else. The request is not
+cancelled, it is never sent again, the target stays blocked, and a timeout is
+never treated as an answer — least of all as evidence that anything reached a
+terminal state. An answer that arrives after the caller has been handed an
+uncertain outcome has nowhere to be returned to, so it is recorded where the
+screen can still show it: a late refusal appears against its target whether or
+not the editor happens to be open, and exactly once. An answer that arrives while
+the confirming read is still running outranks that read, and is returned to the
+caller rather than reported as an unknown outcome.
+
+A confirming read may refresh the registry shown on screen while the mutation is
+still outstanding, but it cannot publish a settlement for that mutation. The
+state it sees can still be changed by the unanswered request, so calling the
+change applied, unchanged or conflicting at that point would put a conclusion
+beside the simultaneous warning that the request has not answered. Classification
+waits until the request itself is over; a precise late answer outranks the read.
+
+**One registry mutation at a time.** Registration, edit and removal are
+serialised through a single synchronous claim. They are not independent of each
+other: the registry holds one target per `(environment, name)`, so a create in
+flight can decide an edit's outcome and neither request knows about the other.
+Diagnostics are unaffected — they are per target and read-only.
+
+The claim is held until the backend request has actually **answered**, not until
+this renderer stops waiting for it. Releasing it on expiry looked reasonable and
+was not: nothing cancels the request, so a timed-out registration is still on its
+way to the registry, and an edit started on top of it is exactly the concurrent
+pair the claim exists to prevent. The answer releases it — success, refusal or
+transport failure alike — exactly once, and a ticket makes that safe: a late
+answer may release only the claim it was itself given, never one a newer request
+now holds. A confirming read does not release it either.
+
+The cost is real and is the intended trade: while a request is outstanding, no
+registry mutation can start anywhere. The target in doubt is blocked regardless;
+this extends that to the registry for as long as a write it does not control may
+still land. What it does not extend to is reading — a diagnostic on another
+target is unaffected.
+
+**A row that matches a registration is not proof that this request made it.**
+The registry allows one target per name and environment, so an identical target
+registered earlier is precisely what makes it REFUSE a second one — and the row
+found afterwards is that earlier target. Attribution is therefore by identity
+against the registry as it was known *before* the request was sent: a row whose
+id was already there predates the request and settles it as refused, and only a
+row that was absent before and points where the request asked is reported as
+registered. Without such a picture there is no attribution to make, and the
+screen says the outcome is unknown instead of guessing.
+
+What is *known* is not only what a read returned. A write the backend confirmed
+changed the registry too, and folding those in is what makes the picture true a
+second time: register a target, register it again without refreshing in between,
+and lose the second reply, and a picture built from reads alone would not contain
+the target from the first registration — so finding it in the read-back looked
+exactly like the second request having created it. Confirmed creates, updates and
+removals are folded in as they happen. What is deliberately *not* folded in is
+the read stamp: it answers whether a READ has happened since the outcome now in
+doubt, and letting a write advance it would let one request's success stand in
+for the confirmation of another request nobody has answered.
+
+**A read that is running has not failed.** The registration form used to state,
+as settled fact, that the registry could not be re-read while the first
+confirming read was still outstanding — which both misinformed the operator and
+invited a second read to find out. The same applies to the recorded history: a
+refresh that shows nothing looks like a click that went nowhere, so it says what
+it is doing and is held while it does it, and what is already on screen stays
+legible underneath. The registration's own re-read is held by a synchronous
+guard as well, because a button that has not re-rendered yet is not a guard.
+
+**A draft is compared with the schema's own spelling of it.** What the operator
+typed and what the schema made of it are the same path written twice —
+`C:\data\reports.sqlite\` and `C:\data\reports.sqlite` — and comparing the raw
+strings told somebody who had changed nothing that the form was theirs to keep,
+leaving a stale entry in front of a target that had in fact been registered. Both
+sides go through `normalizeTargetPath` before the comparison decides whether the
+form still holds what was submitted. Anything genuinely typed since is still the
+operator's work and is still kept.
+
+**A refusal and an unknown outcome are different things.** A backend that answers
+"no" is a fact about the request. A call that fell over in transport is not:
+whether the write was applied is genuinely unknown, and the screen says so, keeps
+the draft — in the provider, so it survives a remount — re-reads the registry, and
+never repeats the write. Whether that re-read actually succeeded is reported as
+itself: "the registry has been re-read" is only ever printed when it has.
+
+The renderer owns no validation rules. Save is enabled by the same
+`newOperationTargetSchema` the IPC layer parses against, so the button cannot be
+live for something the main process is about to refuse. Every result on screen
+is a persisted `OperationDiagnosticRun` read back from the database — never an
+object the UI assembled — and truncation, warnings and unknown values are shown
+as themselves rather than folded into a green tick or defaulted to `0`.
+
 ---
 
 ## 8. Testing strategy
 
-1063 tests, none of which contact Codex, Claude, or GitHub.
+1177 tests, none of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |
 |-------|----------------|
@@ -636,6 +875,37 @@ instead.
 | `db/operations-repositories` | Migration 3 on a fresh database *and* on one that already has 1 and 2, CRUD, uniqueness, the `RESTRICT` audit policy, close/reopen on disk |
 | `adapters/local-sqlite-probe` | **The probe against real SQLite files in a real child process**: read-only proven by hash, size, mtime and the absence of a `-wal`, truncation counts, timeout, cancellation, stdout/stderr separation |
 | `services/operations-diagnostics` · `services/operations-startup-recovery` | The order of events around a probe, the one-at-a-time rule, redaction before persistence, and recovery of a diagnostic an abrupt exit left open |
+| `renderer/operations-view` | **The Operations screen, driven through its real buttons and fields** against a fake preload bridge: reachability without a project, disabled Save, exact IPC payloads, no automatic runs, double clicks, late answers, and the absence of a false success |
+| `renderer/operations-async` | **The screen's asynchronous state**: a failed load asked once and retried only on request, per-target history, answers arriving out of order, a stale list that must not undo a confirmed write, one action per target at a time, and a write whose outcome nobody knows |
+| `renderer/operations-backend-state` | **What the screen knows about work it did not start**: a run the backend is executing, a bounded page that has scrolled past it, a claim held across the read meant to confirm it, and a first list response a write overtook |
+| `renderer/operations-recovery` | **Recovery, and what must not depend on anything else**: Operations reachable through a development bootstrap that never finishes, a manual re-read held until every read it needs has answered, an unconfirmed registration resolved against the registry, a probe request that goes unanswered, and one deep search per run |
+| `renderer/operations-evidence` | **What counts as evidence, what a wait means, and who may write**: a superseded list read, two overlapping recoveries, a list, a deep search and a registration that never answer, a late registration answer, a draft replaced while a create was in flight, a create racing an edit in one tick, an answer that beats its own read-back, a refusal arriving with the editor open, and what an unknown update or delete may be said to prove |
+| `renderer/operations-outcomes` | **Which request an outcome belongs to, and what the screen says before it knows**: a matching row that predates the request, a draft and a normalised path that are the same path, a confirming read still in flight, a refresh that says it is working, a registry write that never answers, and coming back to the screen without running anything |
+
+### Renderer tests
+
+The renderer suite renders real components and clicks real buttons. A helper
+test that never mounts JSX proves the helper; it does not prove that a button is
+wired to it, that Save is disabled when it should be, or that a late answer
+cannot overwrite the screen — which is most of what can go wrong in a UI.
+
+The whole of the renderer's view of the outside world is
+`window.agentRelay.invoke`, so replacing that one function is enough to drive
+every screen with no main process, database or child process anywhere. Races are
+driven by **deferred promises**, never by sleeps: a test that decides when each
+answer arrives is a test whose result does not depend on how loaded the machine
+is.
+
+A double click has to be fired as one: `fireEvent` is wrapped in `act`, so two
+consecutive calls re-render in between and the second lands on a button that is
+already disabled — which tests the attribute, not the guard behind it. The
+harness's `burstClick` nests the clicks inside a single `act` so nothing is
+flushed between them.
+
+Only these files run in `jsdom`, opted into per file with an
+`@vitest-environment` docblock. Everything else — the process, SQLite and Git
+suites — keeps running in a real Node environment, which is the point of putting
+the choice next to the tests that need it rather than in a glob nobody reads.
 
 ### The process-level contract suite
 
