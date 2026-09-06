@@ -1,11 +1,12 @@
 # Manual end-to-end test
 
-The automated suite covers the orchestration logic against fakes, and one suite
-drives the Claude adapter through a **real child process** against a fake CLI —
-argv, the prompt on stdin, split stdout chunks, the stdout/stderr boundary, exit
-codes, denials, resume, and the fact that a timeout or a cancellation leaves no
-process behind. This document covers what is left: the parts that can only be
-checked by driving the real application against the real tools.
+The automated suite covers the orchestration logic against fakes, drives the
+Claude adapter through a **real child process** against a fake CLI, and drives
+the built Electron application through the complete synthetic Operations
+journey in §12. `npm run verify` builds first and then runs that Electron test;
+`npm run test:e2e` repeats it against the current build. This document retains
+the human-readable checklist and covers what is left: exploratory behaviour and
+the parts that require real authenticated tools.
 
 **Nothing here pushes to GitHub.** Sections 1–8 are entirely local. Section 9
 is the only one that touches a remote, and it is clearly marked.
@@ -416,6 +417,13 @@ as you left it.
 ---
 
 ## 12. Operations UI — live acceptance *(Phase 7C-C, passed 2026-09-04)*
+
+The repeatable path below is automated by
+`tests/e2e/operations-electron.e2e.ts`. It uses a fresh temporary profile,
+creates only synthetic files, drives the real UI and validates the durable
+database after the app closes and after a restart. Run the manual form when
+changing presentation details or when an exploratory packaged-GUI smoke is
+warranted; it is no longer required on every ordinary correction.
 
 This checklist was exercised end to end in a running Windows application against
 fresh synthetic SQLite files and an isolated Agent Relay profile. Keep using the

@@ -389,12 +389,12 @@ Being precise about what was actually exercised, rather than merely written:
 | **Codex SDK** | ✅ **Genuinely verified end to end.** Streaming events, `thread.started` ids, `outputSchema`-constrained structured output validating against the Zod schema, and thread resume from a *new* client process. Its diagnostic reports green in the running app. |
 | **Git** | ✅ **Genuinely verified.** 19 integration tests drive the real `git` binary against real temporary repositories: worktree creation and isolation, change collection, diff truncation, refusal to force-remove, commit, and the destructive-command guard. |
 | **SQLite** | ✅ **Genuinely verified.** Migrations, cascades, ordering, and on-disk durability across close/reopen — and confirmed running inside Electron. |
-| **Electron app** | ✅ **Genuinely verified.** Launches on Windows 11, creates its database in WAL mode, renders the UI, and completes a full renderer→main→adapter→renderer diagnostics round-trip. |
+| **Electron app** | ✅ **Genuinely verified.** Launches on Windows 11, creates its database in WAL mode, renders the UI, and completes a full renderer→main→adapter→renderer diagnostics round-trip. The Operations acceptance journey is also automated against a fresh profile and synthetic SQLite files after every build. |
 | **Claude Code CLI** | ✅ **Genuinely verified end to end.** Live implementation and correction rounds exercised `stream-json` parsing, tool-use evidence, a failed verification followed by *Retry verification*, and resume of the same Claude session. The diagnostic reports the installed CLI and authenticated profile without exposing credentials. A process-level contract suite additionally drives the adapter through the real process runner against a fake CLI: argv, the prompt on stdin, the working directory, split and packed stdout chunks, the stdout/stderr boundary, exit codes, denials, resume, timeout and cancellation. |
 | **GitHub CLI** | ⚠️ **Live diagnostics verified; remote publish mutations not yet exercised through Agent Relay.** The running app resolved `gh`, reported its version and authenticated account, and the parser and owner/repository validation remain unit-tested. Creating a repository, pushing a task branch, and opening a pull request through Agent Relay still require a dedicated live acceptance run. |
 
-Test suite: **1177 tests, 40 files, all passing.** No test contacts Codex,
-Claude, or GitHub.
+Test suite: **1177 deterministic tests in 40 files, plus one automated Electron
+acceptance journey, all passing.** No test contacts Codex, Claude, or GitHub.
 
 ---
 
@@ -474,6 +474,11 @@ and its suggestion to disable it instead.
 > guarded, and missing or invalid files failed honestly. The recorded evidence
 > and reusable checklist are in `docs/manual-test.md` §12.
 
+The repeatable part of that checklist now runs under `npm run test:e2e` and at
+the end of `npm run verify`. It launches the built Electron application twice,
+drives the real UI and IPC boundary, asserts the five-run durable record, and
+deletes only the unique temporary profile it created.
+
 ---
 
 ## Known limitations
@@ -523,8 +528,9 @@ and its suggestion to disable it instead.
 
 ## Manual end-to-end test
 
-Step-by-step instructions, including how to verify that cancelling a
-confirmation genuinely changes nothing, are in
+The Operations acceptance journey is automated. Step-by-step instructions for
+the remaining exploratory and real-tool checks, including how to verify that
+cancelling a confirmation genuinely changes nothing, are in
 **[docs/manual-test.md](docs/manual-test.md)**.
 
 ---
@@ -544,7 +550,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1177 tests; no network, no real agents
+├─ tests/              1177 deterministic tests + 1 Electron E2E; no network, no real agents
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```
