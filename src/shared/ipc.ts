@@ -105,6 +105,14 @@ export interface PlanReviewDetail {
     readonly omitted: readonly RuleEvidenceOmission[];
     readonly totalBytes: number;
   } | null;
+  /**
+   * Set when a binding row exists but its snapshot cannot be read back.
+   *
+   * Distinct from `ruleEvidence: null`, which means no task ever bound rules.
+   * Collapsing the two made a corrupt binding look like an un-opted-in task and
+   * invited a re-bind that could not succeed.
+   */
+  readonly ruleEvidenceProblem: string | null;
   readonly gate: PlanReviewGate | null;
   readonly findings: readonly PlanReviewFinding[];
 }
@@ -221,6 +229,7 @@ export const ipcInputSchemas = {
     .object({ taskId: z.string().min(1), acceptDirtyWorkingTree: z.boolean().optional() })
     .strict(),
   'planReview:review': byTask,
+  'planReview:reconcile': byTask,
   'planReview:resolve': z
     .object({
       taskId: z.string().min(1),
@@ -329,6 +338,7 @@ export interface IpcResponseMap {
   'planReview:bindRules': PlanReviewDetail;
   'planReview:prepare': PlanReviewDetail;
   'planReview:review': PlanReviewDetail;
+  'planReview:reconcile': PlanReviewDetail;
   'planReview:resolve': PlanReviewDetail;
 
   'git:changes': GitChangeSet;

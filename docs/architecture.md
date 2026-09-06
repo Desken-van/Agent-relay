@@ -951,7 +951,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1275 deterministic tests plus one automated Electron acceptance journey, none
+1316 deterministic tests plus one automated Electron acceptance journey, none
 of which contact Codex, Claude, or GitHub.
 
 | Suite | What it proves |

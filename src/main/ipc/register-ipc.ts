@@ -31,6 +31,7 @@ import { IPC_INVOKE_CHANNEL } from '../../shared/ipc-channels';
 import type { Application } from '../container';
 import { assertKnownPath } from '../services/path-safety';
 import { parsePlanReviewFindings } from '../../shared/domain/plan-review';
+import { redactAndTruncate } from '../../shared/util/redact';
 import { readBoundRuleEvidence } from '../services/plan-review-gate';
 import {
   configuredRuleSources,
@@ -75,9 +76,24 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     const task = app.tasks.findById(taskId);
     if (task === null) throw new AgentRelayError('NOT_FOUND', 'No such task.');
     const binding = app.taskRuleEvidence.findByTask(taskId);
-    const snapshot = readBoundRuleEvidence(taskId, app.taskRuleEvidence);
+    // A binding that exists but cannot be read back is its own state. Letting
+    // the throw escape made the whole detail fail, and the screen then showed
+    // the "no rules bound yet" call to action for a task that is bound.
+    let snapshot: ReturnType<typeof readBoundRuleEvidence> = null;
+    let ruleEvidenceProblem: string | null = null;
+    if (binding !== null) {
+      try {
+        snapshot = readBoundRuleEvidence(taskId, app.taskRuleEvidence);
+      } catch (error) {
+        ruleEvidenceProblem = redactAndTruncate(
+          error instanceof Error ? error.message : String(error),
+          2_000
+        );
+      }
+    }
     const gate = app.planReviewGates.findByTask(taskId);
     return {
+      ruleEvidenceProblem,
       ruleEvidence: binding === null || snapshot === null ? null : {
         snapshotSha256: binding.snapshotSha256,
         boundAt: binding.boundAt,
@@ -176,6 +192,10 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     },
     'planReview:review': async (input) => {
       await planReviewService().review(input.taskId);
+      return planReviewDetail(input.taskId);
+    },
+    'planReview:reconcile': async (input) => {
+      await planReviewService().reconcile(input.taskId);
       return planReviewDetail(input.taskId);
     },
     'planReview:resolve': async (input) => {

@@ -11,7 +11,17 @@ export const PLAN_REVIEW_STATUSES = [
   'resolving',
   'changes_requested',
   'proceeded',
-  'failed'
+  'failed',
+  /**
+   * A round the provider started and never finished.
+   *
+   * Distinct from `failed`, which is a refusal before anything was dispatched,
+   * and from `prepared`, which has no dispatch behind it at all. It carries no
+   * findings, so it is not `changes_requested` either. A new round may be
+   * started from here by hand, because the provider's own record proves the
+   * previous one produced no result.
+   */
+  'interrupted'
 ] as const;
 
 export const PLAN_REVIEW_VERDICTS = [
@@ -93,6 +103,24 @@ export const planReviewGateSchema = z
     gatingCount: z.number().int().nonnegative().nullable(),
     threshold: z.number().int().nonnegative().nullable(),
     lastError: z.string().max(10_000).nullable(),
+    /**
+     * When an outcome was established by reading the provider back.
+     *
+     * Null for everything this side drove. Set only by reconciliation, so a
+     * `changes_requested` or `proceeded` reached without local decisions is
+     * always distinguishable from one this application resolved itself.
+     */
+    reconciledAt: isoDateTime.nullable(),
+    /**
+     * A monotonic counter bumped by every durable write to this row.
+     *
+     * The version a decision was made against, so a write can be made
+     * conditional on the state that justified it. `updatedAt` cannot do this
+     * job: two writes can land in the same millisecond and read back as
+     * identical, which is not a hypothetical here — the test clock does not
+     * advance at all, so every write would carry the same timestamp.
+     */
+    revision: z.number().int().nonnegative(),
     createdAt: isoDateTime,
     updatedAt: isoDateTime
   })

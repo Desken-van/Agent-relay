@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { correctionAction, latestClaudeRoundResult } from '@shared/domain/claude-assessment';
 import type { GitChangeSet } from '@shared/domain/git';
 import type { ApprovalAction, Task } from '@shared/domain/models';
@@ -393,6 +393,10 @@ export function PlanReviewPanel({
   const [detail, setDetail] = useState<PlanReviewDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
+  // A ref as well as the state: two clicks in one tick see the same rendered
+  // `disabled`, and only a synchronous claim keeps one external call to one
+  // press. It matters most for Reconcile, which talks to the provider.
+  const inFlightRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [dirtyPrompt, setDirtyPrompt] = useState(false);
   const [decisions, setDecisions] = useState<Record<number, DecisionDraft>>({});
@@ -418,6 +422,8 @@ export function PlanReviewPanel({
     key: string,
     operation: () => Promise<PlanReviewDetail>
   ): Promise<void> => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     setBusy(key);
     setError(null);
     try {
@@ -432,11 +438,13 @@ export function PlanReviewPanel({
         setError(caught instanceof Error ? caught.message : String(caught));
       }
     } finally {
+      inFlightRef.current = false;
       setBusy(null);
     }
   };
 
-  if (!integrationEnabled && !detail?.ruleEvidence) return null;
+  const corrupt = detail?.ruleEvidenceProblem ?? null;
+  if (!integrationEnabled && !detail?.ruleEvidence && corrupt === null) return null;
 
   const gate = detail?.gate ?? null;
   const findings = detail?.findings ?? [];
@@ -445,7 +453,10 @@ export function PlanReviewPanel({
     return decision?.action === 'accept' ||
       (decision?.action === 'reject' && decision.reason.trim().length > 0);
   });
-  const inFlight = gate && ['opening', 'reviewing', 'resolving'].includes(gate.status);
+  // `failed` is included: rows written before the phase was preserved used it
+  // for a lost answer too, and those are exactly the ones needing a read-back.
+  const unknownOutcome =
+    gate !== null && ['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status);
 
   return (
     <Card
@@ -459,7 +470,15 @@ export function PlanReviewPanel({
         ) : null}
         {error ? <Notice tone="error">{error}</Notice> : null}
 
-        {!detail?.ruleEvidence ? (
+        {corrupt !== null ? (
+          <Notice tone="error">
+            <strong>The bound rule evidence cannot be read.</strong> This task is bound to a
+            rule snapshot, but the stored bytes no longer match their recorded hash or no
+            longer parse. Rebinding is refused because the binding is immutable, and Agent
+            Relay will not silently replace evidence a specification was reviewed against.
+            <div className="mono selectable" style={{ marginTop: 6 }}>{corrupt}</div>
+          </Notice>
+        ) : !detail?.ruleEvidence ? (
           <>
             <div className="muted">
               Capture the project&apos;s current rule files and the configured conventions before
@@ -541,7 +560,15 @@ export function PlanReviewPanel({
           </Notice>
         ) : null}
 
-        {gate && ['prepared', 'changes_requested'].includes(gate.status) ? (
+        {gate?.status === 'interrupted' ? (
+          <Notice tone="warn">
+            A previous round was started in the provider and never finished. It produced no
+            findings and nothing is waiting on decisions, so a new round can be started by
+            hand — nothing will be repeated.
+          </Notice>
+        ) : null}
+
+        {gate && ['prepared', 'changes_requested', 'interrupted'].includes(gate.status) ? (
           <button
             type="button"
             className="btn btn--wide"
@@ -549,15 +576,27 @@ export function PlanReviewPanel({
             onClick={() => void act('review', () => expect('planReview:review', { taskId: task.id }))}
           >
             {busy === 'review' ? <Spinner /> : <Scope kind="read" />}
-            {gate.status === 'changes_requested' ? 'Run next plan-review round' : 'Run external plan review'}
+            {gate.status === 'prepared' ? 'Run external plan review' : 'Run next plan-review round'}
           </button>
         ) : null}
 
-        {inFlight ? (
-          <Notice tone="warn">
-            The external call was recorded as {gate?.status.replace(/_/g, ' ')}. Agent Relay will
-            not repeat it because the previous outcome may be unknown.
-          </Notice>
+        {unknownOutcome ? (
+          <div className="stack stack--tight">
+            <Notice tone="warn">
+              The external call was recorded as {gate?.status.replace(/_/g, ' ')} and its answer
+              never arrived. Agent Relay will not repeat it: a plan round and a resolution are
+              not idempotent, and either may already have taken effect. Reconciling reads the
+              provider&apos;s own state back without changing it.
+            </Notice>
+            <button
+              type="button"
+              className="btn btn--wide"
+              disabled={!integrationEnabled || busy !== null}
+              onClick={() => void act('reconcile', () => expect('planReview:reconcile', { taskId: task.id }))}
+            >
+              {busy === 'reconcile' ? <Spinner /> : <Scope kind="read" />} Reconcile external state
+            </button>
+          </div>
         ) : null}
         {gate?.lastError ? <Notice tone="error">{gate.lastError}</Notice> : null}
 

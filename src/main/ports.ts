@@ -483,15 +483,33 @@ export interface TaskRuleEvidenceRepository {
   create(binding: TaskRuleEvidenceBinding): TaskRuleEvidenceBinding;
 }
 
-export type NewPlanReviewGate = Omit<PlanReviewGate, 'createdAt' | 'updatedAt'>;
+/** `revision` is owned by the repository and never supplied by a caller. */
+export type NewPlanReviewGate = Omit<PlanReviewGate, 'createdAt' | 'updatedAt' | 'revision'>;
 export type PlanReviewGatePatch = Partial<
-  Omit<PlanReviewGate, 'id' | 'taskId' | 'specificationSha256' | 'ruleEvidenceSha256' | 'createdAt' | 'updatedAt'>
+  Omit<
+    PlanReviewGate,
+    'id' | 'taskId' | 'specificationSha256' | 'ruleEvidenceSha256' | 'createdAt' | 'updatedAt' | 'revision'
+  >
 >;
 
 export interface PlanReviewGateRepository {
   findByTask(taskId: string): PlanReviewGate | null;
   create(gate: NewPlanReviewGate): PlanReviewGate;
   update(id: string, patch: PlanReviewGatePatch): PlanReviewGate;
+  /**
+   * Apply a patch only if the row is still at `expectedRevision`.
+   *
+   * `null` means it was not: something wrote to this gate between the read that
+   * justified the patch and this call, so the patch describes a state that no
+   * longer exists and is discarded rather than applied. Every caller that
+   * decided against a snapshot — anything that awaited an external answer —
+   * must use this instead of {@link update}.
+   */
+  updateIfUnchanged(
+    id: string,
+    patch: PlanReviewGatePatch,
+    expectedRevision: number
+  ): PlanReviewGate | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -590,8 +608,58 @@ export interface ExternalPlanReviewResolution {
   readonly serverVersion: string;
 }
 
+/**
+ * What a read-only status probe can establish about an external session.
+ *
+ * Deliberately narrow. The provider's status surface reports which stage the
+ * session is in and which rounds it has recorded, but it does NOT return the
+ * findings of a completed round. Anything not listed here cannot be recovered
+ * by reading, and must therefore leave a gate in its unknown phase rather than
+ * being guessed at.
+ */
+export interface ExternalPlanReviewRoundCounts {
+  /** Every PlanReview round the provider has recorded, in any state. */
+  readonly total: number;
+  /** Still executing. The provider is mid-round; nothing here may start another. */
+  readonly running: number;
+  /** Finished and recorded. Its findings are NOT readable through status. */
+  readonly done: number;
+  /** Started and never finished. Not a result, and never counted as one. */
+  readonly interrupted: number;
+}
+
+export interface ExternalPlanReviewStatus {
+  /** Required by the provider's contract; never invented when absent. */
+  readonly sessionId: string;
+  readonly stage: string;
+  readonly awaitingResolve: boolean;
+  readonly planProceeded: boolean;
+  /**
+   * The recorded plan rounds, split by the three states the provider reports.
+   *
+   * Kept apart rather than reduced to one number: "no round has run", "a round
+   * is running", "a round finished" and "a round was interrupted" justify four
+   * different durable transitions, and collapsing them loses exactly the
+   * distinctions the recovery depends on.
+   */
+  readonly planRounds: ExternalPlanReviewRoundCounts;
+  readonly serverName: string;
+  readonly serverVersion: string;
+}
+
 export interface ExternalPlanReviewer {
   open(subject: ExternalPlanReviewSubject, signal?: AbortSignal): Promise<ExternalPlanReviewSession>;
+  /**
+   * Read the session back without changing it.
+   *
+   * The only reviewer method Agent Relay may call to recover from an unknown
+   * outcome: it must be read-only, because `review_plan` and `resolve` are not
+   * idempotent and may already have taken effect when their answer was lost.
+   */
+  status(
+    subject: ExternalPlanReviewSubject,
+    signal?: AbortSignal
+  ): Promise<ExternalPlanReviewStatus>;
   reviewPlan(
     subject: ExternalPlanReviewSubject,
     planText: string,

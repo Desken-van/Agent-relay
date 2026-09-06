@@ -6,11 +6,31 @@ const PLAN_REVIEW_CHANNELS = [
   'planReview:bindRules',
   'planReview:prepare',
   'planReview:review',
-  'planReview:resolve'
+  'planReview:resolve',
+  'planReview:reconcile'
 ] as const;
 
 describe('the external plan-review IPC contract', () => {
-  it('registers exactly the five bounded operations', () => {
+  it('accepts only a task id for the read-only reconciliation', () => {
+    const schema = ipcInputSchemas['planReview:reconcile'];
+    expect(schema.safeParse({ taskId: 'task-1' }).success).toBe(true);
+    // Nothing about the process, the repository, the tool or an external result
+    // may cross the boundary: the main process reads all of that from settings.
+    for (const injected of [
+      { taskId: 'task-1', repoPath: 'C:/elsewhere' },
+      { taskId: 'task-1', executablePath: 'C:/evil.exe' },
+      { taskId: 'task-1', args: ['--token=abc'] },
+      { taskId: 'task-1', tool: 'review_plan' },
+      { taskId: 'task-1', stage: 'CodeReview' },
+      { taskId: 'task-1', awaitingResolve: false },
+      { taskId: 'task-1', findings: [] }
+    ]) {
+      expect(schema.safeParse(injected).success).toBe(false);
+    }
+    expect(schema.safeParse({}).success).toBe(false);
+  });
+
+  it('registers exactly the six bounded operations', () => {
     expect(IPC_CHANNELS.filter((channel) => channel.startsWith('planReview:')).sort()).toEqual(
       [...PLAN_REVIEW_CHANNELS].sort()
     );

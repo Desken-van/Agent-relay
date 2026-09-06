@@ -258,6 +258,92 @@ export const MIGRATIONS: readonly Migration[] = [
         CREATE INDEX idx_plan_review_gates_status ON plan_review_gates(status, updated_at);
       `);
     }
+  },
+  {
+    version: 5,
+    name: 'plan-review-external-reconciliation',
+    up(db) {
+      // Two facts the original table could not express.
+      //
+      // `interrupted` is a round the provider started and never finished. It is
+      // not `failed` (nothing refused it), not `prepared` (a round was really
+      // dispatched and a budget consumed), and not `changes_requested` (no
+      // findings ever existed to decide). Only a state of its own is honest.
+      //
+      // `reconciled_at` records that an outcome was established by reading the
+      // provider back rather than by a resolution this side drove. The original
+      // CHECK demanded `decisions_json` for `changes_requested`/`proceeded`,
+      // which is right for a resolution we performed and wrong for one an
+      // operator performed in the provider — the decisions live there, not here.
+      db.exec(`
+        CREATE TABLE plan_review_gates_v5 (
+          id                       TEXT PRIMARY KEY,
+          task_id                  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          specification_sha256     TEXT NOT NULL CHECK (length(specification_sha256) = 64),
+          rule_evidence_sha256     TEXT NOT NULL CHECK (length(rule_evidence_sha256) = 64),
+          session_id               TEXT,
+          server_name              TEXT,
+          server_version           TEXT,
+          status                   TEXT NOT NULL CHECK (status IN (
+                                     'prepared','opening','reviewing','awaiting_resolve','resolving',
+                                     'changes_requested','proceeded','failed','interrupted')),
+          verdict                  TEXT CHECK (verdict IN (
+                                     'proceed','revise','continue_anyway','good_enough',
+                                     'call_human','escalated')),
+          findings_json            TEXT,
+          decisions_json           TEXT,
+          reviewers                TEXT,
+          gating_count             INTEGER CHECK (gating_count IS NULL OR gating_count >= 0),
+          threshold                INTEGER CHECK (threshold IS NULL OR threshold >= 0),
+          last_error               TEXT,
+          reconciled_at            TEXT,
+          created_at               TEXT NOT NULL,
+          updated_at               TEXT NOT NULL,
+          CHECK (status <> 'awaiting_resolve' OR (
+            session_id IS NOT NULL AND server_name IS NOT NULL AND server_version IS NOT NULL
+            AND verdict IS NOT NULL AND findings_json IS NOT NULL
+            AND gating_count IS NOT NULL AND threshold IS NOT NULL
+          )),
+          CHECK (status NOT IN ('changes_requested','proceeded')
+                 OR decisions_json IS NOT NULL
+                 OR reconciled_at IS NOT NULL)
+        );
+
+        INSERT INTO plan_review_gates_v5 (
+          id, task_id, specification_sha256, rule_evidence_sha256,
+          session_id, server_name, server_version, status, verdict,
+          findings_json, decisions_json, reviewers, gating_count, threshold,
+          last_error, reconciled_at, created_at, updated_at)
+        SELECT
+          id, task_id, specification_sha256, rule_evidence_sha256,
+          session_id, server_name, server_version, status, verdict,
+          findings_json, decisions_json, reviewers, gating_count, threshold,
+          last_error, NULL, created_at, updated_at
+        FROM plan_review_gates;
+
+        DROP TABLE plan_review_gates;
+        ALTER TABLE plan_review_gates_v5 RENAME TO plan_review_gates;
+
+        CREATE INDEX idx_plan_review_gates_task ON plan_review_gates(task_id, created_at DESC);
+        CREATE INDEX idx_plan_review_gates_status ON plan_review_gates(status, updated_at);
+      `);
+    }
+  },
+  {
+    version: 6,
+    name: 'plan-review-gate-revision',
+    up(db) {
+      // A version to make a durable write conditional on the state it was
+      // decided against. Reconciliation reads the row, calls out, and comes
+      // back later; without this, an answer computed from a state that no
+      // longer exists would still be written, and an older reading could
+      // overwrite a newer one. A timestamp cannot stand in: two writes can
+      // share a millisecond, and equal timestamps prove nothing about order.
+      //
+      // Existing rows start at 0. Nothing read the column before this
+      // migration, so there is no back-fill and no table rebuild.
+      db.exec(`ALTER TABLE plan_review_gates ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;`);
+    }
   }
 ];
 

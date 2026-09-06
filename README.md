@@ -396,7 +396,7 @@ Being precise about what was actually exercised, rather than merely written:
 | **Project-rule evidence** | 🧪 **Collector contract verified against real temporary Git repositories and filesystems.** It discovers the fixed project-memory locations, reads explicitly selected convention files, refuses symlinks and traversal, records missing or excluded evidence, binds clean convention bytes to an exact Git revision, and hashes a deterministic whole-file snapshot. Opt-in task binding is enforced by the plan-gate row below. |
 | **External plan-review gate** | 🧪 **Durable backend and renderer contract verified with fake reviewers.** Settings hold only a fixed executable, argv and explicit convention selection; task IPC accepts identifiers and decisions, never process configuration or rule bytes. An opt-in task binds immutable rule evidence before specification, prepares an isolated branch, displays every external finding and refuses specification approval until all are resolved. Coai tool names and schemas are fixed by a typed adapter; no real provider is contacted yet. |
 
-Test suite: **1275 deterministic tests in 50 files, plus one automated Electron
+Test suite: **1316 deterministic tests in 50 files, plus one automated Electron
 acceptance journey, all passing.** No test contacts Codex, Claude, or GitHub.
 
 ---
@@ -558,7 +558,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1275 deterministic tests + 1 Electron E2E; no network, no real agents
+├─ tests/              1316 deterministic tests + 1 Electron E2E; no network, no real agents
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

@@ -3,9 +3,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { Task } from '../../src/shared/domain/models';
-import type { PlanReviewDetail } from '../../src/shared/ipc';
+import type { IpcResult, PlanReviewDetail } from '../../src/shared/ipc';
 import { PlanReviewPanel } from '../../src/renderer/src/components/RunView';
-import { installBridge, ok, type Bridge } from './harness';
+import { burstClick, deferred, deliver, installBridge, ok, type Bridge } from './harness';
 
 const task = (status: Task['status'] = 'DRAFT'): Task => ({
   id: 'task-1',
@@ -30,9 +30,15 @@ const task = (status: Task['status'] = 'DRAFT'): Task => ({
   updatedAt: '2026-09-06T00:00:00.000Z'
 });
 
-const emptyDetail: PlanReviewDetail = { ruleEvidence: null, gate: null, findings: [] };
+const emptyDetail: PlanReviewDetail = {
+  ruleEvidence: null,
+  ruleEvidenceProblem: null,
+  gate: null,
+  findings: []
+};
 
 const evidenceDetail: PlanReviewDetail = {
+  ruleEvidenceProblem: null,
   ruleEvidence: {
     snapshotSha256: 'a'.repeat(64),
     boundAt: '2026-09-06T00:00:00.000Z',
@@ -120,6 +126,8 @@ describe('the external plan-review panel', () => {
         gatingCount: 1,
         threshold: 1,
         lastError: null,
+        reconciledAt: null,
+        revision: 0,
         createdAt: '2026-09-06T00:00:00.000Z',
         updatedAt: '2026-09-06T00:00:00.000Z'
       },
@@ -169,6 +177,143 @@ describe('the external plan-review panel', () => {
     });
   });
 
+  const gateWith = (
+    status: string,
+    extra: Record<string, unknown> = {}
+  ): PlanReviewDetail => ({
+    ...evidenceDetail,
+    gate: {
+      id: 'gate-1',
+      taskId: 'task-1',
+      specificationSha256: 'd'.repeat(64),
+      ruleEvidenceSha256: 'a'.repeat(64),
+      sessionId: null,
+      serverName: null,
+      serverVersion: null,
+      status,
+      verdict: null,
+      findingsJson: null,
+      decisionsJson: null,
+      reviewers: null,
+      gatingCount: null,
+      threshold: null,
+      lastError: null,
+      reconciledAt: null,
+      revision: 0,
+      createdAt: '2026-09-06T00:00:00.000Z',
+      updatedAt: '2026-09-06T00:00:00.000Z',
+      ...extra
+    } as PlanReviewDetail['gate']
+  });
+
+  it('offers a read-only reconciliation for an unknown outcome, and never a repeat', async () => {
+    bridge.set('planReview:get', () => ok<'planReview:get'>(gateWith('reviewing')));
+    render(
+      <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+    );
+
+    expect(await screen.findByRole('button', { name: /Reconcile external state/i })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
+  });
+
+  it('offers the same recovery for a row an earlier version closed as failed', async () => {
+    bridge.set('planReview:get', () => ok<'planReview:get'>(gateWith('failed', { lastError: 'answer lost' })));
+    render(
+      <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+    );
+
+    expect(await screen.findByRole('button', { name: /Reconcile external state/i })).toBeTruthy();
+  });
+
+  it('sends one reconciliation for two clicks in the same tick', async () => {
+    bridge.set('planReview:get', () => ok<'planReview:get'>(gateWith('resolving')));
+    const answer = deferred<IpcResult<PlanReviewDetail>>();
+    bridge.set('planReview:reconcile', () => answer.promise);
+    render(
+      <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+    );
+
+    const button = await screen.findByRole('button', { name: /Reconcile external state/i });
+    // Nested in one act, so nothing re-renders between the two presses and the
+    // disabled attribute cannot arbitrate. Only a synchronous claim can.
+    await burstClick(button, 2);
+    expect(bridge.callsTo('planReview:reconcile')).toHaveLength(1);
+
+    // The answer is delivered inside `act` and the panel is watched until it has
+    // finished reacting. A deferred left hanging past the end of the test would
+    // settle with nothing owning the state update it causes, which is the whole
+    // content of a React act warning; the request count is then re-read to show
+    // that finishing the first reconciliation did not release a second.
+    await deliver(answer, ok<'planReview:reconcile'>(gateWith('awaiting_resolve')));
+    expect(await screen.findByText(/Decide every finding/i)).toBeTruthy();
+    expect(bridge.callsTo('planReview:reconcile')).toHaveLength(1);
+  });
+
+  it('offers no way to start a round while the provider is still running one', async () => {
+    bridge.set('planReview:get', () =>
+      ok<'planReview:get'>(
+        gateWith('reviewing', {
+          lastError: 'The provider is still executing a plan round for this session, so nothing here may start another.'
+        })
+      )
+    );
+    render(
+      <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+    );
+
+    expect(await screen.findByText(/still executing a plan round/i)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Run next plan-review round/i })).toBeNull();
+  });
+
+  it('says plainly when the provider answered for another session', async () => {
+    bridge.set('planReview:get', () =>
+      ok<'planReview:get'>(
+        gateWith('resolving', {
+          lastError:
+            'The provider answered for a different session than this gate recorded, so none of it was applied.'
+        })
+      )
+    );
+    render(
+      <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+    );
+
+    expect(await screen.findByText(/different session/i)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Run next plan-review round/i })).toBeNull();
+  });
+
+  it('lets an interrupted round be restarted by hand and says why', async () => {
+    bridge.set('planReview:get', () => ok<'planReview:get'>(gateWith('interrupted')));
+    render(
+      <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+    );
+
+    expect(await screen.findByText(/started in the provider and never finished/i)).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Run next plan-review round/i })).toBeTruthy();
+    // Not a repeat of a finished round: there is no reconciliation to offer here,
+    // because the outcome of the previous one is already known to be nothing.
+    expect(screen.queryByRole('button', { name: /Reconcile external state/i })).toBeNull();
+  });
+
+  it('reports a corrupt binding as corrupt and refuses to offer a rebind', async () => {
+    bridge.set('planReview:get', () =>
+      ok<'planReview:get'>({
+        ruleEvidence: null,
+        ruleEvidenceProblem: 'The stored rule-evidence binding does not match its snapshot.',
+        gate: null,
+        findings: []
+      })
+    );
+    render(
+      <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+    );
+
+    expect(await screen.findByText(/bound rule evidence cannot be read/i)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Capture and bind rules/i })).toBeNull();
+  });
+
   it('shows an unknown in-flight outcome without offering an automatic repeat', async () => {
     bridge.set('planReview:get', () =>
       ok<'planReview:get'>({
@@ -189,6 +334,8 @@ describe('the external plan-review panel', () => {
           gatingCount: null,
           threshold: null,
           lastError: null,
+          reconciledAt: null,
+          revision: 0,
           createdAt: '2026-09-06T00:00:00.000Z',
           updatedAt: '2026-09-06T00:00:00.000Z'
         }
