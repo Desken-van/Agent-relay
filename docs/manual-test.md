@@ -544,6 +544,60 @@ else { $env:AGENT_RELAY_DATA_DIR = $previousDataDir }
 
 ---
 
+## 13. External plan review — opt-in real-provider acceptance
+
+This test is deliberately separate from `npm run verify`. It starts the built
+Electron app with a fresh profile, creates a synthetic Git repository, copies
+only the selected Coai settings into a fresh data directory, binds project
+rules and pinned convention files, generates a specification, and runs one real
+plan-review round. It therefore consumes provider quota and must be started
+only with explicit approval.
+
+Build first, then supply the local inputs without committing them:
+
+```powershell
+npm run build
+
+$env:AGENT_RELAY_LIVE_COAI_EXE = '<absolute path to the coai-mcp executable>'
+$env:AGENT_RELAY_LIVE_COAI_SETTINGS = '<absolute path to the local Coai settings.json>'
+$env:AGENT_RELAY_LIVE_CONVENTIONS_REPO = '<absolute path to the conventions checkout>'
+$env:AGENT_RELAY_LIVE_CONVENTIONS_REV = '<full audited conventions commit SHA>'
+$env:AGENT_RELAY_LIVE_KEEP_ARTIFACTS = '1' # optional; preserve evidence for audit
+
+npm run test:e2e:live-plan-review
+```
+
+Authentication remains owned by the configured provider. The test never reads
+or copies credential files into Agent Relay's database, source tree or evidence
+JSON. It sends only the synthetic repository and the explicitly selected rule
+snapshot. With `KEEP_ARTIFACTS=1`, the unique temporary directory printed as
+`LIVE_PLAN_REVIEW_ARTIFACTS` must be reviewed before it is deleted.
+
+✅ Pass requires all of the following: premature specification approval is
+refused; one plan round reaches a real reviewer; every finding receives one
+decision; resolve advances the durable gate to `proceeded` or
+`changes_requested`; the database contains one matching gate and one immutable
+rule snapshot; and a fresh Electron process renders the same terminal status.
+
+### Recorded integrated evidence
+
+The 2026-09-07 synthetic run used Coai 0.14.0 with one authenticated Codex
+PlanCritique reviewer. It captured `AGENTS.md` and four convention files pinned
+to commit `9b94c018d840d46bd9cbffafdc1060918d06d7a2`, generated a real Codex
+specification, and proved that approval before plan-review resolution was
+refused by the backend. The review returned `proceed`, gating count 4 against
+threshold 6, and five findings. Exactly five accept decisions were persisted;
+resolve advanced the gate to `proceeded`, and restart read-back succeeded.
+Provider accounting recorded 24,672 input and 4,441 output tokens.
+
+The provider round ran only once. Test-only selector defects stopped the first
+automation attempt after the review had completed, so completion resumed the
+same isolated profile and Coai session rather than spending another round. The
+final resume and restart test passed. A new from-scratch single-command run was
+intentionally not purchased merely to prove the harness corrections.
+
+---
+
 ## Cleanup
 
 ```powershell
