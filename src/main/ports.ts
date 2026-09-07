@@ -46,6 +46,15 @@ import type {
   PlanReviewVerdict,
   TaskRuleEvidenceBinding
 } from '../shared/domain/plan-review';
+import type {
+  CodeReviewDecision,
+  CodeReviewFinding,
+  CodeReviewOccurrence,
+  CodeReviewRound,
+  CodeReviewSubject,
+  CodeSnapshotChange,
+  ProviderCodeFinding
+} from '../shared/domain/code-review';
 import type { CodexReviewResult, TaskSpecification } from '../shared/schemas/codex';
 
 /* -------------------------------------------------------------------------- */
@@ -515,6 +524,269 @@ export interface PlanReviewGateRepository {
 /* -------------------------------------------------------------------------- */
 /* External MCP                                                               */
 /* -------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------- */
+/* Code review: immutable subject, durable rounds, findings and decisions      */
+/* -------------------------------------------------------------------------- */
+
+/** What the Git layer observed, before any hashing or policy is applied. */
+export interface RawCodeSnapshotFile {
+  /** Repository-relative POSIX path. */
+  readonly path: string;
+  readonly change: CodeSnapshotChange;
+  /** Absent for a deletion: there is no working-tree content to read. */
+  readonly absolutePath: string | null;
+}
+
+export interface RawCodeSnapshot {
+  readonly baseCommit: string;
+  readonly headCommit: string;
+  readonly branch: string;
+  readonly files: readonly RawCodeSnapshotFile[];
+  /** True when the change set exceeded the caller's entry ceiling. */
+  readonly truncated: boolean;
+  /** True when the worktree holds tracked edits or untracked files. */
+  readonly hasUncommittedState: boolean;
+}
+
+/** Which repository a checkout belongs to, and what it is sitting on. */
+export interface RawCheckoutIdentity {
+  /** The shared Git directory, resolved, so two spellings compare equal. */
+  readonly commonDir: string;
+  /** Null when HEAD is detached. */
+  readonly branch: string | null;
+  readonly detached: boolean;
+}
+
+export interface CodeSnapshotRequest {
+  readonly worktreePath: string;
+  readonly baseBranch: string;
+  readonly maxFiles: number;
+}
+
+export interface CodeSnapshotLimits {
+  /**
+   * The only ceiling left.
+   *
+   * There is deliberately no per-file or total byte limit: files are streamed,
+   * so size costs constant memory, and a size-based skip once gave two
+   * different files of equal length the same identity. Exceeding this ceiling
+   * does not silently drop files either — it marks the snapshot incomplete.
+   */
+  readonly maxFiles: number;
+}
+
+export type NewCodeReviewSubject = Omit<CodeReviewSubject, 'createdAt'>;
+export type NewCodeReviewRound = Omit<
+  CodeReviewRound,
+  'createdAt' | 'updatedAt' | 'revision'
+>;
+export type CodeReviewRoundPatch = Partial<
+  Omit<
+    CodeReviewRound,
+    'id' | 'taskId' | 'subjectId' | 'subjectSha256' | 'createdAt' | 'updatedAt' | 'revision'
+  >
+>;
+export type NewCodeReviewFinding = Omit<
+  CodeReviewFinding,
+  'createdAt' | 'updatedAt' | 'revision' | 'timesReported'
+>;
+export type NewCodeReviewDecision = Omit<CodeReviewDecision, 'createdAt'>;
+export type NewCodeReviewOccurrence = Omit<CodeReviewOccurrence, 'createdAt'>;
+
+/** One finding as a round stated it, with the identity it should be filed under. */
+export interface RoundFindingRecord {
+  readonly finding: NewCodeReviewFinding;
+  readonly occurrence: Omit<NewCodeReviewOccurrence, 'findingId'>;
+}
+
+export interface CompletedRoundResult {
+  readonly round: CodeReviewRound;
+  readonly findings: readonly CodeReviewFinding[];
+  readonly created: number;
+}
+
+/**
+ * Durable storage for the code-review lifecycle.
+ *
+ * Note what is absent: there is no `updateSubject`. A snapshot is the statement
+ * of what was reviewed, and a statement that can be edited afterwards proves
+ * nothing. New working state means a new subject row.
+ */
+export interface CodeReviewRepository {
+  /**
+   * Insert a subject, or return the existing row with the same content hash.
+   *
+   * Idempotent for an unchanged working state, so re-capturing costs nothing
+   * and never produces a second identity for identical content.
+   */
+  createSubject(subject: NewCodeReviewSubject): CodeReviewSubject;
+  findSubjectById(id: string): CodeReviewSubject | null;
+  findSubjectByHash(taskId: string, subjectSha256: string): CodeReviewSubject | null;
+  latestSubject(taskId: string): CodeReviewSubject | null;
+
+  createRound(round: NewCodeReviewRound): CodeReviewRound;
+  findRoundById(id: string): CodeReviewRound | null;
+  latestRound(taskId: string): CodeReviewRound | null;
+  listRounds(taskId: string): CodeReviewRound[];
+  updateRound(id: string, patch: CodeReviewRoundPatch): CodeReviewRound;
+  /** Apply only if the row is still at `expectedRevision`; `null` if it moved. */
+  updateRoundIfUnchanged(
+    id: string,
+    patch: CodeReviewRoundPatch,
+    expectedRevision: number
+  ): CodeReviewRound | null;
+
+  /**
+   * Record a finding, linking to the existing row when the fingerprint repeats.
+   *
+   * Returns the stored row and whether this call created it, so a caller can
+   * report honestly how much of a round was new.
+   */
+  upsertFinding(finding: NewCodeReviewFinding): { finding: CodeReviewFinding; created: boolean };
+  /**
+   * Complete a round and file all of its findings, or write nothing at all.
+   *
+   * One transaction, because the alternative is a `completed` round carrying
+   * however many findings happened to be written before something threw — a row
+   * that says a review finished while under-reporting what it found, which is
+   * the most dangerous shape this table could take.
+   */
+  completeRoundWithFindings(
+    roundId: string,
+    patch: CodeReviewRoundPatch,
+    records: readonly RoundFindingRecord[]
+  ): CompletedRoundResult;
+  listOccurrences(findingId: string): CodeReviewOccurrence[];
+  listOccurrencesForRound(roundId: string): CodeReviewOccurrence[];
+  findFindingById(id: string): CodeReviewFinding | null;
+  listFindings(taskId: string): CodeReviewFinding[];
+  listFindingsForSubject(taskId: string, subjectSha256: string): CodeReviewFinding[];
+
+  /**
+   * Append a decision, only if the finding is still at `expectedRevision`.
+   *
+   * `null` means it was not: something decided this finding between the read
+   * that produced the caller's view and this write, so the caller's answer is
+   * about a state that no longer exists.
+   */
+  appendDecisionIfUnchanged(
+    decision: NewCodeReviewDecision,
+    expectedRevision: number
+  ): { decision: CodeReviewDecision; finding: CodeReviewFinding } | null;
+  listDecisions(findingId: string): CodeReviewDecision[];
+  latestDecision(findingId: string): CodeReviewDecision | null;
+}
+
+/** Captures the working state of a task branch WITHOUT changing it. */
+export interface CodeSnapshotSource {
+  /**
+   * Which repository this checkout belongs to and what branch it is on.
+   *
+   * Read before any durable write, so a worktree pointing at another repository
+   * or sitting on the wrong branch is refused before a round exists.
+   */
+  describeCheckout(worktreePath: string): Promise<RawCheckoutIdentity>;
+  /**
+   * Read the branch's committed tip and its uncommitted changes.
+   *
+   * Read-only by contract: it must not stage, commit, stash, check out or
+   * otherwise touch the index or the working tree. A review that altered what
+   * it was reviewing would be measuring itself.
+   */
+  capture(request: CodeSnapshotRequest): Promise<RawCodeSnapshot>;
+}
+
+export interface ExternalCodeReviewSubject {
+  /**
+   * The TASK WORKTREE, not the project checkout.
+   *
+   * The snapshot is taken from the worktree and includes its uncommitted and
+   * untracked state. Handing a reviewer the project root instead would point it
+   * at a different working tree that happens to share a repository — so it
+   * would review code the subject hash does not describe, and say `proceed`
+   * about it.
+   */
+  readonly worktreePath: string;
+  readonly branch: string;
+  readonly baseRef: string;
+  readonly headCommit: string;
+  /** The exact snapshot hash this dispatch is for. */
+  readonly subjectSha256: string;
+}
+
+/**
+ * Whether a reviewer can be called at all, asked before anything is written.
+ *
+ * A separate, typed question rather than something inferred from whatever a
+ * `reviewCode` call happens to throw. "The provider is not configured" and "the
+ * call went out and its answer was lost" demand opposite responses — the first
+ * leaves no external effect and must leave no durable trace either, the second
+ * must never be retried automatically — and guessing between them from an
+ * exception type is exactly the kind of inference that gets one of them wrong.
+ */
+export interface CodeReviewerAvailability {
+  readonly available: boolean;
+  /** Why not, when not. Bounded and safe: never a path, argv or secret. */
+  readonly reason: string | null;
+}
+
+export interface ExternalCodeReviewRound {
+  /**
+   * The snapshot hash the reviewer attests it actually read.
+   *
+   * The service refuses a result that does not match the subject it dispatched.
+   * `readsUncommittedWorktreeState` is a promise about a reviewer's general
+   * behaviour; this is evidence about THIS answer, and only the second can
+   * catch a reviewer that read the right worktree at the wrong moment, or a
+   * result that arrived for a different round entirely. A reviewer that cannot
+   * produce it returns null and its answers are never treated as confirmed.
+   */
+  readonly reviewedSubjectSha256: string | null;
+  readonly verdict: string;
+  readonly gatingCount: number;
+  readonly threshold: number;
+  readonly reviewers: string;
+  readonly findings: readonly ProviderCodeFinding[];
+  readonly instruction: string;
+  readonly sessionId: string | null;
+  readonly serverName: string;
+  readonly serverVersion: string;
+  readonly tokensIn: number | null;
+  readonly tokensOut: number | null;
+}
+
+/**
+ * The external code reviewer.
+ *
+ * Separate from {@link ExternalPlanReviewer} because the two gates answer
+ * different questions and must be able to fail, be budgeted and be swapped
+ * independently. `reviewCode` is NOT idempotent: it consumes a round.
+ */
+export interface ExternalCodeReviewer {
+  /**
+   * Does this reviewer read the worktree's uncommitted and untracked state?
+   *
+   * A reviewer that reads only committed refs cannot see a subject containing
+   * uncommitted work, and would return a verdict about something else entirely.
+   * Declaring the capability makes that a refusal instead of a wrong answer:
+   * the service will not dispatch such a subject to a committed-only reviewer.
+   * The default for anything that has not thought about it is `false`.
+   */
+  readonly readsUncommittedWorktreeState: boolean;
+  /**
+   * Can this reviewer run right now?
+   *
+   * Called BEFORE the durable round row exists. A refusal here is proof that
+   * nothing external happened, so it must leave nothing behind to reconcile.
+   */
+  availability(signal?: AbortSignal): Promise<CodeReviewerAvailability>;
+  reviewCode(
+    subject: ExternalCodeReviewSubject,
+    scopeText: string,
+    signal?: AbortSignal
+  ): Promise<ExternalCodeReviewRound>;
+}
 
 export interface ExternalMcpToolAnnotations {
   readonly readOnly: boolean | null;

@@ -344,6 +344,167 @@ export const MIGRATIONS: readonly Migration[] = [
       // migration, so there is no back-fill and no table rebuild.
       db.exec(`ALTER TABLE plan_review_gates ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;`);
     }
+  },
+  {
+    version: 7,
+    name: 'code-review-evidence',
+    up(db) {
+      // The code-review lifecycle, deliberately NOT folded into the plan gate.
+      //
+      // The plan gate answers one question per specification identity and keeps
+      // its findings as a JSON blob decided in a single call. Code review asks
+      // the same question of a moving artefact round after round, so a finding
+      // needs a row: its own identity, its own history, and its own decisions.
+      // An array index cannot be that identity — round three's index 2 is
+      // rarely round one's index 2 — and re-serialising the array every round
+      // would erase exactly the history this table exists to keep.
+      db.exec(`
+        CREATE TABLE code_review_subjects (
+          id                 TEXT PRIMARY KEY,
+          task_id            TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          base_commit        TEXT NOT NULL CHECK (length(base_commit) = 40),
+          head_commit        TEXT NOT NULL CHECK (length(head_commit) = 40),
+          branch             TEXT NOT NULL,
+          snapshot_json      TEXT NOT NULL,
+          subject_sha256     TEXT NOT NULL CHECK (length(subject_sha256) = 64),
+          file_count         INTEGER NOT NULL CHECK (file_count >= 0),
+          total_bytes        INTEGER NOT NULL CHECK (total_bytes >= 0),
+          truncated          INTEGER NOT NULL CHECK (truncated IN (0,1)),
+          -- Whether every changed file was actually digested. An incomplete
+          -- snapshot is still worth storing — it says what was and was not
+          -- seen — but it is never treated as an exact statement of the code.
+          complete           INTEGER NOT NULL CHECK (complete IN (0,1)),
+          -- Whether the worktree held tracked edits or untracked files. It
+          -- decides whether a committed-only reviewer could be seeing this at
+          -- all, so it is recorded with the subject rather than recomputed.
+          has_uncommitted    INTEGER NOT NULL CHECK (has_uncommitted IN (0,1)),
+          captured_at        TEXT NOT NULL,
+          created_at         TEXT NOT NULL,
+          -- One row per task per content identity. Re-capturing an unchanged
+          -- working state is idempotent rather than an error, and capturing a
+          -- changed one is a NEW subject: a snapshot is never edited in place.
+          UNIQUE (task_id, subject_sha256)
+        );
+        CREATE INDEX idx_code_review_subjects_task
+          ON code_review_subjects(task_id, created_at DESC);
+
+        CREATE TABLE code_review_rounds (
+          id                 TEXT PRIMARY KEY,
+          task_id            TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          subject_id         TEXT NOT NULL REFERENCES code_review_subjects(id) ON DELETE CASCADE,
+          subject_sha256     TEXT NOT NULL CHECK (length(subject_sha256) = 64),
+          status             TEXT NOT NULL CHECK (status IN (
+                               'requested','reviewing','completed','interrupted','failed')),
+          verdict            TEXT CHECK (verdict IS NULL OR verdict IN (
+                               'proceed','revise','continue_anyway','good_enough',
+                               'call_human','escalated')),
+          session_id         TEXT,
+          server_name        TEXT,
+          server_version     TEXT,
+          reviewers          TEXT,
+          gating_count       INTEGER CHECK (gating_count IS NULL OR gating_count >= 0),
+          threshold          INTEGER CHECK (threshold IS NULL OR threshold >= 0),
+          tokens_in          INTEGER CHECK (tokens_in IS NULL OR tokens_in >= 0),
+          tokens_out         INTEGER CHECK (tokens_out IS NULL OR tokens_out >= 0),
+          last_error         TEXT,
+          revision           INTEGER NOT NULL DEFAULT 0,
+          started_at         TEXT,
+          completed_at       TEXT,
+          created_at         TEXT NOT NULL,
+          updated_at         TEXT NOT NULL,
+          -- A completed round must say what it concluded and against what.
+          CHECK (status <> 'completed' OR (verdict IS NOT NULL AND completed_at IS NOT NULL))
+        );
+        CREATE INDEX idx_code_review_rounds_task
+          ON code_review_rounds(task_id, created_at DESC);
+        CREATE INDEX idx_code_review_rounds_status
+          ON code_review_rounds(status, updated_at);
+
+        CREATE TABLE code_review_findings (
+          id                 TEXT PRIMARY KEY,
+          task_id            TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          subject_sha256     TEXT NOT NULL CHECK (length(subject_sha256) = 64),
+          fingerprint        TEXT NOT NULL CHECK (length(fingerprint) = 64),
+          severity           TEXT NOT NULL CHECK (severity IN ('blocking','major','minor','nit')),
+          category           TEXT NOT NULL CHECK (category IN (
+                               'architecture','security','reliability','performance','ux','convention')),
+          gating             INTEGER NOT NULL CHECK (gating IN (0,1)),
+          title              TEXT NOT NULL,
+          body               TEXT NOT NULL,
+          fix                TEXT NOT NULL,
+          file               TEXT NOT NULL,
+          line               INTEGER NOT NULL CHECK (line >= 0),
+          provider           TEXT NOT NULL,
+          role               TEXT NOT NULL,
+          first_round_id     TEXT NOT NULL REFERENCES code_review_rounds(id) ON DELETE CASCADE,
+          last_round_id      TEXT NOT NULL REFERENCES code_review_rounds(id) ON DELETE CASCADE,
+          times_reported     INTEGER NOT NULL CHECK (times_reported > 0),
+          revision           INTEGER NOT NULL DEFAULT 0,
+          created_at         TEXT NOT NULL,
+          updated_at         TEXT NOT NULL,
+          -- The dedup key. Scoped to the subject because the same sentence about
+          -- different code is a different defect; a later round against the SAME
+          -- subject that repeats a finding links to this row instead of adding one.
+          UNIQUE (task_id, subject_sha256, fingerprint)
+        );
+        CREATE INDEX idx_code_review_findings_task
+          ON code_review_findings(task_id, subject_sha256);
+        CREATE INDEX idx_code_review_findings_round
+          ON code_review_findings(last_round_id);
+
+        -- What one round said about one finding.
+        --
+        -- Separate from the stable finding row because the two genuinely
+        -- diverge: a later round can re-raise the same defect at a different
+        -- severity, count it against the gate when the first did not, or
+        -- suggest a different fix. Folding those into the stable row would
+        -- rewrite what an earlier round said, and a trail that edits its own
+        -- history is not a trail.
+        CREATE TABLE code_review_finding_occurrences (
+          id                 TEXT PRIMARY KEY,
+          finding_id         TEXT NOT NULL REFERENCES code_review_findings(id) ON DELETE CASCADE,
+          round_id           TEXT NOT NULL REFERENCES code_review_rounds(id) ON DELETE CASCADE,
+          subject_sha256     TEXT NOT NULL CHECK (length(subject_sha256) = 64),
+          severity           TEXT NOT NULL CHECK (severity IN ('blocking','major','minor','nit')),
+          category           TEXT NOT NULL CHECK (category IN (
+                               'architecture','security','reliability','performance','ux','convention')),
+          gating             INTEGER NOT NULL CHECK (gating IN (0,1)),
+          title              TEXT NOT NULL,
+          body               TEXT NOT NULL,
+          fix                TEXT NOT NULL,
+          file               TEXT NOT NULL,
+          line               INTEGER NOT NULL CHECK (line >= 0),
+          provider           TEXT NOT NULL,
+          role               TEXT NOT NULL,
+          created_at         TEXT NOT NULL,
+          -- One statement per finding per round. A round repeating itself is a
+          -- provider bug, not two occurrences.
+          UNIQUE (finding_id, round_id)
+        );
+        CREATE INDEX idx_code_review_occurrences_finding
+          ON code_review_finding_occurrences(finding_id, created_at ASC);
+        CREATE INDEX idx_code_review_occurrences_round
+          ON code_review_finding_occurrences(round_id);
+
+        CREATE TABLE code_review_decisions (
+          id                 TEXT PRIMARY KEY,
+          finding_id         TEXT NOT NULL REFERENCES code_review_findings(id) ON DELETE CASCADE,
+          subject_sha256     TEXT NOT NULL CHECK (length(subject_sha256) = 64),
+          action             TEXT NOT NULL CHECK (action IN ('accept','reject','resolved')),
+          reason             TEXT NOT NULL CHECK (length(reason) > 0),
+          actor              TEXT NOT NULL CHECK (actor IN ('operator','system')),
+          source             TEXT NOT NULL,
+          finding_revision   INTEGER NOT NULL CHECK (finding_revision >= 0),
+          decided_at         TEXT NOT NULL,
+          created_at         TEXT NOT NULL
+        );
+        -- Append-only by construction: decisions are inserted, never updated,
+        -- so the trail keeps every answer an operator ever gave, including the
+        -- ones a later decision superseded.
+        CREATE INDEX idx_code_review_decisions_finding
+          ON code_review_decisions(finding_id, created_at DESC);
+      `);
+    }
   }
 ];
 
