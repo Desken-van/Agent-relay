@@ -290,9 +290,10 @@ annotations are evidence; they never grant permission or bypass workflow state.
 
 Each discovery or call owns one bounded process and closes stdin when the result
 is complete. A response is not accepted if that process subsequently times out
-or exits unsuccessfully. INT-A deliberately stops at this boundary: no real
-provider is contacted, no Coai session enters the task FSM, and no credentials
-or shared-rule repository is loaded.
+or exits unsuccessfully. INT-A deliberately stopped at this boundary: no real
+provider was contacted, no Coai session entered the task FSM, and no credentials
+or shared-rule repository was loaded. The later INT-C acceptance crosses that
+boundary only in an isolated, explicitly opt-in synthetic journey.
 
 ### Rule evidence boundary
 
@@ -363,8 +364,11 @@ isolated branch, launches a plan round, and records an accept/reject decision fo
 every finding before resolve. A rejected finding requires a reason in the UI,
 the IPC schema and the service. Durable `opening`, `reviewing` and `resolving`
 states are shown as unknown in-flight outcomes and never become automatic retry
-buttons. Live Coai acceptance remains the boundary between this tested contract
-and calling the integration production-ready.
+buttons. Live acceptance on 2026-09-07 completed the whole `proceed` journey
+through Coai 0.14.0 and a real Codex reviewer, including five durable findings,
+five decisions and restart read-back. This is evidence for that one path, not a
+claim that provider failure, `revise`, timeout and crash windows are all live-
+accepted; those remain INT-G scope.
 
 Executable discovery is explicit
 ([`executable-locator.ts`](../src/main/adapters/process/executable-locator.ts)):
@@ -951,8 +955,10 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1345 deterministic tests plus one automated Electron acceptance journey, none
-of which contact Codex, Claude, or GitHub.
+1345 deterministic tests plus one routine automated Electron acceptance
+journey, none of which contact a model or remote service. A separate opt-in live
+Electron suite contacts the configured reviewer and is excluded from
+`npm run verify` so ordinary verification cannot consume provider quota.
 
 | Suite | What it proves |
 |-------|----------------|
