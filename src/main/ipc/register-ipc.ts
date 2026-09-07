@@ -31,6 +31,7 @@ import { IPC_INVOKE_CHANNEL } from '../../shared/ipc-channels';
 import type { Application } from '../container';
 import { assertKnownPath } from '../services/path-safety';
 import { parsePlanReviewFindings } from '../../shared/domain/plan-review';
+import type { CodeReviewDecision } from '../../shared/domain/code-review';
 import { redactAndTruncate } from '../../shared/util/redact';
 import {
   planReviewGateIdentity,
@@ -111,12 +112,22 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       identity.identity === 'current' && identity.stored !== null
         ? all.filter((finding) => finding.subjectSha256 === identity.stored?.subjectSha256)
         : [];
+    // One current decision per finding that has one. Assembled here so a client
+    // can render what was decided without a second round trip per finding, and
+    // bounded by the finding count rather than by the full decision history.
+    const latestDecisions: Record<string, CodeReviewDecision> = {};
+    for (const finding of all) {
+      const decision = app.codeReviews.latestDecision(finding.id);
+      if (decision !== null) latestDecisions[finding.id] = decision;
+    }
+
     return {
       subject: identity.stored,
       subjectIdentity: identity.identity,
       rounds: app.codeReviews.listRounds(taskId),
       findings: live,
       historicalFindings: all,
+      latestDecisions,
       totalFindingsEverRecorded: all.length,
       identityProblem: identityProblem ?? identity.problem
     };
@@ -265,6 +276,12 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     'codeReview:get': (input) => codeReviewDetail(input.taskId),
     'codeReview:capture': async (input) => {
       await app.codeReview.captureSubject(input.taskId);
+      return codeReviewDetail(input.taskId);
+    },
+    'codeReview:reconcile': async (input) => {
+      // Operator-reachable, and read-only towards the provider: it asks what
+      // happened to a dispatched round, and never starts one.
+      await app.codeReview.reconcile(input.taskId);
       return codeReviewDetail(input.taskId);
     },
     'codeReview:decide': async (input) => {

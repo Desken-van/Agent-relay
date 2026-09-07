@@ -16,12 +16,22 @@
 import { AgentRelayError } from '../../shared/domain/errors';
 import type {
   CodeReviewerAvailability,
+  ExternalCodeRoundLocator,
+  ExternalCodeRoundStatus,
   ExternalCodeReviewer,
   ExternalCodeReviewRound,
   ExternalCodeReviewSubject
 } from '../ports';
 
 export class UnconfiguredCodeReviewer implements ExternalCodeReviewer {
+  /**
+   * A real name, not an empty string, so a round could never be filed under it
+   * by accident and later matched by whatever provider arrives next. Nothing
+   * can reach dispatch through this class anyway; the value exists so the
+   * identity check has something honest to compare against.
+   */
+  readonly providerId = 'unconfigured';
+
   /**
    * False, and not because this reviewer is limited — because it does not
    * exist. The default for anything that has not proved it reads the worktree
@@ -44,7 +54,47 @@ export class UnconfiguredCodeReviewer implements ExternalCodeReviewer {
     };
   }
 
+  /**
+   * Refuses where a real adapter would open a session and reserve a round.
+   *
+   * Deliberately the same refusal as `reviewCode`: with no provider there is no
+   * identity to hand out, and returning an invented locator would let a round be
+   * written down as dispatchable when nothing can ever be asked about it.
+   */
+  async beginRound(
+    _subject: ExternalCodeReviewSubject,
+    _signal?: AbortSignal
+  ): Promise<ExternalCodeRoundLocator> {
+    throw new AgentRelayError(
+      'TOOL_MISSING',
+      'No external code reviewer is configured in this build, so no review round can be opened.',
+      {
+        remediation:
+          'Capturing the review subject and reading recorded findings work without a provider. Running a round needs the provider adapter, which is not part of this phase.'
+      }
+    );
+  }
+
+  /**
+   * Read-only, and equally unable to answer.
+   *
+   * `unknown` rather than `running` or a fabricated result: with no provider
+   * there is nothing to ask, and a recovery that invented an answer would be
+   * worse than one that admits it learned nothing.
+   */
+  async roundStatus(
+    _locator: ExternalCodeRoundLocator,
+    _subject: ExternalCodeReviewSubject,
+    _signal?: AbortSignal
+  ): Promise<ExternalCodeRoundStatus> {
+    return {
+      kind: 'unknown',
+      reason: 'No external code reviewer is configured in this build.'
+    };
+  }
+
   async reviewCode(
+    _locator: ExternalCodeRoundLocator,
     _subject: ExternalCodeReviewSubject,
     _scopeText: string,
     _signal?: AbortSignal

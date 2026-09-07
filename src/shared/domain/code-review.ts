@@ -383,7 +383,19 @@ export const codeReviewRoundSchema = z
     subjectSha256: z.string().regex(/^[0-9a-f]{64}$/),
     status: z.enum(CODE_REVIEW_ROUND_STATUSES),
     verdict: z.enum(CODE_REVIEW_VERDICTS).nullable(),
+    /**
+     * The provider's identity for this round, written before dispatch.
+     *
+     * Null only between the durable intent and the moment the provider names
+     * the round, and null in all three parts together — the database refuses
+     * half a locator. A round with no locator can never be settled by recovery:
+     * there is nothing to ask about, and guessing from the subject would let
+     * another round's verdict land here. `providerId` is part of the name
+     * because a session id means nothing without the provider it belongs to.
+     */
+    providerId: z.string().min(1).max(128).nullable(),
     sessionId: z.string().min(1).max(128).nullable(),
+    providerRoundId: z.string().min(1).max(128).nullable(),
     serverName: z.string().min(1).max(200).nullable(),
     serverVersion: z.string().min(1).max(200).nullable(),
     reviewers: z.string().max(2_000).nullable(),

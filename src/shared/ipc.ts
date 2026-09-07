@@ -42,6 +42,7 @@ import {
 import type { CodexReviewResult, TaskSpecification } from './schemas/codex';
 import {
   CODE_REVIEW_DECISION_ACTIONS,
+  type CodeReviewDecision,
   type CodeReviewFinding,
   type CodeReviewRound,
   type CodeReviewSubject,
@@ -129,6 +130,16 @@ export interface CodeReviewDetail {
    * Nothing is ever deleted; this is where it stays visible.
    */
   readonly historicalFindings: readonly CodeReviewFinding[];
+  /**
+   * The current decision for each finding that has one, keyed by finding id.
+   *
+   * Included now, in the phase that has no renderer, precisely so that INT-D-C
+   * does not have to invent a second, incompatible way to ask. Without it a
+   * client can see that findings exist but not what anybody decided about them,
+   * which is the one thing an audit trail is for. Bounded by the number of
+   * findings; the full per-finding history stays in the repository.
+   */
+  readonly latestDecisions: Readonly<Record<string, CodeReviewDecision>>;
   /** How many findings this task has recorded across every subject, ever. */
   readonly totalFindingsEverRecorded: number;
   /**
@@ -307,6 +318,11 @@ export const ipcInputSchemas = {
   // rather than leaving an unknown field to be quietly ignored.
   'codeReview:get': byTask,
   'codeReview:capture': byTask,
+  // Read-only with respect to the external reviewer: it asks what became of a
+  // round that was already dispatched and never starts one. Without it, a round
+  // whose answer was lost stays unresolved forever and every later review for
+  // that task is refused — safety taken to the point of uselessness.
+  'codeReview:reconcile': byTask,
   'codeReview:decide': z
     .object({
       taskId: z.string().min(1),
@@ -437,6 +453,7 @@ export interface IpcResponseMap {
   'planReview:resolve': PlanReviewDetail;
   'codeReview:get': CodeReviewDetail;
   'codeReview:capture': CodeReviewDetail;
+  'codeReview:reconcile': CodeReviewDetail;
   'codeReview:decide': CodeReviewDetail;
 
   'git:changes': GitChangeSet;

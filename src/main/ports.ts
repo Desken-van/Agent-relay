@@ -538,6 +538,26 @@ export interface RawCodeSnapshotFile {
   readonly absolutePath: string | null;
 }
 
+/**
+ * A cheap, total description of the worktree at one instant.
+ *
+ * Read before and after the file contents are digested. Hashing many files
+ * takes time, and nothing stops the worktree changing during it — so a capture
+ * that only listed and read would happily produce a hash of bytes that never
+ * coexisted: edit A, edit B, restore A, and every individual read is honest
+ * while their combination describes no filesystem state that ever existed.
+ * Comparing this before and after is what turns that from an invisible lie
+ * into a detected instability.
+ */
+export interface RawCodeSnapshotFingerprint {
+  readonly headCommit: string;
+  readonly branch: string;
+  /** The porcelain status text, which moves whenever tracked content does. */
+  readonly status: string;
+  /** The change set as `path\0change` records, so an added file shows up. */
+  readonly changeSet: string;
+}
+
 export interface RawCodeSnapshot {
   readonly baseCommit: string;
   readonly headCommit: string;
@@ -547,6 +567,8 @@ export interface RawCodeSnapshot {
   readonly truncated: boolean;
   /** True when the worktree holds tracked edits or untracked files. */
   readonly hasUncommittedState: boolean;
+  /** Taken at the moment the file list was produced. */
+  readonly fingerprint: RawCodeSnapshotFingerprint;
 }
 
 /** Which repository a checkout belongs to, and what it is sitting on. */
@@ -678,6 +700,45 @@ export interface CodeReviewRepository {
   latestDecision(findingId: string): CodeReviewDecision | null;
 }
 
+/**
+ * Everything about one path that the subject hash is computed from.
+ *
+ * Deliberately the same tuple as `canonicalCodeSnapshot` writes — path, change,
+ * digest, bytes. A manifest holding less than the identity holds cannot prove
+ * the identity was stable: a file whose bytes never move can still change what
+ * it IS between two passes, an untracked file becoming an added one being the
+ * ordinary case, and that alone gives a different subject hash.
+ */
+export interface CodeSnapshotManifestEntry {
+  readonly change: CodeSnapshotChange;
+  readonly contentSha256: string | null;
+  readonly bytes: number;
+}
+
+/**
+ * One capture's content manifest: every path, and what the identity says of it.
+ *
+ * Compared against a second pass to decide whether the tree held still. The
+ * cheap Git fingerprint cannot answer that on its own — an edit that leaves the
+ * same added and removed line counts moves none of its fields — so it is kept
+ * only as an early exit, never as the proof.
+ */
+export interface CodeSnapshotManifest {
+  /** Every path this pass saw, mapped to its identity tuple. Sorted. */
+  readonly entries: ReadonlyMap<string, CodeSnapshotManifestEntry>;
+  readonly headCommit: string;
+  readonly baseCommit: string;
+  readonly branch: string;
+  /**
+   * Which checkout the bytes came out of.
+   *
+   * Compared pass to pass as well, so a worktree re-pointed at another
+   * repository mid-capture is caught even in the case where the two happen to
+   * agree on head, base and branch.
+   */
+  readonly checkout: RawCheckoutIdentity;
+}
+
 /** Captures the working state of a task branch WITHOUT changing it. */
 export interface CodeSnapshotSource {
   /**
@@ -687,6 +748,13 @@ export interface CodeSnapshotSource {
    * or sitting on the wrong branch is refused before a round exists.
    */
   describeCheckout(worktreePath: string): Promise<RawCheckoutIdentity>;
+  /**
+   * Re-read the cheap description, to prove the worktree held still.
+   *
+   * Deliberately not a second full capture: it must be cheap enough to run
+   * after every attempt without doubling the cost of the thing it is checking.
+   */
+  fingerprint(request: CodeSnapshotRequest): Promise<RawCodeSnapshotFingerprint>;
   /**
    * Read the branch's committed tip and its uncommitted changes.
    *
@@ -725,6 +793,26 @@ export interface ExternalCodeReviewSubject {
  * must never be retried automatically — and guessing between them from an
  * exception type is exactly the kind of inference that gets one of them wrong.
  */
+/**
+ * Whether a reviewer can be called at all, asked before anything is written.
+ *
+ * A separate, typed question rather than something inferred from whatever a
+ * `reviewCode` call happens to throw. "The provider is not configured" and "the
+ * call went out and its answer was lost" demand opposite responses — the first
+ * leaves no external effect and must leave no durable trace either, the second
+ * must never be retried automatically — and guessing between them from an
+ * exception type is exactly the kind of inference that gets one of them wrong.
+ *
+ * ## What an implementation may and may not do here
+ *
+ * MAY: read local configuration, look up an executable, check an already-held
+ * credential, ask a provider a read-only discovery question.
+ *
+ * MUST NOT: call `review_code` or any equivalent, consume a review round, or
+ * cause any other non-idempotent effect. The service treats a refusal here as
+ * PROOF that nothing external happened and writes no round; an implementation
+ * that spent a round while answering would make that record false.
+ */
 export interface CodeReviewerAvailability {
   readonly available: boolean;
   /** Why not, when not. Bounded and safe: never a path, argv or secret. */
@@ -732,6 +820,14 @@ export interface CodeReviewerAvailability {
 }
 
 export interface ExternalCodeReviewRound {
+  /**
+   * The locator this answer belongs to, echoed back.
+   *
+   * Checked against the locator that was dispatched. Together with the subject
+   * attestation it answers two different questions — WHICH round this is, and
+   * WHAT it read — and a result that cannot answer both is not applied.
+   */
+  readonly locator: ExternalCodeRoundLocator;
   /**
    * The snapshot hash the reviewer attests it actually read.
    *
@@ -749,12 +845,66 @@ export interface ExternalCodeReviewRound {
   readonly reviewers: string;
   readonly findings: readonly ProviderCodeFinding[];
   readonly instruction: string;
-  readonly sessionId: string | null;
   readonly serverName: string;
   readonly serverVersion: string;
   readonly tokensIn: number | null;
   readonly tokensOut: number | null;
 }
+
+/**
+ * What a reviewer says about a round that was already dispatched.
+ *
+ * Read-only, and the only reviewer call recovery is allowed to make. It exists
+ * because a lost answer leaves a round that nothing else can move: the call was
+ * made, it may well have run, and repeating it would consume a second round.
+ * The three shapes are kept apart because they license different actions —
+ * `completed` may settle the round, `running` may not, and `unknown` is the
+ * admission that nothing was learned at all.
+ */
+/**
+ * Which round at the provider, as the provider itself names it.
+ *
+ * A subject hash cannot do this job. Several rounds legitimately share one
+ * repository, branch, base, head and subject hash — that is the normal shape of
+ * reviewing the same code twice — so asking a provider "what happened to the
+ * round for this subject?" is a question with more than one right answer, and
+ * writing whichever one comes back into whichever durable row is unresolved
+ * attaches somebody else's verdict to this round.
+ *
+ * The locator is obtained BEFORE the non-idempotent dispatch and stored on the
+ * round, so recovery can name exactly the round it lost rather than describing
+ * it and hoping.
+ */
+export interface ExternalCodeRoundLocator {
+  /**
+   * Which provider this round lives at. Stable across restarts.
+   *
+   * Session and round ids are only unique inside one provider's namespace, so
+   * without this a round dispatched to one provider could be reconciled against
+   * another that happens to use the same id shape — and the configuration CAN
+   * change between the dispatch and the recovery, which is exactly when a
+   * durable round is waiting to be settled.
+   */
+  readonly providerId: string;
+  /** The provider's session. Opaque to Agent Relay. */
+  readonly sessionId: string;
+  /** The round within that session. Opaque to Agent Relay. */
+  readonly roundId: string;
+}
+
+export type ExternalCodeRoundStatus =
+  | { readonly kind: 'completed'; readonly round: ExternalCodeReviewRound }
+  | { readonly kind: 'running' }
+  /**
+   * The provider is certain this locator never ran a review.
+   *
+   * Distinct from `unknown`, and only ever returned when the provider can PROVE
+   * it: it is the one answer that could safely release a round for another
+   * attempt. `unknown` cannot, because "no record" and "a record I cannot read"
+   * look identical from here.
+   */
+  | { readonly kind: 'not_started' }
+  | { readonly kind: 'unknown'; readonly reason: string | null };
 
 /**
  * The external code reviewer.
@@ -781,7 +931,48 @@ export interface ExternalCodeReviewer {
    * nothing external happened, so it must leave nothing behind to reconcile.
    */
   availability(signal?: AbortSignal): Promise<CodeReviewerAvailability>;
+  /**
+   * Read back a dispatched round WITHOUT starting or consuming one.
+   *
+   * Must be idempotent and must never call `review_code` or its equivalent.
+   * An implementation that cannot answer returns `unknown` rather than
+   * guessing, because "no answer" is not evidence that no review ran.
+   */
+  /**
+   * This reviewer's stable identity, as it appears in every locator it hands out.
+   *
+   * Compared against the identity recorded on a durable round before recovery
+   * asks anything: a round dispatched to one provider must never be settled by
+   * whatever provider happens to be configured now.
+   */
+  readonly providerId: string;
+  /**
+   * Establish the durable identity this round will be known by, and return it.
+   *
+   * Called after the durable intent row exists and BEFORE `reviewCode`. It must
+   * open or reserve a session/round at the provider and must NOT itself consume
+   * a review round — otherwise a crash between this call and the write that
+   * stores its answer would spend a round nothing can ever find again.
+   */
+  beginRound(
+    subject: ExternalCodeReviewSubject,
+    signal?: AbortSignal
+  ): Promise<ExternalCodeRoundLocator>;
+  /**
+   * Read back ONE named round without starting or consuming any.
+   *
+   * Must be idempotent, must never call `review_code` or its equivalent, and
+   * must answer about the given locator only. An implementation that cannot
+   * prove the answer belongs to that locator returns `unknown` rather than
+   * guessing: "no answer" is not evidence that no review ran.
+   */
+  roundStatus(
+    locator: ExternalCodeRoundLocator,
+    subject: ExternalCodeReviewSubject,
+    signal?: AbortSignal
+  ): Promise<ExternalCodeRoundStatus>;
   reviewCode(
+    locator: ExternalCodeRoundLocator,
     subject: ExternalCodeReviewSubject,
     scopeText: string,
     signal?: AbortSignal

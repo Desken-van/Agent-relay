@@ -383,7 +383,13 @@ export const MIGRATIONS: readonly Migration[] = [
           -- One row per task per content identity. Re-capturing an unchanged
           -- working state is idempotent rather than an error, and capturing a
           -- changed one is a NEW subject: a snapshot is never edited in place.
-          UNIQUE (task_id, subject_sha256)
+          UNIQUE (task_id, subject_sha256),
+          -- Referenced as a composite key below. SQLite can only point a
+          -- foreign key at columns that are themselves unique, and this is what
+          -- lets a round say "the subject I mean is this id, belonging to this
+          -- task, with this content hash" as one indivisible claim rather than
+          -- three independent columns that nothing checks against each other.
+          UNIQUE (id, task_id, subject_sha256)
         );
         CREATE INDEX idx_code_review_subjects_task
           ON code_review_subjects(task_id, created_at DESC);
@@ -398,7 +404,15 @@ export const MIGRATIONS: readonly Migration[] = [
           verdict            TEXT CHECK (verdict IS NULL OR verdict IN (
                                'proceed','revise','continue_anyway','good_enough',
                                'call_human','escalated')),
+          -- The provider's own name for this round, stored BEFORE the
+          -- non-idempotent call so recovery can ask about exactly the round it
+          -- lost. A subject hash cannot serve: several rounds legitimately
+          -- share one, which is what reviewing the same code twice looks like.
+          -- The provider is part of the name because session and round ids are
+          -- only unique within one provider's namespace.
+          provider_id        TEXT,
           session_id         TEXT,
+          provider_round_id  TEXT,
           server_name        TEXT,
           server_version     TEXT,
           reviewers          TEXT,
@@ -413,12 +427,44 @@ export const MIGRATIONS: readonly Migration[] = [
           created_at         TEXT NOT NULL,
           updated_at         TEXT NOT NULL,
           -- A completed round must say what it concluded and against what.
-          CHECK (status <> 'completed' OR (verdict IS NOT NULL AND completed_at IS NOT NULL))
+          CHECK (status <> 'completed' OR (verdict IS NOT NULL AND completed_at IS NOT NULL)),
+          -- The locator is one fact in three columns: a round either has a
+          -- provider identity or it has none. Half a locator is worse than
+          -- none, because it looks answerable and names nothing — and every
+          -- part must be non-empty, since an empty string is a locator that
+          -- silently matches whatever the provider returns for "no round".
+          -- Written as explicit IS NULL / IS NOT NULL tests on purpose: a CHECK
+          -- that evaluates to NULL passes in SQLite, so a naive col <> ''
+          -- would let exactly the half-filled row through that this forbids.
+          CHECK (
+            (provider_id IS NULL AND session_id IS NULL AND provider_round_id IS NULL)
+            OR (provider_id IS NOT NULL AND session_id IS NOT NULL
+                AND provider_round_id IS NOT NULL
+                AND length(provider_id) > 0 AND length(session_id) > 0
+                AND length(provider_round_id) > 0)
+          ),
+          -- The three columns are one fact, not three. Without this a round for
+          -- task A could point at task B's subject while carrying a third,
+          -- unrelated hash, and every later read — live-versus-historical
+          -- filtering included — would return internally contradictory evidence
+          -- that the database itself had accepted.
+          FOREIGN KEY (subject_id, task_id, subject_sha256)
+            REFERENCES code_review_subjects(id, task_id, subject_sha256) ON DELETE CASCADE,
+          -- Referenced by findings and occurrences, for the same reason.
+          UNIQUE (id, task_id, subject_sha256),
+          UNIQUE (id, subject_sha256)
         );
         CREATE INDEX idx_code_review_rounds_task
           ON code_review_rounds(task_id, created_at DESC);
         CREATE INDEX idx_code_review_rounds_status
           ON code_review_rounds(status, updated_at);
+        -- One provider round belongs to one local round. Two local rows holding
+        -- the same locator would both accept the same recovered answer, which
+        -- is the duplicate this whole mechanism exists to prevent. Partial, so
+        -- the rows that have no locator yet do not collide with each other.
+        CREATE UNIQUE INDEX idx_code_review_rounds_locator
+          ON code_review_rounds(provider_id, session_id, provider_round_id)
+          WHERE provider_id IS NOT NULL;
 
         CREATE TABLE code_review_findings (
           id                 TEXT PRIMARY KEY,
@@ -445,7 +491,19 @@ export const MIGRATIONS: readonly Migration[] = [
           -- The dedup key. Scoped to the subject because the same sentence about
           -- different code is a different defect; a later round against the SAME
           -- subject that repeats a finding links to this row instead of adding one.
-          UNIQUE (task_id, subject_sha256, fingerprint)
+          UNIQUE (task_id, subject_sha256, fingerprint),
+          -- The finding belongs to a subject that really exists, for this task,
+          -- at this hash.
+          FOREIGN KEY (task_id, subject_sha256)
+            REFERENCES code_review_subjects(task_id, subject_sha256) ON DELETE CASCADE,
+          -- And both rounds that touched it are rounds of that same subject, so
+          -- a finding cannot cite a round that was reviewing something else.
+          FOREIGN KEY (first_round_id, task_id, subject_sha256)
+            REFERENCES code_review_rounds(id, task_id, subject_sha256) ON DELETE CASCADE,
+          FOREIGN KEY (last_round_id, task_id, subject_sha256)
+            REFERENCES code_review_rounds(id, task_id, subject_sha256) ON DELETE CASCADE,
+          -- Referenced by occurrences and decisions.
+          UNIQUE (id, subject_sha256)
         );
         CREATE INDEX idx_code_review_findings_task
           ON code_review_findings(task_id, subject_sha256);
@@ -479,7 +537,14 @@ export const MIGRATIONS: readonly Migration[] = [
           created_at         TEXT NOT NULL,
           -- One statement per finding per round. A round repeating itself is a
           -- provider bug, not two occurrences.
-          UNIQUE (finding_id, round_id)
+          UNIQUE (finding_id, round_id),
+          -- The finding and the round must be about the SAME subject. An
+          -- occurrence is the join between them, so it is the row that has to
+          -- prove they agree.
+          FOREIGN KEY (finding_id, subject_sha256)
+            REFERENCES code_review_findings(id, subject_sha256) ON DELETE CASCADE,
+          FOREIGN KEY (round_id, subject_sha256)
+            REFERENCES code_review_rounds(id, subject_sha256) ON DELETE CASCADE
         );
         CREATE INDEX idx_code_review_occurrences_finding
           ON code_review_finding_occurrences(finding_id, created_at ASC);
@@ -496,7 +561,12 @@ export const MIGRATIONS: readonly Migration[] = [
           source             TEXT NOT NULL,
           finding_revision   INTEGER NOT NULL CHECK (finding_revision >= 0),
           decided_at         TEXT NOT NULL,
-          created_at         TEXT NOT NULL
+          created_at         TEXT NOT NULL,
+          -- A decision names the snapshot it answered. That has to be the
+          -- finding's own snapshot, or the audit trail records an answer to a
+          -- question that was never asked about that code.
+          FOREIGN KEY (finding_id, subject_sha256)
+            REFERENCES code_review_findings(id, subject_sha256) ON DELETE CASCADE
         );
         -- Append-only by construction: decisions are inserted, never updated,
         -- so the trail keeps every answer an operator ever gave, including the

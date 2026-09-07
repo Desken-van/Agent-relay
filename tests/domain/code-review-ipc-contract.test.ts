@@ -12,19 +12,39 @@ import { ipcInputSchemas, isIpcChannel } from '../../src/shared/ipc';
 const CODE_REVIEW_CHANNELS = [
   'codeReview:get',
   'codeReview:capture',
+  'codeReview:reconcile',
   'codeReview:decide'
 ] as const;
 
 describe('the code-review IPC contract', () => {
-  it('registers exactly the three bounded operations', () => {
+  it('registers exactly the four bounded operations', () => {
     for (const channel of CODE_REVIEW_CHANNELS) {
       expect(isIpcChannel(channel)).toBe(true);
       expect(ipcInputSchemas[channel]).toBeDefined();
     }
     // Running a round is absent on purpose: it needs the provider adapter,
     // which is INT-D-B. A channel that existed and always failed would be a
-    // worse answer than one that does not exist.
+    // worse answer than one that does not exist. Reconciliation is present
+    // because it is read-only towards the provider and is the only way a lost
+    // round ever stops blocking the task.
     expect(isIpcChannel('codeReview:review')).toBe(false);
+  });
+
+  it('accepts only a task id for the read-only reconciliation', () => {
+    const schema = ipcInputSchemas['codeReview:reconcile'];
+    expect(schema.safeParse({ taskId: 'task-1' }).success).toBe(true);
+    expect(schema.safeParse({}).success).toBe(false);
+    // It must not become a way to name a round, a provider or a session: the
+    // service reads those from durable state, and accepting them here would let
+    // a caller reconcile something other than what it dispatched.
+    for (const extra of [
+      { roundId: 'round-1' },
+      { sessionId: 'session-1' },
+      { subjectSha256: 'a'.repeat(64) },
+      { force: true }
+    ]) {
+      expect(schema.safeParse({ taskId: 'task-1', ...extra }).success).toBe(false);
+    }
   });
 
   it('never accepts a process, repository, prompt or provider configuration', () => {

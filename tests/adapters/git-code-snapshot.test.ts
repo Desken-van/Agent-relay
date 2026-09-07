@@ -23,12 +23,15 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   GitCodeSnapshotSource,
-  isContainedRegularFile
+  hashSnapshotFile,
+  nodeSnapshotFileOps,
+  type SnapshotFileOps,
+  type SnapshotFileStat
 } from '../../src/main/adapters/git/git-code-snapshot';
 import { ExecaProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { canonicalCodeSnapshot, codeReviewSnapshotSchema } from '../../src/shared/domain/code-review';
 import { DEFAULT_CODE_SNAPSHOT_LIMITS } from '../../src/main/services/code-review';
-import { hashSnapshotFile } from '../../src/main/adapters/git/git-code-snapshot';
+import { sameFingerprint } from '../../src/main/adapters/git/git-code-snapshot';
 import type { RawCodeSnapshot } from '../../src/main/ports';
 
 let root: string;
@@ -264,13 +267,129 @@ describe.runIf(gitAvailable)('the read-only code snapshot', () => {
     writeFileSync(outside, 'private\n');
 
     // No symlink needed for the plain case: a path that simply is not inside
-    // the worktree must be refused, and refused by the RESOLVED path rather
+    // the worktree must be refused, and refused by the RESOLVED parent rather
     // than by how the string was spelled.
-    expect(isContainedRegularFile(repository, outside)).toBe(false);
-    expect(isContainedRegularFile(repository, join(repository, 'kept.txt'))).toBe(true);
+    expect(await hashSnapshotFile(repository, outside)).toEqual({ error: 'unsafe_path' });
+    expect(await hashSnapshotFile(repository, join(repository, 'kept.txt'))).toMatchObject({
+      bytes: 13
+    });
+  });
 
-    const read = await hashSnapshotFile(repository, outside);
-    expect(read).toEqual({ error: 'unsafe_path' });
+  it('detects a file swapped between the check and the open', async () => {
+    // Deterministic, and deliberately not dependent on the OS allowing
+    // symlinks: a security property tested only where the platform cooperates
+    // is untested exactly where it matters most. The seam models the race
+    // directly — `lstat` sees an innocent regular file, and by the time `open`
+    // runs the name refers to something else.
+    const repository = makeRepository('swap-before-open');
+    const target = join(repository, 'kept.txt');
+
+    const innocent: SnapshotFileStat = {
+      isFile: () => true,
+      isSymbolicLink: () => false,
+      dev: 1,
+      ino: 100,
+      size: 13
+    };
+    const swapped: SnapshotFileStat = {
+      isFile: () => true,
+      isSymbolicLink: () => false,
+      dev: 1,
+      // A different inode: the name now points at another file entirely.
+      ino: 999,
+      size: 13
+    };
+    const ops: SnapshotFileOps = {
+      ...nodeSnapshotFileOps,
+      lstat: () => innocent,
+      fstat: () => swapped
+    };
+
+    expect(await hashSnapshotFile(repository, target, ops)).toEqual({ error: 'unsafe_path' });
+  });
+
+  it('detects a file replaced while it is being read', async () => {
+    const repository = makeRepository('swap-during-read');
+    const target = join(repository, 'kept.txt');
+
+    const identity = { dev: 1, ino: 100 };
+    let fstatCalls = 0;
+    const ops: SnapshotFileOps = {
+      ...nodeSnapshotFileOps,
+      lstat: () => ({ isFile: () => true, isSymbolicLink: () => false, ...identity, size: 13 }),
+      fstat: () => {
+        fstatCalls += 1;
+        // The first `fstat` is the one taken at open; the second is the check
+        // after the read, and by then the handle's file has been truncated
+        // underneath. The digest just taken describes nothing nameable.
+        return {
+          isFile: () => true,
+          isSymbolicLink: () => false,
+          ...identity,
+          size: fstatCalls === 1 ? 13 : 4
+        };
+      }
+    };
+
+    expect(await hashSnapshotFile(repository, target, ops)).toEqual({ error: 'unsafe_path' });
+    expect(fstatCalls).toBe(2);
+  });
+
+  it('refuses a final component that is a symlink, without following it', async () => {
+    const repository = makeRepository('symlink-final');
+    const target = join(repository, 'kept.txt');
+    // Everything else about this file checks out: it reports as a regular file
+    // and its identity is stable across the open and the read. The ONLY thing
+    // wrong with it is that it is a link — so this test can only pass if the
+    // symlink refusal itself is doing the work.
+    const identity = { isFile: () => true, dev: 7, ino: 77, size: 13 };
+    const ops: SnapshotFileOps = {
+      ...nodeSnapshotFileOps,
+      lstat: () => ({ ...identity, isSymbolicLink: () => true }),
+      fstat: () => ({ ...identity, isSymbolicLink: () => false })
+    };
+
+    // Refused outright rather than resolved and then judged: the target can
+    // change between the check and the read, and nothing here needs to follow
+    // one.
+    expect(await hashSnapshotFile(repository, target, ops)).toEqual({ error: 'unsafe_path' });
+  });
+
+  it('reports a stable capture with a fingerprint that can be re-read', async () => {
+    const repository = makeRepository('fingerprint');
+    writeFileSync(join(repository, 'kept.txt'), 'edited\n');
+
+    const raw = await capture(repository);
+    const again = await source.fingerprint({
+      worktreePath: repository,
+      baseBranch: 'main',
+      maxFiles: DEFAULT_CODE_SNAPSHOT_LIMITS.maxFiles
+    });
+
+    // Nothing moved, so the two descriptions agree — which is what lets a
+    // caller conclude the digests it took in between describe one instant.
+    expect(sameFingerprint(raw.fingerprint, again)).toBe(true);
+
+    // An added untracked file moves status and the change set.
+    writeFileSync(join(repository, 'appeared.txt'), 'new\n');
+    const moved = await source.fingerprint({
+      worktreePath: repository,
+      baseBranch: 'main',
+      maxFiles: DEFAULT_CODE_SNAPSHOT_LIMITS.maxFiles
+    });
+    expect(sameFingerprint(raw.fingerprint, moved)).toBe(false);
+
+    // And an edit that changes the line count moves the numstat half —
+    // the case plain `status` cannot see, because the file was already
+    // modified and its status letter never changes.
+    unlinkSync(join(repository, 'appeared.txt'));
+    writeFileSync(join(repository, 'kept.txt'), 'edited\nwith another line\n');
+    const edited = await source.fingerprint({
+      worktreePath: repository,
+      baseBranch: 'main',
+      maxFiles: DEFAULT_CODE_SNAPSHOT_LIMITS.maxFiles
+    });
+    expect(sameFingerprint(raw.fingerprint, edited)).toBe(false);
   });
 
   it('does not follow a symlink that leaves the worktree', async () => {
@@ -292,7 +411,6 @@ describe.runIf(gitAvailable)('the read-only code snapshot', () => {
     if (created) {
       // The path looks like an ordinary file inside the worktree. Following it
       // would digest — and later hand a reviewer — a file from outside.
-      expect(isContainedRegularFile(repository, link)).toBe(false);
       expect(await hashSnapshotFile(repository, link)).toEqual({ error: 'unsafe_path' });
 
       // A snapshot built over it therefore records an omission, which makes the

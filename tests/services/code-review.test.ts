@@ -7,17 +7,22 @@
  * fidelity is proved separately, against a real repository.
  */
 
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SqliteCodeReviewRepository } from '../../src/main/db/repositories/code-review-repository';
 import {
   CodeReviewClaims,
   CodeReviewService,
+  type CodeReviewDeps,
   type CodeReviewRoundOutcome
 } from '../../src/main/services/code-review';
 import { UnconfiguredCodeReviewer } from '../../src/main/services/code-review-provider';
 import type {
   CodeReviewerAvailability,
+  ExternalCodeRoundLocator,
+  ExternalCodeRoundStatus,
+  RawCodeSnapshotFingerprint,
   CodeSnapshotRequest,
   CodeSnapshotSource,
   ExternalCodeReviewer,
@@ -27,6 +32,10 @@ import type {
   RawCodeSnapshot,
   RawCodeSnapshotFile
 } from '../../src/main/ports';
+import {
+  nodeSnapshotFileOps,
+  type SnapshotFileOps
+} from '../../src/main/adapters/git/git-code-snapshot';
 import type { ProviderCodeFinding } from '../../src/shared/domain/code-review';
 import { createHarness, type Harness } from '../helpers/harness';
 
@@ -47,6 +56,15 @@ class FakeSnapshotSource implements CodeSnapshotSource {
   truncated = false;
   hasUncommittedState = false;
   error: Error | null = null;
+  /**
+   * What the stability fingerprint reports, per call.
+   *
+   * The default is a constant, so an ordinary capture is stable. A test that
+   * wants to model the tree moving mid-capture returns a different value on the
+   * later reads.
+   */
+  fingerprints: RawCodeSnapshotFingerprint[] = [];
+  readonly fingerprintCalls: number[] = [];
   /** What `describeCheckout` reports, keyed by the path it is asked about. */
   checkouts = new Map<string, RawCheckoutIdentity>();
   defaultCheckout: RawCheckoutIdentity = {
@@ -60,6 +78,25 @@ class FakeSnapshotSource implements CodeSnapshotSource {
     return this.checkouts.get(worktreePath) ?? this.defaultCheckout;
   }
 
+  private nextFingerprint(): RawCodeSnapshotFingerprint {
+    const index = this.fingerprintCalls.length;
+    this.fingerprintCalls.push(index);
+    return (
+      this.fingerprints[index] ??
+      this.fingerprints[this.fingerprints.length - 1] ?? {
+        headCommit: this.headCommit,
+        branch: 'agent/task-1',
+        status: '',
+        changeSet: ''
+      }
+    );
+  }
+
+  async fingerprint(): Promise<RawCodeSnapshotFingerprint> {
+    if (this.error) throw this.error;
+    return this.nextFingerprint();
+  }
+
   async capture(request: CodeSnapshotRequest): Promise<RawCodeSnapshot> {
     this.calls.push(request);
     if (this.error) throw this.error;
@@ -69,13 +106,16 @@ class FakeSnapshotSource implements CodeSnapshotSource {
       branch: 'agent/task-1',
       files: this.files,
       truncated: this.truncated,
-      hasUncommittedState: this.hasUncommittedState
+      hasUncommittedState: this.hasUncommittedState,
+      fingerprint: this.nextFingerprint()
     };
   }
 }
 
 class FakeCodeReviewer implements ExternalCodeReviewer {
   readsUncommittedWorktreeState = true;
+  /** Who this reviewer is. Tests change it to model a reconfigured build. */
+  providerId = 'coai';
   /** What the typed preflight answers. Tests make it refuse. */
   available: CodeReviewerAvailability = { available: true, reason: null };
   readonly availabilityCalls: number[] = [];
@@ -86,11 +126,34 @@ class FakeCodeReviewer implements ExternalCodeReviewer {
    * adapter does; a test sets it to something else to forge a mismatch.
    */
   attest: string | null | undefined = undefined;
-  readonly calls: { subject: ExternalCodeReviewSubject; scopeText: string }[] = [];
+  readonly calls: {
+    locator: ExternalCodeRoundLocator;
+    subject: ExternalCodeReviewSubject;
+    scopeText: string;
+  }[] = [];
+  /**
+   * The locators `beginRound` hands out, in order.
+   *
+   * A fresh one per call by default, because a real provider opens a new round
+   * each time; a test that wants two rounds to collide sets them explicitly.
+   */
+  locators: ExternalCodeRoundLocator[] = [];
+  readonly beginCalls: ExternalCodeReviewSubject[] = [];
+  beginError: Error | null = null;
+  /** Runs at the moment the round is opened, before a locator is returned. */
+  onBegin: (() => void) | null = null;
+  /**
+   * What the answer claims to be, when it is not simply the dispatched locator.
+   *
+   * `undefined` means "echo the locator it was called with", which is what an
+   * honest adapter does; a test sets it to forge an answer from another round.
+   */
+  answerLocator: ExternalCodeRoundLocator | undefined = undefined;
   /** Runs at the moment the call is dispatched, before it answers. */
   onCall: (() => void) | null = null;
   error: Error | null = null;
   answer: ExternalCodeReviewRound = {
+    locator: { providerId: 'coai', sessionId: 'session-1', roundId: 'round-1' },
     reviewedSubjectSha256: null,
     verdict: 'revise',
     gatingCount: 1,
@@ -98,27 +161,63 @@ class FakeCodeReviewer implements ExternalCodeReviewer {
     reviewers: 'all 3 reviewers answered',
     findings: [],
     instruction: 'resolve every finding',
-    sessionId: 'session-1',
     serverName: 'coai-mcp',
     serverVersion: '1.2.3',
     tokensIn: 100,
     tokensOut: 20
   };
 
+  /** What the read-only round read-back reports. */
+  roundStatusAnswer: ExternalCodeRoundStatus = { kind: 'unknown', reason: 'not configured' };
+  /**
+   * What each read-back was asked about.
+   *
+   * Both halves are recorded because the point of the locator is that the
+   * subject alone is not enough to name a round.
+   */
+  readonly roundStatusCalls: {
+    locator: ExternalCodeRoundLocator;
+    subject: ExternalCodeReviewSubject;
+  }[] = [];
+
   async availability(): Promise<CodeReviewerAvailability> {
     this.availabilityCalls.push(this.calls.length);
     return this.available;
   }
 
+  async beginRound(subject: ExternalCodeReviewSubject): Promise<ExternalCodeRoundLocator> {
+    this.beginCalls.push(subject);
+    this.onBegin?.();
+    if (this.beginError) throw this.beginError;
+    const index = this.beginCalls.length - 1;
+    return (
+      this.locators[index] ?? {
+        providerId: this.providerId,
+        sessionId: `session-${index + 1}`,
+        roundId: `round-${index + 1}`
+      }
+    );
+  }
+
+  async roundStatus(
+    locator: ExternalCodeRoundLocator,
+    subject: ExternalCodeReviewSubject
+  ): Promise<ExternalCodeRoundStatus> {
+    this.roundStatusCalls.push({ locator, subject });
+    return this.roundStatusAnswer;
+  }
+
   async reviewCode(
+    locator: ExternalCodeRoundLocator,
     subject: ExternalCodeReviewSubject,
     scopeText: string
   ): Promise<ExternalCodeReviewRound> {
-    this.calls.push({ subject, scopeText });
+    this.calls.push({ locator, subject, scopeText });
     this.onCall?.();
     if (this.error) throw this.error;
     return {
       ...this.answer,
+      locator: this.answerLocator ?? locator,
       reviewedSubjectSha256:
         this.attest === undefined ? subject.subjectSha256 : this.attest
     };
@@ -154,7 +253,7 @@ function setup() {
   const snapshots = new FakeSnapshotSource();
   const reviewer = new FakeCodeReviewer();
   const claims = new CodeReviewClaims();
-  const build = (): CodeReviewService =>
+  const build = (extra: Partial<CodeReviewDeps> = {}): CodeReviewService =>
     new CodeReviewService({
       tasks: harness.tasks,
       projects: harness.projects,
@@ -163,7 +262,8 @@ function setup() {
       reviewer,
       claims,
       clock: harness.clock,
-      ids: harness.ids
+      ids: harness.ids,
+      ...extra
     });
 
   const project = harness.createProject();
@@ -198,7 +298,10 @@ describe('the code-review subject', () => {
     // The only Git contact is the read-only snapshot source; nothing in this
     // service can reach a mutating command. The fake Git adapter the harness
     // installs records every worktree it was asked to create or commit to.
-    expect(value.snapshots.calls).toHaveLength(1);
+    //
+    // Twice, because an exact snapshot is digested and then digested again to
+    // prove the bytes did not move underneath it. Both passes are reads.
+    expect(value.snapshots.calls).toHaveLength(2);
     expect(value.harness.git.createdWorktrees).toHaveLength(0);
     expect(value.harness.git.commits).toHaveLength(0);
     expect(value.harness.git.pushes).toHaveLength(0);
@@ -796,6 +899,202 @@ describe('code-review incompleteness, duplicates and the dispatch boundary', () 
   });
 });
 
+/**
+ * What INT-D-A-R3 fixed: a lost round that blocked a task forever, a capture
+ * that could hash bytes which never coexisted, and a provider refusal that
+ * leaked its own text.
+ */
+describe('code-review recovery, capture stability and boundary hygiene', () => {
+  async function stranded() {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.error = new Error('the reviewer never answered');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+    value.reviewer.error = null;
+    expect(value.reviews.latestRound(value.task.id)?.status).toBe('reviewing');
+    return value;
+  }
+
+  it('settles a lost round when the provider proves it completed', async () => {
+    const value = await stranded();
+    const subject = value.reviews.latestSubject(value.task.id)!;
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        findings: [finding()],
+        reviewedSubjectSha256: subject.subjectSha256
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    // The round it recovers is the one that was dispatched, not a new one: the
+    // provider was read, never asked to review again.
+    expect(value.reviewer.calls).toHaveLength(1);
+    expect(value.reviewer.roundStatusCalls).toHaveLength(1);
+    expect(outcome.round.status).toBe('completed');
+    expect(outcome.findings).toHaveLength(1);
+    expect(value.reviews.listOccurrencesForRound(outcome.round.id)).toHaveLength(1);
+
+    // And the task is usable again.
+    await expect(value.service.review(value.task.id)).resolves.toBeTruthy();
+  });
+
+  it('leaves a round the provider says is still running exactly where it was', async () => {
+    const value = await stranded();
+    value.reviewer.roundStatusAnswer = { kind: 'running' };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('running');
+    expect(outcome.round.lastError).toMatch(/still running/i);
+    expect(outcome.findings).toHaveLength(0);
+    // Still blocked, and for the right reason: a second dispatch would double a
+    // call that has not finished.
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  it('stays blocked and says why when the provider knows nothing', async () => {
+    const value = await stranded();
+    value.reviewer.roundStatusAnswer = { kind: 'unknown', reason: 'the session is gone' };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('unknown');
+    expect(outcome.round.lastError).toMatch(/could not say what became/i);
+    expect(outcome.round.lastError).toMatch(/session is gone/);
+    // No answer is not evidence that no review ran.
+    expect(outcome.round.lastError).not.toMatch(/did not run|never ran/i);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  it('refuses a recovered result that attests a different subject', async () => {
+    const value = await stranded();
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        findings: [finding()],
+        reviewedSubjectSha256: 'f'.repeat(64)
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('attestation-mismatch');
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+  });
+
+  it('refuses to reconcile a round that is not outstanding', async () => {
+    const value = setup();
+    await reviewOnce(value);
+    await expect(value.service.reconcile(value.task.id)).rejects.toThrow(
+      /no dispatched code-review round/i
+    );
+  });
+
+  it('marks a capture incomplete when the worktree will not hold still', async () => {
+    const value = setup();
+    // Every fingerprint read differs from the last, which is what a worktree
+    // somebody is actively editing looks like.
+    let tick = 0;
+    value.snapshots.fingerprints = [];
+    const moving = (): { headCommit: string; branch: string; status: string; changeSet: string } => ({
+      headCommit: '2'.repeat(40),
+      branch: 'agent/task-1',
+      status: `moving-${(tick += 1)}`,
+      changeSet: ''
+    });
+    value.snapshots.fingerprint = async () => moving();
+    const original = value.snapshots.capture.bind(value.snapshots);
+    value.snapshots.capture = async (request) => ({ ...(await original(request)), fingerprint: moving() });
+
+    const subject = await value.service.captureSubject(value.task.id);
+
+    // The capture is stored — it says what was seen — but never as exact.
+    expect(subject.complete).toBe(false);
+    const identity = await value.service.subjectIdentity(value.task.id);
+    expect(identity.identity).toBe('incomplete');
+    expect(identity.problem).toMatch(/changed while it was being read/i);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/not an exact statement/i);
+  });
+
+  it('accepts a capture the second attempt finds stable', async () => {
+    const value = setup();
+    // First attempt moves, second holds. A worktree that settles must not be
+    // condemned for one unlucky moment.
+    const settled = { headCommit: '2'.repeat(40), branch: 'agent/task-1', status: 'x', changeSet: '' };
+    const answers = [
+      { ...settled, status: 'a' },
+      { ...settled, status: 'b' },
+      settled,
+      settled,
+      settled,
+      settled
+    ];
+    let index = 0;
+    value.snapshots.fingerprint = async () => answers[index++] ?? settled;
+    const original = value.snapshots.capture.bind(value.snapshots);
+    value.snapshots.capture = async (request) => ({
+      ...(await original(request)),
+      fingerprint: answers[index++] ?? settled
+    });
+
+    const subject = await value.service.captureSubject(value.task.id);
+    expect(subject.complete).toBe(true);
+  });
+
+  it('redacts a provider refusal instead of passing its text through', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.available = {
+      available: false,
+      reason: `codex failed: api_key = "AKIA1234567890ABCDEF" at C:\\Users\\someone\\.codex`
+    };
+
+    await expect(value.service.review(value.task.id)).rejects.toMatchObject({
+      code: 'TOOL_MISSING'
+    });
+    try {
+      await value.service.review(value.task.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // A refusal is foreign text like any other: it must not carry a token out
+      // through the error boundary.
+      expect(message).not.toContain('AKIA1234567890ABCDEF');
+    }
+    expect(value.reviews.listRounds(value.task.id)).toHaveLength(0);
+  });
+
+  it('keeps a decision historical when the code moves, without locking anything', async () => {
+    const value = setup();
+    value.reviewer.answer = { ...value.reviewer.answer, findings: [finding()] };
+    const outcome = await reviewOnce(value);
+    const target = outcome.findings[0]!;
+    await value.service.decide(value.task.id, {
+      findingId: target.id,
+      action: 'accept',
+      reason: 'Legitimate.',
+      expectedRevision: target.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+
+    // The code changes afterwards. The decision is not undone and nothing was
+    // locked to prevent this — it is scoped to a snapshot hash that is simply
+    // no longer current, so the finding and its answer become history.
+    value.snapshots.headCommit = '9'.repeat(40);
+    const identity = await value.service.subjectIdentity(value.task.id);
+    expect(identity.identity).toBe('stale');
+    expect(value.reviews.listDecisions(target.id)).toHaveLength(1);
+    expect(value.reviews.latestDecision(target.id)?.subjectSha256).toBe(target.subjectSha256);
+  });
+});
+
 describe('the code-review detail a caller receives', () => {
   function detail(value: ReturnType<typeof setup>) {
     return async () => {
@@ -1037,5 +1336,481 @@ describe('code-review decisions', () => {
       })
     ).rejects.toThrow(/credential-shaped/i);
     expect(value.reviews.listDecisions(target.id)).toHaveLength(0);
+  });
+});
+
+describe('code-review capture exactness at the level of bytes', () => {
+  /**
+   * Two real files in the worktree, and a seam that can move one of them at a
+   * chosen instant. Both files are digested by the production reader.
+   */
+  function twoFiles(value: ReturnType<typeof setup>) {
+    const root = value.harness.worktreesRoot;
+    mkdirSync(root, { recursive: true });
+    const a = join(root, 'a.ts');
+    const b = join(root, 'b.ts');
+    writeFileSync(a, 'const a = 1;\nconst second = 2;\n');
+    writeFileSync(b, 'const b = 1;\nconst second = 2;\n');
+    value.snapshots.files = [
+      { path: 'a.ts', change: 'modified', absolutePath: a },
+      { path: 'b.ts', change: 'modified', absolutePath: b }
+    ];
+    return { a, b };
+  }
+
+  it('refuses to call a capture exact when a file is rewritten while another is read', async () => {
+    const value = setup();
+    const { a, b } = twoFiles(value);
+
+    // Precisely the edit the cheap Git description cannot see. A is rewritten
+    // while B is being opened, to a body with the SAME number of lines - so
+    // `--numstat`, `--name-status` and `status --porcelain` are byte-identical
+    // before and after, and the fingerprint the capture compares is unmoved.
+    // The only witness that anything happened is the content digest itself.
+    let generation = 0;
+    const ops: SnapshotFileOps = {
+      ...nodeSnapshotFileOps,
+      open: (target) => {
+        if (target === b) {
+          generation += 1;
+          writeFileSync(a, `const a = ${generation + 100};\nconst second = 2;\n`);
+        }
+        return nodeSnapshotFileOps.open(target);
+      }
+    };
+    const service = value.build({ fileOps: ops });
+
+    const subject = await service.captureSubject(value.task.id);
+
+    // A never held still, so no attempt could reproduce its digest.
+    expect(generation).toBeGreaterThan(1);
+    expect(subject.complete).toBe(false);
+    const identity = await service.subjectIdentity(value.task.id);
+    expect(identity.identity).toBe('incomplete');
+    await expect(service.review(value.task.id)).rejects.toThrow(/not an exact statement/i);
+  });
+
+  it('accepts a capture whose every digest is reproduced by the second reading', async () => {
+    const value = setup();
+    twoFiles(value);
+    const reads: string[] = [];
+    const ops: SnapshotFileOps = {
+      ...nodeSnapshotFileOps,
+      open: (target) => {
+        reads.push(target);
+        return nodeSnapshotFileOps.open(target);
+      }
+    };
+    const service = value.build({ fileOps: ops });
+
+    const subject = await service.captureSubject(value.task.id);
+
+    // Every file read twice, and the same answer both times.
+    expect(reads).toHaveLength(4);
+    expect(subject.complete).toBe(true);
+    expect((await service.subjectIdentity(value.task.id)).identity).toBe('current');
+  });
+
+  it('refuses to call a capture exact when the file set changes between the passes', async () => {
+    const value = setup();
+    twoFiles(value);
+    const both = value.snapshots.files;
+    let pass = 0;
+    const original = value.snapshots.capture.bind(value.snapshots);
+    value.snapshots.capture = async (request) => {
+      // Every attempt's first pass sees one file and its second sees two, so no
+      // attempt can reproduce its own file set. The fingerprint is constant by
+      // construction, so composition is the only thing that can notice.
+      value.snapshots.files = pass % 2 === 0 ? [both[0]!] : both;
+      pass += 1;
+      return original(request);
+    };
+
+    const subject = await value.build().captureSubject(value.task.id);
+
+    expect(subject.complete).toBe(false);
+  });
+
+  it('refuses to call a capture exact when a file changes what it is, not what it holds', async () => {
+    const value = setup();
+    const { a } = twoFiles(value);
+    expect(a).toBeTruthy();
+
+    // The bytes never move. What moves is what the file IS: an untracked file
+    // that gets added to the index between the passes is the everyday case, and
+    // `canonicalCodeSnapshot` writes `change` into the subject hash, so the two
+    // passes describe two different subjects. A manifest holding only digests
+    // cannot see that, and would call this exact.
+    const both = value.snapshots.files;
+    let pass = 0;
+    const original = value.snapshots.capture.bind(value.snapshots);
+    value.snapshots.capture = async (request) => {
+      const change = pass % 2 === 0 ? 'untracked' : 'added';
+      pass += 1;
+      value.snapshots.files = both.map((file) => ({ ...file, change }));
+      return original(request);
+    };
+
+    const subject = await value.build().captureSubject(value.task.id);
+
+    expect(pass).toBe(6);
+    expect(subject.complete).toBe(false);
+    expect((await value.build().subjectIdentity(value.task.id)).identity).toBe('incomplete');
+  });
+
+  it('refuses to call a capture exact when the checkout itself changes underneath', async () => {
+    const value = setup();
+    twoFiles(value);
+    const real = { commonDir: 'C:/repo/.git', branch: 'agent/task-1', detached: false };
+    // The same branch and the same head, out of a different repository. Only
+    // the checkout's own identity separates the two.
+    const other = { ...real, commonDir: 'C:/other-repo/.git' };
+    let looks = 0;
+    value.snapshots.describeCheckout = async (path) => {
+      if (path !== value.harness.worktreesRoot) return { ...real, branch: 'main' };
+      looks += 1;
+      // Every attempt's first pass sees the real repository and its second pass
+      // sees the other one, so no attempt can reproduce the checkout it read
+      // from and none of them may call itself exact.
+      return looks % 2 === 0 ? other : real;
+    };
+
+    const subject = await value.build().captureSubject(value.task.id);
+
+    // Every bounded attempt was spent, and each one looked twice.
+    expect(looks).toBe(6);
+    expect(subject.complete).toBe(false);
+  });
+});
+
+describe('code-review round identity at the provider', () => {
+  async function stranded() {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.error = new Error('the reviewer never answered');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+    value.reviewer.error = null;
+    return value;
+  }
+
+  it('names the round at the provider and records that name before dispatching it', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+
+    // At the moment the round is opened, the durable row already exists and
+    // still has no locator: intent first, identity second, dispatch last.
+    value.reviewer.onBegin = () => {
+      expect(value.reviewer.calls).toHaveLength(0);
+      const round = value.reviews.latestRound(value.task.id);
+      expect(round).not.toBeNull();
+      expect(round?.providerRoundId).toBeNull();
+    };
+    // And by the time anything non-idempotent goes out, the name is written
+    // down. This is the whole difference between a round that can be recovered
+    // and one that can only be guessed at.
+    value.reviewer.onCall = () => {
+      const round = value.reviews.latestRound(value.task.id);
+      expect(round?.sessionId).toBe('session-1');
+      expect(round?.providerRoundId).toBe('round-1');
+      expect(round?.status).toBe('reviewing');
+    };
+
+    const outcome = await value.service.review(value.task.id);
+    expect(value.reviewer.beginCalls).toHaveLength(1);
+    expect(outcome.round.providerRoundId).toBe('round-1');
+  });
+
+  it('gives each round of one subject its own locator, and asks about that one only', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    const first = await value.service.review(value.task.id);
+
+    // A second round over the SAME subject: identical repository, branch, base,
+    // head and subject hash. Everything except the locator collides.
+    value.reviewer.error = new Error('the reviewer never answered');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+    value.reviewer.error = null;
+
+    const lost = value.reviews.latestRound(value.task.id)!;
+    expect(lost.subjectSha256).toBe(first.round.subjectSha256);
+    expect(lost.id).not.toBe(first.round.id);
+    expect(lost.providerRoundId).not.toBe(first.round.providerRoundId);
+
+    value.reviewer.roundStatusAnswer = { kind: 'running' };
+    await value.service.reconcile(value.task.id);
+
+    // Asked about exactly one round, and it is this one - not the earlier round
+    // of the same code, which the subject alone could not have distinguished.
+    expect(value.reviewer.roundStatusCalls).toHaveLength(1);
+    expect(value.reviewer.roundStatusCalls[0]?.locator).toEqual({
+      providerId: lost.providerId,
+      sessionId: lost.sessionId,
+      roundId: lost.providerRoundId
+    });
+    expect(value.reviewer.roundStatusCalls[0]?.locator.roundId).not.toBe(
+      first.round.providerRoundId
+    );
+  });
+
+  it('refuses a recovered result that belongs to another round of the same subject', async () => {
+    const value = await stranded();
+    const subject = value.reviews.latestSubject(value.task.id)!;
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        // Same provider, same session, same subject, correct attestation -
+        // and still the wrong round. Only the locator can tell.
+        locator: { providerId: 'coai', sessionId: 'session-1', roundId: 'round-99' },
+        findings: [finding()],
+        reviewedSubjectSha256: subject.subjectSha256
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('wrong-round');
+    expect(outcome.round.lastError).toMatch(/different round/i);
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  it('refuses a live answer that carries another round locator', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.answerLocator = {
+      providerId: 'coai',
+      sessionId: 'session-1',
+      roundId: 'round-77'
+    };
+
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/different round/i);
+
+    // The call did go out, so the round stays unresolved rather than failed.
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.status).toBe('reviewing');
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+  });
+
+  it('can never settle a round that has no recorded locator', async () => {
+    const value = await stranded();
+    // A crash between the durable intent and the locator write leaves exactly
+    // this: a row that says a call went out, and nothing to ask about.
+    const round = value.reviews.latestRound(value.task.id)!;
+    value.reviews.updateRound(round.id, {
+      providerId: null,
+      sessionId: null,
+      providerRoundId: null
+    });
+    const subject = value.reviews.latestSubject(value.task.id)!;
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        findings: [finding()],
+        reviewedSubjectSha256: subject.subjectSha256
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    // The provider was not even asked: a question that cannot name its round
+    // has more than one right answer, and any of them would be written here.
+    expect(value.reviewer.roundStatusCalls).toHaveLength(0);
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('no-locator');
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  it('dispatches nothing when the round cannot be opened at all', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.beginError = new Error('the session could not be opened');
+
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/could not be opened/);
+
+    // Above the non-idempotent call, so this is provably a refusal that
+    // reviewed nothing - and it is closed rather than left outstanding.
+    expect(value.reviewer.calls).toHaveLength(0);
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.status).toBe('failed');
+    expect(round.providerRoundId).toBeNull();
+
+    value.reviewer.beginError = null;
+    await expect(value.service.review(value.task.id)).resolves.toBeTruthy();
+  });
+
+  it('keeps the locator when the dispatch is lost, and repeats nothing by itself', async () => {
+    const value = await stranded();
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.status).toBe('reviewing');
+    expect(round.sessionId).toBe('session-1');
+    expect(round.providerRoundId).toBe('round-1');
+    // One call went out and no second one followed on its own.
+    expect(value.reviewer.calls).toHaveLength(1);
+    expect(value.reviewer.beginCalls).toHaveLength(1);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+    expect(value.reviewer.calls).toHaveLength(1);
+  });
+
+  it('releases a round only when the provider proves it never started', async () => {
+    const value = await stranded();
+    value.reviewer.roundStatusAnswer = { kind: 'not_started' };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    // Proof that nothing was consumed, so the round may be closed. Still not an
+    // automatic repeat: reconciliation reads, and a person starts the next one.
+    expect(outcome.round.status).toBe('failed');
+    expect(outcome.unsettledReason).toBe('not-started');
+    expect(outcome.round.lastError).toMatch(/never started/i);
+    expect(outcome.findings).toHaveLength(0);
+    expect(value.reviewer.calls).toHaveLength(1);
+
+    await expect(value.service.review(value.task.id)).resolves.toBeTruthy();
+    expect(value.reviewer.calls).toHaveLength(2);
+  });
+});
+
+describe('code-review locator durability', () => {
+  async function stranded() {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.error = new Error('the reviewer never answered');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+    value.reviewer.error = null;
+    return value;
+  }
+
+  it('keeps the dispatched locator exactly, whatever the answer says about identity', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+
+    // An adapter that still carries the older shape, where the round result
+    // restated its own session. The answer is checked AGAINST the locator, so
+    // letting it write one back would let the evidence rewrite the thing it was
+    // checked against — and a provider that simply omitted the field would
+    // blank half a locator on an otherwise good round.
+    value.reviewer.answer = {
+      ...value.reviewer.answer,
+      sessionId: null,
+      serverName: 'coai-mcp'
+    } as typeof value.reviewer.answer;
+
+    const outcome = await value.service.review(value.task.id);
+
+    expect(outcome.round.status).toBe('completed');
+    expect(outcome.round.providerId).toBe('coai');
+    expect(outcome.round.sessionId).toBe('session-1');
+    expect(outcome.round.providerRoundId).toBe('round-1');
+
+    // Read back from storage, because that is what a later recovery would use.
+    const stored = value.reviews.latestRound(value.task.id)!;
+    expect(stored.providerId).toBe('coai');
+    expect(stored.sessionId).toBe('session-1');
+    expect(stored.providerRoundId).toBe('round-1');
+  });
+
+  it('never dispatches on a locator with an empty or missing part', async () => {
+    for (const locator of [
+      { providerId: 'coai', sessionId: '', roundId: 'round-1' },
+      { providerId: 'coai', sessionId: 'session-1', roundId: '' },
+      { providerId: '', sessionId: 'session-1', roundId: 'round-1' },
+      { providerId: 'coai', sessionId: 'session-1' } as unknown as {
+        providerId: string;
+        sessionId: string;
+        roundId: string;
+      }
+    ]) {
+      const value = setup();
+      await value.service.captureSubject(value.task.id);
+      value.reviewer.locators = [locator];
+
+      await expect(value.service.review(value.task.id)).rejects.toThrow();
+
+      // Nothing left the process, so the round is closed rather than left
+      // outstanding — and no fragment of the unusable locator was written.
+      expect(value.reviewer.calls).toHaveLength(0);
+      const round = value.reviews.latestRound(value.task.id)!;
+      expect(round.status).toBe('failed');
+      expect(round.providerId).toBeNull();
+      expect(round.sessionId).toBeNull();
+      expect(round.providerRoundId).toBeNull();
+    }
+  });
+
+  it('refuses a locator issued under a provider identity that is not the reviewer', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.locators = [
+      { providerId: 'somebody-else', sessionId: 'session-1', roundId: 'round-1' }
+    ];
+
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/usable identity/i);
+
+    expect(value.reviewer.calls).toHaveLength(0);
+    expect(value.reviews.latestRound(value.task.id)?.providerId).toBeNull();
+  });
+
+  it('will not read a lost round back from a different provider than it went to', async () => {
+    const value = await stranded();
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.providerId).toBe('coai');
+
+    // A restart with changed configuration: same session and round ids, and a
+    // provider that has never heard of them. Ids are unique only inside one
+    // namespace, so asking is not merely useless — it can be answered.
+    value.reviewer.providerId = 'a-different-reviewer';
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        locator: {
+          providerId: 'a-different-reviewer',
+          sessionId: 'session-1',
+          roundId: 'round-1'
+        },
+        findings: [finding()],
+        reviewedSubjectSha256: value.reviews.latestSubject(value.task.id)!.subjectSha256
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(value.reviewer.roundStatusCalls).toHaveLength(0);
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('other-provider');
+    expect(outcome.round.lastError).toMatch(/different code reviewer/i);
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+
+    // The locator is untouched, so the round is still settleable by the
+    // provider that actually ran it.
+    const held = value.reviews.latestRound(value.task.id)!;
+    expect(held.providerId).toBe('coai');
+    expect(held.sessionId).toBe('session-1');
+    expect(held.providerRoundId).toBe('round-1');
+  });
+
+  it('refuses a recovered answer whose provider half disagrees', async () => {
+    const value = await stranded();
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        // Right session, right round, wrong namespace.
+        locator: { providerId: 'someone-else', sessionId: 'session-1', roundId: 'round-1' },
+        findings: [finding()],
+        reviewedSubjectSha256: value.reviews.latestSubject(value.task.id)!.subjectSha256
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('wrong-round');
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
   });
 });

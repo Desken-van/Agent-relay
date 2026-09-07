@@ -433,6 +433,30 @@ against it. A truncated change set is incomplete for the same reason. Partial
 evidence presented as exact is how a review comes to describe code nobody looked
 at.
 
+A snapshot also has to say that the tree held still while it was read, and
+that claim is proved at the level of bytes rather than inferred. The whole change
+set is digested, then digested again, and the two content manifests must
+match. A manifest entry is the same tuple the subject hash is
+built from — path, change, digest, size — because a manifest holding less than
+the identity holds cannot prove the identity was stable: an untracked file that
+gets added to the index between the passes has the same bytes and a different
+subject. Alongside the entries the manifest carries the file-set composition,
+the base and head commits, the branch and the checkout's own identity. Divergence is
+retried a bounded number of times; if no attempt reproduces itself, the capture
+is stored as **incomplete** and never as exact.
+
+The cheap Git description (head, branch, `status --porcelain`, the change set
+with its added and removed line counts) is kept ahead of that comparison as an
+early exit, but it is not the proof, because it cannot be. An edit that replaces
+a file's body with a different body of the same shape moves none of its fields:
+`--numstat` still reports the same counts, `--name-status` the same letters,
+`status` the same lines. A file digested early in a pass could therefore be
+rewritten while a later file was being read, and a capture trusting the
+fingerprint would call that combination exact — a subject hash naming a state
+that never existed on disk. Only re-reading the content can rule it out, and a
+snapshot that claims to be an exact statement of the code has to have ruled it
+out.
+
 Path safety is enforced on both sides. The reader resolves the real path and
 refuses anything that is a symlink or reparse point, or that lands outside the
 worktree — a link with an innocent-looking name inside the tree can point at a
@@ -507,6 +531,44 @@ an answer that arrived for another round. An INT-D-B adapter that declares the
 capability must therefore compute and return the same snapshot hash; the boolean
 alone is not sufficient.
 
+Attestation says what an answer read; it does not say which round the answer
+belongs to. Those come apart, because several rounds legitimately share one
+repository, branch, base, head and subject hash — reviewing the same code twice
+is the normal case — so a subject describes a round no more uniquely than a
+street name describes a house. `ExternalCodeReviewer` therefore works in terms
+of an `ExternalCodeRoundLocator`: the provider it lives at, plus that provider's
+own session and round identity, opaque here. The provider is part of the name
+rather than context around it, because session and round ids are unique only
+inside one provider's namespace — and the configured reviewer can genuinely be a
+different one by the time recovery runs, which is exactly when an unresolved
+round is waiting. Reconciliation compares the recorded provider against the
+reviewer it is about to ask, and refuses rather than asking a stranger a
+question that it might answer.
+
+The order matters more than the type. `beginRound` opens or reserves the round
+at the provider and must not consume one; its locator is written into that
+specific durable row **before** the non-idempotent `reviewCode` dispatch, so a
+crash afterwards leaves a round that can be named rather than one that can only
+be described. `reviewCode` and `roundStatus` both take the locator, answers echo
+it back, and a result whose locator is not the dispatched one is refused with the
+round left unresolved — a round with no recorded locator can never be settled by
+recovery at all.
+
+Because the locator is what an answer is checked against, the answer may not
+restate it: the completion transaction writes the verdict, the findings and the
+provider's own reporting, and deliberately leaves all three locator columns
+alone. Letting a result rewrite the identity it was matched on would make the
+check circular, and a provider that merely omitted a field would blank part of a
+locator on an otherwise good round. The database holds the same invariant from
+below — a `CHECK` that the three columns are all present and non-empty or all
+null, so half a locator cannot exist, and a partial `UNIQUE` index so two local
+rounds can never claim one provider round and both accept the same recovered
+answer. Both halves of the locator are validated for shape before the dispatch
+that depends on them, not when the recovery that needs them finally runs. Without that, "what happened to the round for this subject?" is
+a question with more than one right answer, and whichever came back would be
+written into whichever row was still open: another round's verdict, filed as
+this round's evidence.
+
 An answer that lists the same finding twice is folded to one before the
 completion transaction, because a provider repeating itself is not describing
 two defects and must not collide on `UNIQUE (finding_id, round_id)` and discard a
@@ -529,6 +591,19 @@ because a non-idempotent call needs positive evidence that dispatching again
 repeats nothing, and neither state supplies it. A malformed verdict, an
 oversized finding list, a provider refusal or credential-shaped reviewer prose
 all leave the round unresolved with its reason recorded — never `completed`.
+
+`codeReview:reconcile` is how a round that went out and lost its answer is
+settled, and it is read-only by contract: `roundStatus` never starts a review.
+It distinguishes four outcomes, and the distinctions are the point. `completed`
+applies the result, but only after both the locator and the subject attestation
+match. `running` leaves the round exactly where it was, since a second dispatch
+would certainly double a call still in flight. `not_started` is the one answer
+that releases the round, because it is positive evidence that nothing was
+consumed — and it closes the round rather than re-dispatching, since recovery
+reads and a person decides what happens next. `unknown` changes nothing and
+records a bounded, redacted reason: no answer is not evidence that no review
+ran, and treating it as such is precisely how a non-idempotent call gets made
+twice.
 
 A finding keeps its stable identity and history across rounds, while
 `code_review_finding_occurrences` keeps what each individual round said about it
@@ -564,8 +639,8 @@ finding about code the task no longer has — or code nobody could read — is n
 live statement about anything, and presenting it as one is how a stale review
 comes to be acted on. Nothing is ever deleted.
 
-The operational IPC surface is `codeReview:get`, `codeReview:capture` and
-`codeReview:decide`, all `.strict()`. They accept identifiers, a revision and a
+The operational IPC surface is `codeReview:get`, `codeReview:capture`,
+`codeReview:reconcile` and `codeReview:decide`, all `.strict()`. They accept identifiers, a revision and a
 typed decision, and refuse an executable path, repository or worktree path, base
 ref, raw diff, scope text, prompt or provider configuration. The scope a
 reviewer would be given is built in the main process from durable state. There
@@ -1157,8 +1232,8 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1433 deterministic tests plus one routine automated Electron acceptance
-journey, none of which contact a model or remote service. A separate opt-in live
+1475 deterministic tests in 55 files, plus one routine automated Electron
+acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.
 

@@ -39,7 +39,8 @@ const OCCURRENCE_COLUMNS = `id, finding_id, round_id, subject_sha256, severity, 
                             gating, title, body, fix, file, line, provider, role, created_at`;
 
 const ROUND_COLUMNS = `id, task_id, subject_id, subject_sha256, status, verdict,
-                       session_id, server_name, server_version, reviewers,
+                       provider_id, session_id, provider_round_id, server_name, server_version,
+                       reviewers,
                        gating_count, threshold, tokens_in, tokens_out, last_error,
                        revision, started_at, completed_at, created_at, updated_at`;
 
@@ -93,7 +94,9 @@ interface RoundRow {
   subject_sha256: string;
   status: CodeReviewRound['status'];
   verdict: CodeReviewRound['verdict'];
+  provider_id: string | null;
   session_id: string | null;
+  provider_round_id: string | null;
   server_name: string | null;
   server_version: string | null;
   reviewers: string | null;
@@ -192,7 +195,9 @@ function toRound(row: RoundRow): CodeReviewRound {
     subjectSha256: row.subject_sha256,
     status: row.status,
     verdict: row.verdict,
+    providerId: row.provider_id,
     sessionId: row.session_id,
+    providerRoundId: row.provider_round_id,
     serverName: row.server_name,
     serverVersion: row.server_version,
     reviewers: row.reviewers,
@@ -334,15 +339,15 @@ export class SqliteCodeReviewRepository implements CodeReviewRepository {
     this.db
       .prepare(
         `INSERT INTO code_review_rounds (
-           id, task_id, subject_id, subject_sha256, status, verdict, session_id,
-           server_name, server_version, reviewers, gating_count, threshold,
-           tokens_in, tokens_out, last_error, revision, started_at, completed_at,
-           created_at, updated_at)
+           id, task_id, subject_id, subject_sha256, status, verdict, provider_id,
+           session_id, provider_round_id, server_name, server_version, reviewers,
+           gating_count, threshold, tokens_in, tokens_out, last_error, revision,
+           started_at, completed_at, created_at, updated_at)
          VALUES (
-           @id, @taskId, @subjectId, @subjectSha256, @status, @verdict, @sessionId,
-           @serverName, @serverVersion, @reviewers, @gatingCount, @threshold,
-           @tokensIn, @tokensOut, @lastError, @revision, @startedAt, @completedAt,
-           @createdAt, @updatedAt)`
+           @id, @taskId, @subjectId, @subjectSha256, @status, @verdict, @providerId,
+           @sessionId, @providerRoundId, @serverName, @serverVersion, @reviewers,
+           @gatingCount, @threshold, @tokensIn, @tokensOut, @lastError, @revision,
+           @startedAt, @completedAt, @createdAt, @updatedAt)`
       )
       .run(next);
     return next;
@@ -419,7 +424,9 @@ export class SqliteCodeReviewRepository implements CodeReviewRepository {
         `UPDATE code_review_rounds SET
            status = @status,
            verdict = @verdict,
+           provider_id = @providerId,
            session_id = @sessionId,
+           provider_round_id = @providerRoundId,
            server_name = @serverName,
            server_version = @serverVersion,
            reviewers = @reviewers,

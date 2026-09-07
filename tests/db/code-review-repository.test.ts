@@ -102,7 +102,9 @@ function round(subjectId: string, subjectSha256 = SUBJECT_A) {
     subjectSha256,
     status: 'requested',
     verdict: null,
+    providerId: null,
     sessionId: null,
+    providerRoundId: null,
     serverName: null,
     serverVersion: null,
     reviewers: null,
@@ -183,6 +185,43 @@ describe('the durable code-review store', () => {
     expect(
       reviews.updateRoundIfUnchanged(created.id, { status: 'completed', verdict: 'proceed', completedAt: clock.nowIso() }, advanced.revision)
     ).not.toBeNull();
+  });
+
+  it('stores the provider locator durably, and keeps two rounds of one subject apart', () => {
+    const one = subject();
+    const first = round(one.id);
+    const second = round(one.id);
+
+    // Same task, same subject, same hash. In every respect a provider can be
+    // asked about by describing the code, these two rounds are identical.
+    expect(second.subjectSha256).toBe(first.subjectSha256);
+    expect(first.providerRoundId).toBeNull();
+
+    reviews.updateRound(first.id, {
+      providerId: 'coai',
+      sessionId: 'sess-a',
+      providerRoundId: 'round-a'
+    });
+    reviews.updateRound(second.id, {
+      providerId: 'coai',
+      sessionId: 'sess-a',
+      providerRoundId: 'round-b'
+    });
+
+    // Read back from storage, not from memory: this is what survives a restart,
+    // and it is the only thing that can tell the two rounds apart afterwards.
+    expect(reviews.findRoundById(first.id)?.providerRoundId).toBe('round-a');
+    expect(reviews.findRoundById(second.id)?.providerRoundId).toBe('round-b');
+
+    // And it can be cleared, because a round that never reached the provider
+    // must not claim an identity it does not have.
+    reviews.updateRound(second.id, {
+      providerId: null,
+      sessionId: null,
+      providerRoundId: null
+    });
+    expect(reviews.findRoundById(second.id)?.providerRoundId).toBeNull();
+    expect(reviews.findRoundById(first.id)?.providerRoundId).toBe('round-a');
   });
 
   it('links a repeated finding to the record it already has', () => {
@@ -314,6 +353,254 @@ describe('the durable code-review store', () => {
     const trail = reviews.listDecisions(stored.id);
     expect(trail.map((entry) => entry.action)).toEqual(['accept', 'resolved']);
     expect(reviews.latestDecision(stored.id)?.action).toBe('resolved');
+  });
+});
+
+/**
+ * The constraints, attacked directly.
+ *
+ * These bypass the service and write to SQLite by hand, because that is the
+ * only way to find out whether the DATABASE enforces the invariants or whether
+ * a single careful caller has merely been keeping them by convention. A future
+ * recovery path, a migration, or a second writer will not have that caller's
+ * discipline.
+ */
+describe('code-review relational integrity', () => {
+  function otherTask(): string {
+    const projects = new SqliteProjectRepository(db, clock);
+    const tasks = new SqliteTaskRepository(db, clock);
+    const project = projects.create({
+      id: 'p2',
+      name: 'other',
+      localPath: 'C:\\other-repo',
+      projectType: 'existing',
+      defaultBranch: 'main',
+      githubOwner: null,
+      githubRepo: null,
+      githubVisibility: 'private'
+    });
+    return tasks.create({
+      id: 't2',
+      projectId: project.id,
+      title: 'Another task',
+      originalRequest: 'Another.',
+      status: 'READY_FOR_IMPLEMENTATION',
+      currentRound: 0,
+      maxRounds: 3,
+      codexThreadId: null,
+      claudeSessionId: null,
+      worktreePath: null,
+      branchName: null,
+      baseBranch: null,
+      specificationJson: null,
+      specificationApprovedAt: null,
+      lastReviewJson: null,
+      lastError: null,
+      codexModel: null,
+      claudeModel: null
+    }).id;
+  }
+
+  it('has foreign keys switched on, or none of the rest of this means anything', () => {
+    expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
+  });
+
+  it('refuses a round that points at another task\'s subject', () => {
+    const mine = subject();
+    const theirs = otherTask();
+
+    // The round claims to belong to task 2 while citing task 1's subject. The
+    // composite key makes those one fact, so the database can tell.
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO code_review_rounds (
+             id, task_id, subject_id, subject_sha256, status, verdict, session_id,
+             server_name, server_version, reviewers, gating_count, threshold,
+             tokens_in, tokens_out, last_error, revision, started_at, completed_at,
+             created_at, updated_at)
+           VALUES ('r-cross', ?, ?, ?, 'requested', NULL, NULL, NULL, NULL, NULL,
+                   NULL, NULL, NULL, NULL, NULL, 0, 't', NULL, 't', 't')`
+        )
+        .run(theirs, mine.id, mine.subjectSha256)
+    ).toThrow(/FOREIGN KEY/i);
+  });
+
+  it('refuses a round whose hash disagrees with the subject it names', () => {
+    const mine = subject();
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO code_review_rounds (
+             id, task_id, subject_id, subject_sha256, status, verdict, session_id,
+             server_name, server_version, reviewers, gating_count, threshold,
+             tokens_in, tokens_out, last_error, revision, started_at, completed_at,
+             created_at, updated_at)
+           VALUES ('r-hash', ?, ?, ?, 'requested', NULL, NULL, NULL, NULL, NULL,
+                   NULL, NULL, NULL, NULL, NULL, 0, 't', NULL, 't', 't')`
+        )
+        .run(taskId, mine.id, SUBJECT_B)
+    ).toThrow(/FOREIGN KEY/i);
+  });
+
+  it('refuses half a locator, however the halves are arranged', () => {
+    const mine = subject();
+    const insert = (provider: string | null, session: string | null, round_: string | null) =>
+      db
+        .prepare(
+          `INSERT INTO code_review_rounds (
+             id, task_id, subject_id, subject_sha256, status, verdict,
+             provider_id, session_id, provider_round_id,
+             server_name, server_version, reviewers, gating_count, threshold,
+             tokens_in, tokens_out, last_error, revision, started_at, completed_at,
+             created_at, updated_at)
+           VALUES ('r-half', ?, ?, ?, 'requested', NULL, ?, ?, ?, NULL, NULL, NULL,
+                   NULL, NULL, NULL, NULL, NULL, 0, 't', NULL, 't', 't')`
+        )
+        .run(taskId, mine.id, mine.subjectSha256, provider, session, round_);
+
+    // Every way of filling some but not all of it. A row like this looks
+    // answerable and names nothing, so recovery would ask a question it cannot
+    // check the answer of.
+    expect(() => insert('coai', 'sess', null)).toThrow(/CHECK/i);
+    expect(() => insert('coai', null, 'round')).toThrow(/CHECK/i);
+    expect(() => insert(null, 'sess', 'round')).toThrow(/CHECK/i);
+    expect(() => insert('coai', null, null)).toThrow(/CHECK/i);
+
+    // And an empty part is not a part. Written out because a CHECK that
+    // evaluates to NULL passes in SQLite, so this is exactly the case a
+    // carelessly written constraint lets through.
+    expect(() => insert('coai', '', 'round')).toThrow(/CHECK/i);
+    expect(() => insert('', 'sess', 'round')).toThrow(/CHECK/i);
+    expect(() => insert('coai', 'sess', '')).toThrow(/CHECK/i);
+
+    // All three, or none, is what the column set is for.
+    expect(() => insert(null, null, null)).not.toThrow();
+  });
+
+  it('refuses to let two rounds own one provider round', () => {
+    const mine = subject();
+    const first = round(mine.id);
+    const second = round(mine.id);
+    reviews.updateRound(first.id, {
+      providerId: 'coai',
+      sessionId: 'sess-a',
+      providerRoundId: 'round-a'
+    });
+
+    // The same provider round claimed twice. Both rows would accept the same
+    // recovered answer, which is the duplicate the locator exists to prevent.
+    expect(() =>
+      reviews.updateRound(second.id, {
+        providerId: 'coai',
+        sessionId: 'sess-a',
+        providerRoundId: 'round-a'
+      })
+    ).toThrow(/UNIQUE/i);
+
+    // The same session with a different round is a different round, and fine.
+    expect(() =>
+      reviews.updateRound(second.id, {
+        providerId: 'coai',
+        sessionId: 'sess-a',
+        providerRoundId: 'round-b'
+      })
+    ).not.toThrow();
+
+    // As is the same session and round at a different provider: the ids are
+    // only unique inside one provider's namespace.
+    const third = round(mine.id);
+    expect(() =>
+      reviews.updateRound(third.id, {
+        providerId: 'other',
+        sessionId: 'sess-a',
+        providerRoundId: 'round-a'
+      })
+    ).not.toThrow();
+
+    // Rounds with no locator do not collide with each other.
+    const fourth = round(mine.id);
+    const fifth = round(mine.id);
+    expect(fourth.providerId).toBeNull();
+    expect(fifth.providerId).toBeNull();
+  });
+
+  it('refuses a finding for a subject that does not exist', () => {
+    const created = round(subject().id);
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO code_review_findings (
+             id, task_id, subject_sha256, fingerprint, severity, category, gating,
+             title, body, fix, file, line, provider, role, first_round_id,
+             last_round_id, times_reported, revision, created_at, updated_at)
+           VALUES ('f-ghost', ?, ?, ?, 'major', 'reliability', 1, 't', 'b', 'f',
+                   'src/a.ts', 1, 'codex', 'r', ?, ?, 1, 0, 't', 't')`
+        )
+        .run(taskId, SUBJECT_B, 'a'.repeat(64), created.id, created.id)
+    ).toThrow(/FOREIGN KEY/i);
+  });
+
+  it('refuses an occurrence joining a finding and a round of different subjects', () => {
+    const first = subject(SUBJECT_A);
+    const second = subject(SUBJECT_B, '3'.repeat(40));
+    const roundA = round(first.id, SUBJECT_A);
+    const roundB = round(second.id, SUBJECT_B);
+    const findingA = reviews.upsertFinding(finding(roundA.id)).finding;
+
+    // The occurrence would tie a finding about subject A to a round about
+    // subject B — the exact shape that makes later evidence self-contradictory.
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO code_review_finding_occurrences (
+             id, finding_id, round_id, subject_sha256, severity, category, gating,
+             title, body, fix, file, line, provider, role, created_at)
+           VALUES ('o-cross', ?, ?, ?, 'major', 'reliability', 1, 't', 'b', 'f',
+                   'src/a.ts', 1, 'codex', 'r', 't')`
+        )
+        .run(findingA.id, roundB.id, SUBJECT_A)
+    ).toThrow(/FOREIGN KEY/i);
+  });
+
+  it('refuses a decision whose subject disagrees with its finding', () => {
+    const created = round(subject().id);
+    const stored = reviews.upsertFinding(finding(created.id)).finding;
+
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO code_review_decisions (
+             id, finding_id, subject_sha256, action, reason, actor, source,
+             finding_revision, decided_at, created_at)
+           VALUES ('d-cross', ?, ?, 'accept', 'because', 'operator', 'test', 0, 't', 't')`
+        )
+        .run(stored.id, SUBJECT_B)
+    ).toThrow(/FOREIGN KEY/i);
+  });
+
+  it('still accepts the rows the service actually writes', () => {
+    // The constraints must bind the wrong shapes without obstructing the right
+    // one, or they would have been bought at the cost of the feature.
+    const created = round(subject().id);
+    const stored = reviews.upsertFinding(finding(created.id));
+    expect(stored.created).toBe(true);
+    expect(
+      reviews.appendDecisionIfUnchanged(
+        {
+          id: ids.next(),
+          findingId: stored.finding.id,
+          subjectSha256: SUBJECT_A,
+          action: 'accept',
+          reason: 'Legitimate.',
+          actor: 'operator',
+          source: 'test',
+          findingRevision: stored.finding.revision,
+          decidedAt: clock.nowIso()
+        },
+        stored.finding.revision
+      )
+    ).not.toBeNull();
   });
 });
 
