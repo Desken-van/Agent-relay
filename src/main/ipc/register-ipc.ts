@@ -31,6 +31,7 @@ import { IPC_INVOKE_CHANNEL } from '../../shared/ipc-channels';
 import type { Application } from '../container';
 import { assertKnownPath } from '../services/path-safety';
 import { parsePlanReviewFindings } from '../../shared/domain/plan-review';
+import type { CodeReviewDecision } from '../../shared/domain/code-review';
 import { redactAndTruncate } from '../../shared/util/redact';
 import {
   planReviewGateIdentity,
@@ -75,6 +76,62 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
   };
 
   const planReviewService = () => app.createPlanReviewGate(externalPlanReviewConfig(app.settings.get()));
+
+  const codeReviewDetail = async (taskId: string): Promise<IpcResponseMap['codeReview:get']> => {
+    const task = app.tasks.findById(taskId);
+    if (task === null) throw new AgentRelayError('NOT_FOUND', 'No such task.');
+
+    // Reading identity means capturing the working tree again, which can fail
+    // for reasons that say nothing about staleness — a removed worktree, an
+    // unreadable checkout. That distinction is preserved rather than collapsed
+    // into "stale", because the action staleness suggests is to capture again,
+    // and capture is exactly what failed.
+    let identity: Awaited<ReturnType<typeof app.codeReview.subjectIdentity>>;
+    let identityProblem: string | null = null;
+    try {
+      identity = await app.codeReview.subjectIdentity(taskId);
+    } catch (error) {
+      identity = {
+        identity: 'unknown',
+        stored: app.codeReviews.latestSubject(taskId),
+        currentSha256: null,
+        problem: null
+      };
+      identityProblem = redactAndTruncate(
+        error instanceof Error ? error.message : String(error),
+        2_000
+      );
+    }
+
+    const all = app.codeReviews.listFindings(taskId);
+    // Live findings exist only when the subject is provably current. `stale`,
+    // `unknown` and `incomplete` each mean something different, and none of
+    // them means "these findings describe the code you have" — so the live
+    // field is empty and everything stays visible as history instead.
+    const live =
+      identity.identity === 'current' && identity.stored !== null
+        ? all.filter((finding) => finding.subjectSha256 === identity.stored?.subjectSha256)
+        : [];
+    // One current decision per finding that has one. Assembled here so a client
+    // can render what was decided without a second round trip per finding, and
+    // bounded by the finding count rather than by the full decision history.
+    const latestDecisions: Record<string, CodeReviewDecision> = {};
+    for (const finding of all) {
+      const decision = app.codeReviews.latestDecision(finding.id);
+      if (decision !== null) latestDecisions[finding.id] = decision;
+    }
+
+    return {
+      subject: identity.stored,
+      subjectIdentity: identity.identity,
+      rounds: app.codeReviews.listRounds(taskId),
+      findings: live,
+      historicalFindings: all,
+      latestDecisions,
+      totalFindingsEverRecorded: all.length,
+      identityProblem: identityProblem ?? identity.problem
+    };
+  };
   const planReviewDetail = (taskId: string): IpcResponseMap['planReview:get'] => {
     const task = app.tasks.findById(taskId);
     if (task === null) throw new AgentRelayError('NOT_FOUND', 'No such task.');
@@ -207,6 +264,39 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       await planReviewService().reconcile(input.taskId);
       return planReviewDetail(input.taskId);
     },
+    /**
+     * Code review (INT-D-A).
+     *
+     * The detail is assembled here, in the main process, because the two
+     * questions a screen needs answered — "does this review still describe the
+     * code?" and "which findings are live?" — are both content-hash comparisons
+     * against the working tree. Neither is a rendering decision, and neither
+     * may be recomputed on the other side of this boundary.
+     */
+    'codeReview:get': (input) => codeReviewDetail(input.taskId),
+    'codeReview:capture': async (input) => {
+      await app.codeReview.captureSubject(input.taskId);
+      return codeReviewDetail(input.taskId);
+    },
+    'codeReview:reconcile': async (input) => {
+      // Operator-reachable, and read-only towards the provider: it asks what
+      // happened to a dispatched round, and never starts one.
+      await app.codeReview.reconcile(input.taskId);
+      return codeReviewDetail(input.taskId);
+    },
+    'codeReview:decide': async (input) => {
+      await app.codeReview.decide(input.taskId, {
+        findingId: input.findingId,
+        action: input.action,
+        reason: input.reason,
+        expectedRevision: input.expectedRevision,
+        actor: 'operator',
+        // Where the answer entered the system. A channel name, never a path.
+        source: 'codeReview:decide'
+      });
+      return codeReviewDetail(input.taskId);
+    },
+
     'planReview:resolve': async (input) => {
       await planReviewService().resolve(input.taskId, {
         gateId: input.gateId,

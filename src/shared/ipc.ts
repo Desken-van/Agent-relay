@@ -41,6 +41,14 @@ import {
 } from './domain/operations-diagnostics';
 import type { CodexReviewResult, TaskSpecification } from './schemas/codex';
 import {
+  CODE_REVIEW_DECISION_ACTIONS,
+  type CodeReviewDecision,
+  type CodeReviewFinding,
+  type CodeReviewRound,
+  type CodeReviewSubject,
+  type CodeReviewSubjectIdentity
+} from './domain/code-review';
+import {
   planReviewDecisionSchema,
   type PlanReviewFinding,
   type PlanReviewGate,
@@ -90,6 +98,57 @@ export interface PublishOutcome {
   readonly performed: boolean;
   readonly message: string;
   readonly url: string | null;
+}
+
+/**
+ * Everything the code-review screen will need, computed in the main process.
+ *
+ * `subjectIdentity` is server-computed for the same reason the plan gate's is:
+ * deciding whether a stored review still speaks for the code on disk means
+ * comparing two content hashes, and a renderer that recomputed them would be a
+ * second implementation of the rule that decides — free to disagree with the
+ * one that actually governs.
+ */
+export interface CodeReviewDetail {
+  readonly subject: CodeReviewSubject | null;
+  readonly subjectIdentity: CodeReviewSubjectIdentity;
+  readonly rounds: readonly CodeReviewRound[];
+  /**
+   * Findings that are in force RIGHT NOW.
+   *
+   * Non-empty only when `subjectIdentity` is `current`. When the code has moved,
+   * could not be read, or was only partially captured, this is empty and the
+   * findings appear under `historicalFindings` instead — because a finding
+   * about code the task no longer has, or code nobody could read, is not a
+   * live statement about anything, and presenting it as one is how a stale
+   * review comes to be acted on.
+   */
+  readonly findings: readonly CodeReviewFinding[];
+  /**
+   * Everything recorded for this task, in order, whatever its subject.
+   *
+   * Nothing is ever deleted; this is where it stays visible.
+   */
+  readonly historicalFindings: readonly CodeReviewFinding[];
+  /**
+   * The current decision for each finding that has one, keyed by finding id.
+   *
+   * Included now, in the phase that has no renderer, precisely so that INT-D-C
+   * does not have to invent a second, incompatible way to ask. Without it a
+   * client can see that findings exist but not what anybody decided about them,
+   * which is the one thing an audit trail is for. Bounded by the number of
+   * findings; the full per-finding history stays in the repository.
+   */
+  readonly latestDecisions: Readonly<Record<string, CodeReviewDecision>>;
+  /** How many findings this task has recorded across every subject, ever. */
+  readonly totalFindingsEverRecorded: number;
+  /**
+   * Why the working state could not be read, when it could not be.
+   *
+   * Set only for `unknown`. Bounded and redacted, so the reason reaches an
+   * operator without a checkout path or a credential travelling with it.
+   */
+  readonly identityProblem: string | null;
 }
 
 export interface PlanReviewDetail {
@@ -247,6 +306,34 @@ export const ipcInputSchemas = {
     .strict(),
   'planReview:review': byTask,
   'planReview:reconcile': byTask,
+
+  // Code review (INT-D-A). Identifiers and typed decisions only.
+  //
+  // What these channels deliberately do NOT accept: an executable path, a
+  // repository or worktree path, a base ref, a raw diff, a prompt or scope
+  // text, or any provider configuration. All of those are read from durable
+  // state in the main process. A renderer that could supply them would be
+  // choosing what the external reviewer is asked and where it runs, which is
+  // not a rendering decision — and `.strict()` makes the refusal explicit
+  // rather than leaving an unknown field to be quietly ignored.
+  'codeReview:get': byTask,
+  'codeReview:capture': byTask,
+  // Read-only with respect to the external reviewer: it asks what became of a
+  // round that was already dispatched and never starts one. Without it, a round
+  // whose answer was lost stays unresolved forever and every later review for
+  // that task is refused — safety taken to the point of uselessness.
+  'codeReview:reconcile': byTask,
+  'codeReview:decide': z
+    .object({
+      taskId: z.string().min(1),
+      findingId: z.string().min(1),
+      // The revision the caller was looking at, so a stale screen cannot
+      // overwrite a newer answer with an older one.
+      expectedRevision: z.number().int().nonnegative(),
+      action: z.enum(CODE_REVIEW_DECISION_ACTIONS),
+      reason: z.string().min(1).max(10_000)
+    })
+    .strict(),
   // `gateId` and `expectedRevision` name the round the decisions answer. A
   // renderer that has been showing a round which has since been resolved and
   // replaced would otherwise submit its answers against the current one — the
@@ -364,6 +451,10 @@ export interface IpcResponseMap {
   'planReview:review': PlanReviewDetail;
   'planReview:reconcile': PlanReviewDetail;
   'planReview:resolve': PlanReviewDetail;
+  'codeReview:get': CodeReviewDetail;
+  'codeReview:capture': CodeReviewDetail;
+  'codeReview:reconcile': CodeReviewDetail;
+  'codeReview:decide': CodeReviewDetail;
 
   'git:changes': GitChangeSet;
   'git:repositoryInfo': RepositoryInfo;

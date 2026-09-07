@@ -54,6 +54,7 @@ import type {
   GitAdapter,
   GitHubAdapter,
   IdGenerator,
+  CodeReviewRepository,
   PlanReviewGateRepository,
   ProjectRepository,
   RunEventRepository,
@@ -70,6 +71,10 @@ import { ProjectService } from './services/project-service';
 import { reconcileInterruptedWork, type ReconciliationPlan } from './services/startup-reconciliation';
 import { PublishService } from './services/publish-service';
 import { TaskService } from './services/task-service';
+import { SqliteCodeReviewRepository } from './db/repositories/code-review-repository';
+import { GitCodeSnapshotSource } from './adapters/git/git-code-snapshot';
+import { CodeReviewClaims, CodeReviewService } from './services/code-review';
+import { UnconfiguredCodeReviewer } from './services/code-review-provider';
 import { PlanReviewClaims } from './services/plan-review-claims';
 import { PlanReviewGateService } from './services/plan-review-gate';
 import { RuleEvidenceService } from './services/rule-evidence';
@@ -119,6 +124,15 @@ export interface Application {
   readonly approvals: ApprovalRepository;
   readonly taskRuleEvidence: TaskRuleEvidenceRepository;
   readonly planReviewGates: PlanReviewGateRepository;
+  readonly codeReviews: CodeReviewRepository;
+  /**
+   * INT-D-A: the durable code-review foundation.
+   *
+   * Its external provider is not wired yet — see
+   * {@link UnconfiguredCodeReviewer}. Capturing subjects, reading identity and
+   * deciding findings all work; running a round waits for INT-D-B.
+   */
+  readonly codeReview: CodeReviewService;
   readonly operationTargets: OperationTargetRepository;
   readonly operationDiagnosticRuns: OperationDiagnosticRepository;
   readonly projectService: ProjectService;
@@ -249,6 +263,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   const taskRuleEvidence = new SqliteTaskRuleEvidenceRepository(db);
   const planReviewGates = new SqlitePlanReviewGateRepository(db, clock);
   const planReviewClaims = new PlanReviewClaims();
+  const codeReviews = new SqliteCodeReviewRepository(db, clock);
+  const codeReviewClaims = new CodeReviewClaims();
   const operationTargets = new SqliteOperationTargetRepository(db, clock);
   const operationDiagnosticRuns = new SqliteOperationDiagnosticRepository(db);
 
@@ -256,6 +272,18 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   // marked running and tasks stuck in a busy status, and nothing later clears
   // them. Running here means it is finished before IPC is registered and before
   // a window exists, so no new work can race the recovery.
+  const codeReview = new CodeReviewService({
+    tasks,
+    projects,
+    reviews: codeReviews,
+    // Read-only by contract: it never stages, commits or checks anything out.
+    snapshots: new GitCodeSnapshotSource(runner),
+    reviewer: new UnconfiguredCodeReviewer(),
+    claims: codeReviewClaims,
+    clock,
+    ids
+  });
+
   const reconciliation = reconcileInterruptedWork({
     tasks,
     runs,
@@ -371,6 +399,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     approvals,
     taskRuleEvidence,
     planReviewGates,
+    codeReviews,
+    codeReview,
     operationTargets,
     operationDiagnosticRuns,
     projectService,

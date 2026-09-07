@@ -370,6 +370,283 @@ five decisions and restart read-back. This is evidence for that one path, not a
 claim that provider failure, `revise`, timeout and crash windows are all live-
 accepted; those remain INT-G scope.
 
+### External code-review evidence — INT-D-A backend foundation
+
+**Status: backend only.** There is no renderer, no correction loop and no live
+provider acceptance for this path yet. Migration 7 adds the durable layer the
+remaining slices will stand on; the provider adapter that would actually call
+`review_code` is INT-D-B, and until it exists `UnconfiguredCodeReviewer` refuses
+loudly rather than returning an empty round that could be mistaken for a clean
+review.
+
+Why this is separate from the plan gate rather than folded into it: the plan
+gate answers one question per specification identity and decides its findings in
+a single `resolve`, so one JSON blob per gate is an honest representation. Code
+review asks the same question of a moving artefact round after round, and the
+same defect can survive several rounds, be fixed in one, and reappear. That
+needs findings that are rows with their own identity, history and decisions. An
+array index cannot be that identity — the third round's index 2 is rarely the
+first round's index 2 — and re-serialising the array each round would erase
+exactly the history the table exists to keep.
+
+Migration 7 adds four tables. `code_review_subjects` is insert-only: there is no
+update path anywhere in the repository port, because a statement about what was
+reviewed that can be edited afterwards proves nothing. `code_review_rounds`
+carries the provider and server identity, session, verdict, reviewers, gating
+count, threshold, reported usage and a monotonic `revision`.
+`code_review_findings` holds the stable local ids, provenance and dedup
+fingerprints. `code_review_decisions` is append-only, so a superseded answer
+stays in the trail instead of being overwritten. No absolute path is stored in
+any of them.
+
+The subject is the whole contract. `GitCodeSnapshotSource` captures the task
+branch with five read-only commands — `rev-parse`, `merge-base`,
+`diff --name-status`, `ls-files --others` and `status --porcelain` — behind an
+allowlist rather than a forbidden list, because it has exactly those things to
+run and anything else would be a bug. It deliberately does **not** use `git add --intent-to-add`,
+which is how [`collectChanges`](../src/main/adapters/git/git-adapter.ts) makes
+untracked files visible to `git diff`: that writes index entries into a checkout
+the user owns, and producing a snapshot by modifying the thing being measured is
+the one property it must not have. Committed work, uncommitted tracked edits and
+untracked files are all covered, and no hidden commit is ever created.
+
+Every changed regular file is **streamed** and digested, whatever its size, and
+the canonical form ([`canonicalCodeSnapshot`](../src/shared/domain/code-review.ts))
+writes base commit, head commit, branch, entries, omissions, completeness and
+whether the worktree holds uncommitted work, in a fixed order with entries sorted
+by path. It contains repository-relative POSIX paths only — no absolute path, no
+checkout location, no timestamp, no machine identity — so two machines looking at
+the same code agree on what it is.
+
+Streaming replaced a size ceiling, and that was a correctness fix rather than a
+performance one. A file skipped for being large used to record only its path, a
+reason and a byte count, so **two different files of exactly the same length
+produced identical entries and therefore one subject hash** — different code with
+the same identity, which is the single failure this design exists to prevent.
+Constant-memory hashing removes the reason the ceiling existed.
+
+What cannot be digested — an unreadable file, or a path that resolves outside the
+worktree — is recorded by name and reason, and marks the snapshot **incomplete**.
+An incomplete snapshot is still stored, because it honestly says what was and was
+not seen, but it is never treated as exact: `review` and `decide` both refuse
+against it. A truncated change set is incomplete for the same reason. Partial
+evidence presented as exact is how a review comes to describe code nobody looked
+at.
+
+A snapshot also has to say that the tree held still while it was read, and
+that claim is proved at the level of bytes rather than inferred. The whole change
+set is digested, then digested again, and the two content manifests must
+match. A manifest entry is the same tuple the subject hash is
+built from — path, change, digest, size — because a manifest holding less than
+the identity holds cannot prove the identity was stable: an untracked file that
+gets added to the index between the passes has the same bytes and a different
+subject. Alongside the entries the manifest carries the file-set composition,
+the base and head commits, the branch and the checkout's own identity. Divergence is
+retried a bounded number of times; if no attempt reproduces itself, the capture
+is stored as **incomplete** and never as exact.
+
+The cheap Git description (head, branch, `status --porcelain`, the change set
+with its added and removed line counts) is kept ahead of that comparison as an
+early exit, but it is not the proof, because it cannot be. An edit that replaces
+a file's body with a different body of the same shape moves none of its fields:
+`--numstat` still reports the same counts, `--name-status` the same letters,
+`status` the same lines. A file digested early in a pass could therefore be
+rewritten while a later file was being read, and a capture trusting the
+fingerprint would call that combination exact — a subject hash naming a state
+that never existed on disk. Only re-reading the content can rule it out, and a
+snapshot that claims to be an exact statement of the code has to have ruled it
+out.
+
+Path safety is enforced on both sides. The reader resolves the real path and
+refuses anything that is a symlink or reparse point, or that lands outside the
+worktree — a link with an innocent-looking name inside the tree can point at a
+private key. Reviewer-supplied `file` locations are validated as empty or
+repository-relative POSIX, rejecting absolute paths, drive letters, UNC shares,
+`..` traversal, backslashes and NUL: a path is the one field in reviewer output
+that something downstream will eventually try to open, and one that needed
+sanitising meant something this gate does not permit.
+
+Before any durable write and before any external call, the checkout itself is
+validated: the worktree must share a Git common directory with the project, must
+not be detached, and must be on the branch the task records. A worktree that
+moved, was re-pointed or was left on another branch is refused with
+`WORKTREE_INVALID` and leaves no round row behind.
+
+Staleness is therefore not a flag anybody has to remember to set; it is the
+observable difference between two hashes — but only between two hashes that are
+each exact. `subjectIdentity` answers in this order, and the order is the
+contract:
+
+1. the capture failed → `unknown`, carrying a bounded, redacted reason;
+2. either snapshot is incomplete → `incomplete`, **whatever the hashes say**;
+3. both exact and the hashes differ → `stale`;
+4. both exact and equal → `current`.
+
+Completeness is checked before the hashes because an incomplete snapshot's hash
+is not an exact description of the code: two partial captures can cover
+different sets of files and hash differently without anybody having edited
+anything. Reading that difference as `stale` would be a claim — "your code
+moved" — derived from evidence that cannot support it, and would send an
+operator to re-capture when the real problem is a file nobody can read.
+
+The same five states are what a completed round reports, in one
+`subjectAfter` field rather than a pair of booleans. Two booleans express four
+combinations, two of them meaningless, and leave every reader to reconstruct the
+state machine — which is exactly how `incomplete` came to be reported as
+`stale`. Only `current` puts a result in force.
+
+### Where the dispatch boundary is
+
+Everything that can refuse without an external effect happens first, and the
+last of those refusals is a typed preflight: `ExternalCodeReviewer.availability()`
+answers whether a call can be made at all. The order is
+
+> checkout identity → unresolved-round check → subject identity → reviewer
+> capability → **availability preflight** → *(boundary)* → round row → dispatch
+
+A refusal above the boundary is proof that nothing external happened, so it
+leaves no round row to reconcile; a failure below it is not proof of anything and
+leaves the round unresolved, blocking an automatic retry. That distinction is
+carried by an explicit contract rather than inferred from whatever exception a
+`reviewCode` call happens to throw — guessing between "no provider is
+configured" and "the call went out and its answer was lost" from an exception
+type is how a provably local refusal came to leave a `reviewing` row behind.
+
+The reviewer is handed the **task worktree**, not the project checkout, because
+that is where the snapshot came from; pointing it at the project root would hand
+it a different working tree that merely shares a repository. And because a
+reviewer that reads only committed refs cannot see a subject containing
+uncommitted work, `ExternalCodeReviewer` declares
+`readsUncommittedWorktreeState`, defaulting to false — such a subject is refused
+rather than dispatched, since the failure it prevents is not a worse review but a
+confident verdict about different code.
+
+An answer must also attest what it read: `ExternalCodeReviewRound` carries
+`reviewedSubjectSha256`, and a result that does not match the dispatched subject
+— or that omits the attestation — is refused, leaving the round unresolved with
+no findings. `readsUncommittedWorktreeState` is a promise about a reviewer's
+general behaviour; attestation is evidence about this particular answer, and only
+the second catches a reviewer that read the right worktree at the wrong moment or
+an answer that arrived for another round. An INT-D-B adapter that declares the
+capability must therefore compute and return the same snapshot hash; the boolean
+alone is not sufficient.
+
+Attestation says what an answer read; it does not say which round the answer
+belongs to. Those come apart, because several rounds legitimately share one
+repository, branch, base, head and subject hash — reviewing the same code twice
+is the normal case — so a subject describes a round no more uniquely than a
+street name describes a house. `ExternalCodeReviewer` therefore works in terms
+of an `ExternalCodeRoundLocator`: the provider it lives at, plus that provider's
+own session and round identity, opaque here. The provider is part of the name
+rather than context around it, because session and round ids are unique only
+inside one provider's namespace — and the configured reviewer can genuinely be a
+different one by the time recovery runs, which is exactly when an unresolved
+round is waiting. Reconciliation compares the recorded provider against the
+reviewer it is about to ask, and refuses rather than asking a stranger a
+question that it might answer.
+
+The order matters more than the type. `beginRound` opens or reserves the round
+at the provider and must not consume one; its locator is written into that
+specific durable row **before** the non-idempotent `reviewCode` dispatch, so a
+crash afterwards leaves a round that can be named rather than one that can only
+be described. `reviewCode` and `roundStatus` both take the locator, answers echo
+it back, and a result whose locator is not the dispatched one is refused with the
+round left unresolved — a round with no recorded locator can never be settled by
+recovery at all.
+
+Because the locator is what an answer is checked against, the answer may not
+restate it: the completion transaction writes the verdict, the findings and the
+provider's own reporting, and deliberately leaves all three locator columns
+alone. Letting a result rewrite the identity it was matched on would make the
+check circular, and a provider that merely omitted a field would blank part of a
+locator on an otherwise good round. The database holds the same invariant from
+below — a `CHECK` that the three columns are all present and non-empty or all
+null, so half a locator cannot exist, and a partial `UNIQUE` index so two local
+rounds can never claim one provider round and both accept the same recovered
+answer. Both halves of the locator are validated for shape before the dispatch
+that depends on them, not when the recovery that needs them finally runs. Without that, "what happened to the round for this subject?" is
+a question with more than one right answer, and whichever came back would be
+written into whichever row was still open: another round's verdict, filed as
+this round's evidence.
+
+An answer that lists the same finding twice is folded to one before the
+completion transaction, because a provider repeating itself is not describing
+two defects and must not collide on `UNIQUE (finding_id, round_id)` and discard a
+real review. But the fingerprint deliberately excludes `gating` and `fix`, so two
+entries can share an identity while disagreeing about whether the defect gates
+the round — there is no honest way to choose, and choosing silently would record
+a gating decision the reviewer never made, so that answer is refused as the
+contradiction it is. `newFindings` and `repeatedFindings` count distinct
+findings, not array entries.
+
+`CodeReviewService` writes the round row before the reviewer call leaves the
+process, so a crash between dispatch and answer leaves durable intent rather
+than silence. Completion is one transaction: the round status, every finding and
+every occurrence are written together or not at all, because a `completed` round
+holding only the findings that happened to be written before something threw
+would under-report a review that really finished, and nothing downstream could
+tell. A lost answer stays `reviewing`, and `interrupted` marks a round
+that demonstrably went out and vanished; neither authorises an automatic repeat,
+because a non-idempotent call needs positive evidence that dispatching again
+repeats nothing, and neither state supplies it. A malformed verdict, an
+oversized finding list, a provider refusal or credential-shaped reviewer prose
+all leave the round unresolved with its reason recorded — never `completed`.
+
+`codeReview:reconcile` is how a round that went out and lost its answer is
+settled, and it is read-only by contract: `roundStatus` never starts a review.
+It distinguishes four outcomes, and the distinctions are the point. `completed`
+applies the result, but only after both the locator and the subject attestation
+match. `running` leaves the round exactly where it was, since a second dispatch
+would certainly double a call still in flight. `not_started` is the one answer
+that releases the round, because it is positive evidence that nothing was
+consumed — and it closes the round rather than re-dispatching, since recovery
+reads and a person decides what happens next. `unknown` changes nothing and
+records a bounded, redacted reason: no answer is not evidence that no review
+ran, and treating it as such is precisely how a non-idempotent call gets made
+twice.
+
+A finding keeps its stable identity and history across rounds, while
+`code_review_finding_occurrences` keeps what each individual round said about it
+— severity, gating, fix, provider and role. The two genuinely diverge: a later
+round can re-raise the same defect without gating it, or suggest a different
+remedy, and folding that into the stable row would rewrite what an earlier round
+said.
+
+Deduplication is equality, never similarity. The fingerprint covers provider,
+role, category, severity, file, line and normalised title and body, scoped to
+the subject hash; case and whitespace are normalised because rewrapping a line
+is not a different defect, and nothing else is. That direction is deliberate:
+merging two distinct defects hides one for good, while failing to merge a repeat
+costs one extra line to read. A materially rewritten finding is a new record,
+because it says something the previous one did not and inheriting its decision
+would answer a question nobody asked.
+
+Decisions are `accept`, `reject` or `resolved` — the third is distinct because
+"legitimate and will be addressed" and "no longer applies" are different facts,
+and collapsing them loses the difference between an outstanding commitment and
+finished work. Every decision stores a reason, actor, source, timestamp and the
+finding revision it was taken against. Two guards apply: the finding must belong
+to the task's current subject, so an answer written against older code is never
+carried forward onto newer code the operator was not shown; and the write is
+conditional on the finding revision, so a stale screen cannot overwrite a newer
+answer. Reviewer prose is data throughout — stored, hashed and shown, never
+interpreted as an instruction.
+
+`codeReview:get` presents findings as **live** only while the subject is
+provably `current`. Under `stale`, `unknown` or `incomplete` the live list is
+empty and everything remains visible under `historicalFindings`, because a
+finding about code the task no longer has — or code nobody could read — is not a
+live statement about anything, and presenting it as one is how a stale review
+comes to be acted on. Nothing is ever deleted.
+
+The operational IPC surface is `codeReview:get`, `codeReview:capture`,
+`codeReview:reconcile` and `codeReview:decide`, all `.strict()`. They accept identifiers, a revision and a
+typed decision, and refuse an executable path, repository or worktree path, base
+ref, raw diff, scope text, prompt or provider configuration. The scope a
+reviewer would be given is built in the main process from durable state. There
+is deliberately no `codeReview:review` channel yet: a channel that existed and
+always failed would be a worse answer than one that does not exist.
+
 Executable discovery is explicit
 ([`executable-locator.ts`](../src/main/adapters/process/executable-locator.ts)):
 configured path → `PATH` (honouring `PATHEXT`) → well-known Windows locations.
@@ -955,8 +1232,8 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1345 deterministic tests plus one routine automated Electron acceptance
-journey, none of which contact a model or remote service. A separate opt-in live
+1475 deterministic tests in 55 files, plus one routine automated Electron
+acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.
 

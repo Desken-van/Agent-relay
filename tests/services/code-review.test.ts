@@ -1,0 +1,1816 @@
+/**
+ * The lifecycle: durable intent, stale results, and decisions that stay put.
+ *
+ * The reviewer and the Git snapshot are fakes, deliberately: what is under test
+ * is what Agent Relay writes and refuses, and a real provider would make the
+ * ordering non-deterministic without proving anything extra. The snapshot's own
+ * fidelity is proved separately, against a real repository.
+ */
+
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { SqliteCodeReviewRepository } from '../../src/main/db/repositories/code-review-repository';
+import {
+  CodeReviewClaims,
+  CodeReviewService,
+  type CodeReviewDeps,
+  type CodeReviewRoundOutcome
+} from '../../src/main/services/code-review';
+import { UnconfiguredCodeReviewer } from '../../src/main/services/code-review-provider';
+import type {
+  CodeReviewerAvailability,
+  ExternalCodeRoundLocator,
+  ExternalCodeRoundStatus,
+  RawCodeSnapshotFingerprint,
+  CodeSnapshotRequest,
+  CodeSnapshotSource,
+  ExternalCodeReviewer,
+  ExternalCodeReviewRound,
+  ExternalCodeReviewSubject,
+  RawCheckoutIdentity,
+  RawCodeSnapshot,
+  RawCodeSnapshotFile
+} from '../../src/main/ports';
+import {
+  nodeSnapshotFileOps,
+  type SnapshotFileOps
+} from '../../src/main/adapters/git/git-code-snapshot';
+import type { ProviderCodeFinding } from '../../src/shared/domain/code-review';
+import { createHarness, type Harness } from '../helpers/harness';
+
+const BASE = '1'.repeat(40);
+
+/**
+ * A snapshot source whose answer the test controls file by file.
+ *
+ * `content` is what would be on disk; the fake writes it into a temporary
+ * worktree so the service's own file reading and hashing are exercised rather
+ * than stubbed.
+ */
+class FakeSnapshotSource implements CodeSnapshotSource {
+  readonly calls: CodeSnapshotRequest[] = [];
+  readonly checkoutCalls: string[] = [];
+  headCommit = '2'.repeat(40);
+  files: RawCodeSnapshotFile[] = [];
+  truncated = false;
+  hasUncommittedState = false;
+  error: Error | null = null;
+  /**
+   * What the stability fingerprint reports, per call.
+   *
+   * The default is a constant, so an ordinary capture is stable. A test that
+   * wants to model the tree moving mid-capture returns a different value on the
+   * later reads.
+   */
+  fingerprints: RawCodeSnapshotFingerprint[] = [];
+  readonly fingerprintCalls: number[] = [];
+  /** What `describeCheckout` reports, keyed by the path it is asked about. */
+  checkouts = new Map<string, RawCheckoutIdentity>();
+  defaultCheckout: RawCheckoutIdentity = {
+    commonDir: 'C:/repo/.git',
+    branch: 'agent/task-1',
+    detached: false
+  };
+
+  async describeCheckout(worktreePath: string): Promise<RawCheckoutIdentity> {
+    this.checkoutCalls.push(worktreePath);
+    return this.checkouts.get(worktreePath) ?? this.defaultCheckout;
+  }
+
+  private nextFingerprint(): RawCodeSnapshotFingerprint {
+    const index = this.fingerprintCalls.length;
+    this.fingerprintCalls.push(index);
+    return (
+      this.fingerprints[index] ??
+      this.fingerprints[this.fingerprints.length - 1] ?? {
+        headCommit: this.headCommit,
+        branch: 'agent/task-1',
+        status: '',
+        changeSet: ''
+      }
+    );
+  }
+
+  async fingerprint(): Promise<RawCodeSnapshotFingerprint> {
+    if (this.error) throw this.error;
+    return this.nextFingerprint();
+  }
+
+  async capture(request: CodeSnapshotRequest): Promise<RawCodeSnapshot> {
+    this.calls.push(request);
+    if (this.error) throw this.error;
+    return {
+      baseCommit: BASE,
+      headCommit: this.headCommit,
+      branch: 'agent/task-1',
+      files: this.files,
+      truncated: this.truncated,
+      hasUncommittedState: this.hasUncommittedState,
+      fingerprint: this.nextFingerprint()
+    };
+  }
+}
+
+class FakeCodeReviewer implements ExternalCodeReviewer {
+  readsUncommittedWorktreeState = true;
+  /** Who this reviewer is. Tests change it to model a reconfigured build. */
+  providerId = 'coai';
+  /** What the typed preflight answers. Tests make it refuse. */
+  available: CodeReviewerAvailability = { available: true, reason: null };
+  readonly availabilityCalls: number[] = [];
+  /**
+   * What the reviewer attests it read.
+   *
+   * `undefined` means "echo the dispatched subject", which is what an honest
+   * adapter does; a test sets it to something else to forge a mismatch.
+   */
+  attest: string | null | undefined = undefined;
+  readonly calls: {
+    locator: ExternalCodeRoundLocator;
+    subject: ExternalCodeReviewSubject;
+    scopeText: string;
+  }[] = [];
+  /**
+   * The locators `beginRound` hands out, in order.
+   *
+   * A fresh one per call by default, because a real provider opens a new round
+   * each time; a test that wants two rounds to collide sets them explicitly.
+   */
+  locators: ExternalCodeRoundLocator[] = [];
+  readonly beginCalls: ExternalCodeReviewSubject[] = [];
+  beginError: Error | null = null;
+  /** Runs at the moment the round is opened, before a locator is returned. */
+  onBegin: (() => void) | null = null;
+  /**
+   * What the answer claims to be, when it is not simply the dispatched locator.
+   *
+   * `undefined` means "echo the locator it was called with", which is what an
+   * honest adapter does; a test sets it to forge an answer from another round.
+   */
+  answerLocator: ExternalCodeRoundLocator | undefined = undefined;
+  /** Runs at the moment the call is dispatched, before it answers. */
+  onCall: (() => void) | null = null;
+  error: Error | null = null;
+  answer: ExternalCodeReviewRound = {
+    locator: { providerId: 'coai', sessionId: 'session-1', roundId: 'round-1' },
+    reviewedSubjectSha256: null,
+    verdict: 'revise',
+    gatingCount: 1,
+    threshold: 0,
+    reviewers: 'all 3 reviewers answered',
+    findings: [],
+    instruction: 'resolve every finding',
+    serverName: 'coai-mcp',
+    serverVersion: '1.2.3',
+    tokensIn: 100,
+    tokensOut: 20
+  };
+
+  /** What the read-only round read-back reports. */
+  roundStatusAnswer: ExternalCodeRoundStatus = { kind: 'unknown', reason: 'not configured' };
+  /**
+   * What each read-back was asked about.
+   *
+   * Both halves are recorded because the point of the locator is that the
+   * subject alone is not enough to name a round.
+   */
+  readonly roundStatusCalls: {
+    locator: ExternalCodeRoundLocator;
+    subject: ExternalCodeReviewSubject;
+  }[] = [];
+
+  async availability(): Promise<CodeReviewerAvailability> {
+    this.availabilityCalls.push(this.calls.length);
+    return this.available;
+  }
+
+  async beginRound(subject: ExternalCodeReviewSubject): Promise<ExternalCodeRoundLocator> {
+    this.beginCalls.push(subject);
+    this.onBegin?.();
+    if (this.beginError) throw this.beginError;
+    const index = this.beginCalls.length - 1;
+    return (
+      this.locators[index] ?? {
+        providerId: this.providerId,
+        sessionId: `session-${index + 1}`,
+        roundId: `round-${index + 1}`
+      }
+    );
+  }
+
+  async roundStatus(
+    locator: ExternalCodeRoundLocator,
+    subject: ExternalCodeReviewSubject
+  ): Promise<ExternalCodeRoundStatus> {
+    this.roundStatusCalls.push({ locator, subject });
+    return this.roundStatusAnswer;
+  }
+
+  async reviewCode(
+    locator: ExternalCodeRoundLocator,
+    subject: ExternalCodeReviewSubject,
+    scopeText: string
+  ): Promise<ExternalCodeReviewRound> {
+    this.calls.push({ locator, subject, scopeText });
+    this.onCall?.();
+    if (this.error) throw this.error;
+    return {
+      ...this.answer,
+      locator: this.answerLocator ?? locator,
+      reviewedSubjectSha256:
+        this.attest === undefined ? subject.subjectSha256 : this.attest
+    };
+  }
+}
+
+function finding(overrides: Partial<ProviderCodeFinding> = {}): ProviderCodeFinding {
+  return {
+    severity: 'major',
+    category: 'reliability',
+    gating: true,
+    title: 'The retry is ambiguous',
+    body: 'A lost response may repeat work.',
+    fix: 'Persist the intent before calling out.',
+    file: 'src/service.ts',
+    line: 42,
+    provider: 'codex',
+    role: 'SecurityReliability',
+    ...overrides
+  };
+}
+
+const harnesses: Harness[] = [];
+
+afterEach(() => {
+  for (const harness of harnesses.splice(0)) harness.dispose();
+});
+
+function setup() {
+  const harness = createHarness();
+  harnesses.push(harness);
+  const reviews = new SqliteCodeReviewRepository(harness.db, harness.clock);
+  const snapshots = new FakeSnapshotSource();
+  const reviewer = new FakeCodeReviewer();
+  const claims = new CodeReviewClaims();
+  const build = (extra: Partial<CodeReviewDeps> = {}): CodeReviewService =>
+    new CodeReviewService({
+      tasks: harness.tasks,
+      projects: harness.projects,
+      reviews,
+      snapshots,
+      reviewer,
+      claims,
+      clock: harness.clock,
+      ids: harness.ids,
+      ...extra
+    });
+
+  const project = harness.createProject();
+  const task = harness.createTask(project.id, {
+    status: 'READY_FOR_IMPLEMENTATION',
+    worktreePath: harness.worktreesRoot,
+    branchName: 'agent/task-1',
+    baseBranch: 'main'
+  });
+  // The worktree and the project share one repository by default, and the
+  // worktree sits on the branch the task records. Tests that care make them
+  // disagree.
+  snapshots.checkouts.set(project.localPath, {
+    commonDir: 'C:/repo/.git',
+    branch: 'main',
+    detached: false
+  });
+
+  return { harness, reviews, snapshots, reviewer, claims, service: build(), build, task };
+}
+
+async function reviewOnce(value: ReturnType<typeof setup>): Promise<CodeReviewRoundOutcome> {
+  await value.service.captureSubject(value.task.id);
+  return value.service.review(value.task.id);
+}
+
+describe('the code-review subject', () => {
+  it('captures without staging, committing or otherwise touching the worktree', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+
+    // The only Git contact is the read-only snapshot source; nothing in this
+    // service can reach a mutating command. The fake Git adapter the harness
+    // installs records every worktree it was asked to create or commit to.
+    //
+    // Twice, because an exact snapshot is digested and then digested again to
+    // prove the bytes did not move underneath it. Both passes are reads.
+    expect(value.snapshots.calls).toHaveLength(2);
+    expect(value.harness.git.createdWorktrees).toHaveLength(0);
+    expect(value.harness.git.commits).toHaveLength(0);
+    expect(value.harness.git.pushes).toHaveLength(0);
+  });
+
+  it('is idempotent for an unchanged working state', async () => {
+    const value = setup();
+    const first = await value.service.captureSubject(value.task.id);
+    const second = await value.service.captureSubject(value.task.id);
+
+    expect(second.id).toBe(first.id);
+    expect(second.subjectSha256).toBe(first.subjectSha256);
+    expect(value.reviews.listRounds(value.task.id)).toHaveLength(0);
+  });
+
+  it('reports a moved head as stale, and an unreadable checkout as unknown', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    expect((await value.service.subjectIdentity(value.task.id)).identity).toBe('current');
+
+    value.snapshots.headCommit = '9'.repeat(40);
+    expect((await value.service.subjectIdentity(value.task.id)).identity).toBe('stale');
+
+    // Nothing was compared here, so nothing is known. Calling it stale would
+    // send an operator to capture again, which is what just failed.
+    value.snapshots.error = new Error('the worktree is gone');
+    expect((await value.service.subjectIdentity(value.task.id)).identity).toBe('unknown');
+  });
+
+  it('has no subject to judge before one is captured', async () => {
+    const value = setup();
+    expect((await value.service.subjectIdentity(value.task.id)).identity).toBe('no_subject');
+  });
+});
+
+describe('the code-review round', () => {
+  it('writes durable intent before the reviewer is called', async () => {
+    const value = setup();
+    const subject = await value.service.captureSubject(value.task.id);
+
+    // Asserted at the moment of dispatch, not afterwards: a row written only
+    // once the answer came back would leave a crash window in which a
+    // non-idempotent call had run and nothing recorded that it had.
+    value.reviewer.onCall = () => {
+      const round = value.reviews.latestRound(value.task.id);
+      expect(round).not.toBeNull();
+      expect(round?.status).toBe('reviewing');
+      expect(round?.subjectSha256).toBe(subject.subjectSha256);
+      expect(round?.startedAt).not.toBeNull();
+    };
+
+    const outcome = await value.service.review(value.task.id);
+    expect(value.reviewer.calls).toHaveLength(1);
+    expect(outcome.round.status).toBe('completed');
+    expect(outcome.round.verdict).toBe('revise');
+    expect(outcome.round.tokensIn).toBe(100);
+  });
+
+  it('leaves a lost answer as an unknown outcome and never repeats it', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.error = new Error('the reviewer never answered');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+
+    const round = value.reviews.latestRound(value.task.id);
+    expect(round?.status).toBe('reviewing');
+    expect(round?.lastError).toMatch(/never answered/);
+
+    // The call left this process and only its answer was lost. A second
+    // dispatch is refused, and marking it interrupted does not unlock one.
+    value.reviewer.error = null;
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+    value.service.markInterrupted(value.task.id, round!.id, 'no answer arrived');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+    expect(value.reviewer.calls).toHaveLength(1);
+  });
+
+  it('refuses a second round while one is in flight, from any service instance', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+
+    let concurrent: Promise<unknown> | null = null;
+    value.reviewer.onCall = () => {
+      // A second service built from the same container shares the claim, so a
+      // direct call cannot slip past the one already running.
+      concurrent = expect(value.build().review(value.task.id)).rejects.toMatchObject({
+        code: 'BUSY'
+      });
+    };
+
+    await value.service.review(value.task.id);
+    await concurrent;
+    expect(value.reviewer.calls).toHaveLength(1);
+  });
+
+  it('refuses to review without a subject that matches the current code', async () => {
+    const value = setup();
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/no captured code-review subject/i);
+
+    await value.service.captureSubject(value.task.id);
+    value.snapshots.headCommit = '9'.repeat(40);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/no captured code-review subject/i);
+    expect(value.reviewer.calls).toHaveLength(0);
+    expect(value.reviews.listRounds(value.task.id)).toHaveLength(0);
+  });
+
+  it('keeps a result whose code changed underneath as history, not as a live one', async () => {
+    const value = setup();
+    const subject = await value.service.captureSubject(value.task.id);
+    value.reviewer.answer = { ...value.reviewer.answer, findings: [finding()] };
+    // The working tree moves while the reviewer is thinking.
+    value.reviewer.onCall = () => {
+      value.snapshots.headCommit = '9'.repeat(40);
+    };
+
+    const outcome = await value.service.review(value.task.id);
+
+    expect(outcome.subjectAfter).toBe('stale');
+    expect(outcome.round.status).toBe('completed');
+    expect(outcome.round.lastError).toMatch(/changed while the round was running/i);
+    // Findings are recorded against the subject that was actually read, never
+    // re-targeted onto the state the code has since reached.
+    expect(outcome.findings[0]?.subjectSha256).toBe(subject.subjectSha256);
+    expect(value.reviews.listFindingsForSubject(value.task.id, subject.subjectSha256)).toHaveLength(1);
+  });
+
+  it('does not turn a malformed, oversized or refused answer into a completed review', async () => {
+    const cases: { name: string; answer: Partial<ExternalCodeReviewRound>; error: RegExp }[] = [
+      {
+        name: 'an unknown verdict',
+        answer: { verdict: 'looks-fine-to-me' },
+        error: /invalid|expected/i
+      },
+      {
+        name: 'a finding with no severity the gate understands',
+        answer: { findings: [{ ...finding(), severity: 'catastrophic' } as never] },
+        error: /invalid|expected/i
+      },
+      {
+        name: 'more findings than the ceiling allows',
+        answer: { findings: Array.from({ length: 513 }, () => finding()) },
+        error: /too big|at most|expected/i
+      },
+      {
+        name: 'credential-shaped reviewer text',
+        answer: {
+          findings: [finding({ body: 'Use api_key = "AKIA1234567890ABCDEF" for the retry.' })]
+        },
+        error: /credential-shaped/i
+      }
+    ];
+
+    for (const scenario of cases) {
+      const value = setup();
+      await value.service.captureSubject(value.task.id);
+      value.reviewer.answer = { ...value.reviewer.answer, ...scenario.answer };
+
+      await expect(value.service.review(value.task.id)).rejects.toThrow(scenario.error);
+
+      // The round stays unresolved and carries the reason. It is emphatically
+      // not `completed`, because nothing usable came back.
+      const round = value.reviews.latestRound(value.task.id);
+      expect(round?.status, scenario.name).toBe('reviewing');
+      expect(round?.verdict).toBeNull();
+      expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+    }
+  });
+
+  it('refuses to run at all when no provider adapter is configured', async () => {
+    const value = setup();
+    const unconfigured = new CodeReviewService({
+      tasks: value.harness.tasks,
+      projects: value.harness.projects,
+      reviews: value.reviews,
+      snapshots: value.snapshots,
+      reviewer: new UnconfiguredCodeReviewer(),
+      claims: new CodeReviewClaims(),
+      clock: value.harness.clock,
+      ids: value.harness.ids
+    });
+    await value.service.captureSubject(value.task.id);
+
+    // "No provider is configured" must never read as "the review found
+    // nothing". It must not read as "a call went out" either: this refusal
+    // happens before anything leaves the process, so it leaves no round to
+    // reconcile. The earlier version of this test asserted a `reviewing` row
+    // here, which recorded a dispatch that provably never occurred.
+    await expect(unconfigured.review(value.task.id)).rejects.toMatchObject({
+      code: 'TOOL_MISSING'
+    });
+    expect(value.reviews.listRounds(value.task.id)).toHaveLength(0);
+  });
+});
+
+/**
+ * What INT-D-A-R1 fixed: a snapshot that was not exact, a checkout that was not
+ * the task's, an answer written half-way, and staleness inferred from silence.
+ */
+describe('code-review exactness, checkout identity and atomicity', () => {
+  it('refuses to review an incomplete subject rather than calling it exact', async () => {
+    const value = setup();
+    // One file the reader cannot digest. The capture still succeeds and is
+    // still stored — it says what was and was not seen — but it is not an exact
+    // statement of the code, so nothing may be reviewed against it.
+    value.snapshots.files = [
+      { path: 'src/one.ts', change: 'modified', absolutePath: join(value.harness.worktreesRoot, 'missing.ts') }
+    ];
+    const subject = await value.service.captureSubject(value.task.id);
+
+    expect(subject.complete).toBe(false);
+    expect((await value.service.subjectIdentity(value.task.id)).identity).toBe('incomplete');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/not an exact statement/i);
+    expect(value.reviewer.calls).toHaveLength(0);
+    expect(value.reviews.listRounds(value.task.id)).toHaveLength(0);
+  });
+
+  it('treats a truncated change set as incomplete rather than as the whole story', async () => {
+    const value = setup();
+    value.snapshots.truncated = true;
+    const subject = await value.service.captureSubject(value.task.id);
+
+    expect(subject.truncated).toBe(true);
+    expect(subject.complete).toBe(false);
+    expect((await value.service.subjectIdentity(value.task.id)).identity).toBe('incomplete');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/not an exact statement/i);
+  });
+
+  it('refuses to dispatch when the worktree is not the one the task records', async () => {
+    const cases: { name: string; checkout: RawCheckoutIdentity }[] = [
+      {
+        name: 'another repository',
+        checkout: { commonDir: 'C:/somewhere-else/.git', branch: 'agent/task-1', detached: false }
+      },
+      {
+        name: 'a detached HEAD',
+        checkout: { commonDir: 'C:/repo/.git', branch: null, detached: true }
+      },
+      {
+        name: 'a different branch',
+        checkout: { commonDir: 'C:/repo/.git', branch: 'agent/other', detached: false }
+      }
+    ];
+
+    for (const scenario of cases) {
+      const value = setup();
+      await value.service.captureSubject(value.task.id);
+      value.snapshots.checkouts.set(value.harness.worktreesRoot, scenario.checkout);
+
+      await expect(value.service.review(value.task.id), scenario.name).rejects.toMatchObject({
+        code: 'WORKTREE_INVALID'
+      });
+      // Refused before anything durable and before the provider: no round row,
+      // no call, nothing to reconcile afterwards.
+      expect(value.reviews.listRounds(value.task.id), scenario.name).toHaveLength(0);
+      expect(value.reviewer.calls, scenario.name).toHaveLength(0);
+    }
+  });
+
+  it('hands the reviewer the task worktree, not the project checkout', async () => {
+    const value = setup();
+    const subject = await value.service.captureSubject(value.task.id);
+    await value.service.review(value.task.id);
+
+    const sent = value.reviewer.calls[0]?.subject;
+    // The snapshot came from the worktree and includes its uncommitted state.
+    // Pointing the reviewer at the project root would hand it a different
+    // working tree that merely shares a repository.
+    expect(sent?.worktreePath).toBe(value.harness.worktreesRoot);
+    expect(sent?.worktreePath).not.toBe(value.harness.projects.findById(value.task.projectId)?.localPath);
+    expect(sent?.subjectSha256).toBe(subject.subjectSha256);
+    expect(sent?.headCommit).toBe(subject.headCommit);
+    expect(sent?.baseRef).toBe(subject.baseCommit);
+  });
+
+  it('refuses to send uncommitted work to a reviewer that reads only commits', async () => {
+    const value = setup();
+    value.snapshots.hasUncommittedState = true;
+    value.reviewer.readsUncommittedWorktreeState = false;
+    const subject = await value.service.captureSubject(value.task.id);
+
+    expect(subject.hasUncommittedState).toBe(true);
+    // Dispatching would not produce a worse review — it would produce a
+    // confident verdict about different code.
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/reads only committed refs/i);
+    expect(value.reviewer.calls).toHaveLength(0);
+    expect(value.reviews.listRounds(value.task.id)).toHaveLength(0);
+  });
+
+  it('keeps an unreadable check-back as unknown, never as staleness', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    // The checkout becomes unreadable while the round is running, so nothing
+    // can be compared. Deriving staleness from a null hash would file this as
+    // proof the code changed — a claim from the absence of evidence.
+    value.reviewer.onCall = () => {
+      value.snapshots.error = new Error('the worktree is gone');
+    };
+
+    const outcome = await value.service.review(value.task.id);
+
+    expect(outcome.subjectAfter).toBe('unknown');
+    expect(outcome.round.lastError).toMatch(/could not be read back/i);
+    expect(outcome.round.lastError).not.toMatch(/changed while the round was running/i);
+  });
+
+  it('writes the whole round or none of it', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.answer = {
+      ...value.reviewer.answer,
+      findings: [finding(), finding({ title: 'The second one', line: 43 })]
+    };
+
+    // The second finding's insert fails. Without one transaction the round
+    // would be left `completed` while carrying only the first — a row saying a
+    // review finished, under-reporting what it found.
+    let seen = 0;
+    const realUpsert = value.reviews.upsertFinding.bind(value.reviews);
+    value.reviews.upsertFinding = ((record: Parameters<typeof realUpsert>[0]) => {
+      seen += 1;
+      if (seen === 2) throw new Error('the second finding could not be written');
+      return realUpsert(record);
+    }) as typeof value.reviews.upsertFinding;
+
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/second finding/);
+
+    const round = value.reviews.latestRound(value.task.id);
+    expect(round?.status).not.toBe('completed');
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+  });
+
+  it('records what each round said beside the finding it belongs to', async () => {
+    const value = setup();
+    value.reviewer.answer = { ...value.reviewer.answer, findings: [finding()] };
+    const first = await reviewOnce(value);
+
+    // The same defect, no longer counted against the gate and with a different
+    // remedy suggested. Severity, category, location and prose are unchanged,
+    // so the fingerprint matches and this is a repeat rather than a new record
+    // — which is exactly the case where the round-specific facts would be lost
+    // if they were folded into the stable row.
+    value.reviewer.answer = {
+      ...value.reviewer.answer,
+      findings: [finding({ gating: false, fix: 'A different remedy.' })]
+    };
+    const second = await value.service.review(value.task.id);
+
+    // A different body would be a different defect, so this repeat shares the
+    // stable row — and the two rounds' own words are both still readable.
+    const stable = second.findings[0]!;
+    const occurrences = value.reviews.listOccurrences(stable.id);
+    expect(occurrences).toHaveLength(2);
+    expect(occurrences[0]).toMatchObject({
+      gating: true,
+      fix: 'Persist the intent before calling out.',
+      roundId: first.round.id
+    });
+    expect(occurrences[1]).toMatchObject({
+      gating: false,
+      fix: 'A different remedy.',
+      roundId: second.round.id
+    });
+    // One stable row, two statements about it.
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(1);
+    expect(stable.timesReported).toBe(2);
+    expect(value.reviews.listOccurrencesForRound(second.round.id)).toHaveLength(1);
+  });
+
+  it('refuses a finding whose location escapes the repository', async () => {
+    for (const file of [
+      'C:\\Windows\\System32\\drivers\\etc\\hosts',
+      '/etc/passwd',
+      '../../../etc/passwd',
+      'src/../../outside.ts',
+      '//host/share/file.ts',
+      'src\\windows\\path.ts'
+    ]) {
+      const value = setup();
+      await value.service.captureSubject(value.task.id);
+      value.reviewer.answer = {
+        ...value.reviewer.answer,
+        findings: [{ ...finding(), file } as never]
+      };
+
+      // Reviewer output is data from outside, and a path is the field something
+      // downstream will eventually open. Refused, not sanitised.
+      await expect(value.service.review(value.task.id), file).rejects.toThrow(
+        /invalid|repository-relative|expected/i
+      );
+      expect(value.reviews.listFindings(value.task.id), file).toHaveLength(0);
+      expect(value.reviews.latestRound(value.task.id)?.status, file).toBe('reviewing');
+    }
+  });
+});
+
+/**
+ * What a screen would be told.
+ *
+ * Assembled here rather than in the renderer, and asserted here because the
+ * distinction it encodes — live versus historical — is the difference between
+ * an operator acting on a finding about the code they have and acting on one
+ * about code that is gone.
+ */
+/**
+ * What INT-D-A-R2 fixed: an unreadable file reported as a code change, a
+ * provider repeating itself taken as a contradiction of the database, and a
+ * refusal that never left the process leaving a round behind as if it had.
+ */
+describe('code-review incompleteness, duplicates and the dispatch boundary', () => {
+  it('reports an incomplete check-back as incomplete, never as proof the code changed', async () => {
+    const value = setup();
+    // An exact subject is captured first, so there is something precise to
+    // compare against.
+    const subject = await value.service.captureSubject(value.task.id);
+    expect(subject.complete).toBe(true);
+
+    // While the round runs, one of the same files stops being readable. The
+    // recapture therefore covers a different set of files and hashes
+    // differently — but that difference is an artefact of the failed read, not
+    // evidence that anybody edited anything.
+    value.reviewer.onCall = () => {
+      value.snapshots.files = [
+        {
+          path: 'src/one.ts',
+          change: 'modified',
+          absolutePath: join(value.harness.worktreesRoot, 'not-there.ts')
+        }
+      ];
+    };
+
+    const outcome = await value.service.review(value.task.id);
+
+    expect(outcome.subjectAfter).toBe('incomplete');
+    expect(outcome.round.lastError).toMatch(/could not be fully digested/i);
+    expect(outcome.round.lastError).toMatch(/not evidence that the code changed/i);
+    expect(outcome.round.lastError).not.toMatch(/changed while the round was running/i);
+    expect((await value.service.subjectIdentity(value.task.id)).identity).toBe('incomplete');
+  });
+
+  it('puts incompleteness ahead of the hash, because a partial hash proves nothing', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+
+    // A different file list AND unreadable content. The hash differs, but the
+    // honest answer is that nothing exact was compared.
+    value.snapshots.files = [
+      {
+        path: 'src/other.ts',
+        change: 'added',
+        absolutePath: join(value.harness.worktreesRoot, 'missing.ts')
+      }
+    ];
+    const identity = await value.service.subjectIdentity(value.task.id);
+
+    expect(identity.identity).toBe('incomplete');
+    expect(identity.currentSha256).not.toBe(identity.stored?.subjectSha256);
+  });
+
+  it('treats one finding reported twice as one finding', async () => {
+    const value = setup();
+    value.reviewer.answer = {
+      ...value.reviewer.answer,
+      findings: [finding(), finding()]
+    };
+    const outcome = await reviewOnce(value);
+
+    // A provider listing the same defect twice is not describing two defects,
+    // and it must not blow up the completion transaction either.
+    expect(outcome.round.status).toBe('completed');
+    expect(outcome.newFindings).toBe(1);
+    expect(outcome.repeatedFindings).toBe(0);
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(1);
+    expect(value.reviews.listOccurrencesForRound(outcome.round.id)).toHaveLength(1);
+  });
+
+  it('refuses an answer that reports one finding twice with different details', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    // The same fingerprint — `gating` and `fix` are deliberately outside it —
+    // with contradictory round-specific facts. There is no honest way to pick
+    // one, and picking silently would record a gating decision nobody made.
+    value.reviewer.answer = {
+      ...value.reviewer.answer,
+      findings: [finding({ gating: true }), finding({ gating: false, fix: 'Something else.' })]
+    };
+
+    await expect(value.service.review(value.task.id)).rejects.toMatchObject({
+      code: 'PARSE_FAILED'
+    });
+
+    const round = value.reviews.latestRound(value.task.id);
+    expect(round?.status).toBe('reviewing');
+    expect(round?.verdict).toBeNull();
+    expect(round?.lastError).toMatch(/contradicts itself/i);
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+    expect(value.reviews.listOccurrencesForRound(round!.id)).toHaveLength(0);
+
+    // And the next attempt does not mistake that round for a finished one.
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  it('leaves nothing behind when the reviewer is not available at all', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.available = { available: false, reason: 'No reviewer is configured.' };
+
+    await expect(value.service.review(value.task.id)).rejects.toMatchObject({
+      code: 'TOOL_MISSING'
+    });
+
+    // The refusal is provably local, so it must leave nothing to reconcile:
+    // a `reviewing` row here would claim a call went out that never did.
+    expect(value.reviews.listRounds(value.task.id)).toHaveLength(0);
+    expect(value.reviewer.calls).toHaveLength(0);
+    expect(value.reviewer.availabilityCalls).toEqual([0]);
+  });
+
+  it('asks whether the reviewer can run before it writes the round', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+
+    // Ordering, not just presence: the preflight must be the last question
+    // asked while a refusal is still free.
+    let roundsAtPreflight = -1;
+    const realAvailability = value.reviewer.availability.bind(value.reviewer);
+    value.reviewer.availability = async () => {
+      roundsAtPreflight = value.reviews.listRounds(value.task.id).length;
+      return realAvailability();
+    };
+
+    await value.service.review(value.task.id);
+    expect(roundsAtPreflight).toBe(0);
+    expect(value.reviews.listRounds(value.task.id)).toHaveLength(1);
+  });
+
+  it('keeps the capability refusal on the free side of the boundary too', async () => {
+    const value = setup();
+    value.snapshots.hasUncommittedState = true;
+    value.reviewer.readsUncommittedWorktreeState = false;
+    await value.service.captureSubject(value.task.id);
+
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/reads only committed refs/i);
+    expect(value.reviews.listRounds(value.task.id)).toHaveLength(0);
+    expect(value.reviewer.availabilityCalls).toHaveLength(0);
+  });
+
+  it('still leaves a lost answer unresolved, because that call really went out', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.error = new Error('the reviewer never answered');
+
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+
+    // The other side of the same boundary: past the dispatch, a failure is not
+    // evidence of no effect, so the row stays and blocks an automatic retry.
+    const round = value.reviews.latestRound(value.task.id);
+    expect(round?.status).toBe('reviewing');
+    value.reviewer.error = null;
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  it('rejects an answer that does not attest the subject it was given', async () => {
+    for (const attest of [null, 'f'.repeat(64)]) {
+      const value = setup();
+      await value.service.captureSubject(value.task.id);
+      value.reviewer.answer = { ...value.reviewer.answer, findings: [finding()] };
+      value.reviewer.attest = attest;
+
+      // A capability flag is a promise about a reviewer's habits; attestation
+      // is evidence about this answer. Only the second catches a reviewer that
+      // read the right tree at the wrong moment.
+      await expect(value.service.review(value.task.id)).rejects.toMatchObject({
+        code: 'PARSE_FAILED'
+      });
+
+      const round = value.reviews.latestRound(value.task.id);
+      expect(round?.status).toBe('reviewing');
+      expect(round?.verdict).toBeNull();
+      expect(round?.lastError).toMatch(/did not attest/i);
+      expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+    }
+  });
+
+  it('accepts an answer that attests the exact subject dispatched', async () => {
+    const value = setup();
+    const subject = await value.service.captureSubject(value.task.id);
+    value.reviewer.answer = { ...value.reviewer.answer, findings: [finding()] };
+
+    const outcome = await value.service.review(value.task.id);
+
+    expect(value.reviewer.calls[0]?.subject.subjectSha256).toBe(subject.subjectSha256);
+    expect(outcome.round.status).toBe('completed');
+    expect(outcome.subjectAfter).toBe('current');
+    expect(outcome.findings).toHaveLength(1);
+  });
+});
+
+/**
+ * What INT-D-A-R3 fixed: a lost round that blocked a task forever, a capture
+ * that could hash bytes which never coexisted, and a provider refusal that
+ * leaked its own text.
+ */
+describe('code-review recovery, capture stability and boundary hygiene', () => {
+  async function stranded() {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.error = new Error('the reviewer never answered');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+    value.reviewer.error = null;
+    expect(value.reviews.latestRound(value.task.id)?.status).toBe('reviewing');
+    return value;
+  }
+
+  it('settles a lost round when the provider proves it completed', async () => {
+    const value = await stranded();
+    const subject = value.reviews.latestSubject(value.task.id)!;
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        findings: [finding()],
+        reviewedSubjectSha256: subject.subjectSha256
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    // The round it recovers is the one that was dispatched, not a new one: the
+    // provider was read, never asked to review again.
+    expect(value.reviewer.calls).toHaveLength(1);
+    expect(value.reviewer.roundStatusCalls).toHaveLength(1);
+    expect(outcome.round.status).toBe('completed');
+    expect(outcome.findings).toHaveLength(1);
+    expect(value.reviews.listOccurrencesForRound(outcome.round.id)).toHaveLength(1);
+
+    // And the task is usable again.
+    await expect(value.service.review(value.task.id)).resolves.toBeTruthy();
+  });
+
+  it('leaves a round the provider says is still running exactly where it was', async () => {
+    const value = await stranded();
+    value.reviewer.roundStatusAnswer = { kind: 'running' };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('running');
+    expect(outcome.round.lastError).toMatch(/still running/i);
+    expect(outcome.findings).toHaveLength(0);
+    // Still blocked, and for the right reason: a second dispatch would double a
+    // call that has not finished.
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  it('stays blocked and says why when the provider knows nothing', async () => {
+    const value = await stranded();
+    value.reviewer.roundStatusAnswer = { kind: 'unknown', reason: 'the session is gone' };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('unknown');
+    expect(outcome.round.lastError).toMatch(/could not say what became/i);
+    expect(outcome.round.lastError).toMatch(/session is gone/);
+    // No answer is not evidence that no review ran.
+    expect(outcome.round.lastError).not.toMatch(/did not run|never ran/i);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  it('refuses a recovered result that attests a different subject', async () => {
+    const value = await stranded();
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        findings: [finding()],
+        reviewedSubjectSha256: 'f'.repeat(64)
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('attestation-mismatch');
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+  });
+
+  it('refuses to reconcile a round that is not outstanding', async () => {
+    const value = setup();
+    await reviewOnce(value);
+    await expect(value.service.reconcile(value.task.id)).rejects.toThrow(
+      /no dispatched code-review round/i
+    );
+  });
+
+  it('marks a capture incomplete when the worktree will not hold still', async () => {
+    const value = setup();
+    // Every fingerprint read differs from the last, which is what a worktree
+    // somebody is actively editing looks like.
+    let tick = 0;
+    value.snapshots.fingerprints = [];
+    const moving = (): { headCommit: string; branch: string; status: string; changeSet: string } => ({
+      headCommit: '2'.repeat(40),
+      branch: 'agent/task-1',
+      status: `moving-${(tick += 1)}`,
+      changeSet: ''
+    });
+    value.snapshots.fingerprint = async () => moving();
+    const original = value.snapshots.capture.bind(value.snapshots);
+    value.snapshots.capture = async (request) => ({ ...(await original(request)), fingerprint: moving() });
+
+    const subject = await value.service.captureSubject(value.task.id);
+
+    // The capture is stored — it says what was seen — but never as exact.
+    expect(subject.complete).toBe(false);
+    const identity = await value.service.subjectIdentity(value.task.id);
+    expect(identity.identity).toBe('incomplete');
+    expect(identity.problem).toMatch(/changed while it was being read/i);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/not an exact statement/i);
+  });
+
+  it('accepts a capture the second attempt finds stable', async () => {
+    const value = setup();
+    // First attempt moves, second holds. A worktree that settles must not be
+    // condemned for one unlucky moment.
+    const settled = { headCommit: '2'.repeat(40), branch: 'agent/task-1', status: 'x', changeSet: '' };
+    const answers = [
+      { ...settled, status: 'a' },
+      { ...settled, status: 'b' },
+      settled,
+      settled,
+      settled,
+      settled
+    ];
+    let index = 0;
+    value.snapshots.fingerprint = async () => answers[index++] ?? settled;
+    const original = value.snapshots.capture.bind(value.snapshots);
+    value.snapshots.capture = async (request) => ({
+      ...(await original(request)),
+      fingerprint: answers[index++] ?? settled
+    });
+
+    const subject = await value.service.captureSubject(value.task.id);
+    expect(subject.complete).toBe(true);
+  });
+
+  it('redacts a provider refusal instead of passing its text through', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.available = {
+      available: false,
+      reason: `codex failed: api_key = "AKIA1234567890ABCDEF" at C:\\Users\\someone\\.codex`
+    };
+
+    await expect(value.service.review(value.task.id)).rejects.toMatchObject({
+      code: 'TOOL_MISSING'
+    });
+    try {
+      await value.service.review(value.task.id);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // A refusal is foreign text like any other: it must not carry a token out
+      // through the error boundary.
+      expect(message).not.toContain('AKIA1234567890ABCDEF');
+    }
+    expect(value.reviews.listRounds(value.task.id)).toHaveLength(0);
+  });
+
+  it('keeps a decision historical when the code moves, without locking anything', async () => {
+    const value = setup();
+    value.reviewer.answer = { ...value.reviewer.answer, findings: [finding()] };
+    const outcome = await reviewOnce(value);
+    const target = outcome.findings[0]!;
+    await value.service.decide(value.task.id, {
+      findingId: target.id,
+      action: 'accept',
+      reason: 'Legitimate.',
+      expectedRevision: target.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+
+    // The code changes afterwards. The decision is not undone and nothing was
+    // locked to prevent this — it is scoped to a snapshot hash that is simply
+    // no longer current, so the finding and its answer become history.
+    value.snapshots.headCommit = '9'.repeat(40);
+    const identity = await value.service.subjectIdentity(value.task.id);
+    expect(identity.identity).toBe('stale');
+    expect(value.reviews.listDecisions(target.id)).toHaveLength(1);
+    expect(value.reviews.latestDecision(target.id)?.subjectSha256).toBe(target.subjectSha256);
+  });
+});
+
+describe('the code-review detail a caller receives', () => {
+  function detail(value: ReturnType<typeof setup>) {
+    return async () => {
+      const identity = await value.service.subjectIdentity(value.task.id);
+      const all = value.reviews.listFindings(value.task.id);
+      const live =
+        identity.identity === 'current' && identity.stored !== null
+          ? all.filter((f) => f.subjectSha256 === identity.stored?.subjectSha256)
+          : [];
+      return {
+        subjectIdentity: identity.identity,
+        findings: live,
+        historicalFindings: all,
+        identityProblem: identity.problem
+      };
+    };
+  }
+
+  it('presents findings as live only while the subject is provably current', async () => {
+    const value = setup();
+    value.reviewer.answer = { ...value.reviewer.answer, findings: [finding()] };
+    await reviewOnce(value);
+    const read = detail(value);
+
+    const fresh = await read();
+    expect(fresh.subjectIdentity).toBe('current');
+    expect(fresh.findings).toHaveLength(1);
+    expect(fresh.identityProblem).toBeNull();
+
+    // The code moves on. The finding is still real history; it is no longer a
+    // statement about the code this task has.
+    value.snapshots.headCommit = '9'.repeat(40);
+    const stale = await read();
+    expect(stale.subjectIdentity).toBe('stale');
+    expect(stale.findings).toHaveLength(0);
+    expect(stale.historicalFindings).toHaveLength(1);
+    expect(stale.identityProblem).toBeNull();
+  });
+
+  it('withholds live findings and explains itself when the code cannot be read', async () => {
+    const value = setup();
+    value.reviewer.answer = { ...value.reviewer.answer, findings: [finding()] };
+    await reviewOnce(value);
+
+    value.snapshots.error = new Error('the worktree is gone');
+    const unknown = await detail(value)();
+
+    expect(unknown.subjectIdentity).toBe('unknown');
+    expect(unknown.findings).toHaveLength(0);
+    expect(unknown.historicalFindings).toHaveLength(1);
+    // A bare "unknown" tells an operator nothing they can act on. The reason is
+    // carried, bounded and redacted.
+    expect(unknown.identityProblem).toMatch(/worktree is gone/);
+  });
+
+  it('redacts and bounds the reason rather than passing it through', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.snapshots.error = new Error(
+      `capture failed: api_key = "AKIA1234567890ABCDEF" ${'x'.repeat(5_000)}`
+    );
+
+    const problem = (await value.service.subjectIdentity(value.task.id)).problem ?? '';
+    expect(problem.length).toBeLessThanOrEqual(2_100);
+    expect(problem).not.toContain('AKIA1234567890ABCDEF');
+  });
+});
+
+describe('code-review findings across rounds', () => {
+  it('gives a repeated finding the same stable id and keeps the history', async () => {
+    const value = setup();
+    value.reviewer.answer = { ...value.reviewer.answer, findings: [finding()] };
+    const first = await reviewOnce(value);
+    expect(first.newFindings).toBe(1);
+
+    // A second round against the SAME subject, repeating the same finding. The
+    // first round completed, so a new dispatch is allowed: what is refused is a
+    // dispatch on top of an outcome nobody knows.
+    const outcome = await value.service.review(value.task.id);
+    expect(outcome.newFindings).toBe(0);
+    expect(outcome.repeatedFindings).toBe(1);
+    expect(outcome.findings[0]?.id).toBe(first.findings[0]?.id);
+    expect(outcome.findings[0]?.timesReported).toBe(2);
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(1);
+  });
+
+  it('does not collapse two different findings into one', async () => {
+    const value = setup();
+    value.reviewer.answer = {
+      ...value.reviewer.answer,
+      findings: [finding(), finding({ title: 'The retry is unbounded', line: 43 })]
+    };
+    const outcome = await reviewOnce(value);
+
+    expect(outcome.newFindings).toBe(2);
+    expect(new Set(outcome.findings.map((entry) => entry.id)).size).toBe(2);
+  });
+});
+
+describe('code-review decisions', () => {
+  async function decided() {
+    const value = setup();
+    value.reviewer.answer = { ...value.reviewer.answer, findings: [finding()] };
+    const outcome = await reviewOnce(value);
+    return { value, finding: outcome.findings[0]! };
+  }
+
+  it('records an answer with its reason, actor and the revision it was taken against', async () => {
+    const { value, finding: target } = await decided();
+
+    const result = await value.service.decide(value.task.id, {
+      findingId: target.id,
+      action: 'accept',
+      reason: 'Legitimate; the retry really is ambiguous.',
+      expectedRevision: target.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+
+    expect(result.finding.revision).toBe(target.revision + 1);
+    const trail = value.reviews.listDecisions(target.id);
+    expect(trail).toHaveLength(1);
+    expect(trail[0]).toMatchObject({
+      action: 'accept',
+      actor: 'operator',
+      source: 'test',
+      subjectSha256: target.subjectSha256,
+      findingRevision: target.revision
+    });
+    expect(trail[0]?.decidedAt).toBeTruthy();
+  });
+
+  it('requires a reason for every decision, including an acceptance', async () => {
+    const { value, finding: target } = await decided();
+
+    await expect(
+      value.service.decide(value.task.id, {
+        findingId: target.id,
+        action: 'accept',
+        reason: '   ',
+        expectedRevision: target.revision,
+        actor: 'operator',
+        source: 'test'
+      })
+    ).rejects.toThrow(/requires a reason/i);
+    expect(value.reviews.listDecisions(target.id)).toHaveLength(0);
+  });
+
+  it('refuses a decision taken against a revision that has moved', async () => {
+    const { value, finding: target } = await decided();
+    await value.service.decide(value.task.id, {
+      findingId: target.id,
+      action: 'accept',
+      reason: 'Decided first.',
+      expectedRevision: target.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+
+    await expect(
+      value.service.decide(value.task.id, {
+        findingId: target.id,
+        action: 'reject',
+        reason: 'Decided from a screen that had gone stale.',
+        expectedRevision: target.revision,
+        actor: 'operator',
+        source: 'test'
+      })
+    ).rejects.toThrow(/decided by someone else/i);
+
+    expect(value.reviews.listDecisions(target.id)).toHaveLength(1);
+    expect(value.reviews.latestDecision(target.id)?.action).toBe('accept');
+  });
+
+  it('will not apply an old snapshot\'s finding to code that has since changed', async () => {
+    const { value, finding: target } = await decided();
+
+    // The code moves on. The finding still exists and is still history, but it
+    // describes a state this task is no longer in, and the operator deciding it
+    // has not been shown the code that exists now.
+    value.snapshots.headCommit = '9'.repeat(40);
+    await expect(
+      value.service.decide(value.task.id, {
+        findingId: target.id,
+        action: 'resolved',
+        reason: 'Fixed, probably.',
+        expectedRevision: target.revision,
+        actor: 'operator',
+        source: 'test'
+      })
+    ).rejects.toThrow(/no longer matches the captured subject/i);
+
+    // Capturing the new state does not carry the old finding forward either.
+    await value.service.captureSubject(value.task.id);
+    await expect(
+      value.service.decide(value.task.id, {
+        findingId: target.id,
+        action: 'resolved',
+        reason: 'Fixed, probably.',
+        expectedRevision: target.revision,
+        actor: 'operator',
+        source: 'test'
+      })
+    ).rejects.toThrow(/earlier snapshot/i);
+    expect(value.reviews.listDecisions(target.id)).toHaveLength(0);
+  });
+
+  it('refuses a finding that belongs to another task', async () => {
+    const { value, finding: target } = await decided();
+    const other = value.harness.createTask(
+      value.harness.createProject({ id: 'p2', localPath: 'C:\\another-repo' }).id,
+      { status: 'READY_FOR_IMPLEMENTATION' }
+    );
+
+    await expect(
+      value.service.decide(other.id, {
+        findingId: target.id,
+        action: 'accept',
+        reason: 'Cross-task attempt.',
+        expectedRevision: target.revision,
+        actor: 'operator',
+        source: 'test'
+      })
+    ).rejects.toThrow(/no such code review finding/i);
+    expect(value.reviews.listDecisions(target.id)).toHaveLength(0);
+  });
+
+  it('refuses credential-shaped text in a reason', async () => {
+    const { value, finding: target } = await decided();
+
+    await expect(
+      value.service.decide(value.task.id, {
+        findingId: target.id,
+        action: 'reject',
+        reason: 'Not a problem; we authenticate with api_key = "AKIA1234567890ABCDEF".',
+        expectedRevision: target.revision,
+        actor: 'operator',
+        source: 'test'
+      })
+    ).rejects.toThrow(/credential-shaped/i);
+    expect(value.reviews.listDecisions(target.id)).toHaveLength(0);
+  });
+});
+
+describe('code-review capture exactness at the level of bytes', () => {
+  /**
+   * Two real files in the worktree, and a seam that can move one of them at a
+   * chosen instant. Both files are digested by the production reader.
+   */
+  function twoFiles(value: ReturnType<typeof setup>) {
+    const root = value.harness.worktreesRoot;
+    mkdirSync(root, { recursive: true });
+    const a = join(root, 'a.ts');
+    const b = join(root, 'b.ts');
+    writeFileSync(a, 'const a = 1;\nconst second = 2;\n');
+    writeFileSync(b, 'const b = 1;\nconst second = 2;\n');
+    value.snapshots.files = [
+      { path: 'a.ts', change: 'modified', absolutePath: a },
+      { path: 'b.ts', change: 'modified', absolutePath: b }
+    ];
+    return { a, b };
+  }
+
+  it('refuses to call a capture exact when a file is rewritten while another is read', async () => {
+    const value = setup();
+    const { a, b } = twoFiles(value);
+
+    // Precisely the edit the cheap Git description cannot see. A is rewritten
+    // while B is being opened, to a body with the SAME number of lines - so
+    // `--numstat`, `--name-status` and `status --porcelain` are byte-identical
+    // before and after, and the fingerprint the capture compares is unmoved.
+    // The only witness that anything happened is the content digest itself.
+    let generation = 0;
+    const ops: SnapshotFileOps = {
+      ...nodeSnapshotFileOps,
+      open: (target) => {
+        if (target === b) {
+          generation += 1;
+          writeFileSync(a, `const a = ${generation + 100};\nconst second = 2;\n`);
+        }
+        return nodeSnapshotFileOps.open(target);
+      }
+    };
+    const service = value.build({ fileOps: ops });
+
+    const subject = await service.captureSubject(value.task.id);
+
+    // A never held still, so no attempt could reproduce its digest.
+    expect(generation).toBeGreaterThan(1);
+    expect(subject.complete).toBe(false);
+    const identity = await service.subjectIdentity(value.task.id);
+    expect(identity.identity).toBe('incomplete');
+    await expect(service.review(value.task.id)).rejects.toThrow(/not an exact statement/i);
+  });
+
+  it('accepts a capture whose every digest is reproduced by the second reading', async () => {
+    const value = setup();
+    twoFiles(value);
+    const reads: string[] = [];
+    const ops: SnapshotFileOps = {
+      ...nodeSnapshotFileOps,
+      open: (target) => {
+        reads.push(target);
+        return nodeSnapshotFileOps.open(target);
+      }
+    };
+    const service = value.build({ fileOps: ops });
+
+    const subject = await service.captureSubject(value.task.id);
+
+    // Every file read twice, and the same answer both times.
+    expect(reads).toHaveLength(4);
+    expect(subject.complete).toBe(true);
+    expect((await service.subjectIdentity(value.task.id)).identity).toBe('current');
+  });
+
+  it('refuses to call a capture exact when the file set changes between the passes', async () => {
+    const value = setup();
+    twoFiles(value);
+    const both = value.snapshots.files;
+    let pass = 0;
+    const original = value.snapshots.capture.bind(value.snapshots);
+    value.snapshots.capture = async (request) => {
+      // Every attempt's first pass sees one file and its second sees two, so no
+      // attempt can reproduce its own file set. The fingerprint is constant by
+      // construction, so composition is the only thing that can notice.
+      value.snapshots.files = pass % 2 === 0 ? [both[0]!] : both;
+      pass += 1;
+      return original(request);
+    };
+
+    const subject = await value.build().captureSubject(value.task.id);
+
+    expect(subject.complete).toBe(false);
+  });
+
+  it('refuses to call a capture exact when a file changes what it is, not what it holds', async () => {
+    const value = setup();
+    const { a } = twoFiles(value);
+    expect(a).toBeTruthy();
+
+    // The bytes never move. What moves is what the file IS: an untracked file
+    // that gets added to the index between the passes is the everyday case, and
+    // `canonicalCodeSnapshot` writes `change` into the subject hash, so the two
+    // passes describe two different subjects. A manifest holding only digests
+    // cannot see that, and would call this exact.
+    const both = value.snapshots.files;
+    let pass = 0;
+    const original = value.snapshots.capture.bind(value.snapshots);
+    value.snapshots.capture = async (request) => {
+      const change = pass % 2 === 0 ? 'untracked' : 'added';
+      pass += 1;
+      value.snapshots.files = both.map((file) => ({ ...file, change }));
+      return original(request);
+    };
+
+    const subject = await value.build().captureSubject(value.task.id);
+
+    expect(pass).toBe(6);
+    expect(subject.complete).toBe(false);
+    expect((await value.build().subjectIdentity(value.task.id)).identity).toBe('incomplete');
+  });
+
+  it('refuses to call a capture exact when the checkout itself changes underneath', async () => {
+    const value = setup();
+    twoFiles(value);
+    const real = { commonDir: 'C:/repo/.git', branch: 'agent/task-1', detached: false };
+    // The same branch and the same head, out of a different repository. Only
+    // the checkout's own identity separates the two.
+    const other = { ...real, commonDir: 'C:/other-repo/.git' };
+    let looks = 0;
+    value.snapshots.describeCheckout = async (path) => {
+      if (path !== value.harness.worktreesRoot) return { ...real, branch: 'main' };
+      looks += 1;
+      // Every attempt's first pass sees the real repository and its second pass
+      // sees the other one, so no attempt can reproduce the checkout it read
+      // from and none of them may call itself exact.
+      return looks % 2 === 0 ? other : real;
+    };
+
+    const subject = await value.build().captureSubject(value.task.id);
+
+    // Every bounded attempt was spent, and each one looked twice.
+    expect(looks).toBe(6);
+    expect(subject.complete).toBe(false);
+  });
+});
+
+describe('code-review round identity at the provider', () => {
+  async function stranded() {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.error = new Error('the reviewer never answered');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+    value.reviewer.error = null;
+    return value;
+  }
+
+  it('names the round at the provider and records that name before dispatching it', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+
+    // At the moment the round is opened, the durable row already exists and
+    // still has no locator: intent first, identity second, dispatch last.
+    value.reviewer.onBegin = () => {
+      expect(value.reviewer.calls).toHaveLength(0);
+      const round = value.reviews.latestRound(value.task.id);
+      expect(round).not.toBeNull();
+      expect(round?.providerRoundId).toBeNull();
+    };
+    // And by the time anything non-idempotent goes out, the name is written
+    // down. This is the whole difference between a round that can be recovered
+    // and one that can only be guessed at.
+    value.reviewer.onCall = () => {
+      const round = value.reviews.latestRound(value.task.id);
+      expect(round?.sessionId).toBe('session-1');
+      expect(round?.providerRoundId).toBe('round-1');
+      expect(round?.status).toBe('reviewing');
+    };
+
+    const outcome = await value.service.review(value.task.id);
+    expect(value.reviewer.beginCalls).toHaveLength(1);
+    expect(outcome.round.providerRoundId).toBe('round-1');
+  });
+
+  it('gives each round of one subject its own locator, and asks about that one only', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    const first = await value.service.review(value.task.id);
+
+    // A second round over the SAME subject: identical repository, branch, base,
+    // head and subject hash. Everything except the locator collides.
+    value.reviewer.error = new Error('the reviewer never answered');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+    value.reviewer.error = null;
+
+    const lost = value.reviews.latestRound(value.task.id)!;
+    expect(lost.subjectSha256).toBe(first.round.subjectSha256);
+    expect(lost.id).not.toBe(first.round.id);
+    expect(lost.providerRoundId).not.toBe(first.round.providerRoundId);
+
+    value.reviewer.roundStatusAnswer = { kind: 'running' };
+    await value.service.reconcile(value.task.id);
+
+    // Asked about exactly one round, and it is this one - not the earlier round
+    // of the same code, which the subject alone could not have distinguished.
+    expect(value.reviewer.roundStatusCalls).toHaveLength(1);
+    expect(value.reviewer.roundStatusCalls[0]?.locator).toEqual({
+      providerId: lost.providerId,
+      sessionId: lost.sessionId,
+      roundId: lost.providerRoundId
+    });
+    expect(value.reviewer.roundStatusCalls[0]?.locator.roundId).not.toBe(
+      first.round.providerRoundId
+    );
+  });
+
+  it('refuses a recovered result that belongs to another round of the same subject', async () => {
+    const value = await stranded();
+    const subject = value.reviews.latestSubject(value.task.id)!;
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        // Same provider, same session, same subject, correct attestation -
+        // and still the wrong round. Only the locator can tell.
+        locator: { providerId: 'coai', sessionId: 'session-1', roundId: 'round-99' },
+        findings: [finding()],
+        reviewedSubjectSha256: subject.subjectSha256
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('wrong-round');
+    expect(outcome.round.lastError).toMatch(/different round/i);
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  it('refuses a live answer that carries another round locator', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.answerLocator = {
+      providerId: 'coai',
+      sessionId: 'session-1',
+      roundId: 'round-77'
+    };
+
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/different round/i);
+
+    // The call did go out, so the round stays unresolved rather than failed.
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.status).toBe('reviewing');
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+  });
+
+  it('can never settle a round that has no recorded locator', async () => {
+    const value = await stranded();
+    // A crash between the durable intent and the locator write leaves exactly
+    // this: a row that says a call went out, and nothing to ask about.
+    const round = value.reviews.latestRound(value.task.id)!;
+    value.reviews.updateRound(round.id, {
+      providerId: null,
+      sessionId: null,
+      providerRoundId: null
+    });
+    const subject = value.reviews.latestSubject(value.task.id)!;
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        findings: [finding()],
+        reviewedSubjectSha256: subject.subjectSha256
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    // The provider was not even asked: a question that cannot name its round
+    // has more than one right answer, and any of them would be written here.
+    expect(value.reviewer.roundStatusCalls).toHaveLength(0);
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('no-locator');
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  it('dispatches nothing when the round cannot be opened at all', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.beginError = new Error('the session could not be opened');
+
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/could not be opened/);
+
+    // Above the non-idempotent call, so this is provably a refusal that
+    // reviewed nothing - and it is closed rather than left outstanding.
+    expect(value.reviewer.calls).toHaveLength(0);
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.status).toBe('failed');
+    expect(round.providerRoundId).toBeNull();
+
+    value.reviewer.beginError = null;
+    await expect(value.service.review(value.task.id)).resolves.toBeTruthy();
+  });
+
+  it('keeps the locator when the dispatch is lost, and repeats nothing by itself', async () => {
+    const value = await stranded();
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.status).toBe('reviewing');
+    expect(round.sessionId).toBe('session-1');
+    expect(round.providerRoundId).toBe('round-1');
+    // One call went out and no second one followed on its own.
+    expect(value.reviewer.calls).toHaveLength(1);
+    expect(value.reviewer.beginCalls).toHaveLength(1);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+    expect(value.reviewer.calls).toHaveLength(1);
+  });
+
+  it('releases a round only when the provider proves it never started', async () => {
+    const value = await stranded();
+    value.reviewer.roundStatusAnswer = { kind: 'not_started' };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    // Proof that nothing was consumed, so the round may be closed. Still not an
+    // automatic repeat: reconciliation reads, and a person starts the next one.
+    expect(outcome.round.status).toBe('failed');
+    expect(outcome.unsettledReason).toBe('not-started');
+    expect(outcome.round.lastError).toMatch(/never started/i);
+    expect(outcome.findings).toHaveLength(0);
+    expect(value.reviewer.calls).toHaveLength(1);
+
+    await expect(value.service.review(value.task.id)).resolves.toBeTruthy();
+    expect(value.reviewer.calls).toHaveLength(2);
+  });
+});
+
+describe('code-review locator durability', () => {
+  async function stranded() {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.error = new Error('the reviewer never answered');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+    value.reviewer.error = null;
+    return value;
+  }
+
+  it('keeps the dispatched locator exactly, whatever the answer says about identity', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+
+    // An adapter that still carries the older shape, where the round result
+    // restated its own session. The answer is checked AGAINST the locator, so
+    // letting it write one back would let the evidence rewrite the thing it was
+    // checked against — and a provider that simply omitted the field would
+    // blank half a locator on an otherwise good round.
+    value.reviewer.answer = {
+      ...value.reviewer.answer,
+      sessionId: null,
+      serverName: 'coai-mcp'
+    } as typeof value.reviewer.answer;
+
+    const outcome = await value.service.review(value.task.id);
+
+    expect(outcome.round.status).toBe('completed');
+    expect(outcome.round.providerId).toBe('coai');
+    expect(outcome.round.sessionId).toBe('session-1');
+    expect(outcome.round.providerRoundId).toBe('round-1');
+
+    // Read back from storage, because that is what a later recovery would use.
+    const stored = value.reviews.latestRound(value.task.id)!;
+    expect(stored.providerId).toBe('coai');
+    expect(stored.sessionId).toBe('session-1');
+    expect(stored.providerRoundId).toBe('round-1');
+  });
+
+  it('never dispatches on a locator with an empty or missing part', async () => {
+    for (const locator of [
+      { providerId: 'coai', sessionId: '', roundId: 'round-1' },
+      { providerId: 'coai', sessionId: 'session-1', roundId: '' },
+      { providerId: '', sessionId: 'session-1', roundId: 'round-1' },
+      { providerId: 'coai', sessionId: 'session-1' } as unknown as {
+        providerId: string;
+        sessionId: string;
+        roundId: string;
+      }
+    ]) {
+      const value = setup();
+      await value.service.captureSubject(value.task.id);
+      value.reviewer.locators = [locator];
+
+      await expect(value.service.review(value.task.id)).rejects.toThrow();
+
+      // Nothing left the process, so the round is closed rather than left
+      // outstanding — and no fragment of the unusable locator was written.
+      expect(value.reviewer.calls).toHaveLength(0);
+      const round = value.reviews.latestRound(value.task.id)!;
+      expect(round.status).toBe('failed');
+      expect(round.providerId).toBeNull();
+      expect(round.sessionId).toBeNull();
+      expect(round.providerRoundId).toBeNull();
+    }
+  });
+
+  it('refuses a locator issued under a provider identity that is not the reviewer', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.locators = [
+      { providerId: 'somebody-else', sessionId: 'session-1', roundId: 'round-1' }
+    ];
+
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/usable identity/i);
+
+    expect(value.reviewer.calls).toHaveLength(0);
+    expect(value.reviews.latestRound(value.task.id)?.providerId).toBeNull();
+  });
+
+  it('will not read a lost round back from a different provider than it went to', async () => {
+    const value = await stranded();
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.providerId).toBe('coai');
+
+    // A restart with changed configuration: same session and round ids, and a
+    // provider that has never heard of them. Ids are unique only inside one
+    // namespace, so asking is not merely useless — it can be answered.
+    value.reviewer.providerId = 'a-different-reviewer';
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        locator: {
+          providerId: 'a-different-reviewer',
+          sessionId: 'session-1',
+          roundId: 'round-1'
+        },
+        findings: [finding()],
+        reviewedSubjectSha256: value.reviews.latestSubject(value.task.id)!.subjectSha256
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(value.reviewer.roundStatusCalls).toHaveLength(0);
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('other-provider');
+    expect(outcome.round.lastError).toMatch(/different code reviewer/i);
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+
+    // The locator is untouched, so the round is still settleable by the
+    // provider that actually ran it.
+    const held = value.reviews.latestRound(value.task.id)!;
+    expect(held.providerId).toBe('coai');
+    expect(held.sessionId).toBe('session-1');
+    expect(held.providerRoundId).toBe('round-1');
+  });
+
+  it('refuses a recovered answer whose provider half disagrees', async () => {
+    const value = await stranded();
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        // Right session, right round, wrong namespace.
+        locator: { providerId: 'someone-else', sessionId: 'session-1', roundId: 'round-1' },
+        findings: [finding()],
+        reviewedSubjectSha256: value.reviews.latestSubject(value.task.id)!.subjectSha256
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('wrong-round');
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+  });
+});
