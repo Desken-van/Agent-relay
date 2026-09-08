@@ -374,10 +374,10 @@ accepted; those remain INT-G scope.
 
 **Status: backend only.** There is no renderer, no correction loop and no live
 provider acceptance for this path yet. Migration 7 adds the durable layer the
-remaining slices will stand on; the provider adapter that would actually call
-`review_code` is INT-D-B, and until it exists `UnconfiguredCodeReviewer` refuses
-loudly rather than returning an empty round that could be mistaken for a clean
-review.
+remaining slices will stand on. The provider adapter is INT-D-B and is now
+present — see "The code-review provider adapter" below — but it is switched off
+by default and refuses against the Coai build shipped today, because that build
+cannot name a round before it runs one.
 
 Why this is separate from the plan gate rather than folded into it: the plan
 gate answers one question per specification identity and decides its findings in
@@ -494,6 +494,107 @@ The same five states are what a completed round reports, in one
 combinations, two of them meaningless, and leave every reader to reconstruct the
 state machine — which is exactly how `incomplete` came to be reported as
 `stale`. Only `current` puts a result in force.
+
+### The code-review provider adapter (INT-D-B)
+
+`CoaiCodeReviewer` speaks to a Coai MCP server over the same bounded stdio
+transport the plan gate uses: one short-lived process, no shell, a fixed argv
+from persisted settings, and a tool list that must match the configured
+allowlist EXACTLY.
+
+**Two audited profiles, and nothing between them.** A profile is a complete tool
+list, not a minimum.
+
+| Profile | Tools | What it serves |
+|---|---|---|
+| plan | `providers`, `open`, `review_plan`, `review_code`, `resolve`, `status`, `ask_human` | plan review only |
+| addressable | those seven plus `reserve_round`, `run_round`, `round_status` | plan review **and** code review |
+
+A server whose list is missing a tool, carries an unknown extra, or repeats a
+name is refused — the same refusal in all three cases, because from this side
+they are the same fact: the contract is not the one that was read. "The tools I
+need are present" was deliberately not implemented; a server that grew a tool
+nobody here has audited may have changed its others too. `CoaiPlanReviewer`
+accepts either profile, so a deployment running the newer server need not run a
+second one to keep the plan gate working.
+
+**One server, one profile, chosen by what is enabled.** Both gates talk to the
+same executable, so the profile is decided by configuration rather than by which
+gate is asking: with code review off the plan gate is configured for the seven
+tools, and with it on BOTH gates are configured for the ten. Pinning the plan
+gate to seven for ever would have refused the addressable server outright — so
+enabling code review would have silently broken plan review against the very
+server that supports both. The choice is still between two audited lists; it is
+never a subset, a minimum or a superset.
+
+**The installed Coai server is the plan profile.** It has `review_code`, and
+that is precisely the tool this adapter must never call: it creates its own
+round and names it only afterwards, so a caller whose answer was lost has
+nothing to ask about. `availability()` discovers the profile, finds the three
+addressable tools absent, and reports **"addressable code review is not
+supported"** — before `CodeReviewService` writes any durable intent, so a
+refusal leaves no round row to reconcile. Nothing in this build depends on a
+sibling checkout or an unpublished local server: the profile is a wire shape,
+and a server either presents it or is refused.
+
+**Each method calls exactly one tool, and never another.**
+
+| Port method | Tool | Consumes a round? |
+|---|---|---|
+| `availability` | *(discovery only)* | no |
+| `beginRound` | `reserve_round` | no |
+| `reviewCode` | `run_round` | yes |
+| `roundStatus` | `round_status` | no |
+
+**The reservation token is the durable local round id.** `reserve_round` needs a
+stable idempotency key, and the round row already exists when it is called, so
+its id is the key: it survives a restart, it is different for every local round,
+and — unlike the subject hash — it tells two rounds over the SAME code apart,
+which is the ordinary case of reviewing something twice. It is not a timestamp
+and not anything the adapter invents, because neither survives the restart the
+token exists for. `ExternalCodeReviewer.beginRound` therefore takes the token as
+an argument rather than deriving it from the subject.
+
+**Every uncertain read-back is `unknown`.** `roundStatus` maps `running` and
+`completed` as the provider states them, and returns `not_started` only when the
+provider positively says so about a round it holds and has not dispatched. A
+timeout, a transport failure, a refusal returned as data, output that will not
+parse, a `completed` with no result attached, an answer carrying another
+locator, and a provider reporting the round as spent all become `unknown` with a
+bounded redacted reason. None of them is read as "nothing ran", because only one
+of them would be safe to and they are indistinguishable from here.
+
+**Dirty subjects are still refused.** `readsUncommittedWorktreeState` is `false`
+and stays false whatever is configured: `run_round` reviews a commit in a
+worktree the provider pins to a SHA, so uncommitted and untracked work is
+invisible to it. The service refuses such a subject before dispatch rather than
+accepting a confident verdict about different code. Reviewing a dirty tree needs
+a provider that can snapshot it AND prove the snapshot is the caller's own; that
+attestation does not exist, and this pass does not invent it — no hidden commit,
+no staging, no mutation of the user's index.
+
+**Wiring is main-process only.** `SettingsBoundCodeReviewer` resolves the
+configuration per call from persisted settings, so enabling the integration or
+clearing its executable takes effect on the next call rather than the next
+restart, and a build with nothing configured refuses exactly as the unconfigured
+reviewer did. `codeReview:review` accepts a task id and nothing else: the
+executable, argv, working directory, tool profile, provider identity, subject
+and scope are all resolved here from durable state. `CodeReviewClaims` remains
+the single-flight authority, so two windows race in the service rather than at
+the channel.
+
+**A refusal repeats nothing the server sent.** `availability.reason` is stored
+and shown, and carries no path, argv or secret. A tool-profile mismatch is
+recognised by its TYPE — `McpToolProfileMismatchError`, thrown by the transport —
+and answered with names from this build's own `COAI_ADDRESSABLE_TOOLS`. Every
+other discovery failure gets a fixed sentence plus its error code, because the
+transport uses the same `details` field for a failed spawn's raw stderr, which
+can hold an absolute path or a command line. Redaction hides credential shapes;
+it does not hide a path, and was never meant to.
+
+**Live provider acceptance has not been performed.** Every test runs against an
+Agent Relay-owned fake MCP process; no vendor model has been called and no
+provider quota has been spent through this adapter.
 
 ### Where the dispatch boundary is
 
@@ -1232,7 +1333,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1475 deterministic tests in 55 files, plus one routine automated Electron
+1529 deterministic tests in 58 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.

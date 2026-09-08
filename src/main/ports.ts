@@ -954,8 +954,21 @@ export interface ExternalCodeReviewer {
    * a review round — otherwise a crash between this call and the write that
    * stores its answer would spend a round nothing can ever find again.
    */
+  /**
+   * @param clientToken
+   * The durable id of the LOCAL round this reservation is for, used as the
+   * provider's idempotency key. It must come from the round row that already
+   * exists, so the same local round always reserves the same provider round and
+   * a retry after a lost answer resumes instead of reserving a second one.
+   *
+   * Deliberately not the subject hash: several legitimate rounds review one
+   * subject, so a token derived from it would collapse them into one. And not a
+   * timestamp or anything the adapter invents, because neither survives the
+   * restart the token exists for.
+   */
   beginRound(
     subject: ExternalCodeReviewSubject,
+    clientToken: string,
     signal?: AbortSignal
   ): Promise<ExternalCodeRoundLocator>;
   /**

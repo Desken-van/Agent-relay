@@ -139,6 +139,8 @@ class FakeCodeReviewer implements ExternalCodeReviewer {
    */
   locators: ExternalCodeRoundLocator[] = [];
   readonly beginCalls: ExternalCodeReviewSubject[] = [];
+  /** The idempotency key each reservation was asked for. */
+  readonly beginTokens: string[] = [];
   beginError: Error | null = null;
   /** Runs at the moment the round is opened, before a locator is returned. */
   onBegin: (() => void) | null = null;
@@ -185,8 +187,12 @@ class FakeCodeReviewer implements ExternalCodeReviewer {
     return this.available;
   }
 
-  async beginRound(subject: ExternalCodeReviewSubject): Promise<ExternalCodeRoundLocator> {
+  async beginRound(
+    subject: ExternalCodeReviewSubject,
+    clientToken: string
+  ): Promise<ExternalCodeRoundLocator> {
     this.beginCalls.push(subject);
+    this.beginTokens.push(clientToken);
     this.onBegin?.();
     if (this.beginError) throw this.beginError;
     const index = this.beginCalls.length - 1;
@@ -1812,5 +1818,58 @@ describe('code-review locator durability', () => {
     expect(outcome.round.status).toBe('reviewing');
     expect(outcome.unsettledReason).toBe('wrong-round');
     expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+  });
+});
+
+describe('the token a reservation is made under', () => {
+  it('is the durable local round id, not the subject and not a new value each time', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+
+    const first = await value.service.review(value.task.id);
+    // A SECOND round over the same subject. Repository, branch, base, head and
+    // subject hash are all identical — everything a subject-derived token could
+    // see. Only the local round differs.
+    const second = await value.service.review(value.task.id);
+
+    expect(value.reviewer.beginTokens).toHaveLength(2);
+    expect(value.reviewer.beginCalls[0]?.subjectSha256).toBe(
+      value.reviewer.beginCalls[1]?.subjectSha256
+    );
+    expect(value.reviewer.beginTokens[0]).not.toBe(value.reviewer.beginTokens[1]);
+
+    // And each token IS that round's durable id — the row that already exists
+    // when the reservation is made, so it survives a restart unchanged.
+    expect(value.reviewer.beginTokens[0]).toBe(first.round.id);
+    expect(value.reviewer.beginTokens[1]).toBe(second.round.id);
+  });
+
+  it('is stable for one round: a reservation retried under it asks for the same key', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    // The first attempt loses its answer on the way back, so the round is closed
+    // as one that provably reserved nothing and the operator starts another.
+    value.reviewer.beginError = new Error('the reservation answer was lost');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/answer was lost/);
+    const failed = value.reviews.latestRound(value.task.id)!;
+
+    // Asking the same durable round for its token again yields the same string —
+    // it is a stored id, not something recomputed per attempt.
+    expect(value.reviewer.beginTokens).toEqual([failed.id]);
+    expect(value.reviews.findRoundById(failed.id)?.id).toBe(value.reviewer.beginTokens[0]);
+  });
+
+  it('reserves before it dispatches, and a reservation alone dispatches nothing', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.onBegin = () => {
+      // At the moment the round is named, nothing has been sent to review.
+      expect(value.reviewer.calls).toHaveLength(0);
+    };
+
+    await value.service.review(value.task.id);
+
+    expect(value.reviewer.beginTokens).toHaveLength(1);
+    expect(value.reviewer.calls).toHaveLength(1);
   });
 });

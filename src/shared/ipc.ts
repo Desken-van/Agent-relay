@@ -318,6 +318,12 @@ export const ipcInputSchemas = {
   // rather than leaving an unknown field to be quietly ignored.
   'codeReview:get': byTask,
   'codeReview:capture': byTask,
+  // The task, and nothing else. The main process resolves the project, the
+  // worktree, the settings, the executable, the argv and the tool profile; a
+  // renderer that could name any of those would be choosing what the external
+  // reviewer is and where it runs. Single-flight stays with `CodeReviewClaims`,
+  // so two windows pressing the button race in the service rather than here.
+  'codeReview:review': byTask,
   // Read-only with respect to the external reviewer: it asks what became of a
   // round that was already dispatched and never starts one. Without it, a round
   // whose answer was lost stays unresolved forever and every later review for
@@ -453,6 +459,7 @@ export interface IpcResponseMap {
   'planReview:resolve': PlanReviewDetail;
   'codeReview:get': CodeReviewDetail;
   'codeReview:capture': CodeReviewDetail;
+  'codeReview:review': CodeReviewDetail;
   'codeReview:reconcile': CodeReviewDetail;
   'codeReview:decide': CodeReviewDetail;
 

@@ -14,6 +14,7 @@ beforeEach(() => {
     codexExecutablePath: null,
     ghExecutablePath: null,
     externalPlanReviewEnabled: false,
+    externalCodeReviewEnabled: false,
     coaiMcpExecutablePath: null,
     coaiMcpArguments: [],
     coaiMcpWorkingDirectory: null,

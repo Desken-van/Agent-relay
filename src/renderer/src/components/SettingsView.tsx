@@ -330,6 +330,22 @@ export function SettingsView(): React.JSX.Element {
                   </span>
                 </label>
 
+                <label className="row" style={{ alignItems: 'flex-start' }}>
+                  <input
+                    type="checkbox"
+                    checked={draft.externalCodeReviewEnabled}
+                    onChange={(event) => set('externalCodeReviewEnabled', event.target.checked)}
+                  />
+                  <span>
+                    <strong>Also allow external code review</strong>
+                    <span className="muted" style={{ display: 'block', marginTop: 3 }}>
+                      Separate because the capability is separate: code review needs an MCP server that
+                      advertises the addressable round tools. The Coai build shipped today does not, and
+                      the reviewer reports that rather than running anything.
+                    </span>
+                  </span>
+                </label>
+
                 <Field label="MCP executable" hint="Absolute path only. Authentication remains owned by the MCP server.">
                   <input
                     className="input input--mono"

@@ -9,7 +9,7 @@ import type {
   RuleEvidenceLimits,
   RuleEvidenceSourceRequest
 } from '../ports';
-import { COAI_TOOL_ALLOWLIST } from '../adapters/mcp/coai-plan-reviewer';
+import { COAI_ADDRESSABLE_PROFILE, COAI_PLAN_PROFILE } from '../adapters/mcp/coai-profiles';
 
 export const TASK_RULE_EVIDENCE_LIMITS: RuleEvidenceLimits = {
   maxSources: 2,
@@ -94,10 +94,36 @@ export function assertExternalPlanReviewSettings(settings: Settings): void {
     );
   }
 
-  if (!settings.externalPlanReviewEnabled) return;
+  // Either integration needs the same server, so either one enabled makes the
+  // executable required. Checking only the plan flag let a configuration be
+  // saved with code review on and nothing to run it — a setting that reads as
+  // enabled and refuses at the first call, with the reason buried in a provider
+  // error rather than shown where it was set.
+  if (!settings.externalPlanReviewEnabled && !settings.externalCodeReviewEnabled) return;
   if (settings.coaiMcpExecutablePath === null) {
-    invalid('Enabled external plan review requires an absolute MCP executable path.');
+    invalid(
+      settings.externalPlanReviewEnabled
+        ? 'Enabled external plan review requires an absolute MCP executable path.'
+        : 'Enabled external code review requires an absolute MCP executable path.'
+    );
   }
+}
+
+/**
+ * Which exact tool profile this configuration talks to.
+ *
+ * One server serves both gates, so the profile is decided by what is switched
+ * on rather than by which gate is asking. With code review off, that is the
+ * seven plan tools; with it on, the ten. It is never a subset, a minimum or a
+ * superset: the transport compares the server's list to this one exactly, and a
+ * profile nobody audited fails closed either way.
+ *
+ * The alternative — pinning the plan gate to seven for ever — would refuse the
+ * addressable server outright, so enabling code review would silently break
+ * plan review against the very server that supports both.
+ */
+export function coaiToolProfile(settings: Settings): readonly string[] {
+  return settings.externalCodeReviewEnabled ? COAI_ADDRESSABLE_PROFILE : COAI_PLAN_PROFILE;
 }
 
 export function externalPlanReviewConfig(settings: Settings): ExternalMcpServerConfig {
@@ -113,7 +139,7 @@ export function externalPlanReviewConfig(settings: Settings): ExternalMcpServerC
     ...(settings.coaiMcpWorkingDirectory === null
       ? {}
       : { cwd: settings.coaiMcpWorkingDirectory }),
-    allowedTools: COAI_TOOL_ALLOWLIST,
+    allowedTools: coaiToolProfile(settings),
     timeoutMs: settings.processTimeoutMs,
     maxMessageBytes: 2 * 1024 * 1024,
     maxContentBytes: 2 * 1024 * 1024,

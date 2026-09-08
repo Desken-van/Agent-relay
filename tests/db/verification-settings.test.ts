@@ -352,3 +352,45 @@ describe('resetting the permission rules', () => {
     ]);
   });
 });
+
+describe('external review settings that no round could satisfy', () => {
+  it('refuses code review enabled with no MCP executable, whatever plan review says', () => {
+    const store = repository();
+
+    // The case the plan-only check missed: plan review off, so its own rule
+    // never fired, while code review was switched on with nothing to run it.
+    expect(() =>
+      store.update({ externalCodeReviewEnabled: true, coaiMcpExecutablePath: null })
+    ).toThrow(/absolute MCP executable path/i);
+
+    // And with plan review on as well, for the same reason.
+    expect(() =>
+      store.update({
+        externalPlanReviewEnabled: true,
+        externalCodeReviewEnabled: true,
+        coaiMcpExecutablePath: null
+      })
+    ).toThrow(/absolute MCP executable path/i);
+
+    // Nothing was written on the way to either refusal.
+    expect(store.get().externalCodeReviewEnabled).toBe(false);
+  });
+
+  it('accepts code review enabled once an executable is set', () => {
+    const store = repository();
+
+    const saved = store.update({
+      externalCodeReviewEnabled: true,
+      coaiMcpExecutablePath: 'C:\\tools\\coai-mcp.exe'
+    });
+
+    expect(saved.externalCodeReviewEnabled).toBe(true);
+    expect(store.get().coaiMcpExecutablePath).toBe('C:\\tools\\coai-mcp.exe');
+  });
+
+  it('keeps refusing both integrations off with no executable as perfectly fine', () => {
+    const store = repository();
+
+    expect(() => store.update({ coaiMcpExecutablePath: null })).not.toThrow();
+  });
+});

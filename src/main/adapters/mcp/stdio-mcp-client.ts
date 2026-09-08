@@ -154,23 +154,76 @@ function validateConfig(config: ExternalMcpServerConfig): void {
   }
 }
 
+/**
+ * The server's advertised tools are not the configured profile.
+ *
+ * A distinct TYPE rather than a code plus a string, because a caller that wants
+ * to say something useful about a mismatch has to be able to recognise one
+ * without reading `details` — and `details` is not safe to read. The same field
+ * carries a process's raw stderr for a failed spawn, which can hold an absolute
+ * path, an argv or whatever the server chose to print. Matching on the sentence
+ * would be worse still: a caller doing that would be one message reword away
+ * from silently treating a spawn failure as a profile mismatch.
+ *
+ * The codes are unchanged — a duplicate is still `PARSE_FAILED` and a mismatch
+ * still `VALIDATION_FAILED` — so every existing caller behaves exactly as it did.
+ */
+export class McpToolProfileMismatchError extends AgentRelayError {
+  /**
+   * Which configured tools the server did not advertise.
+   *
+   * Taken from the ALLOWLIST, which this application supplied, so every string
+   * here originates locally. Nothing the server sent is copied into it.
+   */
+  readonly missing: readonly string[];
+
+  /**
+   * How many tools the server advertised that the allowlist does not name.
+   *
+   * A count, deliberately, and never the names: those are the server's own text
+   * and belong nowhere near a message an operator is shown.
+   */
+  readonly unexpectedCount: number;
+
+  /** The server advertised one name twice. */
+  readonly duplicated: boolean;
+
+  constructor(
+    code: 'PARSE_FAILED' | 'VALIDATION_FAILED',
+    message: string,
+    facts: { missing: readonly string[]; unexpectedCount: number; duplicated: boolean }
+  ) {
+    super(code, message, {
+      remediation: 'Review the server update and explicitly update the allowlist before using it.',
+      // Safe by construction: local names and a count. It is still not what a
+      // caller should render — `missing` is the field for that.
+      details: `missing=${facts.missing.join(',') || '-'} unexpected=${facts.unexpectedCount}`
+    });
+    this.name = 'McpToolProfileMismatchError';
+    this.missing = facts.missing;
+    this.unexpectedCount = facts.unexpectedCount;
+    this.duplicated = facts.duplicated;
+  }
+}
+
 function validateToolSet(tools: readonly ExternalMcpTool[], allowedNames: readonly string[]): void {
   const actual = tools.map((tool) => tool.name);
   const unique = new Set(actual);
-  if (unique.size !== actual.length) {
-    throw new AgentRelayError('PARSE_FAILED', 'The MCP server advertised a duplicate tool name.');
-  }
   const allowed = new Set(allowedNames);
-  const unexpected = actual.filter((name) => !allowed.has(name));
+  const unexpectedCount = actual.filter((name) => !allowed.has(name)).length;
   const missing = allowedNames.filter((name) => !unique.has(name));
-  if (unexpected.length > 0 || missing.length > 0) {
-    throw new AgentRelayError(
+  if (unique.size !== actual.length) {
+    throw new McpToolProfileMismatchError(
+      'PARSE_FAILED',
+      'The MCP server advertised a duplicate tool name.',
+      { missing, unexpectedCount, duplicated: true }
+    );
+  }
+  if (unexpectedCount > 0 || missing.length > 0) {
+    throw new McpToolProfileMismatchError(
       'VALIDATION_FAILED',
       'The MCP server tool list does not match the configured allowlist.',
-      {
-        remediation: 'Review the server update and explicitly update the allowlist before using it.',
-        details: `unexpected=${unexpected.join(',') || '-'} missing=${missing.join(',') || '-'}`
-      }
+      { missing, unexpectedCount, duplicated: false }
     );
   }
 }

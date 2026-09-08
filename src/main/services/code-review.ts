@@ -774,7 +774,11 @@ export class CodeReviewService {
       // it. `providerId` is required to match the reviewer that produced it: a
       // round filed under somebody else's namespace could never be read back.
       locator = externalRoundLocatorSchema.parse(
-        await this.deps.reviewer.beginRound(externalSubject, signal)
+        // The token is the durable round row's own id: it exists before this
+        // call, survives a restart, and is different for every local round —
+        // including two rounds over one subject, which a subject hash could not
+        // tell apart.
+        await this.deps.reviewer.beginRound(externalSubject, round.id, signal)
       );
       if (locator.providerId !== this.deps.reviewer.providerId) {
         throw new AgentRelayError('PARSE_FAILED', LOCATOR_INVALID);

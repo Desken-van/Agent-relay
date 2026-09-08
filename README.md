@@ -376,6 +376,31 @@ Git refuses and you are told, rather than losing it.
 | `npm run test:watch` | Vitest, watch mode |
 | `npm run lint` | ESLint over everything |
 | `npm run typecheck` | `tsc --noEmit` for both the Node and web projects |
+### External code review (INT-D-B)
+
+The provider adapter exists and is **off by default**. It requires an MCP server
+that advertises an exact ten-tool profile — the seven Coai plan tools plus
+`reserve_round`, `run_round` and `round_status` — because a code round must be
+named before it runs for its answer to be findable afterwards.
+
+**The Coai build shipped today advertises seven.** Plan review works against it
+exactly as before; code review reports *"addressable code review is not
+supported"* and writes nothing. That answer comes from discovery, so a refusal
+costs no round and leaves nothing to reconcile. A server with a missing tool, an
+unknown extra one, or a duplicated name is refused the same way: the profile is
+audited as a whole, never as a minimum.
+
+Uncommitted and untracked work is still out of reach. The provider reviews a
+commit in a worktree it pins to a SHA, so Agent Relay refuses to send it a
+subject containing dirty state rather than accept a verdict about different
+code. Reviewing a dirty tree needs a separate immutable-snapshot attestation
+that does not exist yet; this build creates no hidden commits and never touches
+the index to work around it.
+
+No sibling repository and no unpublished local build is required or referenced —
+the profile is a wire contract. **Live provider acceptance has not been
+performed:** every test runs against an Agent Relay-owned fake MCP process.
+
 | `npm run verify` | lint → typecheck → deterministic tests → build → Electron acceptance |
 
 ---
@@ -396,7 +421,7 @@ Being precise about what was actually exercised, rather than merely written:
 | **Project-rule evidence** | 🧪 **Collector contract verified against real temporary Git repositories and filesystems.** It discovers the fixed project-memory locations, reads explicitly selected convention files, refuses symlinks and traversal, records missing or excluded evidence, binds clean convention bytes to an exact Git revision, and hashes a deterministic whole-file snapshot. Opt-in task binding is enforced by the plan-gate row below. |
 | **External plan-review gate** | ✅ **Durable contract and real-provider journey verified.** Settings hold only a fixed executable, argv and explicit convention selection; task IPC accepts identifiers and decisions, never process configuration or rule bytes. The live synthetic journey bound project rules plus four pinned convention files, generated a real specification, proved premature approval was refused, prepared an isolated branch, completed one Coai/Codex review, resolved all five findings, persisted `proceeded`, and read it back after restart. |
 
-Test suite: **1475 deterministic tests in 55 files, plus one automated Electron
+Test suite: **1529 deterministic tests in 58 files, plus one automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -559,7 +584,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1475 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              1529 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```
