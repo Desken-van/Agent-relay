@@ -720,3 +720,382 @@ describe('the reservation is checked before anything is dispatched', () => {
     expect(client.toolsCalled).not.toContain('run_round');
   });
 });
+
+// ---------------------------------------------------------------------------
+// A read-back that contradicts itself
+// ---------------------------------------------------------------------------
+
+describe('a round_status answer that contradicts itself', () => {
+  /**
+   * The defect this closes: `review` used to be optional on ONE object shared
+   * by every state, so a payload could say `not_started` and carry a finished
+   * review at the same time — and the `not_started` branch never looked at it.
+   * That produced the single answer which licenses a re-dispatch, for a round
+   * the provider had just said it had completed.
+   *
+   * The schema is now a discriminated union, so the contradiction cannot even
+   * be represented: `review` exists only on `completed`.
+   */
+  it('refuses a not_started that also carries a completed review', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('round_status', {
+        locator,
+        state: 'not_started',
+        instruction: 'reserved, never run',
+        // The locator agrees, so nothing else in the method would have caught it.
+        review: completed()
+      })
+    );
+
+    const status = await new CoaiCodeReviewer(client, config).roundStatus(locator, subject);
+
+    // Ambiguous, and therefore not evidence that nothing ran.
+    expect(status.kind).toBe('unknown');
+    expect(status.kind === 'unknown' && status.reason).toBeTruthy();
+    // Read-only throughout: a contradiction is never a reason to dispatch.
+    expect(client.toolsCalled).toEqual(['round_status']);
+  });
+
+  it.each(['running', 'failed', 'unknown'])(
+    'refuses a %s that also carries a review',
+    async (state) => {
+      const client = new FakeMcpClient();
+      client.responses.push(
+        result('round_status', {
+          locator,
+          state,
+          instruction: 'contradictory',
+          review: completed()
+        })
+      );
+
+      const status = await new CoaiCodeReviewer(client, config).roundStatus(locator, subject);
+
+      expect(status.kind).toBe('unknown');
+      expect(client.toolsCalled).toEqual(['round_status']);
+    }
+  );
+
+  it('leaves the two coherent answers working exactly as before', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('round_status', { locator, state: 'not_started', instruction: 'reserved' })
+    );
+    client.responses.push(
+      result('round_status', {
+        locator,
+        state: 'completed',
+        instruction: 'done',
+        review: completed()
+      })
+    );
+    const reviewer = new CoaiCodeReviewer(client, config);
+
+    expect((await reviewer.roundStatus(locator, subject)).kind).toBe('not_started');
+
+    const finished = await reviewer.roundStatus(locator, subject);
+    expect(finished.kind).toBe('completed');
+    expect(finished.kind === 'completed' && finished.round.findings).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What a server may put in its own identity
+// ---------------------------------------------------------------------------
+
+describe('the MCP server identity a round would store', () => {
+  /**
+   * `serverInfo` comes from the INITIALIZE handshake, not from the tool result,
+   * so the credential scan that runs over a payload never saw it — and it was
+   * written to the durable round regardless. A token in a finding refused the
+   * whole round; the same token in a "version" was stored and shown.
+   */
+  const ESCAPE = String.fromCharCode(27);
+
+  function withServer(name: string, version: string) {
+    return { server: { name, version, protocolVersion: '2024-11-05' } };
+  }
+
+  const unsafe = [
+    { what: 'a credential-shaped name', name: 'coai-mcp ghp_A1b2C3d4E5f6G7h8I9j0', version: '0.19.0' },
+    { what: 'a credential-shaped version', name: 'coai-mcp', version: '0.19.0+sk-ant-A1b2C3d4E5f6G7h8' },
+    { what: 'an authorization header', name: 'coai Bearer A1b2C3d4E5f6G7h8I9j0', version: '1.0' },
+    { what: 'an escape sequence', name: 'coai' + ESCAPE + '[31m', version: '1.0' },
+    { what: 'an over-long version', name: 'coai-mcp', version: 'v'.repeat(201) }
+  ];
+
+  it.each(unsafe)('refuses to build a round when the server reports $what', async (
+    { name, version }
+  ) => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('run_round', completed(), withServer(name, version)));
+
+    await expect(
+      new CoaiCodeReviewer(client, config).reviewCode(locator, subject, 'scope')
+    ).rejects.toThrow(/was not accepted/i);
+  });
+
+  it('never repeats the offending identity in its refusal', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('run_round', completed(), withServer('coai-mcp ghp_A1b2C3d4E5f6G7h8I9j0', '0.19.0'))
+    );
+
+    const error = await new CoaiCodeReviewer(client, config)
+      .reviewCode(locator, subject, 'scope')
+      .catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(AgentRelayError);
+    // The message is itself stored, so it names the field and the problem only.
+    expect(String(error)).not.toContain('ghp_A1b2C3d4E5f6G7h8I9j0');
+    expect(String(error)).toMatch(/credential-shaped/i);
+  });
+
+  it('answers unknown on read-back rather than throwing out of it', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result(
+        'round_status',
+        { locator, state: 'completed', instruction: 'done', review: completed() },
+        withServer('coai-mcp ghp_A1b2C3d4E5f6G7h8I9j0', '0.19.0')
+      )
+    );
+
+    const status = await new CoaiCodeReviewer(client, config).roundStatus(locator, subject);
+
+    // `roundStatus` always answers. An answer that cannot be stored is exactly
+    // the ambiguity `unknown` exists to express.
+    expect(status.kind).toBe('unknown');
+    expect(status.kind === 'unknown' && status.reason).not.toContain('ghp_A1b2C3d4E5f6G7h8I9j0');
+  });
+
+  it('carries an ordinary identity through untouched', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('run_round', completed(), withServer('coai-mcp', '0.19.0')));
+
+    const round = await new CoaiCodeReviewer(client, config).reviewCode(locator, subject, 'scope');
+
+    expect(round.serverName).toBe('coai-mcp');
+    expect(round.serverVersion).toBe('0.19.0');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reviewer prose on a completed round
+// ---------------------------------------------------------------------------
+
+describe('provider prose a completed round would store', () => {
+  const ESCAPE = String.fromCharCode(27);
+  const BELL = String.fromCharCode(7);
+  const NEWLINE = String.fromCharCode(10);
+
+  const unsafe = [
+    {
+      what: 'an escape sequence in the reviewer summary',
+      field: 'reviewers',
+      value: 'all 3' + ESCAPE + '[2J answered'
+    },
+    {
+      what: 'a bell character in the instruction',
+      field: 'instruction',
+      value: 'resolve' + BELL + ' every finding'
+    },
+    {
+      what: 'a credential in the reviewer summary',
+      field: 'reviewers',
+      value: 'answered with GH_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0'
+    },
+    {
+      what: 'a credential in the instruction',
+      field: 'instruction',
+      value: 'export API_KEY=sk-ant-A1b2C3d4E5f6G7h8'
+    }
+  ];
+
+  it.each(unsafe)('refuses a run_round answer carrying $what', async ({ field, value }) => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('run_round', completed({ [field]: value })));
+
+    await expect(
+      new CoaiCodeReviewer(client, config).reviewCode(locator, subject, 'scope')
+    ).rejects.toThrow(/was not accepted/i);
+  });
+
+  it.each(unsafe)('turns a completed read-back carrying $what into unknown', async ({
+    field,
+    value
+  }) => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('round_status', {
+        locator,
+        state: 'completed',
+        instruction: 'done',
+        review: completed({ [field]: value })
+      })
+    );
+
+    const status = await new CoaiCodeReviewer(client, config).roundStatus(locator, subject);
+
+    expect(status.kind).toBe('unknown');
+    expect(status.kind === 'unknown' && status.reason).not.toContain(value);
+  });
+
+  it('names the field and the problem, never the value', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('run_round', completed({ reviewers: 'all 3' + ESCAPE + '[2J answered' }))
+    );
+
+    const error = await new CoaiCodeReviewer(client, config)
+      .reviewCode(locator, subject, 'scope')
+      .catch((reason: unknown) => reason);
+
+    // The control-character rule belongs to THIS check: the payload scan looks
+    // for credential shapes and would have passed an escape sequence straight
+    // through to storage.
+    expect(String(error)).toMatch(/reviewer summary is carrying control characters/i);
+    expect(String(error)).not.toContain(ESCAPE);
+  });
+
+  it('leaves a credential in prose to the payload scan, which refuses it first', async () => {
+    // Two layers, and this says which one fires. The result-wide scan runs
+    // inside `parse`, before a round is built at all, so a credential never
+    // reaches the per-field check — and both refuse the round either way.
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result(
+        'run_round',
+        completed({ reviewers: 'answered with GH_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0' })
+      )
+    );
+
+    const error = await new CoaiCodeReviewer(client, config)
+      .reviewCode(locator, subject, 'scope')
+      .catch((reason: unknown) => reason);
+
+    expect(String(error)).toMatch(/credential-shaped text/i);
+    expect(String(error)).not.toContain('ghp_A1b2C3d4E5f6G7h8I9j0');
+  });
+
+  it('leaves ordinary prose alone, wrapping included', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result(
+        'run_round',
+        completed({
+          reviewers: 'all 3 reviewers answered',
+          instruction: 'resolve every finding' + NEWLINE + 'then run the gate again'
+        })
+      )
+    );
+
+    const round = await new CoaiCodeReviewer(client, config).reviewCode(locator, subject, 'scope');
+
+    expect(round.reviewers).toBe('all 3 reviewers answered');
+    // A newline is prose, not a control character to refuse.
+    expect(round.instruction).toContain(NEWLINE);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What a read-back reason may contain
+// ---------------------------------------------------------------------------
+
+describe('what a read-back reason may contain', () => {
+  const ESCAPE = String.fromCharCode(27);
+
+  /**
+   * A wholly fictional path, argv and token. Nothing here exists; the string
+   * exists to be refused, and every fragment of it is asserted absent below.
+   */
+  const HOSTILE =
+    'died at C:/Users/someone/AppData/coai/coai-mcp.exe --stdio' + ESCAPE + '[31m';
+
+  const leaks = ['C:/Users/someone', 'coai-mcp.exe', '--stdio', 'AppData', ESCAPE];
+
+  /**
+   * Deliberately WITHOUT a credential shape.
+   *
+   * A payload carrying one is refused wholesale by the result scan, long before
+   * a state branch is reached — which is correct, and is covered separately. It
+   * would also make these tests prove nothing about the branch they name, since
+   * the answer would come from the scan either way.
+   */
+
+  it.each(['failed', 'unknown'])(
+    'repeats nothing from a %s round_status instruction',
+    async (state) => {
+      const client = new FakeMcpClient();
+      client.responses.push(result('round_status', { locator, state, instruction: HOSTILE }));
+
+      const status = await new CoaiCodeReviewer(client, config).roundStatus(locator, subject);
+
+      expect(status.kind).toBe('unknown');
+      const reason = status.kind === 'unknown' ? (status.reason ?? '') : '';
+      for (const leak of leaks) expect(reason, leak).not.toContain(leak);
+      // It still says which kind of nothing this is.
+      expect(reason).toMatch(/not repeated here|no usable record/i);
+    }
+  );
+
+  it('refuses the whole payload when the instruction is credential-shaped', async () => {
+    // The scan runs over the parsed result before any state branch, so this
+    // never reaches the `failed` case at all.
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('round_status', {
+        locator,
+        state: 'failed',
+        instruction: 'died with GH_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0'
+      })
+    );
+
+    const status = await new CoaiCodeReviewer(client, config).roundStatus(locator, subject);
+
+    expect(status.kind).toBe('unknown');
+    const reason = status.kind === 'unknown' ? (status.reason ?? '') : '';
+    expect(reason).not.toContain('ghp_A1b2C3d4E5f6G7h8I9j0');
+    expect(reason).toContain('could not be read back (PARSE_FAILED)');
+  });
+
+  it('repeats nothing from a server refusal returned as data', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('round_status', { error: HOSTILE }));
+
+    const status = await new CoaiCodeReviewer(client, config).roundStatus(locator, subject);
+
+    expect(status.kind).toBe('unknown');
+    const reason = status.kind === 'unknown' ? (status.reason ?? '') : '';
+    for (const leak of leaks) expect(reason, leak).not.toContain(leak);
+    // The closed-set code survives, because this application owns it.
+    expect(reason).toMatch(/could not be read back \(TOOL_FAILED\)/);
+  });
+
+  it('still maps the coherent states exactly as before', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('round_status', { locator, state: 'running', instruction: HOSTILE })
+    );
+    client.responses.push(
+      result('round_status', { locator, state: 'not_started', instruction: HOSTILE })
+    );
+    client.responses.push(
+      result('round_status', {
+        locator,
+        state: 'completed',
+        instruction: HOSTILE,
+        review: completed()
+      })
+    );
+    const reviewer = new CoaiCodeReviewer(client, config);
+
+    expect((await reviewer.roundStatus(locator, subject)).kind).toBe('running');
+    expect((await reviewer.roundStatus(locator, subject)).kind).toBe('not_started');
+    // A hostile envelope `instruction` does not spoil a coherent completion:
+    // the instruction that gets STORED is the review's own, and that one is
+    // checked. The envelope's copy is simply never read.
+    expect((await reviewer.roundStatus(locator, subject)).kind).toBe('completed');
+  });
+});

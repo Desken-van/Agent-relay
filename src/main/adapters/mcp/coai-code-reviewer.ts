@@ -4,6 +4,11 @@ import { z } from 'zod';
 import { AgentRelayError } from '../../../shared/domain/errors';
 import { providerCodeFindingSchema } from '../../../shared/domain/code-review';
 import { containsSecretShape, redactAndTruncate } from '../../../shared/util/redact';
+import {
+  unsafeProviderIdentity,
+  unsafeProviderProse,
+  type UnsafeProviderTextReason
+} from '../../../shared/util/provider-text';
 import type {
   CodeReviewerAvailability,
   ExternalCodeReviewer,
@@ -90,15 +95,47 @@ const completedRoundSchema = z
   })
   .strict();
 
-/** What `round_status` returns for one locator. */
-const roundStatusSchema = z
-  .object({
-    locator: locatorSchema,
-    state: z.enum(['not_started', 'running', 'completed', 'failed', 'unknown']),
-    instruction: z.string().max(20_000),
-    review: completedRoundSchema.optional()
-  })
-  .strict();
+/**
+ * What `round_status` returns for one locator: a discriminated union on
+ * `state`, not one object with an optional `review`.
+ *
+ * The difference is a safety property rather than a tidiness one. With the
+ * optional field, `{ state: 'not_started', review: { …a completed round… } }`
+ * parsed happily and the `not_started` branch never looked at `review` — so a
+ * payload that contradicts itself produced the ONE answer that licenses a
+ * re-dispatch, and a provider could be asked to run a round it had already
+ * completed.
+ *
+ * Only `completed` may carry a review. Every other state is a strict object
+ * WITHOUT the key, so a review arriving beside `not_started`, `running`,
+ * `failed` or `unknown` is an unrecognised field: the parse fails, and a parse
+ * failure is answered with `unknown`. Contradiction is ambiguity, and ambiguity
+ * is never positive evidence that nothing ran.
+ *
+ * The union also makes the original mistake unspellable — outside the
+ * `completed` branch there is no `review` left to forget to check.
+ */
+const roundStatusSchema = z.discriminatedUnion('state', [
+  z
+    .object({
+      locator: locatorSchema,
+      state: z.literal('completed'),
+      instruction: z.string().max(20_000),
+      // Optional even here: a server may call a round completed and produce no
+      // result for it. That is its own ambiguity, and it is answered with
+      // `unknown` rather than a parse error, because the state itself is
+      // coherent — the server is simply unable to say what it found.
+      review: completedRoundSchema.optional()
+    })
+    .strict(),
+  z
+    .object({
+      locator: locatorSchema,
+      state: z.enum(['not_started', 'running', 'failed', 'unknown']),
+      instruction: z.string().max(20_000)
+    })
+    .strict()
+]);
 
 /**
  * The Coai code-review adapter, bound to one audited server configuration.
@@ -279,9 +316,14 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
     subject: ExternalCodeReviewSubject
   ): void {
     if (value.state !== 'not_started') {
+      // Fixed wording, and deliberately NOT `value.state`. That field is the
+      // provider's own string, this error reaches a durable column through the
+      // service's reservation path, and a state nobody constrained could carry
+      // an absolute path, an argv or a control character just as easily as a
+      // word. Which state it was is not worth storing at that price.
       throw new AgentRelayError(
         'PARSE_FAILED',
-        `The reservation came back as '${value.state}' rather than a round that has not run, so nothing was dispatched.`
+        'The reservation is not a round that has yet to run, so nothing was dispatched.'
       );
     }
 
@@ -378,13 +420,7 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
       );
       value = this.parse(result, roundStatusSchema);
     } catch (error) {
-      return {
-        kind: 'unknown',
-        reason: redactAndTruncate(
-          error instanceof Error ? error.message : String(error),
-          REASON_LIMIT
-        )
-      };
+      return { kind: 'unknown', reason: this.unreadable(error) };
     }
 
     if (!sameLocator(value.locator, locator)) {
@@ -417,7 +453,21 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
           };
         }
 
-        return { kind: 'completed', round: this.round(value.review, locator, result) };
+        // `round` refuses a server identity that cannot be stored, and it
+        // refuses by throwing. That must not escape a read-back: this method's
+        // whole contract is that it always answers, and an answer that cannot
+        // be stored is exactly the ambiguity `unknown` exists to express.
+        try {
+          return { kind: 'completed', round: this.round(value.review, locator, result) };
+        } catch (error) {
+          return {
+            kind: 'unknown',
+            reason: redactAndTruncate(
+              error instanceof Error ? error.message : String(error),
+              REASON_LIMIT
+            )
+          };
+        }
       }
 
       case 'failed':
@@ -427,21 +477,18 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
         // already have consumed a round.
         return {
           kind: 'unknown',
-          reason: redactAndTruncate(
-            `The provider reports this round as failed: ${value.instruction}`,
-            REASON_LIMIT
-          )
+          // `instruction` is the provider's own prose and this reason is stored
+          // by the service, so it is not repeated. Redaction hides credential
+          // SHAPES; it hides neither an absolute path nor a control character,
+          // and it was never meant to.
+          reason:
+            'The provider reports this round as failed. What it said about the failure is not repeated here, because a provider message can carry a path, a command line or a control character.'
         };
 
       default:
         return {
           kind: 'unknown',
-          reason: redactAndTruncate(
-            value.instruction.length > 0
-              ? value.instruction
-              : 'The provider has no record of this round.',
-            REASON_LIMIT
-          )
+          reason: 'The provider has no usable record of this round.'
         };
     }
   }
@@ -466,6 +513,12 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
       );
     }
 
+    // Checked HERE, before any of it becomes part of a stored round.
+    const unstorable = this.unstorableRound(value, result);
+    if (unstorable !== null) {
+      throw new AgentRelayError('PARSE_FAILED', unstorable);
+    }
+
     return {
       locator: value.locator,
       reviewedSubjectSha256: value.reviewedSubjectSha256,
@@ -481,6 +534,59 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
       tokensIn: value.tokensIn ?? null,
       tokensOut: value.tokensOut ?? null
     };
+  }
+
+  /**
+   * Why nothing about this round can be stored, or `null` when it all can.
+   *
+   * Every provider-controlled string the round would carry into storage, in one
+   * place. `serverInfo.name` and `serverInfo.version` arrive in the MCP
+   * INITIALIZE handshake rather than in a tool result, so the credential scan
+   * {@link parse} runs over the payload never sees them at all; `reviewers` and
+   * `instruction` are in the payload but are prose, which the scan checks for
+   * credential shapes and not for anything else.
+   *
+   * Identity and prose are judged by different rules on purpose: a name or a
+   * version has no business carrying any control character, while a reviewer's
+   * instruction may legitimately wrap. The service applies the same four checks
+   * again at its own boundary, because `ExternalCodeReviewer` is an interface
+   * and the service is where an answer becomes durable.
+   *
+   * The answer names the FIELD and the problem and never the value: this
+   * message is itself stored, so repeating the value would defeat the check
+   * that produced it.
+   */
+  private unstorableRound(
+    value: z.infer<typeof completedRoundSchema>,
+    result: ExternalMcpCallResult
+  ): string | null {
+    const checks: readonly (readonly [string, UnsafeProviderTextReason | null])[] = [
+      ['The MCP server name', unsafeProviderIdentity(result.server.name)],
+      ['The MCP server version', unsafeProviderIdentity(result.server.version)],
+      ['The reviewer summary', unsafeProviderProse(value.reviewers, 2_000)],
+      ['The reviewer instruction', unsafeProviderProse(value.instruction, 20_000)]
+    ];
+    for (const [what, reason] of checks) {
+      if (reason !== null) {
+        return `${what} is ${reason}, so the round was not accepted.`;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Why a read-back could not be read, said without repeating anything foreign.
+   *
+   * The error can be the transport's, or {@link parse}'s report of a refusal the
+   * server returned as data — and that one embeds the server's own sentence. The
+   * code is a closed enum this application owns; the message is not, so only the
+   * code is used.
+   */
+  private unreadable(error: unknown): string {
+    const code = error instanceof AgentRelayError ? error.code : 'UNKNOWN';
+
+    return `The round could not be read back (${code}). What the provider said is not repeated here, because it can carry a path, a command line or a credential.`;
   }
 
   private assertOurProvider(locator: ExternalCodeRoundLocator): void {

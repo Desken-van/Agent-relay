@@ -3,7 +3,7 @@
 import { AgentRelayError } from '../../shared/domain/errors';
 import type { Settings } from '../../shared/domain/models';
 import type { ExternalMcpServerConfig } from '../ports';
-import { assertExternalPlanReviewSettings, coaiToolProfile } from './plan-review-configuration';
+import { assertExternalPlanReviewSettings, coaiServerConfig } from './plan-review-configuration';
 
 /**
  * The code reviewer's server configuration, built in the MAIN process only.
@@ -33,25 +33,13 @@ export function externalCodeReviewConfig(settings: Settings): ExternalMcpServerC
     );
   }
 
-  return {
-    id: 'coai-code-review',
-    enabled: true,
-    executablePath: settings.coaiMcpExecutablePath,
-    args: settings.coaiMcpArguments,
-    ...(settings.coaiMcpWorkingDirectory === null
-      ? {}
-      : { cwd: settings.coaiMcpWorkingDirectory }),
-    // The exact audited profile, and the SAME one the plan gate uses whenever
-    // code review is enabled — one server, one tool list, so neither gate can
-    // be configured into refusing the server the other is talking to. The
-    // transport compares it exactly, so a legacy seven-tool server cannot be
-    // talked to at all, which is the honest outcome rather than a degraded one.
-    allowedTools: coaiToolProfile(settings),
-    timeoutMs: settings.processTimeoutMs,
-    maxMessageBytes: 2 * 1024 * 1024,
-    maxContentBytes: 2 * 1024 * 1024,
-    maxContentBlocks: 128
-  };
+  // The same server as the plan gate, so the same builder: one executable, one
+  // argv, one transport capacity, and the exact audited profile chosen by what
+  // is enabled — so neither gate can be configured into refusing the server the
+  // other is talking to. The transport compares that profile exactly, which is
+  // why a legacy seven-tool server cannot be talked to at all. That is the
+  // honest outcome rather than a degraded one.
+  return coaiServerConfig(settings, 'coai-code-review', settings.coaiMcpExecutablePath);
 }
 
 /** Is external code review switched on and configured well enough to try? */

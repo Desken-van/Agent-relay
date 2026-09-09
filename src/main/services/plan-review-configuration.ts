@@ -126,25 +126,59 @@ export function coaiToolProfile(settings: Settings): readonly string[] {
   return settings.externalCodeReviewEnabled ? COAI_ADDRESSABLE_PROFILE : COAI_PLAN_PROFILE;
 }
 
-export function externalPlanReviewConfig(settings: Settings): ExternalMcpServerConfig {
-  assertExternalPlanReviewSettings(settings);
-  if (!settings.externalPlanReviewEnabled || settings.coaiMcpExecutablePath === null) {
-    invalid('External plan review is disabled.');
-  }
+/**
+ * The transport capacity both gates run under, stated once.
+ *
+ * The two configurations describe the SAME server process reached over the same
+ * stdio transport, so a limit that differs between them is not a policy choice
+ * but drift. Written out twice, raising `maxContentBytes` for the plan gate
+ * would leave the code gate refusing a message the plan gate accepts from the
+ * one server both are talking to, and nothing in either file would say why.
+ */
+export const COAI_MCP_CAPACITY = {
+  maxMessageBytes: 2 * 1024 * 1024,
+  maxContentBytes: 2 * 1024 * 1024,
+  maxContentBlocks: 128
+} as const;
+
+/**
+ * Everything the two gates share, built once from trusted settings.
+ *
+ * They differ in exactly two things: the `id` their transport is filed under,
+ * and the checks each runs before it asks for a configuration at all. All the
+ * rest — executable, argv, working directory, tool profile, timeout, capacity —
+ * belongs to one server, so it is described in one place.
+ *
+ * `executablePath` is a parameter rather than read from `settings` here
+ * because each gate has already narrowed it away from null with its OWN
+ * message, and a shared builder must not replace that message with a vaguer one.
+ */
+export function coaiServerConfig(
+  settings: Settings,
+  id: string,
+  executablePath: string
+): ExternalMcpServerConfig {
   return {
-    id: 'coai-plan-review',
+    id,
     enabled: true,
-    executablePath: settings.coaiMcpExecutablePath,
+    executablePath,
     args: settings.coaiMcpArguments,
     ...(settings.coaiMcpWorkingDirectory === null
       ? {}
       : { cwd: settings.coaiMcpWorkingDirectory }),
     allowedTools: coaiToolProfile(settings),
     timeoutMs: settings.processTimeoutMs,
-    maxMessageBytes: 2 * 1024 * 1024,
-    maxContentBytes: 2 * 1024 * 1024,
-    maxContentBlocks: 128
+    ...COAI_MCP_CAPACITY
   };
+}
+
+export function externalPlanReviewConfig(settings: Settings): ExternalMcpServerConfig {
+  assertExternalPlanReviewSettings(settings);
+  if (!settings.externalPlanReviewEnabled || settings.coaiMcpExecutablePath === null) {
+    invalid('External plan review is disabled.');
+  }
+
+  return coaiServerConfig(settings, 'coai-plan-review', settings.coaiMcpExecutablePath);
 }
 
 export function configuredRuleSources(

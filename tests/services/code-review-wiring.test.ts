@@ -18,7 +18,10 @@ import {
   externalCodeReviewConfigured
 } from '../../src/main/services/code-review-configuration';
 import { CoaiPlanReviewer } from '../../src/main/adapters/mcp/coai-plan-reviewer';
-import { externalPlanReviewConfig } from '../../src/main/services/plan-review-configuration';
+import {
+  COAI_MCP_CAPACITY,
+  externalPlanReviewConfig
+} from '../../src/main/services/plan-review-configuration';
 import { defaultSettings } from '../../src/main/container';
 import { SettingsBoundCodeReviewer } from '../../src/main/services/code-review-provider';
 import type { Settings } from '../../src/shared/domain/models';
@@ -266,5 +269,66 @@ describe('the profile both gates are configured with', () => {
     expect(
       () => new CoaiPlanReviewer(client, { ...config, allowedTools: COAI_PLAN_PROFILE.slice(0, 6) })
     ).toThrow(/audited profiles/i);
+  });
+});
+
+describe('the two gates describe one server', () => {
+  /**
+   * The transport limits used to be written out twice, once per configuration
+   * builder. Both describe the SAME server process reached over the same stdio
+   * transport, so a limit raised in one and not the other is not a policy — it
+   * is drift, and it would show up as one gate refusing a message the other
+   * accepts from the one server they share.
+   */
+  it('shares executable, argv, working directory, profile and capacity', () => {
+    const value = settings({
+      externalPlanReviewEnabled: true,
+      externalCodeReviewEnabled: true,
+      coaiMcpWorkingDirectory: 'C:/work'
+    });
+
+    const plan = externalPlanReviewConfig(value);
+    const code = externalCodeReviewConfig(value);
+
+    // They differ in exactly one field, and it is the one they are entitled to
+    // differ in: the id their transport is filed under.
+    expect(plan.id).toBe('coai-plan-review');
+    expect(code.id).toBe('coai-code-review');
+    expect({ ...code, id: plan.id }).toEqual(plan);
+
+    // The capacity is the shared constant rather than a repeated literal, so a
+    // change to it cannot reach one gate and miss the other.
+    for (const config of [plan, code]) {
+      expect(config.maxMessageBytes).toBe(COAI_MCP_CAPACITY.maxMessageBytes);
+      expect(config.maxContentBytes).toBe(COAI_MCP_CAPACITY.maxContentBytes);
+      expect(config.maxContentBlocks).toBe(COAI_MCP_CAPACITY.maxContentBlocks);
+      expect(config.timeoutMs).toBe(value.processTimeoutMs);
+      expect(config.executablePath).toBe(value.coaiMcpExecutablePath);
+      expect(config.args).toEqual(value.coaiMcpArguments);
+      expect(config.cwd).toBe('C:/work');
+    }
+
+    // And the profile stays exact: ten tools, because code review is on.
+    expect(plan.allowedTools).toEqual(COAI_ADDRESSABLE_PROFILE);
+    expect(code.allowedTools).toEqual(COAI_ADDRESSABLE_PROFILE);
+  });
+
+  it('leaves the plan gate on the seven-tool profile when code review is off', () => {
+    const plan = externalPlanReviewConfig(
+      settings({ externalPlanReviewEnabled: true, externalCodeReviewEnabled: false })
+    );
+
+    expect(plan.allowedTools).toEqual(COAI_PLAN_PROFILE);
+    expect(plan.maxContentBlocks).toBe(COAI_MCP_CAPACITY.maxContentBlocks);
+  });
+
+  it('omits the working directory when none is configured', () => {
+    const value = settings({
+      externalPlanReviewEnabled: true,
+      coaiMcpWorkingDirectory: null
+    });
+
+    expect(externalPlanReviewConfig(value).cwd).toBeUndefined();
+    expect(externalCodeReviewConfig(value).cwd).toBeUndefined();
   });
 });

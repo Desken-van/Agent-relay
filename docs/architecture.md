@@ -555,6 +555,15 @@ and not anything the adapter invents, because neither survives the restart the
 token exists for. `ExternalCodeReviewer.beginRound` therefore takes the token as
 an argument rather than deriving it from the subject.
 
+**Known, and bounded: a lost `reserve_round` answer strands its reservation.**
+If the reservation succeeded at the provider and only its answer was lost, the
+local round is closed as a refusal that provably reviewed nothing, and the next
+review builds a new row with a new token — so nothing ever addresses the old
+reservation again. The cost is bounded to the provider's own bookkeeping: a
+reservation dispatches no reviewer and spends no round quota, so a stranded one
+reviews nothing and costs nothing. Resuming it would need a durable reservation
+phase of its own, and that is deliberately not designed here.
+
 **Every uncertain read-back is `unknown`.** `roundStatus` maps `running` and
 `completed` as the provider states them, and returns `not_started` only when the
 provider positively says so about a round it holds and has not dispatched. A
@@ -563,6 +572,76 @@ parse, a `completed` with no result attached, an answer carrying another
 locator, and a provider reporting the round as spent all become `unknown` with a
 bounded redacted reason. None of them is read as "nothing ran", because only one
 of them would be safe to and they are indistinguishable from here.
+
+**A contradictory answer is ambiguity, not evidence.** `round_status` is parsed
+as a discriminated union on `state`: only `completed` may carry a `review`, and
+every other state is a strict object without the key. A payload claiming
+`not_started` while also carrying a finished review therefore does not parse,
+and a parse failure is `unknown`. That closes the one path by which a provider
+could be asked to re-run a round it had just said it completed — `not_started`
+is the single answer that releases a round, so it has to be free of
+self-contradiction.
+
+**Exactly four provider strings are stored, and all four are checked twice.**
+A completed round carries `serverName`, `serverVersion`, `reviewers` and
+`instruction` into SQLite. `serverInfo.name` and `serverInfo.version` arrive in
+the MCP initialize handshake rather than in a tool result, so the credential scan
+that runs over a payload never saw them at all; `reviewers` and `instruction` are
+in the payload, but that scan looks for credential shapes and for nothing else.
+
+| Field | Rule |
+|---|---|
+| `serverName`, `serverVersion` | identity: bounded length, **no** control character of any kind, no credential shape |
+| `reviewers`, `instruction` | prose: bounded length, tab/newline/carriage-return allowed and every other control character refused, no credential shape |
+| `findings` | unchanged — parsed against its schema and scanned as a whole |
+
+The check runs in `CoaiCodeReviewer` before a round is built, and **again** in
+`CodeReviewService.validateAnswer`, which is the boundary where an answer becomes
+durable and is shared by a live dispatch and by reconciliation.
+`ExternalCodeReviewer` is an interface: a second implementation reaches storage
+without passing the adapter at all, so the adapter's check is a convenience and
+the service's is the guarantee. An unstorable value fails the round rather than
+being cleaned up — none of it is kept, and the refusal names the field and the
+problem, never the value.
+
+Two layers, in this order: the result-wide credential scan inside `parse` refuses
+a payload before a round is built, so a credential never reaches the per-field
+check. The per-field check is what adds the control-character and length rules,
+which the scan was never meant to cover.
+
+**A provider's own explanation is never stored, on any of the four paths.**
+`lastError` is durable and operator-visible, and redaction hides credential
+*shapes* — it hides neither an absolute path, nor an argv, nor a control
+character, and was never meant to. So no provider-authored sentence reaches it.
+The reviewer can produce one at four different moments, and each is answered with
+a fixed message this build owns:
+
+| Path | What the provider could say | What is stored |
+|---|---|---|
+| reservation (`reserve_round`) | a refusal, a transport error, a `state` string nothing constrains | `RESERVATION_FAILED` — closed as failed, nothing was dispatched |
+| live dispatch (`run_round`) | a refusal, a timeout, a lost answer | `DISPATCH_UNCONFIRMED` — stays unresolved, because it may have run |
+| completed answer | `serverName`, `serverVersion`, `reviewers`, `instruction` | the round itself, once all four pass the checks above; otherwise the owned sentence naming the field, or `ANSWER_MALFORMED` for a schema failure |
+| reconciliation (`round_status`) | an `instruction` beside `failed`/`unknown`, and the port's `reason` | `RECONCILE_UNKNOWN`; `status.reason` is deliberately not read |
+
+The reservation path matters most and was closed last. `CoaiCodeReviewer.parse`
+quotes an MCP server's refusal sentence into `AgentRelayError.message` **on
+purpose**, so the caller who asked for a review can be told what the server said
+— which meant both live catches were copying foreign text into SQLite by simply
+storing `error.message`. The adapter's reservation check no longer interpolates
+the provider's `state` either: which state it was is not worth storing at the
+price of a field nothing constrains.
+
+**Transient and durable are deliberately different.** The original error is
+rethrown untouched, so the immediate caller keeps its `code`, its message and
+whatever classification it needs to decide what to do or what to show. Only the
+copy that lands in the round is fixed. Being told what went wrong and recording
+it forever are different acts with different risks, and this is the seam between
+them.
+
+What is lost is a provider's description of its own failure, which was never
+trustworthy enough to store. What is kept is the part that governs behaviour: a
+reservation that failed dispatched nothing, and a dispatch whose answer was lost
+may well have run.
 
 **Dirty subjects are still refused.** `readsUncommittedWorktreeState` is `false`
 and stays false whatever is configured: `run_round` reviews a commit in a
@@ -1333,7 +1412,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1529 deterministic tests in 58 files, plus one routine automated Electron
+1578 deterministic tests in 58 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.
