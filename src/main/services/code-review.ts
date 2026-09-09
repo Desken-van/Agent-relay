@@ -42,9 +42,11 @@ import type { Task } from '../../shared/domain/models';
 import { containsSecretShape, redactAndTruncate } from '../../shared/util/redact';
 import {
   unsafeProviderIdentity,
+  unsafeProviderLocatorId,
   unsafeProviderProse,
   type UnsafeProviderTextReason
 } from '../../shared/util/provider-text';
+import { CodeReviewNotDispatchedError } from './code-review-provider';
 import {
   hashSnapshotFile,
   nodeSnapshotFileOps,
@@ -130,6 +132,17 @@ const RESERVATION_FAILED =
  */
 const DISPATCH_UNCONFIRMED =
   'The review was dispatched and its outcome could not be confirmed. The round stays unresolved: the request left this process, so a reviewer may well have run, and no answer is not evidence that none did. What the reviewer said is deliberately not recorded here, because a provider error is foreign text and this field is stored.';
+
+/**
+ * What a round records when the reviewer went away before anything was sent.
+ *
+ * Distinct from {@link DISPATCH_UNCONFIRMED} because the fact is different, and
+ * the difference decides what the operator may do next. This one is only ever
+ * written on typed proof that no request left the process, so the round is
+ * closed and a new one may be started once the integration is configured again.
+ */
+const DISPATCH_NOT_ATTEMPTED =
+  'The round was reserved, but external code review stopped being configured before anything was sent, so no reviewer ran and nothing was dispatched. The round is closed as failed; start a new one once external code review is configured again.';
 
 /**
  * What an answer this build cannot read records.
@@ -322,6 +335,37 @@ const externalRoundLocatorSchema = z
     roundId: z.string().min(1).max(128)
   })
   .strict();
+
+/**
+ * Why this locator may not be written down, or `null` when it may.
+ *
+ * The service checks it as well as the Coai adapter, and not out of caution:
+ * `ExternalCodeReviewer` is an INTERFACE. A second implementation reaches this
+ * line without passing through the adapter's schema at all, and this is where a
+ * locator becomes durable — it is stored on the round and shown wherever the
+ * round's provider identity is.
+ *
+ * `providerId` is checked here for shape and, separately and immediately below,
+ * for equality with the trusted local provider identity. The two answer
+ * different questions: whether the string is storable, and whether the round is
+ * ours.
+ *
+ * Names the FIELD and the violation, never the value.
+ */
+function unstorableLocator(locator: ExternalCodeRoundLocator): string | null {
+  const checks: readonly (readonly [string, UnsafeProviderTextReason | null])[] = [
+    ['The provider session id', unsafeProviderLocatorId(locator.sessionId)],
+    ['The provider round id', unsafeProviderLocatorId(locator.roundId)],
+    ['The provider id', unsafeProviderLocatorId(locator.providerId)]
+  ];
+  for (const [what, reason] of checks) {
+    if (reason !== null) {
+      return `${what} is ${reason}, so nothing was dispatched.`;
+    }
+  }
+
+  return null;
+}
 
 function sameLocator(a: ExternalCodeRoundLocator, b: ExternalCodeRoundLocator): boolean {
   return (
@@ -835,6 +879,13 @@ export class CodeReviewService {
         // tell apart.
         await this.deps.reviewer.beginRound(externalSubject, round.id, signal)
       );
+      // Shape first: an unstorable component must stop the dispatch here, above
+      // the non-idempotent call, rather than be discovered by whatever later
+      // reads the row it would have been written into.
+      const unstorable = unstorableLocator(locator);
+      if (unstorable !== null) {
+        throw new AgentRelayError('PARSE_FAILED', unstorable);
+      }
       if (locator.providerId !== this.deps.reviewer.providerId) {
         throw new AgentRelayError('PARSE_FAILED', LOCATOR_INVALID);
       }
@@ -870,9 +921,26 @@ export class CodeReviewService {
     try {
       answer = await this.deps.reviewer.reviewCode(locator, externalSubject, scopeText, signal);
     } catch (error) {
-      // The phase stays at `reviewing`: the request left this process and only
-      // its answer was lost. Writing `failed` here would assert the call had no
-      // effect, which nothing on this side can know.
+      // Two failures that look identical from here, and only one of them may
+      // close the round.
+      //
+      // The typed error is positive proof that nothing was sent: it comes from
+      // the configuration seam, which is resolved BEFORE any MCP call, so a
+      // throw from there means the request never left. Recognised by TYPE and
+      // never by its code — a real adapter can raise `TOOL_MISSING` from inside
+      // an external call, once the request has already gone out, and treating
+      // that as proof would close a round that may well have run.
+      if (error instanceof CodeReviewNotDispatchedError) {
+        this.deps.reviews.updateRound(dispatched.id, {
+          status: 'failed',
+          lastError: redactAndTruncate(DISPATCH_NOT_ATTEMPTED, 10_000)
+        });
+        throw error;
+      }
+
+      // Everything else: the phase stays at `reviewing`, because the request
+      // left this process and only its answer was lost. Writing `failed` here
+      // would assert the call had no effect, which nothing on this side knows.
       this.deps.reviews.updateRound(dispatched.id, {
         lastError: redactAndTruncate(DISPATCH_UNCONFIRMED, 10_000)
       });

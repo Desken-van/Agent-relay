@@ -6,6 +6,7 @@ import { providerCodeFindingSchema } from '../../../shared/domain/code-review';
 import { containsSecretShape, redactAndTruncate } from '../../../shared/util/redact';
 import {
   unsafeProviderIdentity,
+  unsafeProviderLocatorId,
   unsafeProviderProse,
   type UnsafeProviderTextReason
 } from '../../../shared/util/provider-text';
@@ -31,11 +32,29 @@ import { McpToolProfileMismatchError } from './stdio-mcp-client';
 /** How much of a provider's prose may reach a stored reason. */
 const REASON_LIMIT = 2_000;
 
+/**
+ * One component of a locator: opaque to this build, and therefore shaped.
+ *
+ * Length alone is not a contract. These strings are stored on the durable round
+ * and shown wherever its provider identity is, so a server that answered a
+ * reservation with an escape sequence, a path or a token in its own session id
+ * had it persisted verbatim. The allow-list is stricter than the old bound in
+ * every direction, so nothing is weakened: it also enforces 1..128 characters.
+ *
+ * Refused at the SCHEMA, so a bad component fails the whole payload closed
+ * rather than being caught later by whoever happened to look. Nothing is
+ * normalised: a locator edited on the way in no longer names the round the
+ * provider created.
+ */
+const opaqueLocatorId = z.string().refine((value) => unsafeProviderLocatorId(value) === null, {
+  message: 'is not a plain opaque identifier this build is willing to store'
+});
+
 const locatorSchema = z
   .object({
-    providerId: z.string().min(1).max(128),
-    sessionId: z.string().min(1).max(128),
-    roundId: z.string().min(1).max(128)
+    providerId: opaqueLocatorId,
+    sessionId: opaqueLocatorId,
+    roundId: opaqueLocatorId
   })
   .strict();
 

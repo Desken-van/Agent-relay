@@ -564,6 +564,34 @@ reservation dispatches no reviewer and spends no round quota, so a stranded one
 reviews nothing and costs nothing. Resuming it would need a durable reservation
 phase of its own, and that is deliberately not designed here.
 
+**A locator component is an opaque identifier, and it has a shape.**
+`sessionId` and `roundId` are opaque to Agent Relay — it never parses them, only
+stores them and hands them back — and that is precisely why they need one. They
+are written to the durable round and shown wherever a round's provider identity
+is, so a length bound alone let a server name its own session with an escape
+sequence, a path, an argv fragment or a token and have it persisted verbatim.
+
+The allowed alphabet is letters, digits and `. _ - :`, starting with a letter or
+a digit, 1–128 characters. That covers every identifier a real server produces —
+UUIDs, hex digests, dotted and colon-namespaced slugs — and excludes whitespace,
+control characters, quotes, slashes and backslashes, so a component can be
+neither a path nor a command line fragment. The leading character is constrained
+separately so an id cannot begin with `-` and read as an option. A
+credential-shaped value is refused on top of that, because a token satisfies the
+alphabet on its own.
+
+Nothing is normalised or stripped: either the value is acceptable whole or the
+locator is refused whole, since a locator edited on the way in no longer names
+the round the provider created. The check runs at the adapter's SCHEMA, so a bad
+component fails the whole payload closed, and again in `CodeReviewService` before
+the locator becomes durable — `ExternalCodeReviewer` is an interface, and a
+second implementation reaches that line without passing through the adapter at
+all. `providerId` is checked for shape there too and, separately, for equality
+with the trusted local provider identity: whether the string is storable and
+whether the round is ours are different questions. A refusal names the field and
+the violation, never the value, and it happens above the non-idempotent call, so
+the round is closed as a pre-dispatch failure rather than left unresolved.
+
 **Every uncertain read-back is `unknown`.** `roundStatus` maps `running` and
 `completed` as the provider states them, and returns `not_started` only when the
 provider positively says so about a round it holds and has not dispatched. A
@@ -620,6 +648,7 @@ a fixed message this build owns:
 |---|---|---|
 | reservation (`reserve_round`) | a refusal, a transport error, a `state` string nothing constrains | `RESERVATION_FAILED` — closed as failed, nothing was dispatched |
 | live dispatch (`run_round`) | a refusal, a timeout, a lost answer | `DISPATCH_UNCONFIRMED` — stays unresolved, because it may have run |
+| dispatch never attempted | nothing; the reviewer was gone before anything was sent | `DISPATCH_NOT_ATTEMPTED` — closed as failed, on typed proof |
 | completed answer | `serverName`, `serverVersion`, `reviewers`, `instruction` | the round itself, once all four pass the checks above; otherwise the owned sentence naming the field, or `ANSWER_MALFORMED` for a schema failure |
 | reconciliation (`round_status`) | an `instruction` beside `failed`/`unknown`, and the port's `reason` | `RECONCILE_UNKNOWN`; `status.reason` is deliberately not read |
 
@@ -630,6 +659,24 @@ purpose**, so the caller who asked for a review can be told what the server said
 storing `error.message`. The adapter's reservation check no longer interpolates
 the provider's `state` either: which state it was is not worth storing at the
 price of a field nothing constrains.
+
+**`failed before dispatch` and `unconfirmed after dispatch` are different facts,
+and only one of them may close a round.** From inside a catch block they look
+identical, so the distinction cannot be guessed: it is carried by a TYPE.
+`SettingsBoundCodeReviewer` resolves configuration per call, so a round can be
+reserved while the integration is on and find it switched off before anything is
+sent; `required()` throws `CodeReviewNotDispatchedError` there, and that class is
+positive evidence that no request left the process, because it is raised from the
+configuration seam which is always reached BEFORE any MCP call.
+
+`CodeReviewService` branches on `instanceof`, never on the code. `TOOL_MISSING`
+alone proves nothing — a real adapter can raise it from inside an external call,
+once the request has already gone out, and treating that as proof would close a
+round that may well have run. On the typed error the round is closed `failed`
+with `DISPATCH_NOT_ATTEMPTED` and a new round may be started once the integration
+is configured again; on anything else it stays `reviewing` with
+`DISPATCH_UNCONFIRMED`. The typed error is rethrown unchanged, so the caller
+still receives its ordinary `TOOL_MISSING` code and message.
 
 **Transient and durable are deliberately different.** The original error is
 rethrown untouched, so the immediate caller keeps its `code`, its message and
@@ -1412,7 +1459,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1578 deterministic tests in 58 files, plus one routine automated Electron
+1592 deterministic tests in 58 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.

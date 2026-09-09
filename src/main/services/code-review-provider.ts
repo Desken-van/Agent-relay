@@ -27,6 +27,31 @@ import type {
   ExternalCodeReviewSubject
 } from '../ports';
 
+/**
+ * Typed proof that no external call was attempted.
+ *
+ * The service has to tell two failures apart that look identical from a catch
+ * block: a request that left this process and lost its answer, and a request
+ * that was never made at all. The first must leave the round unresolved,
+ * because a reviewer may well have run; the second may close it, because
+ * nothing did.
+ *
+ * A TYPE rather than a code, because `TOOL_MISSING` is not proof of anything on
+ * its own — a real adapter can raise it from inside an external call, once the
+ * request has already gone out. Only the throw site knows whether anything was
+ * attempted, so only the throw site can say so, and it says so by choosing this
+ * class.
+ *
+ * The code and message are an ordinary `TOOL_MISSING` for the caller, which is
+ * entitled to exactly what it was entitled to before.
+ */
+export class CodeReviewNotDispatchedError extends AgentRelayError {
+  constructor(message: string, options?: { remediation?: string }) {
+    super('TOOL_MISSING', message, options);
+    this.name = 'CodeReviewNotDispatchedError';
+  }
+}
+
 export class UnconfiguredCodeReviewer implements ExternalCodeReviewer {
   /**
    * A real name, not an empty string, so a round could never be filed under it
@@ -204,11 +229,18 @@ export class SettingsBoundCodeReviewer implements ExternalCodeReviewer {
       : reviewer.roundStatus(locator, subject, signal);
   }
 
+  /**
+   * The configured reviewer, or typed proof that nothing was attempted.
+   *
+   * Reached BEFORE any MCP call, always: this resolves configuration and either
+   * hands back a reviewer or throws. So a throw from here is positive evidence
+   * that no request left the process, and {@link CodeReviewNotDispatchedError}
+   * is how that evidence crosses the boundary to the service.
+   */
   private required(): ExternalCodeReviewer {
     const reviewer = this.reviewer();
     if (reviewer === null) {
-      throw new AgentRelayError(
-        'TOOL_MISSING',
+      throw new CodeReviewNotDispatchedError(
         'External code review is not enabled, so no round can be reserved or run.',
         {
           remediation:

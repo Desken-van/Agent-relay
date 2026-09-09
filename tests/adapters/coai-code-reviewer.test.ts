@@ -1099,3 +1099,96 @@ describe('what a read-back reason may contain', () => {
     expect((await reviewer.roundStatus(locator, subject)).kind).toBe('completed');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Locator components are opaque identifiers, not free text
+// ---------------------------------------------------------------------------
+
+describe('the locator a reservation hands back', () => {
+  /**
+   * `sessionId` and `roundId` used to be bounded only by length, and they are
+   * written straight to the durable round and shown wherever its provider
+   * identity is. A server could therefore name its own session with an escape
+   * sequence, a path or a token and have it persisted verbatim.
+   */
+  const ESCAPE = String.fromCharCode(27);
+  const BELL = String.fromCharCode(7);
+
+  const hostile = [
+    { what: 'an escape sequence in the session id', field: 'sessionId', value: 'session' + ESCAPE + '[31m' },
+    { what: 'a control character in the round id', field: 'roundId', value: 'round' + BELL + '1' },
+    { what: 'a path in the session id', field: 'sessionId', value: 'C:/Users/someone/AppData/coai' },
+    { what: 'an argv fragment in the round id', field: 'roundId', value: '--data-dir /tmp/x' },
+    { what: 'a credential-shaped session id', field: 'sessionId', value: 'ghp_A1b2C3d4E5f6G7h8I9j0' },
+    { what: 'a credential-shaped round id', field: 'roundId', value: 'sk-ant-A1b2C3d4E5f6G7h8' }
+  ];
+
+  it.each(hostile)('refuses a reservation carrying $what, and dispatches nothing', async ({
+    field,
+    value
+  }) => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('reserve_round', { ...reservation, locator: { ...locator, [field]: value } })
+    );
+
+    const failure = await new CoaiCodeReviewer(client, config)
+      .beginRound(subject, 'local-round-7')
+      .catch((reason: unknown) => reason);
+
+    expect(failure).toBeInstanceOf(AgentRelayError);
+    expect((failure as AgentRelayError).code).toBe('PARSE_FAILED');
+    // The refusal repeats nothing the server sent.
+    expect(String(failure)).not.toContain(value);
+    // Reserved and no more: run_round is never reached.
+    expect(client.toolsCalled).toEqual(['reserve_round']);
+  });
+
+  it('still accepts the identifier shapes a real server actually produces', async () => {
+    const realistic = [
+      '9f2c1e7a-3b4d-4e5f-8a9b-0c1d2e3f4a5b',
+      'a3f5c9e1b7d2a4f6',
+      'coai:session:2026-09-09',
+      'round_42.retry-3',
+      '7'
+    ];
+
+    for (const id of realistic) {
+      const client = new FakeMcpClient();
+      client.responses.push(
+        result('reserve_round', {
+          ...reservation,
+          locator: { ...locator, sessionId: id, roundId: id }
+        })
+      );
+
+      const answer = await new CoaiCodeReviewer(client, config).beginRound(
+        subject,
+        'local-round-7'
+      );
+
+      // Carried through exactly: nothing is normalised or stripped, because a
+      // locator edited on the way in no longer names the provider's round.
+      expect(answer.sessionId, id).toBe(id);
+      expect(answer.roundId, id).toBe(id);
+    }
+  });
+
+  it('refuses the same shapes on a completed read-back, not only on reserving', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('round_status', {
+        locator: { ...locator, sessionId: 'session' + ESCAPE + '[31m' },
+        state: 'completed',
+        instruction: 'done',
+        review: completed()
+      })
+    );
+
+    const status = await new CoaiCodeReviewer(client, config).roundStatus(locator, subject);
+
+    // The schema refuses the payload, and a parse failure is `unknown`.
+    expect(status.kind).toBe('unknown');
+    expect(status.kind === 'unknown' && status.reason).not.toContain(ESCAPE);
+  });
+});

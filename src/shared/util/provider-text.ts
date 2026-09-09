@@ -31,7 +31,31 @@ export const PROVIDER_IDENTITY_LIMIT = 200;
 export type UnsafeProviderTextReason =
   | 'longer than the limit allows'
   | 'carrying control characters'
-  | 'credential-shaped';
+  | 'credential-shaped'
+  | 'not a plain opaque identifier';
+
+/**
+ * How long an external locator component may be.
+ *
+ * A session or round id is a NAME the provider chose for something. Real ones
+ * are UUIDs, hex digests or short slugs; 128 characters is generous for all of
+ * them and small enough that nothing interesting fits.
+ */
+export const PROVIDER_LOCATOR_LIMIT = 128;
+
+/**
+ * The only shape an external locator component may take.
+ *
+ * Letters, digits and `. _ - :`, starting with a letter or a digit. That covers
+ * every identifier a real Coai server produces — UUIDs, hex, dotted and
+ * colon-namespaced slugs — and excludes everything that makes a stored string
+ * dangerous: no whitespace, no control character, no quote, no slash or
+ * backslash, so it can be neither a path nor a command line fragment.
+ *
+ * The leading character is constrained separately so an id cannot begin with
+ * `-` and read as an option to something that later interpolates it.
+ */
+const LOCATOR_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 /**
  * An identity is a name or a version: no control character belongs in one, and
@@ -73,6 +97,37 @@ export function unsafeProviderProse(
 ): UnsafeProviderTextReason | null {
   if (value.length > maxLength) return 'longer than the limit allows';
   if (PROSE_CONTROL.test(value)) return 'carrying control characters';
+  if (containsSecretShape(value)) return 'credential-shaped';
+
+  return null;
+}
+
+/**
+ * Why this external locator component cannot be trusted, or `null` when it can.
+ *
+ * `sessionId` and `roundId` are opaque to Agent Relay — it never parses them,
+ * only stores them and hands them back — and that is exactly why they need a
+ * shape. They are written to the durable round and shown wherever a round's
+ * provider identity is displayed, so a server that answered a reservation with
+ * an escape sequence, a path or a token in its own session id would have had it
+ * persisted verbatim.
+ *
+ * Allow-list rather than deny-list: the set of safe identifiers is small and
+ * knowable, the set of dangerous strings is not. The value is never normalised
+ * or stripped — either it is acceptable whole, or the locator is refused whole,
+ * because a locator that was edited on the way in no longer names the round the
+ * provider created.
+ *
+ * The credential check runs last and is genuinely additive: a token like a
+ * GitHub PAT is letters, digits and underscores, so it satisfies the alphabet
+ * and has to be refused on its own account.
+ */
+export function unsafeProviderLocatorId(
+  value: string,
+  maxLength: number = PROVIDER_LOCATOR_LIMIT
+): UnsafeProviderTextReason | null {
+  if (value.length > maxLength) return 'longer than the limit allows';
+  if (!LOCATOR_IDENTIFIER.test(value)) return 'not a plain opaque identifier';
   if (containsSecretShape(value)) return 'credential-shaped';
 
   return null;
