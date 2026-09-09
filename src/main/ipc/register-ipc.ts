@@ -278,6 +278,14 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       await app.codeReview.captureSubject(input.taskId);
       return codeReviewDetail(input.taskId);
     },
+    'codeReview:review': async (input) => {
+      // Everything the provider is asked, and everything it is asked WITH, is
+      // resolved here from durable state and trusted settings: the task, its
+      // project, its worktree, the scope built from the stored subject, and the
+      // MCP configuration. The renderer named a task.
+      await app.codeReview.review(input.taskId);
+      return codeReviewDetail(input.taskId);
+    },
     'codeReview:reconcile': async (input) => {
       // Operator-reachable, and read-only towards the provider: it asks what
       // happened to a dispatched round, and never starts one.

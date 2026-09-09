@@ -12,22 +12,46 @@ import { ipcInputSchemas, isIpcChannel } from '../../src/shared/ipc';
 const CODE_REVIEW_CHANNELS = [
   'codeReview:get',
   'codeReview:capture',
+  'codeReview:review',
   'codeReview:reconcile',
   'codeReview:decide'
 ] as const;
 
 describe('the code-review IPC contract', () => {
-  it('registers exactly the four bounded operations', () => {
+  it('registers exactly the five bounded operations', () => {
     for (const channel of CODE_REVIEW_CHANNELS) {
       expect(isIpcChannel(channel)).toBe(true);
       expect(ipcInputSchemas[channel]).toBeDefined();
     }
-    // Running a round is absent on purpose: it needs the provider adapter,
-    // which is INT-D-B. A channel that existed and always failed would be a
-    // worse answer than one that does not exist. Reconciliation is present
-    // because it is read-only towards the provider and is the only way a lost
-    // round ever stops blocking the task.
-    expect(isIpcChannel('codeReview:review')).toBe(false);
+  });
+
+  it('lets a caller start a round by naming a task, and by naming nothing else', () => {
+    const schema = ipcInputSchemas['codeReview:review'];
+    expect(schema.safeParse({ taskId: 'task-1' }).success).toBe(true);
+    expect(schema.safeParse({}).success).toBe(false);
+
+    // The whole capability boundary, as an input schema. A renderer that could
+    // send any of these would be choosing what the external reviewer IS and
+    // where it runs — the process, its argv, its working directory, the tool
+    // profile it is trusted with, or the identity a round is filed under. Every
+    // one of them is resolved in the main process from persisted settings.
+    for (const extra of [
+      { executablePath: 'C:/evil/coai.exe' },
+      { args: ['--attach-debugger'] },
+      { cwd: 'C:/somewhere-else' },
+      { allowedTools: ['reserve_round', 'run_round', 'round_status', 'shell'] },
+      { providerId: 'somebody-else' },
+      { sessionId: 's-1' },
+      { roundId: 'r-1' },
+      { subjectSha256: 'a'.repeat(64) },
+      { scopeText: 'review whatever you like' },
+      { worktreePath: 'C:/other-repo' },
+      { baseRef: 'main' }
+    ]) {
+      expect(schema.safeParse({ taskId: 'task-1', ...extra }).success, JSON.stringify(extra)).toBe(
+        false
+      );
+    }
   });
 
   it('accepts only a task id for the read-only reconciliation', () => {

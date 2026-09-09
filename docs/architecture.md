@@ -374,10 +374,10 @@ accepted; those remain INT-G scope.
 
 **Status: backend only.** There is no renderer, no correction loop and no live
 provider acceptance for this path yet. Migration 7 adds the durable layer the
-remaining slices will stand on; the provider adapter that would actually call
-`review_code` is INT-D-B, and until it exists `UnconfiguredCodeReviewer` refuses
-loudly rather than returning an empty round that could be mistaken for a clean
-review.
+remaining slices will stand on. The provider adapter is INT-D-B and is now
+present — see "The code-review provider adapter" below — but it is switched off
+by default and refuses against the Coai build shipped today, because that build
+cannot name a round before it runs one.
 
 Why this is separate from the plan gate rather than folded into it: the plan
 gate answers one question per specification identity and decides its findings in
@@ -494,6 +494,233 @@ The same five states are what a completed round reports, in one
 combinations, two of them meaningless, and leave every reader to reconstruct the
 state machine — which is exactly how `incomplete` came to be reported as
 `stale`. Only `current` puts a result in force.
+
+### The code-review provider adapter (INT-D-B)
+
+`CoaiCodeReviewer` speaks to a Coai MCP server over the same bounded stdio
+transport the plan gate uses: one short-lived process, no shell, a fixed argv
+from persisted settings, and a tool list that must match the configured
+allowlist EXACTLY.
+
+**Two audited profiles, and nothing between them.** A profile is a complete tool
+list, not a minimum.
+
+| Profile | Tools | What it serves |
+|---|---|---|
+| plan | `providers`, `open`, `review_plan`, `review_code`, `resolve`, `status`, `ask_human` | plan review only |
+| addressable | those seven plus `reserve_round`, `run_round`, `round_status` | plan review **and** code review |
+
+A server whose list is missing a tool, carries an unknown extra, or repeats a
+name is refused — the same refusal in all three cases, because from this side
+they are the same fact: the contract is not the one that was read. "The tools I
+need are present" was deliberately not implemented; a server that grew a tool
+nobody here has audited may have changed its others too. `CoaiPlanReviewer`
+accepts either profile, so a deployment running the newer server need not run a
+second one to keep the plan gate working.
+
+**One server, one profile, chosen by what is enabled.** Both gates talk to the
+same executable, so the profile is decided by configuration rather than by which
+gate is asking: with code review off the plan gate is configured for the seven
+tools, and with it on BOTH gates are configured for the ten. Pinning the plan
+gate to seven for ever would have refused the addressable server outright — so
+enabling code review would have silently broken plan review against the very
+server that supports both. The choice is still between two audited lists; it is
+never a subset, a minimum or a superset.
+
+**The installed Coai server is the plan profile.** It has `review_code`, and
+that is precisely the tool this adapter must never call: it creates its own
+round and names it only afterwards, so a caller whose answer was lost has
+nothing to ask about. `availability()` discovers the profile, finds the three
+addressable tools absent, and reports **"addressable code review is not
+supported"** — before `CodeReviewService` writes any durable intent, so a
+refusal leaves no round row to reconcile. Nothing in this build depends on a
+sibling checkout or an unpublished local server: the profile is a wire shape,
+and a server either presents it or is refused.
+
+**Each method calls exactly one tool, and never another.**
+
+| Port method | Tool | Consumes a round? |
+|---|---|---|
+| `availability` | *(discovery only)* | no |
+| `beginRound` | `reserve_round` | no |
+| `reviewCode` | `run_round` | yes |
+| `roundStatus` | `round_status` | no |
+
+**The reservation token is the durable local round id.** `reserve_round` needs a
+stable idempotency key, and the round row already exists when it is called, so
+its id is the key: it survives a restart, it is different for every local round,
+and — unlike the subject hash — it tells two rounds over the SAME code apart,
+which is the ordinary case of reviewing something twice. It is not a timestamp
+and not anything the adapter invents, because neither survives the restart the
+token exists for. `ExternalCodeReviewer.beginRound` therefore takes the token as
+an argument rather than deriving it from the subject.
+
+**Known, and bounded: a lost `reserve_round` answer strands its reservation.**
+If the reservation succeeded at the provider and only its answer was lost, the
+local round is closed as a refusal that provably reviewed nothing, and the next
+review builds a new row with a new token — so nothing ever addresses the old
+reservation again. The cost is bounded to the provider's own bookkeeping: a
+reservation dispatches no reviewer and spends no round quota, so a stranded one
+reviews nothing and costs nothing. Resuming it would need a durable reservation
+phase of its own, and that is deliberately not designed here.
+
+**A locator component is an opaque identifier, and it has a shape.**
+`sessionId` and `roundId` are opaque to Agent Relay — it never parses them, only
+stores them and hands them back — and that is precisely why they need one. They
+are written to the durable round and shown wherever a round's provider identity
+is, so a length bound alone let a server name its own session with an escape
+sequence, a path, an argv fragment or a token and have it persisted verbatim.
+
+The allowed alphabet is letters, digits and `. _ - :`, starting with a letter or
+a digit, 1–128 characters. That covers every identifier a real server produces —
+UUIDs, hex digests, dotted and colon-namespaced slugs — and excludes whitespace,
+control characters, quotes, slashes and backslashes, so a component can be
+neither a path nor a command line fragment. The leading character is constrained
+separately so an id cannot begin with `-` and read as an option. A
+credential-shaped value is refused on top of that, because a token satisfies the
+alphabet on its own.
+
+Nothing is normalised or stripped: either the value is acceptable whole or the
+locator is refused whole, since a locator edited on the way in no longer names
+the round the provider created. The check runs at the adapter's SCHEMA, so a bad
+component fails the whole payload closed, and again in `CodeReviewService` before
+the locator becomes durable — `ExternalCodeReviewer` is an interface, and a
+second implementation reaches that line without passing through the adapter at
+all. `providerId` is checked for shape there too and, separately, for equality
+with the trusted local provider identity: whether the string is storable and
+whether the round is ours are different questions. A refusal names the field and
+the violation, never the value, and it happens above the non-idempotent call, so
+the round is closed as a pre-dispatch failure rather than left unresolved.
+
+**Every uncertain read-back is `unknown`.** `roundStatus` maps `running` and
+`completed` as the provider states them, and returns `not_started` only when the
+provider positively says so about a round it holds and has not dispatched. A
+timeout, a transport failure, a refusal returned as data, output that will not
+parse, a `completed` with no result attached, an answer carrying another
+locator, and a provider reporting the round as spent all become `unknown` with a
+bounded redacted reason. None of them is read as "nothing ran", because only one
+of them would be safe to and they are indistinguishable from here.
+
+**A contradictory answer is ambiguity, not evidence.** `round_status` is parsed
+as a discriminated union on `state`: only `completed` may carry a `review`, and
+every other state is a strict object without the key. A payload claiming
+`not_started` while also carrying a finished review therefore does not parse,
+and a parse failure is `unknown`. That closes the one path by which a provider
+could be asked to re-run a round it had just said it completed — `not_started`
+is the single answer that releases a round, so it has to be free of
+self-contradiction.
+
+**Exactly four provider strings are stored, and all four are checked twice.**
+A completed round carries `serverName`, `serverVersion`, `reviewers` and
+`instruction` into SQLite. `serverInfo.name` and `serverInfo.version` arrive in
+the MCP initialize handshake rather than in a tool result, so the credential scan
+that runs over a payload never saw them at all; `reviewers` and `instruction` are
+in the payload, but that scan looks for credential shapes and for nothing else.
+
+| Field | Rule |
+|---|---|
+| `serverName`, `serverVersion` | identity: bounded length, **no** control character of any kind, no credential shape |
+| `reviewers`, `instruction` | prose: bounded length, tab/newline/carriage-return allowed and every other control character refused, no credential shape |
+| `findings` | unchanged — parsed against its schema and scanned as a whole |
+
+The check runs in `CoaiCodeReviewer` before a round is built, and **again** in
+`CodeReviewService.validateAnswer`, which is the boundary where an answer becomes
+durable and is shared by a live dispatch and by reconciliation.
+`ExternalCodeReviewer` is an interface: a second implementation reaches storage
+without passing the adapter at all, so the adapter's check is a convenience and
+the service's is the guarantee. An unstorable value fails the round rather than
+being cleaned up — none of it is kept, and the refusal names the field and the
+problem, never the value.
+
+Two layers, in this order: the result-wide credential scan inside `parse` refuses
+a payload before a round is built, so a credential never reaches the per-field
+check. The per-field check is what adds the control-character and length rules,
+which the scan was never meant to cover.
+
+**A provider's own explanation is never stored, on any of the four paths.**
+`lastError` is durable and operator-visible, and redaction hides credential
+*shapes* — it hides neither an absolute path, nor an argv, nor a control
+character, and was never meant to. So no provider-authored sentence reaches it.
+The reviewer can produce one at four different moments, and each is answered with
+a fixed message this build owns:
+
+| Path | What the provider could say | What is stored |
+|---|---|---|
+| reservation (`reserve_round`) | a refusal, a transport error, a `state` string nothing constrains | `RESERVATION_FAILED` — closed as failed, nothing was dispatched |
+| live dispatch (`run_round`) | a refusal, a timeout, a lost answer | `DISPATCH_UNCONFIRMED` — stays unresolved, because it may have run |
+| dispatch never attempted | nothing; the reviewer was gone before anything was sent | `DISPATCH_NOT_ATTEMPTED` — closed as failed, on typed proof |
+| completed answer | `serverName`, `serverVersion`, `reviewers`, `instruction` | the round itself, once all four pass the checks above; otherwise the owned sentence naming the field, or `ANSWER_MALFORMED` for a schema failure |
+| reconciliation (`round_status`) | an `instruction` beside `failed`/`unknown`, and the port's `reason` | `RECONCILE_UNKNOWN`; `status.reason` is deliberately not read |
+
+The reservation path matters most and was closed last. `CoaiCodeReviewer.parse`
+quotes an MCP server's refusal sentence into `AgentRelayError.message` **on
+purpose**, so the caller who asked for a review can be told what the server said
+— which meant both live catches were copying foreign text into SQLite by simply
+storing `error.message`. The adapter's reservation check no longer interpolates
+the provider's `state` either: which state it was is not worth storing at the
+price of a field nothing constrains.
+
+**`failed before dispatch` and `unconfirmed after dispatch` are different facts,
+and only one of them may close a round.** From inside a catch block they look
+identical, so the distinction cannot be guessed: it is carried by a TYPE.
+`SettingsBoundCodeReviewer` resolves configuration per call, so a round can be
+reserved while the integration is on and find it switched off before anything is
+sent; `required()` throws `CodeReviewNotDispatchedError` there, and that class is
+positive evidence that no request left the process, because it is raised from the
+configuration seam which is always reached BEFORE any MCP call.
+
+`CodeReviewService` branches on `instanceof`, never on the code. `TOOL_MISSING`
+alone proves nothing — a real adapter can raise it from inside an external call,
+once the request has already gone out, and treating that as proof would close a
+round that may well have run. On the typed error the round is closed `failed`
+with `DISPATCH_NOT_ATTEMPTED` and a new round may be started once the integration
+is configured again; on anything else it stays `reviewing` with
+`DISPATCH_UNCONFIRMED`. The typed error is rethrown unchanged, so the caller
+still receives its ordinary `TOOL_MISSING` code and message.
+
+**Transient and durable are deliberately different.** The original error is
+rethrown untouched, so the immediate caller keeps its `code`, its message and
+whatever classification it needs to decide what to do or what to show. Only the
+copy that lands in the round is fixed. Being told what went wrong and recording
+it forever are different acts with different risks, and this is the seam between
+them.
+
+What is lost is a provider's description of its own failure, which was never
+trustworthy enough to store. What is kept is the part that governs behaviour: a
+reservation that failed dispatched nothing, and a dispatch whose answer was lost
+may well have run.
+
+**Dirty subjects are still refused.** `readsUncommittedWorktreeState` is `false`
+and stays false whatever is configured: `run_round` reviews a commit in a
+worktree the provider pins to a SHA, so uncommitted and untracked work is
+invisible to it. The service refuses such a subject before dispatch rather than
+accepting a confident verdict about different code. Reviewing a dirty tree needs
+a provider that can snapshot it AND prove the snapshot is the caller's own; that
+attestation does not exist, and this pass does not invent it — no hidden commit,
+no staging, no mutation of the user's index.
+
+**Wiring is main-process only.** `SettingsBoundCodeReviewer` resolves the
+configuration per call from persisted settings, so enabling the integration or
+clearing its executable takes effect on the next call rather than the next
+restart, and a build with nothing configured refuses exactly as the unconfigured
+reviewer did. `codeReview:review` accepts a task id and nothing else: the
+executable, argv, working directory, tool profile, provider identity, subject
+and scope are all resolved here from durable state. `CodeReviewClaims` remains
+the single-flight authority, so two windows race in the service rather than at
+the channel.
+
+**A refusal repeats nothing the server sent.** `availability.reason` is stored
+and shown, and carries no path, argv or secret. A tool-profile mismatch is
+recognised by its TYPE — `McpToolProfileMismatchError`, thrown by the transport —
+and answered with names from this build's own `COAI_ADDRESSABLE_TOOLS`. Every
+other discovery failure gets a fixed sentence plus its error code, because the
+transport uses the same `details` field for a failed spawn's raw stderr, which
+can hold an absolute path or a command line. Redaction hides credential shapes;
+it does not hide a path, and was never meant to.
+
+**Live provider acceptance has not been performed.** Every test runs against an
+Agent Relay-owned fake MCP process; no vendor model has been called and no
+provider quota has been spent through this adapter.
 
 ### Where the dispatch boundary is
 
@@ -1232,7 +1459,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1475 deterministic tests in 55 files, plus one routine automated Electron
+1592 deterministic tests in 58 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.

@@ -9,7 +9,7 @@ import type {
   RuleEvidenceLimits,
   RuleEvidenceSourceRequest
 } from '../ports';
-import { COAI_TOOL_ALLOWLIST } from '../adapters/mcp/coai-plan-reviewer';
+import { COAI_ADDRESSABLE_PROFILE, COAI_PLAN_PROFILE } from '../adapters/mcp/coai-profiles';
 
 export const TASK_RULE_EVIDENCE_LIMITS: RuleEvidenceLimits = {
   maxSources: 2,
@@ -94,10 +94,82 @@ export function assertExternalPlanReviewSettings(settings: Settings): void {
     );
   }
 
-  if (!settings.externalPlanReviewEnabled) return;
+  // Either integration needs the same server, so either one enabled makes the
+  // executable required. Checking only the plan flag let a configuration be
+  // saved with code review on and nothing to run it — a setting that reads as
+  // enabled and refuses at the first call, with the reason buried in a provider
+  // error rather than shown where it was set.
+  if (!settings.externalPlanReviewEnabled && !settings.externalCodeReviewEnabled) return;
   if (settings.coaiMcpExecutablePath === null) {
-    invalid('Enabled external plan review requires an absolute MCP executable path.');
+    invalid(
+      settings.externalPlanReviewEnabled
+        ? 'Enabled external plan review requires an absolute MCP executable path.'
+        : 'Enabled external code review requires an absolute MCP executable path.'
+    );
   }
+}
+
+/**
+ * Which exact tool profile this configuration talks to.
+ *
+ * One server serves both gates, so the profile is decided by what is switched
+ * on rather than by which gate is asking. With code review off, that is the
+ * seven plan tools; with it on, the ten. It is never a subset, a minimum or a
+ * superset: the transport compares the server's list to this one exactly, and a
+ * profile nobody audited fails closed either way.
+ *
+ * The alternative — pinning the plan gate to seven for ever — would refuse the
+ * addressable server outright, so enabling code review would silently break
+ * plan review against the very server that supports both.
+ */
+export function coaiToolProfile(settings: Settings): readonly string[] {
+  return settings.externalCodeReviewEnabled ? COAI_ADDRESSABLE_PROFILE : COAI_PLAN_PROFILE;
+}
+
+/**
+ * The transport capacity both gates run under, stated once.
+ *
+ * The two configurations describe the SAME server process reached over the same
+ * stdio transport, so a limit that differs between them is not a policy choice
+ * but drift. Written out twice, raising `maxContentBytes` for the plan gate
+ * would leave the code gate refusing a message the plan gate accepts from the
+ * one server both are talking to, and nothing in either file would say why.
+ */
+export const COAI_MCP_CAPACITY = {
+  maxMessageBytes: 2 * 1024 * 1024,
+  maxContentBytes: 2 * 1024 * 1024,
+  maxContentBlocks: 128
+} as const;
+
+/**
+ * Everything the two gates share, built once from trusted settings.
+ *
+ * They differ in exactly two things: the `id` their transport is filed under,
+ * and the checks each runs before it asks for a configuration at all. All the
+ * rest — executable, argv, working directory, tool profile, timeout, capacity —
+ * belongs to one server, so it is described in one place.
+ *
+ * `executablePath` is a parameter rather than read from `settings` here
+ * because each gate has already narrowed it away from null with its OWN
+ * message, and a shared builder must not replace that message with a vaguer one.
+ */
+export function coaiServerConfig(
+  settings: Settings,
+  id: string,
+  executablePath: string
+): ExternalMcpServerConfig {
+  return {
+    id,
+    enabled: true,
+    executablePath,
+    args: settings.coaiMcpArguments,
+    ...(settings.coaiMcpWorkingDirectory === null
+      ? {}
+      : { cwd: settings.coaiMcpWorkingDirectory }),
+    allowedTools: coaiToolProfile(settings),
+    timeoutMs: settings.processTimeoutMs,
+    ...COAI_MCP_CAPACITY
+  };
 }
 
 export function externalPlanReviewConfig(settings: Settings): ExternalMcpServerConfig {
@@ -105,20 +177,8 @@ export function externalPlanReviewConfig(settings: Settings): ExternalMcpServerC
   if (!settings.externalPlanReviewEnabled || settings.coaiMcpExecutablePath === null) {
     invalid('External plan review is disabled.');
   }
-  return {
-    id: 'coai-plan-review',
-    enabled: true,
-    executablePath: settings.coaiMcpExecutablePath,
-    args: settings.coaiMcpArguments,
-    ...(settings.coaiMcpWorkingDirectory === null
-      ? {}
-      : { cwd: settings.coaiMcpWorkingDirectory }),
-    allowedTools: COAI_TOOL_ALLOWLIST,
-    timeoutMs: settings.processTimeoutMs,
-    maxMessageBytes: 2 * 1024 * 1024,
-    maxContentBytes: 2 * 1024 * 1024,
-    maxContentBlocks: 128
-  };
+
+  return coaiServerConfig(settings, 'coai-plan-review', settings.coaiMcpExecutablePath);
 }
 
 export function configuredRuleSources(

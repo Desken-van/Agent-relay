@@ -316,6 +316,15 @@ export const settingsSchema = z.object({
   ghExecutablePath: z.string().nullable(),
   /** Opt-in gate: when enabled, a task must bind rules and pass external plan review. */
   externalPlanReviewEnabled: z.boolean(),
+  /**
+   * Opt-in, and separate from plan review because the capability is separate.
+   *
+   * Code review needs the addressable ten-tool profile; plan review needs seven.
+   * A deployment whose server has only the seven can run the plan gate and must
+   * still be refused code review, so one flag could not answer for both.
+   * Defaults to false: an integration nobody enabled must not reach a provider.
+   */
+  externalCodeReviewEnabled: z.boolean(),
   /** Explicit MCP server executable. Authentication remains owned by that server. */
   coaiMcpExecutablePath: z.string().max(32_767).nullable(),
   /** Fixed argv passed to the MCP executable; never interpreted through a shell. */

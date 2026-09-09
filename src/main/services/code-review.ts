@@ -41,6 +41,13 @@ import {
 import type { Task } from '../../shared/domain/models';
 import { containsSecretShape, redactAndTruncate } from '../../shared/util/redact';
 import {
+  unsafeProviderIdentity,
+  unsafeProviderLocatorId,
+  unsafeProviderProse,
+  type UnsafeProviderTextReason
+} from '../../shared/util/provider-text';
+import { CodeReviewNotDispatchedError } from './code-review-provider';
+import {
   hashSnapshotFile,
   nodeSnapshotFileOps,
   sameFingerprint,
@@ -101,6 +108,53 @@ const SUBJECT_UNVERIFIABLE_AFTER =
 const SUBJECT_INCOMPLETE_AFTER =
   'The reviewed code could not be fully digested after the round, so this result cannot be confirmed against an exact subject. This is not evidence that the code changed.';
 
+/**
+ * What a failed reservation records, and the whole of what it records.
+ *
+ * The reviewer's own error is NOT quoted. `CoaiCodeReviewer.parse` deliberately
+ * puts an MCP server's refusal sentence inside the error message, so the caller
+ * that asked can be told what happened — and that sentence is foreign text,
+ * which can carry an absolute path, an argv, a control character or a
+ * credential. `lastError` is durable and operator-visible, so it gets this
+ * instead. The original error is still THROWN, so the immediate caller keeps
+ * its code and its classification; only the stored copy is fixed.
+ */
+const RESERVATION_FAILED =
+  'The reviewer could not open a round for this subject, so nothing was dispatched and no review ran. The round is closed as failed. Why the reviewer refused is deliberately not recorded here, because a provider error is foreign text and this field is stored.';
+
+/**
+ * What a dispatch whose outcome never came back records.
+ *
+ * Distinct from {@link RESERVATION_FAILED} in the one way that matters: the
+ * request left this process. Whether a reviewer ran is not knowable from here,
+ * so the round stays unresolved rather than closed, and nothing in this message
+ * may suggest that repeating it is free.
+ */
+const DISPATCH_UNCONFIRMED =
+  'The review was dispatched and its outcome could not be confirmed. The round stays unresolved: the request left this process, so a reviewer may well have run, and no answer is not evidence that none did. What the reviewer said is deliberately not recorded here, because a provider error is foreign text and this field is stored.';
+
+/**
+ * What a round records when the reviewer went away before anything was sent.
+ *
+ * Distinct from {@link DISPATCH_UNCONFIRMED} because the fact is different, and
+ * the difference decides what the operator may do next. This one is only ever
+ * written on typed proof that no request left the process, so the round is
+ * closed and a new one may be started once the integration is configured again.
+ */
+const DISPATCH_NOT_ATTEMPTED =
+  'The round was reserved, but external code review stopped being configured before anything was sent, so no reviewer ran and nothing was dispatched. The round is closed as failed; start a new one once external code review is configured again.';
+
+/**
+ * What an answer this build cannot read records.
+ *
+ * Every check in `validateAnswer` throws an {@link AgentRelayError} whose
+ * sentence this application authored — each names a field and a problem and
+ * never a value — so those are both safe to store and worth storing. A schema
+ * failure is not ours to quote, and gets this fixed sentence instead.
+ */
+const ANSWER_MALFORMED =
+  'The reviewer answered with something this build could not read as a review, so nothing was applied. The parser detail is not recorded here.';
+
 const ATTESTATION_MISMATCH =
   'The reviewer did not attest that it read the subject this round dispatched, so its answer was not accepted. Nothing was recorded as a confirmed result.';
 
@@ -113,8 +167,22 @@ const SUBJECT_UNSTABLE =
 const RECONCILE_RUNNING =
   'The provider reports that this round is still running. Nothing was repeated, and no new round may start until it ends.';
 
+/**
+ * What an unreadable round says, and it is the WHOLE of what it says.
+ *
+ * The reviewer's own `reason` used to be appended here, which put arbitrary
+ * provider prose into a durable, operator-visible column. Redaction hides
+ * credential shapes; it hides neither an absolute path nor a control character,
+ * and `ExternalCodeReviewer` is an interface — so any implementation, not only
+ * the audited Coai adapter, could fill this field with whatever it liked.
+ *
+ * The message is therefore fixed and owned by Agent Relay. What is lost is a
+ * provider's description of its own failure, which was never trustworthy enough
+ * to store; what is kept is the only part that governs behaviour, which is that
+ * the round stays unresolved.
+ */
 const RECONCILE_UNKNOWN =
-  'The provider could not say what became of this round. It stays unresolved: no answer is not evidence that no review ran, and starting another would risk a second non-idempotent call.';
+  'The provider could not say what became of this round. It stays unresolved: no answer is not evidence that no review ran, and starting another would risk a second non-idempotent call. What the provider said about it is deliberately not repeated here, because a provider message is foreign text that can carry a path, a command line or a credential, and this field is stored.';
 
 const LOCATOR_INVALID =
   'The reviewer opened a round without a usable identity for it, so nothing was dispatched. A locator that is missing a part, or empty in one, names no round and could never be reconciled.';
@@ -267,6 +335,37 @@ const externalRoundLocatorSchema = z
     roundId: z.string().min(1).max(128)
   })
   .strict();
+
+/**
+ * Why this locator may not be written down, or `null` when it may.
+ *
+ * The service checks it as well as the Coai adapter, and not out of caution:
+ * `ExternalCodeReviewer` is an INTERFACE. A second implementation reaches this
+ * line without passing through the adapter's schema at all, and this is where a
+ * locator becomes durable — it is stored on the round and shown wherever the
+ * round's provider identity is.
+ *
+ * `providerId` is checked here for shape and, separately and immediately below,
+ * for equality with the trusted local provider identity. The two answer
+ * different questions: whether the string is storable, and whether the round is
+ * ours.
+ *
+ * Names the FIELD and the violation, never the value.
+ */
+function unstorableLocator(locator: ExternalCodeRoundLocator): string | null {
+  const checks: readonly (readonly [string, UnsafeProviderTextReason | null])[] = [
+    ['The provider session id', unsafeProviderLocatorId(locator.sessionId)],
+    ['The provider round id', unsafeProviderLocatorId(locator.roundId)],
+    ['The provider id', unsafeProviderLocatorId(locator.providerId)]
+  ];
+  for (const [what, reason] of checks) {
+    if (reason !== null) {
+      return `${what} is ${reason}, so nothing was dispatched.`;
+    }
+  }
+
+  return null;
+}
 
 function sameLocator(a: ExternalCodeRoundLocator, b: ExternalCodeRoundLocator): boolean {
   return (
@@ -774,18 +873,40 @@ export class CodeReviewService {
       // it. `providerId` is required to match the reviewer that produced it: a
       // round filed under somebody else's namespace could never be read back.
       locator = externalRoundLocatorSchema.parse(
-        await this.deps.reviewer.beginRound(externalSubject, signal)
+        // The token is the durable round row's own id: it exists before this
+        // call, survives a restart, and is different for every local round —
+        // including two rounds over one subject, which a subject hash could not
+        // tell apart.
+        await this.deps.reviewer.beginRound(externalSubject, round.id, signal)
       );
+      // Shape first: an unstorable component must stop the dispatch here, above
+      // the non-idempotent call, rather than be discovered by whatever later
+      // reads the row it would have been written into.
+      const unstorable = unstorableLocator(locator);
+      if (unstorable !== null) {
+        throw new AgentRelayError('PARSE_FAILED', unstorable);
+      }
       if (locator.providerId !== this.deps.reviewer.providerId) {
         throw new AgentRelayError('PARSE_FAILED', LOCATOR_INVALID);
       }
     } catch (error) {
       // Still above the non-idempotent call, so the round is closed as a
       // refusal that provably reviewed nothing.
+      //
+      // KNOWN AND BOUNDED: if `reserve_round` succeeded at the provider and only
+      // its ANSWER was lost, that reservation is now stranded — this row is
+      // closed, the next review builds a new row with a new token, and nothing
+      // addresses the old one again. The cost stops at the provider's own
+      // bookkeeping: a reservation dispatches no reviewer and spends no round
+      // quota, so a stranded one reviews nothing and costs nothing. Resuming it
+      // would need a durable reservation phase of its own, which is deliberately
+      // not designed here.
       this.deps.reviews.updateRound(round.id, {
         status: 'failed',
-        lastError: redactAndTruncate(error instanceof Error ? error.message : String(error), 10_000)
+        lastError: redactAndTruncate(RESERVATION_FAILED, 10_000)
       });
+      // Rethrown untouched: the caller that asked for this review is entitled
+      // to the code and the sentence. Only the DURABLE copy is Agent Relay's.
       throw error;
     }
 
@@ -800,12 +921,30 @@ export class CodeReviewService {
     try {
       answer = await this.deps.reviewer.reviewCode(locator, externalSubject, scopeText, signal);
     } catch (error) {
-      // The phase stays at `reviewing`: the request left this process and only
-      // its answer was lost. Writing `failed` here would assert the call had no
-      // effect, which nothing on this side can know.
+      // Two failures that look identical from here, and only one of them may
+      // close the round.
+      //
+      // The typed error is positive proof that nothing was sent: it comes from
+      // the configuration seam, which is resolved BEFORE any MCP call, so a
+      // throw from there means the request never left. Recognised by TYPE and
+      // never by its code — a real adapter can raise `TOOL_MISSING` from inside
+      // an external call, once the request has already gone out, and treating
+      // that as proof would close a round that may well have run.
+      if (error instanceof CodeReviewNotDispatchedError) {
+        this.deps.reviews.updateRound(dispatched.id, {
+          status: 'failed',
+          lastError: redactAndTruncate(DISPATCH_NOT_ATTEMPTED, 10_000)
+        });
+        throw error;
+      }
+
+      // Everything else: the phase stays at `reviewing`, because the request
+      // left this process and only its answer was lost. Writing `failed` here
+      // would assert the call had no effect, which nothing on this side knows.
       this.deps.reviews.updateRound(dispatched.id, {
-        lastError: redactAndTruncate(error instanceof Error ? error.message : String(error), 10_000)
+        lastError: redactAndTruncate(DISPATCH_UNCONFIRMED, 10_000)
       });
+      // Rethrown untouched, for the same reason as the reservation above.
       throw error;
     }
 
@@ -878,14 +1017,49 @@ export class CodeReviewService {
           'The reviewer returned credential-shaped text; the round was not persisted as complete.'
         );
       }
+
+      // The same standard for every OTHER provider-controlled string this
+      // answer would put into storage. `findings` above is one of them; these
+      // are the rest, and they used to be trusted here because the Coai adapter
+      // had already checked them — which is a promise about ONE implementation
+      // of an interface, not about the interface. This is the boundary where an
+      // answer becomes durable, so this is where the check has to hold for
+      // anything that reaches it.
+      //
+      // Identity and prose are judged differently on purpose: a server name or
+      // version has no business carrying any control character, while a
+      // reviewer's instruction may legitimately wrap.
+      const foreign: readonly (readonly [string, UnsafeProviderTextReason | null])[] = [
+        ['The reviewer summary', unsafeProviderProse(answer.reviewers, 2_000)],
+        ['The reviewer instruction', unsafeProviderProse(answer.instruction, 20_000)],
+        ['The MCP server name', unsafeProviderIdentity(answer.serverName)],
+        ['The MCP server version', unsafeProviderIdentity(answer.serverVersion)]
+      ];
+      for (const [what, reason] of foreign) {
+        if (reason !== null) {
+          // Names the field and the problem, never the value: this message is
+          // stored on the round, and repeating the value would defeat the check.
+          throw new AgentRelayError(
+            'PARSE_FAILED',
+            `${what} is ${reason}; the round was not persisted as complete.`
+          );
+        }
+      }
       // An answer that lists one finding twice with different round-specific
       // details contradicts itself, and that is a property of the answer — so
       // it is judged here, with the other answer checks, and long before the
       // completion transaction it would otherwise blow up inside.
       return { findings: this.collapseDuplicates(parsed, subject), verdict };
     } catch (error) {
+      // Ours is storable, a parser's is not. Everything thrown inside this try
+      // that is an `AgentRelayError` was constructed here from a constant or a
+      // field name, so it quotes no provider value; a schema failure comes from
+      // outside that guarantee and is replaced rather than repeated.
       this.deps.reviews.updateRound(roundId, {
-        lastError: redactAndTruncate(error instanceof Error ? error.message : String(error), 10_000)
+        lastError: redactAndTruncate(
+          error instanceof AgentRelayError ? error.message : ANSWER_MALFORMED,
+          10_000
+        )
       });
       throw error;
     }
@@ -1124,11 +1298,10 @@ export class CodeReviewService {
     }
 
     if (status.kind === 'unknown') {
+      // `status.reason` is deliberately NOT read. It is the one field on this
+      // port that carries a reviewer's own words, and this write is durable.
       const held = this.deps.reviews.updateRound(round.id, {
-        lastError: redactAndTruncate(
-          `${RECONCILE_UNKNOWN} ${status.reason ?? ''}`.trim(),
-          10_000
-        )
+        lastError: redactAndTruncate(RECONCILE_UNKNOWN, 10_000)
       });
       return this.unsettled(held, 'unknown');
     }

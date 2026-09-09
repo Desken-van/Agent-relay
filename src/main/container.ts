@@ -74,7 +74,7 @@ import { TaskService } from './services/task-service';
 import { SqliteCodeReviewRepository } from './db/repositories/code-review-repository';
 import { GitCodeSnapshotSource } from './adapters/git/git-code-snapshot';
 import { CodeReviewClaims, CodeReviewService } from './services/code-review';
-import { UnconfiguredCodeReviewer } from './services/code-review-provider';
+import { SettingsBoundCodeReviewer } from './services/code-review-provider';
 import { PlanReviewClaims } from './services/plan-review-claims';
 import { PlanReviewGateService } from './services/plan-review-gate';
 import { RuleEvidenceService } from './services/rule-evidence';
@@ -92,6 +92,7 @@ export function defaultSettings(paths: ApplicationPaths): Settings {
     codexExecutablePath: process.env.AGENT_RELAY_CODEX_PATH ?? null,
     ghExecutablePath: process.env.AGENT_RELAY_GH_PATH ?? null,
     externalPlanReviewEnabled: false,
+    externalCodeReviewEnabled: false,
     coaiMcpExecutablePath: null,
     coaiMcpArguments: [],
     coaiMcpWorkingDirectory: null,
@@ -278,7 +279,15 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     reviews: codeReviews,
     // Read-only by contract: it never stages, commits or checks anything out.
     snapshots: new GitCodeSnapshotSource(runner),
-    reviewer: new UnconfiguredCodeReviewer(),
+    // Settings-bound and resolved per call: enabling the integration, or
+    // clearing its executable, takes effect on the next call rather than the
+    // next restart. Nothing the renderer sends reaches this.
+    reviewer: new SettingsBoundCodeReviewer({
+      settings: () => settings.get(),
+      client: new StdioMcpClient(
+        runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner()
+      )
+    }),
     claims: codeReviewClaims,
     clock,
     ids

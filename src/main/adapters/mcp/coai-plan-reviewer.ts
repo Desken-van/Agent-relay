@@ -10,6 +10,7 @@ import {
   type PlanReviewDecision,
   type PlanReviewFinding
 } from '../../../shared/domain/plan-review';
+import { COAI_ADDRESSABLE_PROFILE, COAI_PLAN_PROFILE, isAuditedProfile } from './coai-profiles';
 import type {
   ExternalMcpCallResult,
   ExternalMcpClient,
@@ -22,15 +23,14 @@ import type {
   ExternalPlanReviewSubject
 } from '../../ports';
 
-export const COAI_TOOL_ALLOWLIST = [
-  'providers',
-  'open',
-  'review_plan',
-  'review_code',
-  'resolve',
-  'status',
-  'ask_human'
-] as const;
+/**
+ * The profile the plan gate configures by default.
+ *
+ * Re-exported under its original name so every existing caller keeps working;
+ * the list itself now lives with the other audited profiles, beside the
+ * addressable one it is a prefix of.
+ */
+export const COAI_TOOL_ALLOWLIST = COAI_PLAN_PROFILE;
 
 const stageSchema = z.enum(['PlanReview', 'CodeReview', 'Done']);
 
@@ -118,13 +118,24 @@ const resolutionSchema = z.object({
   instruction: z.string().max(20_000)
 });
 
+/**
+ * Either audited profile, and nothing between them.
+ *
+ * The plan tools are identical in both, so a server presenting the exact
+ * ten-tool profile serves this gate as well as the seven-tool one does — and a
+ * deployment that has the newer server should not have to run two of them to
+ * keep plan review working. What is NOT accepted is a superset: "the seven I
+ * need are present" would admit any server that grew tools nobody here has
+ * read, and its other tools may have changed too.
+ */
 function assertCoaiAllowlist(config: ExternalMcpServerConfig): void {
-  const actual = [...config.allowedTools].sort();
-  const expected = [...COAI_TOOL_ALLOWLIST].sort();
-  if (actual.length !== expected.length || actual.some((name, index) => name !== expected[index])) {
+  if (
+    !isAuditedProfile(config.allowedTools, COAI_PLAN_PROFILE) &&
+    !isAuditedProfile(config.allowedTools, COAI_ADDRESSABLE_PROFILE)
+  ) {
     throw new AgentRelayError(
       'VALIDATION_FAILED',
-      'The Coai adapter requires its exact audited seven-tool allowlist.'
+      'The Coai plan adapter requires one of its exact audited profiles: the seven plan tools, or those ten.'
     );
   }
 }

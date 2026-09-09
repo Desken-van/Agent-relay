@@ -17,7 +17,13 @@ import {
   type CodeReviewDeps,
   type CodeReviewRoundOutcome
 } from '../../src/main/services/code-review';
-import { UnconfiguredCodeReviewer } from '../../src/main/services/code-review-provider';
+import {
+  CodeReviewNotDispatchedError,
+  SettingsBoundCodeReviewer,
+  UnconfiguredCodeReviewer
+} from '../../src/main/services/code-review-provider';
+import { defaultSettings } from '../../src/main/container';
+import type { Settings } from '../../src/shared/domain/models';
 import type {
   CodeReviewerAvailability,
   ExternalCodeRoundLocator,
@@ -28,6 +34,11 @@ import type {
   ExternalCodeReviewer,
   ExternalCodeReviewRound,
   ExternalCodeReviewSubject,
+  ExternalMcpCallResult,
+  ExternalMcpClient,
+  ExternalMcpDiscovery,
+  ExternalMcpServerConfig,
+  ExternalMcpTool,
   RawCheckoutIdentity,
   RawCodeSnapshot,
   RawCodeSnapshotFile
@@ -37,9 +48,39 @@ import {
   type SnapshotFileOps
 } from '../../src/main/adapters/git/git-code-snapshot';
 import type { ProviderCodeFinding } from '../../src/shared/domain/code-review';
+import { AgentRelayError } from '../../src/shared/domain/errors';
+import { CoaiCodeReviewer } from '../../src/main/adapters/mcp/coai-code-reviewer';
+import {
+  COAI_ADDRESSABLE_PROFILE,
+  COAI_PROVIDER_ID
+} from '../../src/main/adapters/mcp/coai-profiles';
 import { createHarness, type Harness } from '../helpers/harness';
 
 const BASE = '1'.repeat(40);
+
+const ESCAPE = String.fromCharCode(27);
+
+/**
+ * A wholly fictional path, argv, escape sequence and token.
+ *
+ * Nothing here exists. It is shaped like what an MCP server could actually put
+ * in a refusal — `CoaiCodeReviewer.parse` quotes a server's refusal sentence
+ * into the error message on purpose — and every fragment is asserted absent
+ * from durable storage.
+ */
+const HOSTILE =
+  'refused at C:/Users/someone/AppData/coai/coai-mcp.exe --stdio' +
+  ESCAPE +
+  '[31m GH_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0';
+
+const LEAKS = [
+  'C:/Users/someone',
+  'coai-mcp.exe',
+  '--stdio',
+  'AppData',
+  ESCAPE,
+  'ghp_A1b2C3d4E5f6G7h8I9j0'
+];
 
 /**
  * A snapshot source whose answer the test controls file by file.
@@ -139,6 +180,8 @@ class FakeCodeReviewer implements ExternalCodeReviewer {
    */
   locators: ExternalCodeRoundLocator[] = [];
   readonly beginCalls: ExternalCodeReviewSubject[] = [];
+  /** The idempotency key each reservation was asked for. */
+  readonly beginTokens: string[] = [];
   beginError: Error | null = null;
   /** Runs at the moment the round is opened, before a locator is returned. */
   onBegin: (() => void) | null = null;
@@ -185,8 +228,12 @@ class FakeCodeReviewer implements ExternalCodeReviewer {
     return this.available;
   }
 
-  async beginRound(subject: ExternalCodeReviewSubject): Promise<ExternalCodeRoundLocator> {
+  async beginRound(
+    subject: ExternalCodeReviewSubject,
+    clientToken: string
+  ): Promise<ExternalCodeRoundLocator> {
     this.beginCalls.push(subject);
+    this.beginTokens.push(clientToken);
     this.onBegin?.();
     if (this.beginError) throw this.beginError;
     const index = this.beginCalls.length - 1;
@@ -368,7 +415,10 @@ describe('the code-review round', () => {
 
     const round = value.reviews.latestRound(value.task.id);
     expect(round?.status).toBe('reviewing');
-    expect(round?.lastError).toMatch(/never answered/);
+    // The reviewer's own sentence reached the CALLER above, where it belongs.
+    // The durable column gets Agent Relay's own words and nothing foreign.
+    expect(round?.lastError).toMatch(/outcome could not be confirmed/i);
+    expect(round?.lastError).not.toMatch(/never answered/);
 
     // The call left this process and only its answer was lost. A second
     // dispatch is refused, and marking it interrupted does not unlock one.
@@ -965,7 +1015,9 @@ describe('code-review recovery, capture stability and boundary hygiene', () => {
     expect(outcome.round.status).toBe('reviewing');
     expect(outcome.unsettledReason).toBe('unknown');
     expect(outcome.round.lastError).toMatch(/could not say what became/i);
-    expect(outcome.round.lastError).toMatch(/session is gone/);
+    // The provider's own words are NOT persisted. This field is durable and
+    // operator-visible, and a reviewer's reason is foreign text.
+    expect(outcome.round.lastError).not.toMatch(/session is gone/);
     // No answer is not evidence that no review ran.
     expect(outcome.round.lastError).not.toMatch(/did not run|never ran/i);
     await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
@@ -1812,5 +1864,755 @@ describe('code-review locator durability', () => {
     expect(outcome.round.status).toBe('reviewing');
     expect(outcome.unsettledReason).toBe('wrong-round');
     expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+  });
+});
+
+describe('the token a reservation is made under', () => {
+  it('is the durable local round id, not the subject and not a new value each time', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+
+    const first = await value.service.review(value.task.id);
+    // A SECOND round over the same subject. Repository, branch, base, head and
+    // subject hash are all identical — everything a subject-derived token could
+    // see. Only the local round differs.
+    const second = await value.service.review(value.task.id);
+
+    expect(value.reviewer.beginTokens).toHaveLength(2);
+    expect(value.reviewer.beginCalls[0]?.subjectSha256).toBe(
+      value.reviewer.beginCalls[1]?.subjectSha256
+    );
+    expect(value.reviewer.beginTokens[0]).not.toBe(value.reviewer.beginTokens[1]);
+
+    // And each token IS that round's durable id — the row that already exists
+    // when the reservation is made, so it survives a restart unchanged.
+    expect(value.reviewer.beginTokens[0]).toBe(first.round.id);
+    expect(value.reviewer.beginTokens[1]).toBe(second.round.id);
+  });
+
+  it('is stable for one round: a reservation retried under it asks for the same key', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    // The first attempt loses its answer on the way back, so the round is closed
+    // as one that provably reserved nothing and the operator starts another.
+    value.reviewer.beginError = new Error('the reservation answer was lost');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/answer was lost/);
+    const failed = value.reviews.latestRound(value.task.id)!;
+
+    // Asking the same durable round for its token again yields the same string —
+    // it is a stored id, not something recomputed per attempt.
+    expect(value.reviewer.beginTokens).toEqual([failed.id]);
+    expect(value.reviews.findRoundById(failed.id)?.id).toBe(value.reviewer.beginTokens[0]);
+  });
+
+  it('reserves before it dispatches, and a reservation alone dispatches nothing', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.onBegin = () => {
+      // At the moment the round is named, nothing has been sent to review.
+      expect(value.reviewer.calls).toHaveLength(0);
+    };
+
+    await value.service.review(value.task.id);
+
+    expect(value.reviewer.beginTokens).toHaveLength(1);
+    expect(value.reviewer.calls).toHaveLength(1);
+  });
+});
+
+describe('provider-controlled text that would become durable', () => {
+  /**
+   * `ExternalCodeReviewer` is an INTERFACE. The Coai adapter checks its own
+   * server's identity, but a second implementation — or this fake — reaches the
+   * service without passing through that check at all, and the service is the
+   * boundary where an answer becomes durable. So the same standard is applied
+   * again here rather than assumed to have happened upstream.
+   */
+  const ESCAPE = String.fromCharCode(27);
+
+  const cases: { what: string; answer: Partial<ExternalCodeReviewRound>; leak: string }[] = [
+    {
+      what: 'a credential-shaped server name',
+      answer: { serverName: 'coai ghp_A1b2C3d4E5f6G7h8I9j0' },
+      leak: 'ghp_A1b2C3d4E5f6G7h8I9j0'
+    },
+    {
+      what: 'a credential-shaped server version',
+      answer: { serverVersion: '1.0+sk-ant-A1b2C3d4E5f6G7h8' },
+      leak: 'sk-ant-A1b2C3d4E5f6G7h8'
+    },
+    {
+      what: 'an escape sequence in the server name',
+      answer: { serverName: 'coai' + ESCAPE + '[31m' },
+      leak: ESCAPE
+    },
+    {
+      what: 'a credential in the reviewer summary',
+      answer: { reviewers: 'answered as GH_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0' },
+      leak: 'ghp_A1b2C3d4E5f6G7h8I9j0'
+    },
+    {
+      what: 'a credential in the reviewer instruction',
+      answer: { instruction: 'run with API_KEY=sk-ant-A1b2C3d4E5f6G7h8' },
+      leak: 'sk-ant-A1b2C3d4E5f6G7h8'
+    }
+  ];
+
+  it.each(cases)('refuses to complete a round carrying $what', async ({ answer, leak }) => {
+    const value = setup();
+    value.reviewer.answer = { ...value.reviewer.answer, ...answer };
+    await value.service.captureSubject(value.task.id);
+
+    await expect(value.service.review(value.task.id)).rejects.toThrow(
+      /not persisted as complete/i
+    );
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.status).not.toBe('completed');
+    // None of the offending text reached storage — not through the round's own
+    // columns, and not through the error that was recorded on it.
+    expect(JSON.stringify(round)).not.toContain(leak);
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+  });
+
+  it('still stores an ordinary server identity', async () => {
+    const value = setup();
+    const outcome = await reviewOnce(value);
+
+    expect(outcome.round.status).toBe('completed');
+    expect(outcome.round.serverName).toBe('coai-mcp');
+    expect(outcome.round.serverVersion).toBe('1.2.3');
+  });
+});
+
+describe('a contradictory read-back, from the transport to the durable round', () => {
+  function mcpTool(name: string): ExternalMcpTool {
+    return {
+      name,
+      title: null,
+      description: null,
+      inputSchema: { type: 'object' },
+      annotations: { readOnly: null, destructive: null, idempotent: null, openWorld: null }
+    };
+  }
+
+  const SERVER = { name: 'coai-mcp', version: '0.19.0', protocolVersion: '2024-11-05' };
+
+  const mcpConfig: ExternalMcpServerConfig = {
+    id: 'coai-code-review',
+    enabled: true,
+    executablePath: 'C:/tools/coai-mcp.exe',
+    args: ['--stdio'],
+    allowedTools: COAI_ADDRESSABLE_PROFILE,
+    timeoutMs: 30_000,
+    maxMessageBytes: 100_000,
+    maxContentBytes: 100_000,
+    maxContentBlocks: 4
+  };
+
+  /** The smallest transport that can script one answer per call, in order. */
+  class ScriptedMcpClient implements ExternalMcpClient {
+    readonly calls: string[] = [];
+    readonly responses: ExternalMcpCallResult[] = [];
+
+    async discover(): Promise<ExternalMcpDiscovery> {
+      return { server: SERVER, tools: COAI_ADDRESSABLE_PROFILE.map(mcpTool) };
+    }
+
+    async call(
+      _config: ExternalMcpServerConfig,
+      name: string
+    ): Promise<ExternalMcpCallResult> {
+      this.calls.push(name);
+      const next = this.responses.shift();
+      if (!next) throw new Error('no scripted response for ' + name);
+
+      return next;
+    }
+  }
+
+  function payload(tool: string, value: unknown): ExternalMcpCallResult {
+    return { server: SERVER, tool: mcpTool(tool), isError: false, content: [JSON.stringify(value)] };
+  }
+
+  /**
+   * The whole chain, because the adapter's mapping is only half the property.
+   * What matters durably is that the round is NOT released: `not_started` is
+   * the one status that would let a fresh dispatch repeat a review the provider
+   * has just claimed to have finished.
+   */
+  it('leaves the round dispatched, blocks the next review, and runs nothing again', async () => {
+    const value = setup();
+    const client = new ScriptedMcpClient();
+    const service = value.build({ reviewer: new CoaiCodeReviewer(client, mcpConfig) });
+    const locator = { providerId: COAI_PROVIDER_ID, sessionId: 'session-1', roundId: 'round-1' };
+
+    const captured = await service.captureSubject(value.task.id);
+
+    // The reservation is honest and matches the subject, so the dispatch goes
+    // out; its answer is then lost, which is what strands a round at all.
+    client.responses.push(
+      payload('reserve_round', {
+        locator,
+        attestation: {
+          repoIdentity: 'repo',
+          baseRef: captured.baseCommit,
+          baseSha: captured.baseCommit,
+          headSha: captured.headCommit,
+          treeSha: captured.headCommit,
+          subjectHash: captured.subjectSha256
+        },
+        state: 'not_started',
+        alreadyReserved: false,
+        instruction: 'store this locator before calling run_round'
+      })
+    );
+    client.responses.push(payload('run_round', { error: 'the connection dropped' }));
+
+    await expect(service.review(value.task.id)).rejects.toThrow();
+    expect(value.reviews.latestRound(value.task.id)?.status).toBe('reviewing');
+
+    // Now the provider contradicts itself: nothing ran, and here is the review.
+    client.responses.push(
+      payload('round_status', {
+        locator,
+        state: 'not_started',
+        instruction: 'reserved, never run',
+        review: {
+          locator,
+          reviewedSubjectSha256: captured.subjectSha256,
+          verdict: 'revise',
+          gatingCount: 1,
+          threshold: 0,
+          reviewers: 'all 3 reviewers answered',
+          findings: [],
+          instruction: 'resolve every finding',
+          tokensIn: 10,
+          tokensOut: 5
+        }
+      })
+    );
+
+    const outcome = await service.reconcile(value.task.id);
+
+    // Not released, and not settled either: the answer taught nothing.
+    expect(outcome.unsettledReason).toBe('unknown');
+    expect(outcome.round.status).toBe('reviewing');
+    expect(value.reviews.latestRound(value.task.id)?.status).toBe('reviewing');
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+
+    // `run_round` was called exactly once — by the original dispatch, never by
+    // the recovery.
+    expect(client.calls.filter((name) => name === 'run_round')).toHaveLength(1);
+    expect(client.calls).toEqual(['reserve_round', 'run_round', 'round_status']);
+
+    // And the task stays blocked rather than being offered a free retry.
+    await expect(service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  /**
+   * The same property, driven through the REAL adapter instead of a fake port.
+   *
+   * `parse` puts an MCP server's refusal sentence inside the error message on
+   * purpose, so this is the exact route by which provider prose used to reach
+   * SQLite: the server refuses as DATA, the adapter quotes it, and the service
+   * stored what the adapter quoted.
+   */
+  it('stores none of a refusal the real adapter quoted, at reservation', async () => {
+    const value = setup();
+    const client = new ScriptedMcpClient();
+    const service = value.build({ reviewer: new CoaiCodeReviewer(client, mcpConfig) });
+
+    await service.captureSubject(value.task.id);
+    client.responses.push(payload('reserve_round', { error: HOSTILE }));
+
+    // The CALLER is still told what kind of failure this was.
+    await expect(service.review(value.task.id)).rejects.toMatchObject({ code: 'TOOL_FAILED' });
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.status).toBe('failed');
+    for (const leak of LEAKS) expect(JSON.stringify(round), leak).not.toContain(leak);
+    expect(round.lastError).toMatch(/could not open a round/i);
+    // Nothing was dispatched, so there is nothing to reconcile.
+    expect(client.calls).toEqual(['reserve_round']);
+  });
+
+  it('stores none of a refusal the real adapter quoted, at dispatch', async () => {
+    const value = setup();
+    const client = new ScriptedMcpClient();
+    const service = value.build({ reviewer: new CoaiCodeReviewer(client, mcpConfig) });
+    const locator = { providerId: COAI_PROVIDER_ID, sessionId: 'session-1', roundId: 'round-1' };
+
+    const captured = await service.captureSubject(value.task.id);
+    client.responses.push(
+      payload('reserve_round', {
+        locator,
+        attestation: {
+          repoIdentity: 'repo',
+          baseRef: captured.baseCommit,
+          baseSha: captured.baseCommit,
+          headSha: captured.headCommit,
+          treeSha: captured.headCommit,
+          subjectHash: captured.subjectSha256
+        },
+        state: 'not_started',
+        alreadyReserved: false,
+        instruction: 'store this locator before calling run_round'
+      })
+    );
+    client.responses.push(payload('run_round', { error: HOSTILE }));
+
+    await expect(service.review(value.task.id)).rejects.toMatchObject({ code: 'TOOL_FAILED' });
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    // Dispatched, so it stays unresolved: a reviewer may well have run.
+    expect(round.status).toBe('reviewing');
+    for (const leak of LEAKS) expect(JSON.stringify(round), leak).not.toContain(leak);
+    expect(round.lastError).toMatch(/outcome could not be confirmed/i);
+
+    // Exactly one run_round, and a second review is refused rather than retried.
+    expect(client.calls.filter((name) => name === 'run_round')).toHaveLength(1);
+    await expect(service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+    expect(client.calls.filter((name) => name === 'run_round')).toHaveLength(1);
+  });
+
+  it('says nothing of a provider state that is not a fresh reservation', async () => {
+    const value = setup();
+    const client = new ScriptedMcpClient();
+    const service = value.build({ reviewer: new CoaiCodeReviewer(client, mcpConfig) });
+    const locator = { providerId: COAI_PROVIDER_ID, sessionId: 'session-1', roundId: 'round-1' };
+
+    const captured = await service.captureSubject(value.task.id);
+    client.responses.push(
+      payload('reserve_round', {
+        locator,
+        attestation: {
+          repoIdentity: 'repo',
+          baseRef: captured.baseCommit,
+          baseSha: captured.baseCommit,
+          headSha: captured.headCommit,
+          treeSha: captured.headCommit,
+          subjectHash: captured.subjectSha256
+        },
+        // The provider's own `state` string, and nothing constrains it.
+        state: HOSTILE,
+        alreadyReserved: true,
+        instruction: 'resumed'
+      })
+    );
+
+    await expect(service.review(value.task.id)).rejects.toMatchObject({ code: 'PARSE_FAILED' });
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.status).toBe('failed');
+    for (const leak of LEAKS) expect(JSON.stringify(round), leak).not.toContain(leak);
+    // Never dispatched: a reservation that is not fresh licenses nothing.
+    expect(client.calls).toEqual(['reserve_round']);
+  });
+});
+
+describe('a reviewer-supplied reason never reaches storage', () => {
+  const ESCAPE = String.fromCharCode(27);
+
+  /**
+   * A wholly fictional path, argv and token. Every fragment is asserted absent.
+   *
+   * The point is the PORT, not the Coai adapter: `ExternalCodeReviewer` is an
+   * interface, so a second implementation can hand the service whatever string
+   * it likes as a reason. `lastError` is durable and operator-visible, so the
+   * service must not write that string whatever it contains.
+   */
+  const HOSTILE =
+    'died at C:/Users/someone/AppData/coai/coai-mcp.exe --stdio' +
+    ESCAPE +
+    '[31m GH_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0';
+
+  const leaks = [
+    'C:/Users/someone',
+    'coai-mcp.exe',
+    '--stdio',
+    'AppData',
+    ESCAPE,
+    'ghp_A1b2C3d4E5f6G7h8I9j0'
+  ];
+
+  async function strandedRound() {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.error = new Error('the reviewer never answered');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+    value.reviewer.error = null;
+    expect(value.reviews.latestRound(value.task.id)?.status).toBe('reviewing');
+
+    return value;
+  }
+
+  it('persists none of an unknown reason, whatever the reviewer put in it', async () => {
+    const value = await strandedRound();
+    value.reviewer.roundStatusAnswer = { kind: 'unknown', reason: HOSTILE };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    const stored = outcome.round.lastError ?? '';
+    for (const leak of leaks) expect(stored, leak).not.toContain(leak);
+    // What it says instead is Agent Relay's own, and it still says the part
+    // that governs behaviour.
+    expect(stored).toMatch(/could not say what became/i);
+    expect(stored).toMatch(/not repeated here/i);
+
+    // Semantics unchanged: unresolved, blocked, and never described as safe.
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('unknown');
+    expect(stored).not.toMatch(/did not run|never ran/i);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+  });
+
+  it('reads the same durable row back with nothing of it either', async () => {
+    const value = await strandedRound();
+    value.reviewer.roundStatusAnswer = { kind: 'unknown', reason: HOSTILE };
+
+    await value.service.reconcile(value.task.id);
+
+    // Straight from the repository, not from the outcome the call returned.
+    const stored = value.reviews.latestRound(value.task.id)?.lastError ?? '';
+    for (const leak of leaks) expect(stored, leak).not.toContain(leak);
+  });
+
+  it('leaves running and not_started saying exactly what they said before', async () => {
+    const running = await strandedRound();
+    running.reviewer.roundStatusAnswer = { kind: 'running' };
+    const held = await running.service.reconcile(running.task.id);
+    expect(held.unsettledReason).toBe('running');
+    expect(held.round.status).toBe('reviewing');
+    expect(held.round.lastError).toMatch(/still running/i);
+
+    const released = await strandedRound();
+    released.reviewer.roundStatusAnswer = { kind: 'not_started' };
+    const closed = await released.service.reconcile(released.task.id);
+    expect(closed.unsettledReason).toBe('not-started');
+    expect(closed.round.status).toBe('failed');
+    expect(closed.round.lastError).toMatch(/never started/i);
+    // The one state that releases a round still releases it.
+    await expect(released.service.review(released.task.id)).resolves.toBeTruthy();
+  });
+});
+
+describe('an external error never reaches durable storage', () => {
+  /**
+   * The PORT, not the Coai adapter. `ExternalCodeReviewer` is an interface, so
+   * an implementation may throw whatever it likes — and both of these catches
+   * used to copy `error.message` straight into a durable, operator-visible
+   * column. `details` is carried too, because it is exactly as foreign as the
+   * message and the transport uses it for a failed process's stderr.
+   */
+  function hostileError(): AgentRelayError {
+    return new AgentRelayError('TOOL_FAILED', HOSTILE, { details: HOSTILE });
+  }
+
+  it('closes the round as failed when the reservation refuses, storing none of it', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.beginError = hostileError();
+
+    // Classification survives to the caller, which is the boundary it is for.
+    await expect(value.service.review(value.task.id)).rejects.toMatchObject({
+      code: 'TOOL_FAILED',
+      message: HOSTILE
+    });
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    // No reviewer was dispatched, so the round is provably closed.
+    expect(round.status).toBe('failed');
+    for (const leak of LEAKS) expect(JSON.stringify(round), leak).not.toContain(leak);
+    expect(round.lastError).toMatch(/could not open a round/i);
+    expect(round.lastError).toMatch(/nothing was dispatched/i);
+    // run_round was never reached.
+    expect(value.reviewer.calls).toHaveLength(0);
+  });
+
+  it('leaves the round unresolved when the dispatch fails, storing none of it', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.error = hostileError();
+
+    await expect(value.service.review(value.task.id)).rejects.toMatchObject({
+      code: 'TOOL_FAILED',
+      message: HOSTILE
+    });
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    // The request left this process, so a reviewer may well have run.
+    expect(round.status).toBe('reviewing');
+    for (const leak of LEAKS) expect(JSON.stringify(round), leak).not.toContain(leak);
+    expect(round.lastError).toMatch(/outcome could not be confirmed/i);
+    // And it must never read as proof that nothing ran.
+    expect(round.lastError).not.toMatch(/did not run|never ran/i);
+
+    // Exactly one dispatch, and no automatic retry: a second attempt is refused
+    // rather than repeated.
+    expect(value.reviewer.calls).toHaveLength(1);
+    value.reviewer.error = null;
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+    expect(value.reviewer.calls).toHaveLength(1);
+  });
+
+  it('keeps the two failures telling different stories', async () => {
+    // Ordinary, non-hostile failures. The durable WORDING is Agent Relay's now;
+    // the state each one leaves is exactly what it always was.
+    const reserved = setup();
+    await reserved.service.captureSubject(reserved.task.id);
+    reserved.reviewer.beginError = new Error('the provider refused to reserve');
+    await expect(reserved.service.review(reserved.task.id)).rejects.toThrow(/refused to reserve/);
+    expect(reserved.reviews.latestRound(reserved.task.id)?.status).toBe('failed');
+    expect(reserved.reviewer.calls).toHaveLength(0);
+
+    const dispatched = setup();
+    await dispatched.service.captureSubject(dispatched.task.id);
+    dispatched.reviewer.error = new Error('the reviewer never answered');
+    await expect(dispatched.service.review(dispatched.task.id)).rejects.toThrow(/never answered/);
+    expect(dispatched.reviews.latestRound(dispatched.task.id)?.status).toBe('reviewing');
+    expect(dispatched.reviewer.calls).toHaveLength(1);
+  });
+
+  it('records only owned text when the answer will not parse', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    // A SCHEMA failure, whose message this application did not author — the one
+    // error in that path that is not built here from a constant or a field name.
+    value.reviewer.answer = { ...value.reviewer.answer, verdict: HOSTILE };
+
+    await expect(value.service.review(value.task.id)).rejects.toBeTruthy();
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    for (const leak of LEAKS) expect(JSON.stringify(round), leak).not.toContain(leak);
+    expect(round.lastError).toMatch(/could not read as a review/i);
+  });
+});
+
+describe('a locator this build refuses to write down', () => {
+  /**
+   * The SERVICE guard, not the adapter's. `ExternalCodeReviewer` is an
+   * interface: this fake reaches the persistence path without passing through
+   * the Coai adapter's schema at all, which is exactly the case the second
+   * check exists for.
+   */
+  const ESC = String.fromCharCode(27);
+
+  const hostile = [
+    {
+      what: 'an escape sequence in the session id',
+      locator: { sessionId: 'session' + ESC + '[31m', roundId: 'round-1' },
+      leak: ESC
+    },
+    {
+      what: 'a path in the round id',
+      locator: { sessionId: 'session-1', roundId: 'C:/Users/someone/coai' },
+      leak: 'C:/Users/someone'
+    },
+    {
+      what: 'a credential-shaped session id',
+      locator: { sessionId: 'ghp_A1b2C3d4E5f6G7h8I9j0', roundId: 'round-1' },
+      leak: 'ghp_A1b2C3d4E5f6G7h8I9j0'
+    }
+  ];
+
+  it.each(hostile)('refuses $what, closing the round before any dispatch', async ({
+    locator,
+    leak
+  }) => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.locators = [{ providerId: value.reviewer.providerId, ...locator }];
+
+    await expect(value.service.review(value.task.id)).rejects.toMatchObject({
+      code: 'PARSE_FAILED'
+    });
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    // Refused ABOVE the non-idempotent call, so the round is provably closed.
+    expect(round.status).toBe('failed');
+    // Nothing of the offending value reached the row.
+    expect(JSON.stringify(round)).not.toContain(leak);
+    // run_round was never called.
+    expect(value.reviewer.calls).toHaveLength(0);
+  });
+
+  it('leaves an ordinary locator working exactly as before', async () => {
+    const value = setup();
+    value.reviewer.locators = [
+      {
+        providerId: value.reviewer.providerId,
+        sessionId: '9f2c1e7a-3b4d-4e5f-8a9b-0c1d2e3f4a5b',
+        roundId: 'round_42.retry-3'
+      }
+    ];
+
+    const outcome = await reviewOnce(value);
+
+    expect(outcome.round.status).toBe('completed');
+    expect(outcome.round.sessionId).toBe('9f2c1e7a-3b4d-4e5f-8a9b-0c1d2e3f4a5b');
+    expect(outcome.round.providerRoundId).toBe('round_42.retry-3');
+  });
+});
+
+describe('a reviewer that goes away between reserving and dispatching', () => {
+  /**
+   * The real `SettingsBoundCodeReviewer`, because the defect lives in it: it
+   * resolves configuration PER CALL, so a round can be reserved while the
+   * integration is on and then find it switched off before anything is sent.
+   * The old catch stored `DISPATCH_UNCONFIRMED` for that, which claims the
+   * request left the process — a falsehood that also stranded the task.
+   */
+  function mcpTool(name: string): ExternalMcpTool {
+    return {
+      name,
+      title: null,
+      description: null,
+      inputSchema: { type: 'object' },
+      annotations: { readOnly: null, destructive: null, idempotent: null, openWorld: null }
+    };
+  }
+
+  const SERVER = { name: 'coai-mcp', version: '0.19.0', protocolVersion: '2024-11-05' };
+
+  function payload(tool: string, value: unknown): ExternalMcpCallResult {
+    return { server: SERVER, tool: mcpTool(tool), isError: false, content: [JSON.stringify(value)] };
+  }
+
+  /** A transport that can also run a hook at the moment a call goes out. */
+  class DriftingMcpClient implements ExternalMcpClient {
+    readonly calls: string[] = [];
+    readonly responses: ExternalMcpCallResult[] = [];
+    onCall: ((name: string) => void) | null = null;
+
+    async discover(): Promise<ExternalMcpDiscovery> {
+      return { server: SERVER, tools: COAI_ADDRESSABLE_PROFILE.map(mcpTool) };
+    }
+
+    async call(_config: ExternalMcpServerConfig, name: string): Promise<ExternalMcpCallResult> {
+      this.calls.push(name);
+      this.onCall?.(name);
+      const next = this.responses.shift();
+      if (!next) throw new Error('no scripted response for ' + name);
+
+      return next;
+    }
+  }
+
+  function liveSettings(): Settings {
+    return {
+      ...defaultSettings({ dataDir: 'C:/user-data', documentsDir: 'C:/documents' }),
+      externalCodeReviewEnabled: true,
+      coaiMcpExecutablePath: 'C:/tools/coai-mcp.exe',
+      coaiMcpArguments: ['--stdio']
+    };
+  }
+
+  function reservation(
+    captured: { baseCommit: string; headCommit: string; subjectSha256: string },
+    roundId = 'round-1'
+  ) {
+    return {
+      locator: { providerId: COAI_PROVIDER_ID, sessionId: 'session-1', roundId },
+      attestation: {
+        repoIdentity: 'repo',
+        baseRef: captured.baseCommit,
+        baseSha: captured.baseCommit,
+        headSha: captured.headCommit,
+        treeSha: captured.headCommit,
+        subjectHash: captured.subjectSha256
+      },
+      state: 'not_started',
+      alreadyReserved: false,
+      instruction: 'store this locator before calling run_round'
+    };
+  }
+
+  it('closes the round as a proven pre-dispatch failure and sends nothing', async () => {
+    const value = setup();
+    let enabled = true;
+    const client = new DriftingMcpClient();
+    const reviewer = new SettingsBoundCodeReviewer({
+      settings: () => ({ ...liveSettings(), externalCodeReviewEnabled: enabled }),
+      client
+    });
+    const service = value.build({ reviewer });
+
+    const captured = await service.captureSubject(value.task.id);
+    client.responses.push(payload('reserve_round', reservation(captured)));
+    // Switched off while the reservation is in flight, which is the real race:
+    // settings are resolved per call.
+    client.onCall = (name) => {
+      if (name === 'reserve_round') enabled = false;
+    };
+
+    const failure = await service
+      .review(value.task.id)
+      .then(() => null)
+      .catch((reason: unknown) => reason);
+
+    // The caller keeps the typed error, its code and its safe message.
+    expect(failure).toBeInstanceOf(CodeReviewNotDispatchedError);
+    expect((failure as AgentRelayError).code).toBe('TOOL_MISSING');
+    expect((failure as AgentRelayError).message).toMatch(/not enabled/i);
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    // Closed, because nothing was sent — not left unresolved.
+    expect(round.status).toBe('failed');
+    expect(round.lastError).toMatch(/nothing was dispatched/i);
+    expect(round.lastError).toMatch(/closed as failed/i);
+    // And it must NOT claim the request left this process.
+    expect(round.lastError).not.toMatch(/could not be confirmed/i);
+    // run_round was never called.
+    expect(client.calls).toEqual(['reserve_round']);
+
+    // Once the setting comes back, the operator may start a new round.
+    enabled = true;
+    client.onCall = null;
+    // A distinct provider round: the first one was reserved and abandoned, and
+    // a durable round is unique per provider locator.
+    client.responses.push(payload('reserve_round', reservation(captured, 'round-2')));
+    client.responses.push(
+      payload('run_round', {
+        locator: { providerId: COAI_PROVIDER_ID, sessionId: 'session-1', roundId: 'round-2' },
+        reviewedSubjectSha256: captured.subjectSha256,
+        verdict: 'revise',
+        gatingCount: 1,
+        threshold: 0,
+        reviewers: 'all 3 reviewers answered',
+        findings: [],
+        instruction: 'resolve every finding',
+        tokensIn: 10,
+        tokensOut: 5
+      })
+    );
+
+    await expect(service.review(value.task.id)).resolves.toBeTruthy();
+    expect(client.calls.filter((name) => name === 'run_round')).toHaveLength(1);
+  });
+
+  it('still leaves a genuine post-dispatch failure unresolved and blocked', async () => {
+    const value = setup();
+    const client = new DriftingMcpClient();
+    const reviewer = new SettingsBoundCodeReviewer({ settings: liveSettings, client });
+    const service = value.build({ reviewer });
+
+    const captured = await service.captureSubject(value.task.id);
+    client.responses.push(payload('reserve_round', reservation(captured)));
+    // The dispatch goes out and the server refuses as data: TOOL_FAILED, raised
+    // from INSIDE the external call. Nothing here proves it did not run.
+    client.responses.push(payload('run_round', { error: 'the connection dropped' }));
+
+    await expect(service.review(value.task.id)).rejects.toMatchObject({ code: 'TOOL_FAILED' });
+
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.status).toBe('reviewing');
+    expect(round.lastError).toMatch(/outcome could not be confirmed/i);
+    expect(round.lastError).not.toMatch(/nothing was dispatched/i);
+
+    // Exactly one dispatch, and no second run is permitted.
+    expect(client.calls.filter((name) => name === 'run_round')).toHaveLength(1);
+    await expect(service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
+    expect(client.calls.filter((name) => name === 'run_round')).toHaveLength(1);
   });
 });

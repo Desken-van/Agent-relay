@@ -1,20 +1,24 @@
 /**
- * The external code reviewer that INT-D-A does not have yet.
+ * The two reviewers the object graph can be built with, and neither pretends.
  *
- * INT-D-A delivers the evidence layer: an immutable subject, durable rounds,
- * findings with stable identity and decisions with an audit trail. What it does
- * NOT deliver is the adapter that calls a real provider's `review_code` — that
- * is INT-D-B, together with its allowlist, budget and live acceptance.
+ * {@link UnconfiguredCodeReviewer} is the honest empty slot: it refuses loudly
+ * and specifically, because leaving the dependency optional or returning an
+ * empty round would let a caller mistake "no provider is configured" for "the
+ * review found nothing" — the one confusion a review gate must never allow.
  *
- * This class exists so the object graph is complete and honest rather than
- * half-wired. It refuses loudly and specifically. The alternative — leaving the
- * dependency optional, or returning an empty round — would let a caller mistake
- * "no provider is configured" for "the review found nothing", which is the one
- * confusion a review gate must never allow.
+ * {@link SettingsBoundCodeReviewer} is what the running app uses. It resolves
+ * persisted settings per call and refuses exactly as the empty slot does when
+ * the integration is off, its executable is unset, or the configured server
+ * does not advertise the audited addressable profile.
  */
 
 import { AgentRelayError } from '../../shared/domain/errors';
+import type { Settings } from '../../shared/domain/models';
+import { CoaiCodeReviewer } from '../adapters/mcp/coai-code-reviewer';
+import { COAI_PROVIDER_ID } from '../adapters/mcp/coai-profiles';
+import { externalCodeReviewConfig } from './code-review-configuration';
 import type {
+  ExternalMcpClient,
   CodeReviewerAvailability,
   ExternalCodeRoundLocator,
   ExternalCodeRoundStatus,
@@ -22,6 +26,31 @@ import type {
   ExternalCodeReviewRound,
   ExternalCodeReviewSubject
 } from '../ports';
+
+/**
+ * Typed proof that no external call was attempted.
+ *
+ * The service has to tell two failures apart that look identical from a catch
+ * block: a request that left this process and lost its answer, and a request
+ * that was never made at all. The first must leave the round unresolved,
+ * because a reviewer may well have run; the second may close it, because
+ * nothing did.
+ *
+ * A TYPE rather than a code, because `TOOL_MISSING` is not proof of anything on
+ * its own — a real adapter can raise it from inside an external call, once the
+ * request has already gone out. Only the throw site knows whether anything was
+ * attempted, so only the throw site can say so, and it says so by choosing this
+ * class.
+ *
+ * The code and message are an ordinary `TOOL_MISSING` for the caller, which is
+ * entitled to exactly what it was entitled to before.
+ */
+export class CodeReviewNotDispatchedError extends AgentRelayError {
+  constructor(message: string, options?: { remediation?: string }) {
+    super('TOOL_MISSING', message, options);
+    this.name = 'CodeReviewNotDispatchedError';
+  }
+}
 
 export class UnconfiguredCodeReviewer implements ExternalCodeReviewer {
   /**
@@ -63,6 +92,7 @@ export class UnconfiguredCodeReviewer implements ExternalCodeReviewer {
    */
   async beginRound(
     _subject: ExternalCodeReviewSubject,
+    _clientToken: string,
     _signal?: AbortSignal
   ): Promise<ExternalCodeRoundLocator> {
     throw new AgentRelayError(
@@ -107,5 +137,139 @@ export class UnconfiguredCodeReviewer implements ExternalCodeReviewer {
           'Capturing the review subject and reading recorded findings work without a provider. Running a round needs the provider adapter, which is not part of this phase.'
       }
     );
+  }
+}
+
+/**
+ * The code reviewer the running app uses: settings-bound, and refusing by default.
+ *
+ * The service is built once at startup while settings change while it runs, so
+ * the reviewer is resolved per CALL rather than captured. A configuration that
+ * was switched off, or an executable that was cleared, therefore takes effect on
+ * the next call instead of at the next restart — and a build with nothing
+ * configured refuses exactly as {@link UnconfiguredCodeReviewer} does.
+ */
+export class SettingsBoundCodeReviewer implements ExternalCodeReviewer {
+  constructor(
+    private readonly deps: {
+      readonly settings: () => Settings;
+      readonly client: ExternalMcpClient;
+    }
+  ) {}
+
+  /**
+   * False, whatever is configured.
+   *
+   * Not delegated: the answer must not depend on whether a provider happens to
+   * be reachable this second, because the service asks it to decide whether a
+   * dirty subject may be dispatched at all. Until an immutable-snapshot
+   * attestation exists, no configuration makes this true.
+   */
+  readonly readsUncommittedWorktreeState = false;
+
+  /**
+   * Constant, and deliberately not read from configuration.
+   *
+   * A round dispatched while the integration was enabled must still be
+   * recognisable after somebody disables it — recovery compares this against the
+   * identity stored on the durable round, and an identity that disappeared with
+   * the configuration would strand every outstanding round.
+   */
+  readonly providerId = COAI_PROVIDER_ID;
+
+  async availability(signal?: AbortSignal): Promise<CodeReviewerAvailability> {
+    const reviewer = this.reviewer();
+
+    return reviewer === null
+      ? {
+          available: false,
+          reason:
+            'External code review is not enabled in this build\u2019s settings, or its MCP server is not configured.'
+        }
+      : reviewer.availability(signal);
+  }
+
+  async beginRound(
+    subject: ExternalCodeReviewSubject,
+    clientToken: string,
+    signal?: AbortSignal
+  ): Promise<ExternalCodeRoundLocator> {
+    return this.required().beginRound(subject, clientToken, signal);
+  }
+
+  async reviewCode(
+    locator: ExternalCodeRoundLocator,
+    subject: ExternalCodeReviewSubject,
+    scopeText: string,
+    signal?: AbortSignal
+  ): Promise<ExternalCodeReviewRound> {
+    return this.required().reviewCode(locator, subject, scopeText, signal);
+  }
+
+  /**
+   * Read-only, and it answers rather than throwing.
+   *
+   * Recovery runs against a round dispatched by a build that may since have been
+   * reconfigured. `unknown` is the honest answer there: this server cannot say
+   * what became of that round, which is not the same as saying nothing ran.
+   */
+  async roundStatus(
+    locator: ExternalCodeRoundLocator,
+    subject: ExternalCodeReviewSubject,
+    signal?: AbortSignal
+  ): Promise<ExternalCodeRoundStatus> {
+    const reviewer = this.reviewer();
+
+    return reviewer === null
+      ? {
+          kind: 'unknown',
+          reason:
+            'External code review is not configured now, so this build cannot ask what became of that round.'
+        }
+      : reviewer.roundStatus(locator, subject, signal);
+  }
+
+  /**
+   * The configured reviewer, or typed proof that nothing was attempted.
+   *
+   * Reached BEFORE any MCP call, always: this resolves configuration and either
+   * hands back a reviewer or throws. So a throw from here is positive evidence
+   * that no request left the process, and {@link CodeReviewNotDispatchedError}
+   * is how that evidence crosses the boundary to the service.
+   */
+  private required(): ExternalCodeReviewer {
+    const reviewer = this.reviewer();
+    if (reviewer === null) {
+      throw new CodeReviewNotDispatchedError(
+        'External code review is not enabled, so no round can be reserved or run.',
+        {
+          remediation:
+            'Enable external code review in Settings and point it at an MCP server that advertises the addressable ten-tool profile.'
+        }
+      );
+    }
+
+    return reviewer;
+  }
+
+  /**
+   * The configured reviewer, or null when there is none.
+   *
+   * A configuration that will not validate is the same as none: refusing is
+   * correct either way, and the settings screen is where the reason belongs.
+   */
+  private reviewer(): ExternalCodeReviewer | null {
+    let config;
+    try {
+      config = externalCodeReviewConfig(this.deps.settings());
+    } catch {
+      return null;
+    }
+
+    try {
+      return new CoaiCodeReviewer(this.deps.client, config);
+    } catch {
+      return null;
+    }
   }
 }

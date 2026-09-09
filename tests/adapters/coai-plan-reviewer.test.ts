@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { CoaiPlanReviewer, COAI_TOOL_ALLOWLIST } from '../../src/main/adapters/mcp/coai-plan-reviewer';
+import {
+  COAI_ADDRESSABLE_PROFILE,
+  COAI_PLAN_PROFILE
+} from '../../src/main/adapters/mcp/coai-profiles';
 import type {
   ExternalMcpCallResult,
   ExternalMcpClient,
@@ -259,9 +263,38 @@ describe('Coai plan reviewer adapter', () => {
     ).rejects.toMatchObject({ code: 'PARSE_FAILED' });
   });
 
-  it('refuses a partial or expanded tool allowlist at construction', () => {
+  it('accepts either audited profile and refuses everything between them', () => {
+    // The plan tools are identical in both, and a deployment running the newer
+    // server should not have to run a second one to keep the plan gate working.
+    expect(
+      () => new CoaiPlanReviewer(new FakeMcpClient(), { ...config, allowedTools: COAI_PLAN_PROFILE })
+    ).not.toThrow();
+    expect(
+      () =>
+        new CoaiPlanReviewer(new FakeMcpClient(), { ...config, allowedTools: COAI_ADDRESSABLE_PROFILE })
+    ).not.toThrow();
+
+    // A subset is not a profile, and neither is a superset: a server that grew a
+    // tool nobody here has read may have changed its others too, and the two are
+    // indistinguishable from this side.
     expect(
       () => new CoaiPlanReviewer(new FakeMcpClient(), { ...config, allowedTools: ['open', 'review_plan'] })
-    ).toThrow(/seven-tool allowlist/i);
+    ).toThrow(/audited profiles/i);
+    expect(
+      () =>
+        new CoaiPlanReviewer(new FakeMcpClient(), {
+          ...config,
+          allowedTools: [...COAI_PLAN_PROFILE, 'something_new']
+        })
+    ).toThrow(/audited profiles/i);
+    // Ten names with a duplicate standing in for a missing one is still not the
+    // ten-tool profile, however the counts line up.
+    expect(
+      () =>
+        new CoaiPlanReviewer(new FakeMcpClient(), {
+          ...config,
+          allowedTools: [...COAI_ADDRESSABLE_PROFILE.slice(0, 9), 'run_round']
+        })
+    ).toThrow(/audited profiles/i);
   });
 });
