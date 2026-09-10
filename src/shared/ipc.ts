@@ -289,6 +289,7 @@ export const ipcInputSchemas = {
     implementationProvider: executionProviderSchema, reviewProvider: executionProviderSchema }).strict(),
   'workflow:implement': z.object({ taskId: z.string().min(1), acceptDirtyWorkingTree: z.boolean().optional() }).strict(),
   'workflow:review': byTask,
+  'workflow:verify': byTask,
   'workflow:approveSpecification': byTask,
   'workflow:sendToClaude': z
     .object({
@@ -453,6 +454,7 @@ export interface IpcResponseMap {
   'workflow:generateSpecification': Task;
   'workflow:approveSpecification': Task;
   'workflow:sendToClaude': Task;
+  'workflow:verify': Task;
   'workflow:configureProviders': Task;
   'workflow:implement': Task;
   'workflow:review': Task;

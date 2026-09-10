@@ -445,7 +445,21 @@ Being precise about what was actually exercised, rather than merely written:
 | **Project-rule evidence** | 🧪 **Collector contract verified against real temporary Git repositories and filesystems.** It discovers the fixed project-memory locations, reads explicitly selected convention files, refuses symlinks and traversal, records missing or excluded evidence, binds clean convention bytes to an exact Git revision, and hashes a deterministic whole-file snapshot. Opt-in task binding is enforced by the plan-gate row below. |
 | **External plan-review gate** | ✅ **Durable contract and real-provider journey verified.** Settings hold only a fixed executable, argv and explicit convention selection; task IPC accepts identifiers and decisions, never process configuration or rule bytes. The live synthetic journey bound project rules plus four pinned convention files, generated a real specification, proved premature approval was refused, prepared an isolated branch, completed one Coai/Codex review, resolved all five findings, persisted `proceeded`, and read it back after restart. |
 
-Test suite: **1620 deterministic tests in 62 files, plus one automated Electron
+### Verify saved implementation without an AI round
+
+In **Run → Actions → Writes local files**, choose **Run verification**. This
+runs the project's existing `npm run verify` in the task worktree, without
+starting Claude/Codex or consuming an implementation round. The project must
+provide `scripts.verify` in `package.json`; Node.js and npm must be installed.
+Project scripts are trusted code and may produce local build/test artifacts.
+
+Open **Relay Timeline → Verification · npm run verify** for output, exit code,
+duration and snapshot identity. A confirmed pass opens **Run review**. Failure,
+cancellation, interruption or changed inputs never grant a pass. There is no
+automatic retry. Current files are checked again before review and publishing.
+This is verification, not Coai review and not live acceptance of a model.
+
+Test suite: **1645 deterministic tests in 65 files, plus one automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -608,7 +622,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1620 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              1645 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

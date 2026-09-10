@@ -81,8 +81,11 @@ import {
 import { renderRuleEvidence } from './rule-evidence';
 import { join } from 'node:path';
 import { canChangeProviders, executionProviderSchema, type ExecutionProvider } from '../../shared/domain/execution-providers';
+import { latestVerification, readVerification } from '../../shared/domain/verification';
+import type { VerificationExecutor } from './worktree-verification';
 
 export interface OrchestratorDeps {
+  readonly verification?: VerificationExecutor;
   readonly projects: ProjectRepository;
   readonly tasks: TaskRepository;
   readonly runs: RunRepository;
@@ -167,6 +170,64 @@ export class Orchestrator {
 
   isRunning(taskId: string): boolean {
     return this.inFlight.has(taskId);
+  }
+
+  /** Re-check existing files, without spending an implementation/review round. */
+  async runVerification(taskId: string): Promise<Task> {
+    let task = this.requireTask(taskId);
+    if (!['READY_FOR_IMPLEMENTATION', 'READY_FOR_REVIEW', 'CHANGES_REQUESTED', 'APPROVED', 'READY_TO_PUBLISH'].includes(task.status)) {
+      throw new InvalidTransitionError(task.status, 'verification_started');
+    }
+    if (!task.specificationApprovedAt || !task.worktreePath || !task.branchName) {
+      throw new AgentRelayError('APPROVAL_REQUIRED', 'Approve the specification and create an implementation worktree first.');
+    }
+    const executor = this.deps.verification;
+    if (!executor) throw new AgentRelayError('TOOL_MISSING', 'Verification is not configured in this build.');
+    if (this.deps.runs.listByTask(taskId).some(run => run.status === 'running')) {
+      throw new AgentRelayError('BUSY', 'A run is still outstanding for this task.');
+    }
+    const settings = this.deps.settings.get();
+    const project = this.requireProject(task.projectId);
+    assertPlanReviewAllowsApproval({ task, ruleEvidence: this.deps.ruleEvidence, gates: this.deps.planReviews });
+    // A test pass is not permission to erase an implementation security denial.
+    const previous = readClaudeAssessment(latestClaudeRoundResult(this.deps.runs.listByTask(taskId)));
+    if (previous.ok && previous.assessment.publishBlock === 'security') {
+      throw new AgentRelayError('VALIDATION_FAILED', 'Resolve the implementation security denial before verification recovery.');
+    }
+    const controller = this.beginExclusive(taskId);
+    let handle: ReturnType<RunRecorder['start']> | undefined;
+    let identity = '';
+    try {
+      identity = await executor.identity({ task, settings, project });
+      if (controller.signal.aborted) throw new AgentRelayError('CANCELLED', 'Verification cancelled before execution.');
+      task = this.requireTask(taskId);
+      task = this.applyEvent(task, 'verification_started', { lastError: null, lastReviewJson: null });
+      handle = this.recorder(settings).start({ taskId, agent: 'system', runType: 'verification', round: task.currentRound });
+      const result = await executor.execute({ task, settings, project }, controller.signal, event => handle!.append(event));
+      const after = await executor.identity({ task: this.requireTask(taskId), settings: this.deps.settings.get(), project: this.requireProject(task.projectId) });
+      const passed = result.exitCode === 0 && !result.failed && !result.timedOut && !result.cancelled && !controller.signal.aborted && after === identity;
+      const reason = passed ? null : after !== identity ? 'Files or task inputs changed during verification. Run verification again.' : result.cancelled || controller.signal.aborted ? 'Verification cancelled; success was not established.' : result.timedOut ? 'Verification timed out; success was not established.' : `npm run verify failed (exit ${result.exitCode ?? 'unknown'}). See command output.`;
+      handle.finish({ status: passed ? 'succeeded' : 'failed', finalMessage: passed ? 'Verification passed for this code snapshot. Ready for review.' : reason,
+        errorMessage: reason, structuredResult: { version: 1, command: 'npm run verify', identity, passed, exitCode: result.exitCode, durationMs: result.durationMs, reason } });
+      if (this.requireTask(taskId).status !== 'VERIFYING') return this.requireTask(taskId);
+      return this.applyEvent(this.requireTask(taskId), passed ? 'verification_completed' : 'verification_aborted', { lastError: reason });
+    } catch (error) {
+      const message = Orchestrator.describeError(error);
+      handle?.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: message,
+        structuredResult: { version: 1, command: 'npm run verify', identity, passed: false, exitCode: null, durationMs: 0, reason: message } });
+      if (this.requireTask(taskId).status === 'VERIFYING') this.applyEvent(this.requireTask(taskId), 'verification_aborted', { lastError: message });
+      throw error;
+    } finally { this.endExclusive(taskId); }
+  }
+
+  private async assertVerificationCurrent(task: Task): Promise<void> {
+    const run = latestVerification(this.deps.runs.listByTask(task.id));
+    if (!run) return;
+    const record = readVerification(run);
+    if (!record.success || !record.data.passed || run.status !== 'succeeded' || !this.deps.verification ||
+      record.data.identity !== await this.deps.verification.identity({ task, settings: this.deps.settings.get(), project: this.requireProject(task.projectId) })) {
+      throw new AgentRelayError('VALIDATION_FAILED', 'Verification is missing, failed or stale. Choose Run verification before review.');
+    }
   }
 
   configureProviders(input: { taskId: string; expectedRevision: number; implementationProvider: ExecutionProvider; reviewProvider: ExecutionProvider }): Task {
@@ -486,7 +547,8 @@ export class Orchestrator {
       }
 
       task = this.applyEvent(task, 'implementation_started', {
-        currentRound: 1,
+        // Verification recovery can return a later round here; never reset its budget.
+        currentRound: Math.max(1, task.currentRound),
         lastError: null
       });
 
@@ -847,16 +909,31 @@ export class Orchestrator {
       throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to review.');
     }
 
+    // Verification itself costs no round. A NEW review after a completed review
+    // still does: externally corrected files must not bypass the review budget.
+    const priorReview = this.deps.runs.findLatestByType(taskId, 'review');
+    const nextRound = latestVerification(this.deps.runs.listByTask(taskId)) &&
+      priorReview?.status === 'succeeded' && priorReview.round >= task.currentRound
+      ? priorReview.round + 1 : Math.max(1, task.currentRound);
+    if (nextRound > task.maxRounds) throw new AgentRelayError('VALIDATION_FAILED', 'The review round budget is exhausted. Verification does not reset it.');
+
     const controller = this.beginExclusive(taskId);
+    try {
+      await this.assertVerificationCurrent(task);
+    } catch (error) {
+      this.endExclusive(taskId);
+      this.applyEvent(this.requireTask(taskId), 'verification_invalidated', { lastError: Orchestrator.describeError(error) });
+      throw error;
+    }
     const handle = this.recorder(settings).start({
       taskId,
       agent: task.reviewProvider,
       runType: 'review',
-      round: task.currentRound
+      round: nextRound
     });
 
     try {
-      task = this.applyEvent(task, 'review_started', { lastError: null });
+      task = this.applyEvent(task, 'review_started', { lastError: null, currentRound: nextRound });
 
       handle.append({ type: 'log', text: 'Collecting Git changes from the worktree…' });
       const changes = await this.deps.git.collectChanges(worktreePath, baseBranch, {
@@ -894,6 +971,7 @@ export class Orchestrator {
         }
       );
 
+      await this.assertVerificationCurrent(this.requireTask(taskId));
       handle.finish({
         status: 'succeeded',
         finalMessage: outcome.review.summary,

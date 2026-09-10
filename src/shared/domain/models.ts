@@ -138,6 +138,7 @@ export type Task = z.infer<typeof taskSchema>;
 
 export const RUN_AGENTS = ['codex', 'claude', 'system'] as const;
 export const RUN_TYPES = [
+  'verification',
   'specification',
   'implementation',
   'review',
