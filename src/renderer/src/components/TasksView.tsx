@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { CLAUDE_MODEL_ALIASES } from '@shared/domain/models';
+import type { ExecutionProvider } from '@shared/domain/execution-providers';
 import {
   choiceFromModel,
   choiceToModel,
@@ -29,6 +30,8 @@ export function TasksView(): React.JSX.Element {
 
   const [title, setTitle] = useState('');
   const [request, setRequest] = useState('');
+  const [implementationProvider, setImplementationProvider] = useState<ExecutionProvider>('claude');
+  const [reviewProvider, setReviewProvider] = useState<ExecutionProvider>('codex');
 
   // The round budget is derived, not synchronised: the settings ceiling is the
   // default, and an explicit choice is clamped to it. Lowering the ceiling in
@@ -158,9 +161,19 @@ export function TasksView(): React.JSX.Element {
               />
             </Field>
 
+            <Field label="Implementation provider">
+              <select className="input" aria-label="Implementation provider" value={implementationProvider} onChange={(e) => setImplementationProvider(e.target.value as ExecutionProvider)}>
+                <option value="claude">Claude</option><option value="codex">Codex</option>
+              </select>
+            </Field>
+            <Field label="Review provider">
+              <select className="input" aria-label="Review provider" value={reviewProvider} onChange={(e) => setReviewProvider(e.target.value as ExecutionProvider)}>
+                <option value="codex">Codex</option><option value="claude">Claude</option>
+              </select>
+            </Field>
             <ModelPicker
-              label="Codex model — specification + review"
-              hint="Fixed for the life of the task. Its Codex thread is resumed for every review, so the model cannot change later."
+              label="Codex model"
+              hint="Used for specification and any role assigned to Codex. Reviews start in a separate, fresh session."
               presets={codexPresets}
               choice={codexSelection}
               onChange={setCodexChoice}
@@ -192,7 +205,7 @@ export function TasksView(): React.JSX.Element {
             />
 
             <ModelPicker
-              label="Claude model — implementation + corrections"
+              label="Claude model"
               hint="Fixed for the life of the task. Availability depends on your Claude account, not on this list."
               presets={CLAUDE_MODEL_ALIASES}
               choice={claudeSelection}
@@ -201,7 +214,7 @@ export function TasksView(): React.JSX.Element {
 
             <Field
               label={`Maximum review rounds: ${rounds}`}
-              hint={`The relay loop stops after this many Codex reviews. Ceiling from Settings: ${maxRounds}.`}
+              hint={`The relay loop stops after this many review rounds. Ceiling from Settings: ${maxRounds}.`}
             >
               <input
                 type="range"
@@ -227,7 +240,9 @@ export function TasksView(): React.JSX.Element {
                     // for "Tool default" is what stops a configured Settings
                     // default from being inherited against the user's wish.
                     codexModel,
-                    claudeModel
+                    claudeModel,
+                    implementationProvider,
+                    reviewProvider
                   });
                   setTitle('');
                   setRequest('');
@@ -246,7 +261,7 @@ export function TasksView(): React.JSX.Element {
 
             <Notice tone="info">
               Creating a task writes nothing to your repository. The isolated branch and worktree are
-              created later, when you send the approved specification to Claude.
+              created later, when you start the selected implementation provider.
             </Notice>
           </div>
         </Card>

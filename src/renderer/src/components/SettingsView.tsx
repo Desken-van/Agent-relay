@@ -570,7 +570,7 @@ export function SettingsView(): React.JSX.Element {
                 </Notice>
 
                 <Field
-                  label="Claude verification commands"
+                  label="Implementation verification commands (Claude and Codex)"
                   hint="One rule per line. A round has to run one of these successfully before it can be published."
                 >
                   <textarea

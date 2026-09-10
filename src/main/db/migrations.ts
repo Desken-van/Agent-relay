@@ -575,6 +575,30 @@ export const MIGRATIONS: readonly Migration[] = [
           ON code_review_decisions(finding_id, created_at DESC);
       `);
     }
+  },
+  {
+    version: 8,
+    name: 'task-provider-routing',
+    up(db) {
+      db.exec(`
+        ALTER TABLE tasks ADD COLUMN implementation_provider TEXT NOT NULL DEFAULT 'claude'
+          CHECK (implementation_provider IN ('claude','codex'));
+        ALTER TABLE tasks ADD COLUMN review_provider TEXT NOT NULL DEFAULT 'codex'
+          CHECK (review_provider IN ('claude','codex'));
+        ALTER TABLE tasks ADD COLUMN provider_revision INTEGER NOT NULL DEFAULT 0 CHECK (provider_revision >= 0);
+        ALTER TABLE tasks ADD COLUMN implementation_thread_id TEXT;
+        CREATE TABLE task_provider_changes (
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          revision INTEGER NOT NULL,
+          previous_implementation TEXT NOT NULL,
+          implementation TEXT NOT NULL,
+          previous_review TEXT NOT NULL,
+          review TEXT NOT NULL,
+          changed_at TEXT NOT NULL,
+          PRIMARY KEY(task_id, revision)
+        );
+      `);
+    }
   }
 ];
 

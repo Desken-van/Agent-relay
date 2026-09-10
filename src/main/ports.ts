@@ -12,6 +12,7 @@ import type {
   CodexModelOption
 } from '../shared/domain/codex-catalog';
 import type { DiagnosticsReport, ToolDiagnostic } from '../shared/domain/diagnostics';
+import type { ClaudeRoundAssessmentRecord } from '../shared/domain/claude-assessment';
 import type { GitChangeSet, RepositoryInfo, WorktreeInfo } from '../shared/domain/git';
 import type {
   LocalInferenceCapabilities,
@@ -103,7 +104,8 @@ export interface ProjectRepository {
   delete(id: string): void;
 }
 
-export type NewTask = Omit<Task, 'createdAt' | 'updatedAt'>;
+export type NewTask = Omit<Task, 'createdAt' | 'updatedAt' | 'implementationProvider' | 'reviewProvider' | 'providerRevision' | 'implementationThreadId'> &
+  Partial<Pick<Task, 'implementationProvider' | 'reviewProvider' | 'providerRevision' | 'implementationThreadId'>>;
 export type TaskPatch = Partial<Omit<Task, 'id' | 'projectId' | 'createdAt' | 'updatedAt'>>;
 
 export interface TaskRepository {
@@ -118,6 +120,7 @@ export interface TaskRepository {
   findById(id: string): Task | null;
   create(task: NewTask): Task;
   update(id: string, patch: TaskPatch): Task;
+  changeProviders(id: string, expectedRevision: number, implementation: Task['implementationProvider'], review: Task['reviewProvider']): Task;
   /** Tasks whose worktree is currently allocated — used to prevent sharing. */
   listActiveWorktreePaths(): { taskId: string; worktreePath: string }[];
   delete(id: string): void;
@@ -241,6 +244,7 @@ export interface CodexModelCatalog {
 }
 
 export interface CodexAdapter {
+  implement(request: ImplementationRequest, context: AgentRunContext): Promise<ImplementationResult>;
   /**
    * Produce a structured specification. Runs with workspace access limited to
    * reading the project, because the specification step must not edit anything.
@@ -486,11 +490,27 @@ export interface ClaudeImplementationResult {
 }
 
 export interface ClaudeAdapter {
+  reviewImplementation(request: CodexReviewRequest, context: AgentRunContext): Promise<CodexReviewOutcome>;
   run(
     request: ClaudeImplementationRequest,
     context: AgentRunContext
   ): Promise<ClaudeImplementationResult>;
   diagnose(): Promise<ToolDiagnostic>;
+}
+
+/** Provider-neutral execution result. Assessments describe observed commands, never report prose. */
+export interface ImplementationRequest {
+  readonly worktreePath: string;
+  readonly prompt: string;
+  readonly sessionId: string | null;
+  readonly model: string | null;
+  readonly verificationCommands: readonly string[];
+}
+
+export interface ImplementationResult {
+  readonly sessionId: string | null;
+  readonly finalMessage: string;
+  readonly assessment: ClaudeRoundAssessmentRecord;
 }
 
 export interface TaskRuleEvidenceRepository {

@@ -19,6 +19,7 @@ import { closeDatabase, openDatabase, type Db } from '../../src/main/db/database
 import { FixedClock, SequentialIdGenerator } from '../../src/main/infra/clock';
 import { InMemoryEventPublisher } from '../../src/main/services/event-bus';
 import { Orchestrator } from '../../src/main/services/orchestrator';
+import type { VerificationExecutor } from '../../src/main/services/worktree-verification';
 import { ProjectService } from '../../src/main/services/project-service';
 import { PublishService } from '../../src/main/services/publish-service';
 import { TaskService } from '../../src/main/services/task-service';
@@ -61,7 +62,7 @@ export interface Harness {
 }
 
 export function createHarness(
-  options: { confirmAnswer?: boolean; settings?: Partial<Settings> } = {}
+  options: { confirmAnswer?: boolean; settings?: Partial<Settings>; verification?: VerificationExecutor } = {}
 ): Harness {
   const tempRoot = mkdtempSync(join(tmpdir(), 'agent-relay-test-'));
   const db = openDatabase({ file: ':memory:' });
@@ -98,6 +99,7 @@ export function createHarness(
   const confirmation = new RecordingConfirmationService(options.confirmAnswer ?? true);
 
   const orchestrator = new Orchestrator({
+    verification: options.verification,
     projects,
     tasks,
     runs,
@@ -114,6 +116,7 @@ export function createHarness(
   });
 
   const publishService = new PublishService({
+    verification: options.verification,
     tasks,
     projects,
     approvals,

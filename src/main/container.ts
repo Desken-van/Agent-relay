@@ -67,6 +67,7 @@ import { ToolDiagnosticsService } from './services/diagnostics-service';
 import { OperationsDiagnosticsService } from './services/operations-diagnostics-service';
 import { OperationsRegistry } from './services/operations-registry';
 import { Orchestrator } from './services/orchestrator';
+import { WorktreeVerification } from './services/worktree-verification';
 import { ProjectService } from './services/project-service';
 import { reconcileInterruptedWork, type ReconciliationPlan } from './services/startup-reconciliation';
 import { PublishService } from './services/publish-service';
@@ -213,6 +214,7 @@ function lateBound(factories: ReturnType<typeof adapterFactories>): {
 } {
   return {
     codex: {
+      implement: (request, context) => factories.codex().implement(request, context),
       createSpecification: (request, context) =>
         factories.codex().createSpecification(request, context),
       reviewImplementation: (request, context) =>
@@ -220,6 +222,7 @@ function lateBound(factories: ReturnType<typeof adapterFactories>): {
       diagnose: () => factories.codex().diagnose()
     },
     claude: {
+      reviewImplementation: (request, context) => factories.claude().reviewImplementation(request, context),
       run: (request, context) => factories.claude().run(request, context),
       diagnose: () => factories.claude().diagnose()
     },
@@ -328,6 +331,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   });
 
   const orchestrator = new Orchestrator({
+    verification: new WorktreeVerification(runner),
     projects,
     tasks,
     runs,
@@ -344,6 +348,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   });
 
   const publishService = new PublishService({
+    verification: new WorktreeVerification(runner),
     tasks,
     projects,
     approvals,

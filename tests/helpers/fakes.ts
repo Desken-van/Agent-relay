@@ -28,7 +28,9 @@ import type {
   GitAdapter,
   GitHubAdapter,
   GitHubPullRequestRequest,
-  GitHubRepositoryRequest
+  GitHubRepositoryRequest,
+  ImplementationRequest,
+  ImplementationResult
 } from '../../src/main/ports';
 
 export function makeSpecification(overrides: Partial<TaskSpecification> = {}): TaskSpecification {
@@ -70,6 +72,17 @@ const okDiagnostic = (tool: ToolDiagnostic['tool']): ToolDiagnostic => ({
 /* -------------------------------------------------------------------------- */
 
 export class FakeCodexAdapter implements CodexAdapter {
+  implementationCalls: ImplementationRequest[] = [];
+  implementationError: Error | null = null;
+  async implement(request: ImplementationRequest, context: AgentRunContext): Promise<ImplementationResult> {
+    this.implementationCalls.push(request);
+    context.onProgress({ type: 'started', text: 'Implementation started', data: { threadId: 'codex-implementation-1' } });
+    if (this.implementationError) throw this.implementationError;
+    return { sessionId: 'codex-implementation-1', finalMessage: 'Implemented and verified.', assessment: {
+      version: 1, disposition: 'pass', verificationStatus: 'passed', publishBlock: 'none', reasonCodes: [], denials: [],
+      verification: { tool: 'Codex', command: 'npm test', matchedRule: 'Bash(npm test:*)', toolUseSequence: 1 }
+    } };
+  }
   specificationCalls: CodexSpecificationRequest[] = [];
   reviewCalls: CodexReviewRequest[] = [];
 
@@ -152,6 +165,12 @@ export function passingVerificationEvidence(
 }
 
 export class FakeClaudeAdapter implements ClaudeAdapter {
+  reviewCalls: CodexReviewRequest[] = [];
+  async reviewImplementation(request: CodexReviewRequest, _context: AgentRunContext): Promise<CodexReviewOutcome> {
+    this.reviewCalls.push(request);
+    const review = makeReview();
+    return { threadId: 'claude-review-1', review, rawResponse: JSON.stringify(review) };
+  }
   calls: ClaudeImplementationRequest[] = [];
   sessionId: string | null = 'claude-session-1';
   finalMessage = 'Implemented the change and ran the tests.\n\n```\n2 passed\n```';

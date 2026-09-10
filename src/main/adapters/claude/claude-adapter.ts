@@ -56,6 +56,9 @@ import type {
 import { launchFor, locateExecutable, configuredPathIsBroken } from '../process/executable-locator';
 import type { ProcessRunner } from '../process/process-runner';
 import { consumeLine, createStreamState, finalizeState } from './stream-parser';
+import { buildReviewPrompt } from '../codex/prompts';
+import { codexReviewResultJsonSchema, parseCodexReviewResult } from '../../../shared/schemas/codex';
+import type { CodexReviewRequest, CodexReviewOutcome } from '../../ports';
 
 export interface ClaudeAdapterOptions {
   readonly configuredPath?: string | null;
@@ -340,5 +343,30 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       permissionDenials: finalized.denials,
       evidence: finalized.evidence
     };
+  }
+
+  /** A fresh review with read tools only. Never resume an implementation session. */
+  async reviewImplementation(request: CodexReviewRequest, context: AgentRunContext): Promise<CodexReviewOutcome> {
+    const launch = launchFor(this.claudePath());
+    const state = createStreamState();
+    const args = [...launch.prefixArgs, '--print', '--output-format', 'stream-json', '--verbose',
+      '--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+      '--tools', 'Read,Grep,Glob', '--allowedTools', 'Read', 'Grep', 'Glob', '--max-turns', '40',
+      ...(request.model ? ['--model', request.model] : [])];
+    const result = await this.runner.run(launch.file, args, {
+      cwd: request.worktreePath, timeoutMs: context.timeoutMs, signal: context.signal,
+      passthroughEnvNames: CLAUDE_ENV_PASSTHROUGH, env: launch.env,
+      input: `${buildReviewPrompt(request)}\nRequired output schema:\n${JSON.stringify(codexReviewResultJsonSchema())}`,
+      onLine: (line) => { for (const event of consumeLine(line, state)) context.onProgress(event); }
+    });
+    const final = finalizeState(state);
+    if (result.cancelled) throw new AgentRelayError('CANCELLED', 'Claude review was stopped.');
+    if (result.timedOut) throw new AgentRelayError('TIMEOUT', 'Claude review exceeded its process timeout.');
+    if (result.exitCode !== 0 || final.isError || !final.evidence.resultEnvelopeSeen || final.evidence.resultEnvelopeIsError !== false || final.evidence.resultEnvelopeConflict || final.denials.length > 0) {
+      throw new AgentRelayError('TOOL_FAILED', 'Claude review did not complete successfully.');
+    }
+    const parsed = parseCodexReviewResult(final.finalMessage);
+    if (!parsed.ok || !parsed.value) throw new AgentRelayError('PARSE_FAILED', 'Claude returned no valid review.');
+    return { threadId: final.sessionId, review: parsed.value, rawResponse: final.finalMessage };
   }
 }

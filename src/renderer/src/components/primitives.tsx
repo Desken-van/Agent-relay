@@ -9,6 +9,7 @@ export function agentTone(agent: RunAgent): 'codex' | 'claude' | 'system' {
 }
 
 const STATUS_CLASS: Record<TaskStatus, string> = {
+  VERIFYING: 'impl',
   DRAFT: 'draft',
   SPECIFYING: 'spec',
   READY_FOR_IMPLEMENTATION: 'spec',
@@ -25,6 +26,7 @@ const STATUS_CLASS: Record<TaskStatus, string> = {
 };
 
 const BUSY: ReadonlySet<TaskStatus> = new Set([
+  'VERIFYING',
   'SPECIFYING',
   'IMPLEMENTING',
   'REVIEWING',

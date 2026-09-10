@@ -11,6 +11,7 @@
 
 import { z } from 'zod';
 import { TASK_STATUSES } from './workflow';
+import { executionProviderSchema } from './execution-providers';
 
 /** ISO-8601 instant, e.g. `2026-08-10T09:41:12.004Z`. */
 export const isoDateTime = z.string().min(20).max(32);
@@ -100,6 +101,10 @@ export const taskSchema = z.object({
   maxRounds: z.number().int().min(1).max(20),
   codexThreadId: z.string().nullable(),
   claudeSessionId: z.string().nullable(),
+  implementationProvider: executionProviderSchema.default('claude'),
+  reviewProvider: executionProviderSchema.default('codex'),
+  providerRevision: z.number().int().min(0).default(0),
+  implementationThreadId: z.string().nullable().default(null),
   worktreePath: z.string().nullable(),
   branchName: z.string().nullable(),
   /** Base branch the worktree was cut from. */
@@ -133,6 +138,7 @@ export type Task = z.infer<typeof taskSchema>;
 
 export const RUN_AGENTS = ['codex', 'claude', 'system'] as const;
 export const RUN_TYPES = [
+  'verification',
   'specification',
   'implementation',
   'review',

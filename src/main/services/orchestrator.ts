@@ -25,7 +25,7 @@ import {
 } from '../../shared/domain/claude-tool-rules';
 import {
   correctionAction,
-  latestClaudeRoundResult,
+  latestImplementationRoundResult as latestClaudeRoundResult,
   readClaudeAssessment
 } from '../../shared/domain/claude-assessment';
 import { AgentRelayError, InvalidTransitionError } from '../../shared/domain/errors';
@@ -80,8 +80,12 @@ import {
 } from './plan-review-gate';
 import { renderRuleEvidence } from './rule-evidence';
 import { join } from 'node:path';
+import { canChangeProviders, executionProviderSchema, type ExecutionProvider } from '../../shared/domain/execution-providers';
+import { latestVerification, readVerification } from '../../shared/domain/verification';
+import type { VerificationExecutor } from './worktree-verification';
 
 export interface OrchestratorDeps {
+  readonly verification?: VerificationExecutor;
   readonly projects: ProjectRepository;
   readonly tasks: TaskRepository;
   readonly runs: RunRepository;
@@ -166,6 +170,76 @@ export class Orchestrator {
 
   isRunning(taskId: string): boolean {
     return this.inFlight.has(taskId);
+  }
+
+  /** Re-check existing files, without spending an implementation/review round. */
+  async runVerification(taskId: string): Promise<Task> {
+    let task = this.requireTask(taskId);
+    if (!['READY_FOR_IMPLEMENTATION', 'READY_FOR_REVIEW', 'CHANGES_REQUESTED', 'APPROVED', 'READY_TO_PUBLISH'].includes(task.status)) {
+      throw new InvalidTransitionError(task.status, 'verification_started');
+    }
+    if (!task.specificationApprovedAt || !task.worktreePath || !task.branchName) {
+      throw new AgentRelayError('APPROVAL_REQUIRED', 'Approve the specification and create an implementation worktree first.');
+    }
+    const executor = this.deps.verification;
+    if (!executor) throw new AgentRelayError('TOOL_MISSING', 'Verification is not configured in this build.');
+    if (this.deps.runs.listByTask(taskId).some(run => run.status === 'running')) {
+      throw new AgentRelayError('BUSY', 'A run is still outstanding for this task.');
+    }
+    const settings = this.deps.settings.get();
+    const project = this.requireProject(task.projectId);
+    assertPlanReviewAllowsApproval({ task, ruleEvidence: this.deps.ruleEvidence, gates: this.deps.planReviews });
+    // A test pass is not permission to erase an implementation security denial.
+    const previous = readClaudeAssessment(latestClaudeRoundResult(this.deps.runs.listByTask(taskId)));
+    if (previous.ok && previous.assessment.publishBlock === 'security') {
+      throw new AgentRelayError('VALIDATION_FAILED', 'Resolve the implementation security denial before verification recovery.');
+    }
+    const controller = this.beginExclusive(taskId);
+    let handle: ReturnType<RunRecorder['start']> | undefined;
+    let identity = '';
+    try {
+      identity = await executor.identity({ task, settings, project });
+      if (controller.signal.aborted) throw new AgentRelayError('CANCELLED', 'Verification cancelled before execution.');
+      task = this.requireTask(taskId);
+      task = this.applyEvent(task, 'verification_started', { lastError: null, lastReviewJson: null });
+      handle = this.recorder(settings).start({ taskId, agent: 'system', runType: 'verification', round: task.currentRound });
+      const result = await executor.execute({ task, settings, project }, controller.signal, event => handle!.append(event));
+      const after = await executor.identity({ task: this.requireTask(taskId), settings: this.deps.settings.get(), project: this.requireProject(task.projectId) });
+      const passed = result.exitCode === 0 && !result.failed && !result.timedOut && !result.cancelled && !controller.signal.aborted && after === identity;
+      const reason = passed ? null : after !== identity ? 'Files or task inputs changed during verification. Run verification again.' : result.cancelled || controller.signal.aborted ? 'Verification cancelled; success was not established.' : result.timedOut ? 'Verification timed out; success was not established.' : `npm run verify failed (exit ${result.exitCode ?? 'unknown'}). See command output.`;
+      handle.finish({ status: passed ? 'succeeded' : 'failed', finalMessage: passed ? 'Verification passed for this code snapshot. Ready for review.' : reason,
+        errorMessage: reason, structuredResult: { version: 1, command: 'npm run verify', identity, passed, exitCode: result.exitCode, durationMs: result.durationMs, reason } });
+      if (this.requireTask(taskId).status !== 'VERIFYING') return this.requireTask(taskId);
+      return this.applyEvent(this.requireTask(taskId), passed ? 'verification_completed' : 'verification_aborted', { lastError: reason });
+    } catch (error) {
+      const message = Orchestrator.describeError(error);
+      handle?.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: message,
+        structuredResult: { version: 1, command: 'npm run verify', identity, passed: false, exitCode: null, durationMs: 0, reason: message } });
+      if (this.requireTask(taskId).status === 'VERIFYING') this.applyEvent(this.requireTask(taskId), 'verification_aborted', { lastError: message });
+      throw error;
+    } finally { this.endExclusive(taskId); }
+  }
+
+  private async assertVerificationCurrent(task: Task): Promise<void> {
+    const run = latestVerification(this.deps.runs.listByTask(task.id));
+    if (!run) return;
+    const record = readVerification(run);
+    if (!record.success || !record.data.passed || run.status !== 'succeeded' || !this.deps.verification ||
+      record.data.identity !== await this.deps.verification.identity({ task, settings: this.deps.settings.get(), project: this.requireProject(task.projectId) })) {
+      throw new AgentRelayError('VALIDATION_FAILED', 'Verification is missing, failed or stale. Choose Run verification before review.');
+    }
+  }
+
+  configureProviders(input: { taskId: string; expectedRevision: number; implementationProvider: ExecutionProvider; reviewProvider: ExecutionProvider }): Task {
+    const task = this.requireTask(input.taskId);
+    if (this.isRunning(task.id) || !canChangeProviders(task.status) || this.deps.runs.listByTask(task.id).some((r) => r.status === 'running')) {
+      throw new AgentRelayError('INVALID_TRANSITION', 'Providers can only change while the task is idle and not approved for publication.');
+    }
+    const implementation = executionProviderSchema.parse(input.implementationProvider);
+    const review = executionProviderSchema.parse(input.reviewProvider);
+    const updated = this.deps.tasks.changeProviders(task.id, input.expectedRevision, implementation, review);
+    this.deps.events.publishTask(updated);
+    return updated;
   }
 
   /**
@@ -456,7 +530,7 @@ export class Orchestrator {
     // Before the worktree, not after: creating a branch and a directory for a
     // round that cannot legally start leaves debris the user has to clean up,
     // for a failure that was knowable before any of it happened.
-    Orchestrator.assertVerificationConfigured(settings);
+    this.assertImplementationConfigured(task, settings);
 
     const controller = this.beginExclusive(taskId);
     try {
@@ -473,7 +547,8 @@ export class Orchestrator {
       }
 
       task = this.applyEvent(task, 'implementation_started', {
-        currentRound: 1,
+        // Verification recovery can return a later round here; never reset its budget.
+        currentRound: Math.max(1, task.currentRound),
         lastError: null
       });
 
@@ -485,7 +560,7 @@ export class Orchestrator {
         ruleEvidence: this.ruleEvidenceText(task.id)
       });
 
-      return await this.runClaude(task, controller, prompt, {
+      return await this.runImplementation(task, controller, prompt, {
         runType: 'implementation',
         recoverableFailure: 'implementation_aborted'
       });
@@ -536,7 +611,7 @@ export class Orchestrator {
 
     // Same gate as the first round, and for the same reason: an unusable
     // configuration must not reach the point of writing a run row.
-    Orchestrator.assertVerificationConfigured(settings);
+    this.assertImplementationConfigured(task, settings);
 
     const review = readReview(task);
     if (!review && !recovering) {
@@ -569,7 +644,7 @@ export class Orchestrator {
             ruleEvidence: this.ruleEvidenceText(task.id)
           });
 
-      return await this.runClaude(task, controller, prompt, {
+      return await this.runImplementation(task, controller, `${buildImplementationPrompt({ specification: readSpecification(task), worktreePath: task.worktreePath!, branchName: task.branchName!, originalRequest: task.originalRequest, ruleEvidence: this.ruleEvidenceText(task.id) })}\n\n${prompt}`, {
         runType: 'correction',
         recoverableFailure: 'correction_aborted'
       });
@@ -636,7 +711,50 @@ export class Orchestrator {
     );
   }
 
-  /** Shared body of the first implementation round and every correction round. */
+  private assertImplementationConfigured(task: Task, settings: Settings): void {
+    if (task.implementationProvider === 'claude') { Orchestrator.assertVerificationConfigured(settings); return; }
+    const configured = resolveVerificationConfig(settings.claudeVerificationTools, settings.claudeVerificationTools);
+    if (!configured.ok) throw new AgentRelayError('VALIDATION_FAILED', 'Configure valid implementation verification commands in Settings.');
+  }
+
+  private async runImplementation(task: Task, controller: AbortController, prompt: string,
+    options: { runType: 'implementation' | 'correction'; recoverableFailure: WorkflowEvent }): Promise<Task> {
+    if (task.implementationProvider === 'claude') return this.runClaude(task, controller, prompt, options);
+    const settings = this.deps.settings.get();
+    const project = this.requireProject(task.projectId);
+    const worktreePath = task.worktreePath;
+    if (!worktreePath || !task.branchName) throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree.');
+    assertSafeWorktreePath({ worktreePath, worktreesRoot: settings.worktreesRoot, repositoryPath: project.localPath });
+    if (!this.deps.codex.implement) throw new AgentRelayError('TOOL_MISSING', 'This Codex adapter does not support implementation.');
+    const configured = resolveVerificationConfig(settings.claudeVerificationTools, settings.claudeVerificationTools);
+    if (!configured.ok) throw new AgentRelayError('VALIDATION_FAILED', 'Configure valid verification commands in Settings.');
+    const handle = this.recorder(settings).start({ taskId: task.id, agent: 'codex', runType: options.runType, round: task.currentRound });
+    try {
+      const result = await this.deps.codex.implement({ worktreePath, prompt, sessionId: task.implementationThreadId,
+        model: task.codexModel, verificationCommands: settings.claudeVerificationTools }, {
+        signal: controller.signal, timeoutMs: settings.processTimeoutMs,
+        onProgress: (event) => {
+          handle.append(event);
+          const thread = event.type === 'started' ? event.data?.['threadId'] : undefined;
+          if (typeof thread === 'string' && thread.length > 0 && thread.length < 256) this.patchTask(task.id, { implementationThreadId: thread });
+        }
+      });
+      const checked = readClaudeAssessment(JSON.stringify({ assessment: result.assessment }));
+      const failed = !checked.ok || checked.assessment.disposition !== 'pass' || checked.assessment.publishBlock !== 'none' || checked.assessment.verificationStatus !== 'passed';
+      const error = failed ? 'Implementation saved, but this Codex run did not prove verification passed. Check the run and verification commands before retrying.' : null;
+      handle.finish({ status: failed ? 'failed' : 'succeeded', finalMessage: result.finalMessage,
+        errorMessage: error ?? undefined, structuredResult: { provider: 'codex', providerRevision: task.providerRevision,
+          sessionId: result.sessionId, assessment: result.assessment } });
+      return this.applyEvent(this.requireTask(task.id), failed ? options.recoverableFailure : 'implementation_completed', {
+        implementationThreadId: result.sessionId ?? this.requireTask(task.id).implementationThreadId, lastError: error
+      });
+    } catch (error) {
+      handle.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: Orchestrator.describeError(error) });
+      throw error;
+    }
+  }
+
+  /** Claude's existing evidence contract remains unchanged. */
   private async runClaude(
     task: Task,
     controller: AbortController,
@@ -730,6 +848,7 @@ export class Orchestrator {
         finalMessage: result.finalMessage,
         errorMessage: failureMessage ?? undefined,
         structuredResult: {
+          provider: 'claude', providerRevision: task.providerRevision,
           numTurns: result.numTurns,
           sessionId: result.sessionId,
           // Kept for diagnostics. It conflates a CLI failure with a denial, so
@@ -790,16 +909,31 @@ export class Orchestrator {
       throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to review.');
     }
 
+    // Verification itself costs no round. A NEW review after a completed review
+    // still does: externally corrected files must not bypass the review budget.
+    const priorReview = this.deps.runs.findLatestByType(taskId, 'review');
+    const nextRound = latestVerification(this.deps.runs.listByTask(taskId)) &&
+      priorReview?.status === 'succeeded' && priorReview.round >= task.currentRound
+      ? priorReview.round + 1 : Math.max(1, task.currentRound);
+    if (nextRound > task.maxRounds) throw new AgentRelayError('VALIDATION_FAILED', 'The review round budget is exhausted. Verification does not reset it.');
+
     const controller = this.beginExclusive(taskId);
+    try {
+      await this.assertVerificationCurrent(task);
+    } catch (error) {
+      this.endExclusive(taskId);
+      this.applyEvent(this.requireTask(taskId), 'verification_invalidated', { lastError: Orchestrator.describeError(error) });
+      throw error;
+    }
     const handle = this.recorder(settings).start({
       taskId,
-      agent: 'codex',
+      agent: task.reviewProvider,
       runType: 'review',
-      round: task.currentRound
+      round: nextRound
     });
 
     try {
-      task = this.applyEvent(task, 'review_started', { lastError: null });
+      task = this.applyEvent(task, 'review_started', { lastError: null, currentRound: nextRound });
 
       handle.append({ type: 'log', text: 'Collecting Git changes from the worktree…' });
       const changes = await this.deps.git.collectChanges(worktreePath, baseBranch, {
@@ -815,10 +949,12 @@ export class Orchestrator {
         ?? this.deps.runs.findLatestByType(taskId, 'implementation')?.finalMessage
         ?? '';
 
-      const outcome = await this.deps.codex.reviewImplementation(
+      const reviewer = task.reviewProvider === 'claude' ? this.deps.claude : this.deps.codex;
+      if (!reviewer.reviewImplementation) throw new AgentRelayError('TOOL_MISSING', 'The selected provider does not support review.');
+      const outcome = await reviewer.reviewImplementation(
         {
           worktreePath,
-          threadId: task.codexThreadId,
+          threadId: null,
           specification,
           ruleEvidence: this.ruleEvidenceText(task.id),
           changes,
@@ -826,7 +962,7 @@ export class Orchestrator {
           testOutput: extractTestOutput(claudeReport),
           round: task.currentRound,
           maxRounds: task.maxRounds,
-          model: task.codexModel
+          model: task.reviewProvider === 'claude' ? task.claudeModel : task.codexModel
         },
         {
           signal: controller.signal,
@@ -835,10 +971,11 @@ export class Orchestrator {
         }
       );
 
+      await this.assertVerificationCurrent(this.requireTask(taskId));
       handle.finish({
         status: 'succeeded',
         finalMessage: outcome.review.summary,
-        structuredResult: outcome.review
+        structuredResult: { ...outcome.review, provider: task.reviewProvider, threadId: outcome.threadId }
       });
 
       return this.applyReviewOutcome(taskId, outcome.review, outcome.threadId, settings);
@@ -864,14 +1001,13 @@ export class Orchestrator {
   private applyReviewOutcome(
     taskId: string,
     review: CodexReviewResult,
-    threadId: string | null,
+    _threadId: string | null,
     _settings: Settings
   ): Task {
     const task = this.requireTask(taskId);
     const decision = decideReviewOutcome(review.verdict, task.currentRound, task.maxRounds);
 
     const updated = this.applyEvent(task, decision.event, {
-      codexThreadId: threadId ?? task.codexThreadId,
       lastReviewJson: JSON.stringify(review),
       lastError: decision.haltReason ?? null
     });
