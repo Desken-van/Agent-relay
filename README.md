@@ -464,7 +464,7 @@ cancellation, interruption or changed inputs never grant a pass. There is no
 automatic retry. Current files are checked again before review and publishing.
 This is verification, not Coai review and not live acceptance of a model.
 
-Test suite: **1791 deterministic tests in 68 files, plus one automated Electron
+Test suite: **1792 deterministic tests in 68 files, plus one automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -627,7 +627,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1791 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              1792 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

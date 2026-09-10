@@ -308,7 +308,9 @@ until the primary runtime has exited and the job is empty. Agent Relay requests
 an explicit stop by closing a private control pipe; the launcher terminates the
 job, observes it empty and only then exits, making that exit positive whole-tree
 evidence. If the supervisor or launcher crashes, kill-on-close still terminates
-the remaining members. The launcher is resolved only from Agent
+the remaining members, but an abnormal or reserved launcher failure exit is not
+called proof: ownership remains held and a second runtime stays blocked. The
+launcher is resolved only from Agent
 Relay's own build output or beside the bundled main process. If it is absent,
 launch fails before the configured runtime is created—there is no uncontained
 fallback and no PATH lookup.
@@ -1510,7 +1512,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1791 deterministic tests in 68 files, plus one routine automated Electron
+1792 deterministic tests in 68 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.

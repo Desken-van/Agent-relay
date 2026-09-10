@@ -155,7 +155,9 @@ launcher does not exit normally until it has terminated the remaining group and
 observed the Job Object empty. Agent Relay requests an explicit stop by closing
 a private control pipe; the launcher then terminates the Job Object, observes it
 empty, and exits. If the launcher itself is terminated, closing its last Job
-Object handle still terminates the contained processes.
+Object handle still terminates the contained processes. A reserved launcher
+failure exit is not accepted as cleanup evidence: the provider retains ownership
+and refuses another start when empty-job confirmation is unavailable.
 
 Ownership of the process is continuous: it is handed from the current runtime to the outstanding one in the same synchronous step, and held across the wait for the cleanup. Nothing can observe the provider mid-handover, so an explicit `stop` that arrives while an automatic cleanup is still running finds that same process and joins the attempt already in flight rather than starting a second kill. It cannot answer `stopped` while the outcome is still unknown.
 

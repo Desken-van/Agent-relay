@@ -11,6 +11,8 @@ namespace {
 constexpr DWORD kJobDrainTimeoutMs = 10000;
 constexpr DWORD kJobDrainPollMs = 10;
 constexpr DWORD kStoppedExitCode = 130;
+constexpr DWORD kTargetExitCodeCeiling = 239;
+constexpr DWORD kCleanupUnconfirmedExitCode = 250;
 
 void diagnostic(const wchar_t* code) {
   std::wcerr << L"Agent Relay Windows job launcher failed: " << code << L".\n";
@@ -80,6 +82,11 @@ bool waitForEmptyJob(HANDLE job) {
   }
 }
 
+bool terminateSuspendedProcess(HANDLE process, DWORD exitCode) {
+  return TerminateProcess(process, exitCode) != FALSE &&
+         WaitForSingleObject(process, kJobDrainTimeoutMs) == WAIT_OBJECT_0;
+}
+
 enum class ControlPipeState { Open, Closed, Failed };
 
 ControlPipeState controlPipeState(HANDLE input) {
@@ -93,7 +100,10 @@ ControlPipeState controlPipeState(HANDLE input) {
 }
 
 int boundedExitCode(DWORD value) {
-  return static_cast<int>(std::min<DWORD>(value, 255));
+  // 240-255 are reserved for launcher protocol outcomes. The supervisor does
+  // not need an exact high target exit code; it does need a range that cannot
+  // be confused with failure to prove the Job Object empty.
+  return static_cast<int>(std::min<DWORD>(value, kTargetExitCodeCeiling));
 }
 
 }  // namespace
@@ -175,23 +185,20 @@ int wmain(int argc, wchar_t* argv[]) {
 
   if (AssignProcessToJobObject(job, process.hProcess) == FALSE) {
     diagnostic(L"ASSIGN_JOB_FAILED");
-    TerminateProcess(process.hProcess, 124);
-    ResumeThread(process.hThread);
-    WaitForSingleObject(process.hProcess, kJobDrainTimeoutMs);
+    const bool targetGone = terminateSuspendedProcess(process.hProcess, 124);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     CloseHandle(job);
-    return 124;
+    return targetGone ? 124 : kCleanupUnconfirmedExitCode;
   }
 
   if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
     diagnostic(L"RESUME_PROCESS_FAILED");
-    TerminateJobObject(job, 125);
-    WaitForSingleObject(process.hProcess, kJobDrainTimeoutMs);
+    const bool jobEmpty = TerminateJobObject(job, 125) != FALSE && waitForEmptyJob(job);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     CloseHandle(job);
-    return 125;
+    return jobEmpty ? 125 : kCleanupUnconfirmedExitCode;
   }
   CloseHandle(process.hThread);
 
@@ -228,12 +235,12 @@ int wmain(int argc, wchar_t* argv[]) {
   if (TerminateJobObject(job, exitCode) == FALSE) {
     diagnostic(L"TERMINATE_JOB_FAILED");
     CloseHandle(job);
-    return 127;
+    return kCleanupUnconfirmedExitCode;
   }
   if (!waitForEmptyJob(job)) {
     diagnostic(L"JOB_DRAIN_FAILED");
     CloseHandle(job);
-    return 127;
+    return kCleanupUnconfirmedExitCode;
   }
 
   CloseHandle(job);

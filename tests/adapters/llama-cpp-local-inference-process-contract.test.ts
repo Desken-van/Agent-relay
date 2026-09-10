@@ -24,6 +24,7 @@ import type {
 } from '../../src/main/adapters/local-inference/llama-cpp-local-inference';
 import {
   ExecaProcessRunner,
+  windowsJobExitConfirmsEmpty,
   type ManagedProcess,
   type ManagedProcessExit,
   type ManagedProcessOptions,
@@ -131,6 +132,30 @@ async function expectTreeGone(built: Harness): Promise<void> {
 /* -------------------------------------------------------------------------- */
 
 describe('local inference process contract: the whole path', () => {
+  it('accepts only the launcher exit range that proves its Job Object empty', () => {
+    const exit = (exitCode: number | null, signal: string | null = null): ManagedProcessExit => ({
+      exitCode,
+      signal,
+      spawnFailed: false,
+      errorCode: null
+    });
+
+    expect(windowsJobExitConfirmsEmpty(exit(0))).toBe(true);
+    expect(windowsJobExitConfirmsEmpty(exit(130))).toBe(true);
+    expect(windowsJobExitConfirmsEmpty(exit(239))).toBe(true);
+    expect(windowsJobExitConfirmsEmpty(exit(250))).toBe(false);
+    expect(windowsJobExitConfirmsEmpty(exit(0xc0000005))).toBe(false);
+    expect(windowsJobExitConfirmsEmpty(exit(null, 'SIGTERM'))).toBe(false);
+    expect(
+      windowsJobExitConfirmsEmpty({
+        exitCode: null,
+        signal: null,
+        spawnFailed: true,
+        errorCode: 'ENOENT'
+      })
+    ).toBe(false);
+  });
+
   it('discovers, probes, starts, checks health, infers once and stops', async () => {
     const built = await harness({ health: 'ok', completion: 'ok', completionText: 'Hello there.' });
 

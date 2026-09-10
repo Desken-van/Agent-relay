@@ -452,6 +452,18 @@ async function waitForPosixGroupGone(pid: number, ms: number): Promise<boolean> 
 type WindowsTreeKill = 'terminated' | 'not_found' | 'unconfirmed';
 
 const WINDOWS_JOB_LAUNCHER = 'agent-relay-windows-job.exe';
+const WINDOWS_JOB_MAX_CONFIRMED_EXIT_CODE = 239;
+
+/** Whether the native launcher's exit is proof that its Job Object was empty. */
+export function windowsJobExitConfirmsEmpty(exit: ManagedProcessExit): boolean {
+  return (
+    !exit.spawnFailed &&
+    exit.signal === null &&
+    exit.exitCode !== null &&
+    exit.exitCode >= 0 &&
+    exit.exitCode <= WINDOWS_JOB_MAX_CONFIRMED_EXIT_CODE
+  );
+}
 
 /**
  * Locate the Agent Relay-owned launcher built by `scripts/build-native.mjs`.
@@ -642,7 +654,12 @@ class ExecaManagedProcess implements ManagedProcess {
       // remains proof even when the runtime itself crashed first: the kernel,
       // not a vanished parent pid, retained the descendants.
       if (this.windowsJobContained && this.settledExit !== null) {
-        return { kind: 'stopped', exit: this.settledExit };
+        return windowsJobExitConfirmsEmpty(this.settledExit)
+          ? { kind: 'stopped', exit: this.settledExit }
+          : {
+              kind: 'unconfirmed',
+              reason: 'The Windows process-containment launcher exited without proving its Job Object empty.'
+            };
       }
 
       if (this.windowsJobContained) {
@@ -660,9 +677,13 @@ class ExecaManagedProcess implements ManagedProcess {
           };
         }
         const exit = await settleWithin(this.exited, remaining());
-        return exit === null
-          ? notGone
-          : { kind: 'stopped', exit };
+        if (exit === null) return notGone;
+        return windowsJobExitConfirmsEmpty(exit)
+          ? { kind: 'stopped', exit }
+          : {
+              kind: 'unconfirmed',
+              reason: 'The Windows process-containment launcher exited without proving its Job Object empty.'
+            };
       }
 
       // For a legacy/non-contained handle, `/T` only proves a tree while its
