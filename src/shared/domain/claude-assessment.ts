@@ -252,6 +252,16 @@ export function latestClaudeRoundResult(runs: readonly ClaudeRoundRun[]): string
   return null;
 }
 
+/** Latest writer wins across provider handoffs, including a failed/incomplete run with no assessment. */
+export function latestImplementationRoundResult(runs: readonly ClaudeRoundRun[]): string | null {
+  for (let index = runs.length - 1; index >= 0; index--) {
+    const run = runs[index];
+    if (run && (run.agent === 'claude' || run.agent === 'codex') &&
+      (run.runType === 'implementation' || run.runType === 'correction')) return run.structuredResult;
+  }
+  return null;
+}
+
 const ROUND_BUDGET_SPENT = 'The review round budget for this task is exhausted.';
 
 /**

@@ -3,10 +3,34 @@
 A local Windows desktop application that relays one software task between two
 coding agents:
 
-> **Codex** writes the specification → you approve it → **Claude Code**
-> implements it in an isolated Git worktree → **Codex** reviews the result in
-> read-only mode → its feedback goes back to the *same* Claude session →
-> repeat until Codex approves, you stop it, or the review-round budget runs out.
+> **Codex** writes the specification → you approve it → your selected
+> **Claude or Codex** implements it in an isolated Git worktree → your selected
+> **Codex or Claude** reviews the result in a fresh read-only session →
+> corrections return to the executor until approval, stop, or the round limit.
+
+### Choosing the implementation and review providers
+
+New tasks have independent **Implementation provider** and **Review provider**
+selectors. Defaults remain Claude / Codex for compatibility. To work without a
+Claude quota, select Codex for both. Each review is a fresh session, separate from
+specification and implementation; using the same vendor is not a multi-vendor review.
+
+For an existing idle task, use the selectors in **Run → Actions**, then **Apply
+providers**. This does not start a model. Changing the executor keeps the worktree,
+specification, previous runs and round budget, but discards its session pointer so
+the next executor starts with the current files and full task instructions. A timeout
+does not cause automatic fallback or discard partial work. Stop/wait for an active
+run to finish before changing providers. Approved or terminal tasks cannot switch.
+
+Codex implementation uses `workspace-write`, no interactive approvals, and disabled
+network/web search. Prepare dependencies separately if the task needs downloads.
+Verification commands come from Settings' **Implementation verification commands**;
+the saved assessment uses SDK command completion events, not the model's claim.
+Unsupported/compound command shapes or edits after verification block publication.
+Claude review exposes only Read/Grep/Glob, without implementation-session reuse or
+MCP tools. Coai remains a separate, explicitly configured external review gate;
+these selectors neither configure it nor invoke it automatically. Ornith is not an
+executor option in this change.
 
 Nothing is committed, pushed, or published without an explicit confirmation
 dialog owned by the main process.
@@ -421,7 +445,7 @@ Being precise about what was actually exercised, rather than merely written:
 | **Project-rule evidence** | 🧪 **Collector contract verified against real temporary Git repositories and filesystems.** It discovers the fixed project-memory locations, reads explicitly selected convention files, refuses symlinks and traversal, records missing or excluded evidence, binds clean convention bytes to an exact Git revision, and hashes a deterministic whole-file snapshot. Opt-in task binding is enforced by the plan-gate row below. |
 | **External plan-review gate** | ✅ **Durable contract and real-provider journey verified.** Settings hold only a fixed executable, argv and explicit convention selection; task IPC accepts identifiers and decisions, never process configuration or rule bytes. The live synthetic journey bound project rules plus four pinned convention files, generated a real specification, proved premature approval was refused, prepared an isolated branch, completed one Coai/Codex review, resolved all five findings, persisted `proceeded`, and read it back after restart. |
 
-Test suite: **1592 deterministic tests in 58 files, plus one automated Electron
+Test suite: **1620 deterministic tests in 62 files, plus one automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -584,7 +608,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1592 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              1620 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

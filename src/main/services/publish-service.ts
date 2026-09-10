@@ -25,7 +25,7 @@
 
 import {
   assessmentPublishRefusal,
-  latestClaudeRoundResult,
+  latestImplementationRoundResult as latestClaudeRoundResult,
   readClaudeAssessment,
   type PublishRefusalCode
 } from '../../shared/domain/claude-assessment';

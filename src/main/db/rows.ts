@@ -67,6 +67,10 @@ export interface TaskRow {
   max_rounds: number;
   codex_thread_id: string | null;
   claude_session_id: string | null;
+  implementation_provider: Task['implementationProvider'];
+  review_provider: Task['reviewProvider'];
+  provider_revision: number;
+  implementation_thread_id: string | null;
   worktree_path: string | null;
   branch_name: string | null;
   base_branch: string | null;
@@ -91,6 +95,10 @@ export function toTask(row: TaskRow): Task {
     maxRounds: row.max_rounds,
     codexThreadId: row.codex_thread_id,
     claudeSessionId: row.claude_session_id,
+    implementationProvider: row.implementation_provider,
+    reviewProvider: row.review_provider,
+    providerRevision: row.provider_revision,
+    implementationThreadId: row.implementation_thread_id,
     worktreePath: row.worktree_path,
     branchName: row.branch_name,
     baseBranch: row.base_branch,

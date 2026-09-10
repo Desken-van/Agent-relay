@@ -1,13 +1,48 @@
 # Architecture
 
 Agent Relay is an Electron desktop application that relays one software task
-between two agents: **Codex** specifies and reviews, **Claude Code** implements.
+between selectable agents: **Codex** specifies; **Claude Code** or **Codex**
+implements, and either provider can perform the primary read-only review.
 All the work happens inside a dedicated Git worktree, and nothing leaves the
 machine without an explicit confirmation.
 
 ---
 
 ## 1. The relay loop
+
+### EXEC-0: provider routing
+
+The diagram below shows the legacy default (Claude implementation / Codex review).
+Migration 8 adds task-level `implementation_provider`, `review_provider`,
+`provider_revision` and a dedicated `implementation_thread_id`. Existing rows
+retain their prior provider choices. The specification thread is never reused for
+review; every review is fresh, including when the executor and reviewer are Codex.
+
+`workflow:configureProviders` is an explicit idle-only, revision-checked operation.
+It refuses active process claims, durable running runs, approved and terminal states.
+The repository records the change and updates selection in one transaction.
+Changing executor clears both implementation session pointers; it does not reset
+rounds, discard files or erase history. Corrections carry the full specification as
+well as the review, so switching executor does not depend on another vendor's memory.
+`workflow:implement` and `workflow:review` route by persisted task selection;
+the old channel names remain compatibility aliases, not forced-provider overrides.
+
+Codex writes only with the SDK workspace-write sandbox and approvalPolicy=never;
+network and web search are disabled. Command telemetry is assessed using the existing
+version-1 assessment envelope. A completed verification command must follow writes;
+missing completion, failed checks, ambiguous command shapes, MCP calls or observed
+destructive commands fail closed. Simple literal shell launchers are unwrapped for
+matching, not executed by Relay. This is command evidence, not proof that a project's
+test script is comprehensive. SDK abort receives both cancellation and process deadline.
+Claude's implementation assessor is unchanged. Publication and retry selection read
+the latest implementation/correction from either provider, including a null result;
+an older passing Claude record cannot mask a later failed Codex run.
+
+Claude review uses a fresh print session with only Read/Grep/Glob, no settings sources
+and an empty strict MCP configuration. Coai configuration and external gates are
+unchanged. Automated provider tests use fake adapters/SDK streams; routine Electron
+E2E exercises Operations, not a paid live provider coding session. A first live task
+is still required to validate installed model access and local sandbox prerequisites.
 
 ```
                     ┌──────────────────────────────────────────────┐
@@ -1459,7 +1494,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1592 deterministic tests in 58 files, plus one routine automated Electron
+1620 deterministic tests in 62 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.
