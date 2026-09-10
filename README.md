@@ -258,7 +258,9 @@ The default GitHub owner is `Desken-van`, changeable in Settings.
 
 ## Architecture
 
-Full detail in **[docs/architecture.md](docs/architecture.md)**. In short:
+Full detail in **[docs/architecture.md](docs/architecture.md)**. The internal,
+versioned local-model process and inference boundary is documented separately in
+**[docs/local-inference.md](docs/local-inference.md)**. In short:
 
 ```
 Renderer (React)  →  preload bridge  →  Zod-validated IPC  →  services
@@ -421,7 +423,7 @@ Being precise about what was actually exercised, rather than merely written:
 | **Project-rule evidence** | 🧪 **Collector contract verified against real temporary Git repositories and filesystems.** It discovers the fixed project-memory locations, reads explicitly selected convention files, refuses symlinks and traversal, records missing or excluded evidence, binds clean convention bytes to an exact Git revision, and hashes a deterministic whole-file snapshot. Opt-in task binding is enforced by the plan-gate row below. |
 | **External plan-review gate** | ✅ **Durable contract and real-provider journey verified.** Settings hold only a fixed executable, argv and explicit convention selection; task IPC accepts identifiers and decisions, never process configuration or rule bytes. The live synthetic journey bound project rules plus four pinned convention files, generated a real specification, proved premature approval was refused, prepared an isolated branch, completed one Coai/Codex review, resolved all five findings, persisted `proceeded`, and read it back after restart. |
 
-Test suite: **1592 deterministic tests in 58 files, plus one automated Electron
+Test suite: **1737 deterministic tests in 61 files, plus one automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -584,7 +586,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1592 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              1737 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

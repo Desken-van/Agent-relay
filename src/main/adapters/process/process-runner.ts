@@ -17,6 +17,7 @@
 import { execa, type Options, type ResultPromise } from 'execa';
 import { AgentRelayError } from '../../../shared/domain/errors';
 import { redactSecrets, scrubEnvironment } from '../../../shared/util/redact';
+import { findOnPath } from './executable-locator';
 
 export type OutputStream = 'stdout' | 'stderr';
 
@@ -116,8 +117,109 @@ export interface InteractiveProcessRunner {
   ): Promise<ProcessResult>;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Supervised long-lived execution                                             */
+/* -------------------------------------------------------------------------- */
+
+export interface ManagedProcessOptions {
+  readonly cwd?: string;
+  /** Extra environment entries merged on top of the scrubbed parent env. */
+  readonly env?: Readonly<Record<string, string>>;
+  readonly passthroughEnvNames?: readonly string[];
+  /** Cap on retained stdout and stderr, counted separately. */
+  readonly maxOutputBytes?: number;
+  /** How long {@link ManagedProcess.stop} may take before it gives up. */
+  readonly shutdownTimeoutMs?: number;
+}
+
+/**
+ * How a managed child ended.
+ *
+ * Deliberately holds no message from `execa`: its failure text embeds the whole
+ * command line, and this record is read by a provider that puts diagnostics into
+ * durable state. A short OS error code is all that survives.
+ */
+export interface ManagedProcessExit {
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  /** True when the child could not be started at all (e.g. `ENOENT`). */
+  readonly spawnFailed: boolean;
+  /** A short OS error code, or null. Never a command line, path or argv. */
+  readonly errorCode: string | null;
+}
+
+/** A bounded, redacted snapshot of what the child has printed so far. */
+export interface ManagedProcessOutput {
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/**
+ * The result of asking a managed child to go away.
+ *
+ * `unconfirmed` exists because "we could not verify that it is gone" is a
+ * genuinely different fact from "it is gone", and a caller that reports a
+ * confirmed cancellation or timeout must not be able to do so on the strength
+ * of a kill it never observed landing.
+ */
+export type ManagedProcessStopResult =
+  | { readonly kind: 'stopped'; readonly exit: ManagedProcessExit }
+  | { readonly kind: 'unconfirmed'; readonly reason: string };
+
+/**
+ * A long-lived child, held at arm's length.
+ *
+ * Deliberately no streams, no `kill(signal)`, no subprocess. A supervisor may
+ * watch it end, read a bounded snapshot of what it printed, and ask for the
+ * whole tree to go away. That is the entire surface, which is what stops a
+ * caller from writing to a server's stdin or parsing its log as a protocol.
+ */
+export interface ManagedProcess {
+  /** The operating system's id for the child, or null if it never started. */
+  readonly pid: number | null;
+  /** Settles when the child is gone. Never rejects. */
+  readonly exited: Promise<ManagedProcessExit>;
+  /** False once {@link exited} has settled. */
+  running(): boolean;
+  /** Redacted, bounded, with an omission marker when anything was dropped. */
+  output(): ManagedProcessOutput;
+  /**
+   * Terminate the process **tree** and wait for confirmed exit.
+   *
+   * `stopped` means the tree was accounted for, not merely that the child's exit
+   * was observed: a descendant still alive after the budget is `unconfirmed`.
+   *
+   * Idempotent: repeated and concurrent calls share one cleanup and never start
+   * a second kill.
+   *
+   * That holds for a CONFIRMED stop, which is remembered for ever. An
+   * unconfirmed one is not an outcome but the absence of one, so a later call
+   * may attempt the cleanup again rather than replaying a stale "could not be
+   * confirmed" that nothing could ever move past.
+   */
+  stop(): Promise<ManagedProcessStopResult>;
+}
+
+/**
+ * Start a child that outlives the call.
+ *
+ * Split from {@link ProcessRunner} on purpose. `run` is one-shot and owns the
+ * child's whole lifetime; a managed runtime is a server that has to be up while
+ * many requests are made against it, and only the local-inference provider needs
+ * that. Both are implemented by `ExecaProcessRunner`, so there is still exactly
+ * one place in the application that creates a child process.
+ */
+export interface ManagedProcessRunner {
+  launch(
+    file: string,
+    args: readonly string[],
+    options?: ManagedProcessOptions
+  ): ManagedProcess;
+}
+
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 2_000_000;
+const DEFAULT_SHUTDOWN_MS = 10_000;
 const DEFAULT_MAX_INPUT_MESSAGES = 100;
 const DEFAULT_MAX_INPUT_BYTES = 256 * 1024;
 /**
@@ -127,6 +229,12 @@ const DEFAULT_MAX_INPUT_BYTES = 256 * 1024;
  * may already be gone — so this is a courtesy, never a dependency.
  */
 const STDERR_GRACE_MS = 250;
+/**
+ * How much of a Windows shutdown budget is held back from `taskkill` itself.
+ *
+ * Enough to observe the exit that `taskkill` has already caused, and no more.
+ */
+const WINDOWS_EXIT_RESERVE_MS = 200;
 
 /**
  * The longest prefix of `text` that fits in `limit` UTF-8 bytes.
@@ -265,7 +373,384 @@ function commandLabelFor(file: string, args: readonly string[]): string {
   return `${file} ${args.join(' ')}`.trim();
 }
 
-export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunner {
+/* -------------------------------------------------------------------------- */
+/* Process-tree termination                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** Resolve `promise`, or `null` if it has not settled within `ms`. */
+function settleWithin<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), Math.max(0, ms));
+    // `unref` so a pending grace period cannot hold the process open.
+    timer.unref?.();
+    void promise.then((value) => {
+      clearTimeout(timer);
+      resolve(value);
+    });
+  });
+}
+
+/**
+ * Signal the child's whole process **group**, not just the child.
+ *
+ * POSIX only. The managed child is spawned `detached`, which makes it the leader
+ * of a new group whose id equals its pid, so `kill(-pid)` reaches every
+ * descendant that has not deliberately left the group. This is also why it keeps
+ * working for a moment after the leader itself has died: the group outlives its
+ * leader, and an orphaned helper is exactly the thing worth reaching.
+ */
+function signalPosixTree(pid: number, subprocess: ResultPromise, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+    return;
+  } catch {
+    // No such group (already reaped, or never detached). Fall through.
+  }
+  try {
+    subprocess.kill(signal);
+  } catch {
+    // Already gone.
+  }
+}
+
+/**
+ * Is any process still a member of `pid`'s process group?
+ *
+ * POSIX only, and it is what turns "the child exited" into "the tree is gone".
+ * Signal 0 performs the permission and existence checks without delivering
+ * anything, so `kill(-pid, 0)` asks the kernel the one question that matters:
+ * does that group still have members? `EPERM` is read as **alive** on purpose —
+ * a group we may not signal is a group we certainly cannot claim to have
+ * terminated.
+ */
+function posixGroupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** Poll until `pid`'s group is empty, or give up after `ms`. */
+async function waitForPosixGroupGone(pid: number, ms: number): Promise<boolean> {
+  const until = Date.now() + Math.max(0, ms);
+  for (;;) {
+    if (!posixGroupAlive(pid)) return true;
+    if (Date.now() >= until) return false;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 10);
+      timer.unref?.();
+    });
+  }
+}
+
+/** What a `taskkill /T` attempt established about the tree. */
+type WindowsTreeKill = 'terminated' | 'not_found' | 'unconfirmed';
+
+/**
+ * Kill a process tree on Windows.
+ *
+ * `taskkill /T` is the only mechanism available: Node's `kill()` maps to
+ * `TerminateProcess` for one pid, and a runtime's helper processes would simply
+ * carry on. It is spawned here rather than in the caller because this file is
+ * the single child-process boundary — and with the same no-shell, hidden-window,
+ * scrubbed-environment rules as everything else.
+ *
+ * There is deliberately no graceful step before it. Windows has no `SIGTERM`:
+ * asking Node to "gracefully" stop the parent would terminate it outright and
+ * orphan the very descendants `/T` exists to collect.
+ *
+ * Its **result is the tree evidence**, and the caller depends on it. Exit code 0
+ * means every process `/T` walked was terminated; 128 means there was nothing by
+ * that pid to walk; anything else — access denied, a partial failure, `taskkill`
+ * itself missing or timing out — establishes nothing, and saying so is the only
+ * way a descendant that survived can be reported instead of assumed away.
+ */
+async function killWindowsTree(pid: number, timeoutMs: number): Promise<WindowsTreeKill> {
+  const taskkill = findOnPath('taskkill');
+  if (taskkill === null) return 'unconfirmed';
+
+  try {
+    const result = await execa(taskkill, ['/pid', String(pid), '/T', '/F'], {
+      shell: false,
+      windowsHide: true,
+      timeout: Math.max(1, timeoutMs),
+      stdin: 'ignore',
+      env: scrubEnvironment(process.env, []),
+      extendEnv: false,
+      reject: false
+    });
+    if (result.exitCode === 0) return 'terminated';
+    // 128 is "there is no running instance of the task": the pid is already
+    // gone, which `/T` cannot distinguish from "and so are its children".
+    return result.exitCode === 128 ? 'not_found' : 'unconfirmed';
+  } catch {
+    return 'unconfirmed';
+  }
+}
+
+/**
+ * A long-lived child and everything needed to supervise it safely.
+ *
+ * Kept private to this module: the only way to obtain one is
+ * {@link ExecaProcessRunner.launch}, and the only thing handed back is the
+ * narrow {@link ManagedProcess} interface.
+ */
+class ExecaManagedProcess implements ManagedProcess {
+  readonly pid: number | null;
+  readonly exited: Promise<ManagedProcessExit>;
+
+  private readonly stdoutBuffer: BoundedBuffer;
+  private readonly stderrBuffer: BoundedBuffer;
+  private settledExit: ManagedProcessExit | null = null;
+  /** The one cleanup. Every `stop` call after the first awaits this. */
+  private stopping: Promise<ManagedProcessStopResult> | null = null;
+
+  constructor(
+    private readonly subprocess: ResultPromise,
+    private readonly shutdownTimeoutMs: number,
+    maxOutputBytes: number
+  ) {
+    this.pid = subprocess.pid ?? null;
+    this.stdoutBuffer = new BoundedBuffer(maxOutputBytes);
+    this.stderrBuffer = new BoundedBuffer(maxOutputBytes);
+
+    // Both streams are drained continuously and separately. A server that fills
+    // a pipe nobody reads blocks, and a blocked server never answers a health
+    // check — which would present as a startup timeout with no explanation.
+    this.drain('stdout', this.stdoutBuffer);
+    this.drain('stderr', this.stderrBuffer);
+
+    this.exited = subprocess.then(
+      (result) => this.settle(toManagedExit(result)),
+      (error) => this.settle(toManagedExit(error))
+    );
+  }
+
+  running(): boolean {
+    return this.settledExit === null;
+  }
+
+  output(): ManagedProcessOutput {
+    return { stdout: this.stdoutBuffer.toString(), stderr: this.stderrBuffer.toString() };
+  }
+
+  stop(): Promise<ManagedProcessStopResult> {
+    // Only a CONFIRMED stop is final.
+    //
+    // Caching every outcome made the first unconfirmed answer permanent: the
+    // process might exit a moment later and every subsequent call would still
+    // replay "could not be confirmed", so nothing could ever establish that the
+    // tree was gone. Releasing the slot on an unconfirmed result lets a later
+    // call look again, within the same bounded shutdown budget.
+    //
+    // Idempotence is unchanged where it matters. Concurrent callers still share
+    // one in-flight attempt, because the slot is cleared only once that attempt
+    // has settled; and a confirmed stop is remembered for ever, so a second kill
+    // is never issued against a process already known to be gone.
+    this.stopping ??= this.terminate().then((result) => {
+      if (result.kind !== 'stopped') this.stopping = null;
+      return result;
+    });
+    return this.stopping;
+  }
+
+  private settle(exit: ManagedProcessExit): ManagedProcessExit {
+    this.settledExit = exit;
+    return exit;
+  }
+
+  private drain(stream: 'stdout' | 'stderr', buffer: BoundedBuffer): void {
+    void (async () => {
+      try {
+        for await (const raw of this.subprocess.iterable({ from: stream })) {
+          // Redacted before retention, never after: what is kept is what a
+          // caller may read, and a secret retained "temporarily" is retained.
+          buffer.push(`${redactSecrets(String(raw))}\n`);
+        }
+      } catch {
+        // The child ending mid-read is the ordinary case; `exited` reports it.
+      }
+    })();
+  }
+
+  /**
+   * Terminate the **tree** within the shutdown budget, or admit that it did not.
+   *
+   * The parent exiting is not the answer to the question this method is asked.
+   * A runtime spawns helpers, and a helper that outlives the process that
+   * started it is exactly the orphan a supervised launch exists to prevent — so
+   * `stopped` is returned only when the tree, not merely the child, has been
+   * accounted for.
+   *
+   * The budget is split: half for a polite request, the remainder for force.
+   * On Windows there is no polite request, so the whole budget goes to
+   * `taskkill /T /F` and the fallback single-process kill after it.
+   */
+  private async terminate(): Promise<ManagedProcessStopResult> {
+    const pid = this.pid;
+    if (pid === null) {
+      // Never spawned. There is nothing to kill, but the exit still has to be
+      // observed before this can honestly be called stopped.
+      const exit = await settleWithin(this.exited, this.shutdownTimeoutMs);
+      return exit === null
+        ? { kind: 'unconfirmed', reason: 'The runtime process never started and never settled.' }
+        : { kind: 'stopped', exit };
+    }
+
+    const budget = Math.max(1, this.shutdownTimeoutMs);
+    const startedAt = Date.now();
+    const remaining = (): number => Math.max(1, budget - (Date.now() - startedAt));
+    const notGone: ManagedProcessStopResult = {
+      kind: 'unconfirmed',
+      reason: `The runtime process did not exit within ${budget}ms of being terminated.`
+    };
+
+    if (process.platform === 'win32') {
+      // `/T` walks the tree from the parent, so its verdict only means anything
+      // while the parent is still there to be walked from. Once the parent has
+      // gone, Windows keeps no record of the relationship and a surviving
+      // grandchild is unreachable by pid — see the limitation in
+      // `docs/local-inference.md`.
+      const walkable = this.settledExit === null;
+      // Almost the whole budget. Windows has no graceful phase to reserve time
+      // for, and `taskkill` walking a tree is the expensive part by a wide
+      // margin — once it reports back, the exit promise has usually settled
+      // already. Splitting the budget evenly, as a POSIX-shaped implementation
+      // would, only made the tree verdict expire on a slow machine and turned a
+      // perfectly ordinary cleanup into an unconfirmed one.
+      const tree = await killWindowsTree(pid, Math.max(1, budget - WINDOWS_EXIT_RESERVE_MS));
+
+      if (this.settledExit === null) {
+        try {
+          this.subprocess.kill();
+        } catch {
+          // Already gone; the exit promise is the authority either way.
+        }
+      }
+
+      // The taskkill attempt is part of—not additional to—the configured
+      // shutdown deadline. Spend only what remains after it returns.
+      const exit = await settleWithin(this.exited, remaining());
+      if (exit === null) return notGone;
+      if (!walkable || tree !== 'terminated') {
+        return {
+          kind: 'unconfirmed',
+          reason: `The runtime process exited, but its process tree could not be confirmed terminated within ${budget}ms.`
+        };
+      }
+      return { kind: 'stopped', exit };
+    }
+
+    signalPosixTree(pid, this.subprocess, 'SIGTERM');
+    const afterTerm = await settleWithin(this.exited, Math.max(1, Math.floor(budget / 2)));
+    // The parent exiting politely says nothing about a descendant that ignored
+    // the same signal. The group is what is checked, and while it still has
+    // members the escalation below happens whether or not the child is gone.
+    if (afterTerm !== null && !posixGroupAlive(pid)) return { kind: 'stopped', exit: afterTerm };
+
+    signalPosixTree(pid, this.subprocess, 'SIGKILL');
+
+    const exit = afterTerm ?? (await settleWithin(this.exited, remaining()));
+    if (exit === null) return notGone;
+
+    return (await waitForPosixGroupGone(pid, remaining()))
+      ? { kind: 'stopped', exit }
+      : {
+          kind: 'unconfirmed',
+          reason: `A descendant of the runtime process was still alive ${budget}ms after the process tree was terminated.`
+        };
+  }
+}
+
+/**
+ * Read an execa outcome — success, failure or spawn error — as a managed exit.
+ *
+ * `reject: false` means a non-zero exit resolves rather than throws, but a
+ * genuine spawn failure can still arrive down either path, so both are folded
+ * through here.
+ */
+function toManagedExit(value: unknown): ManagedProcessExit {
+  const result = (value ?? {}) as {
+    exitCode?: number;
+    signal?: string;
+    isTerminated?: boolean;
+    failed?: boolean;
+    code?: string;
+  };
+
+  const exitCode = typeof result.exitCode === 'number' ? result.exitCode : null;
+  const signal = typeof result.signal === 'string' ? result.signal : null;
+  const errorCode = typeof result.code === 'string' ? result.code.slice(0, 64) : null;
+
+  return {
+    exitCode,
+    signal,
+    // Nothing ran: no code, no signal, and the child was never terminated by us.
+    spawnFailed:
+      Boolean(result.failed) && exitCode === null && signal === null && !result.isTerminated,
+    errorCode
+  };
+}
+
+export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunner, ManagedProcessRunner {
+  /**
+   * Start a server-shaped child and hand back a supervisor for it.
+   *
+   * Everything that makes {@link run} safe applies unchanged — same options
+   * builder, same `shell: false`, same scrubbed environment, same redaction,
+   * same bounded and separated output. Three things differ, and each is there
+   * because a long-lived process is not a one-shot one:
+   *
+   *  * **No timeout.** execa's would kill the server out from under its
+   *    supervisor at an arbitrary moment. Deadlines belong to the caller, which
+   *    is the only party that knows whether it is starting up, health checking
+   *    or inferring.
+   *  * **stdin is `ignore`.** There is no protocol on it; the runtime is spoken
+   *    to over loopback HTTP. Leaving it open would be a channel nobody owns.
+   *  * **`detached` on POSIX.** It makes the child a process-group leader, which
+   *    is what turns "kill the child" into "kill the tree".
+   */
+  launch(
+    file: string,
+    args: readonly string[],
+    options: ManagedProcessOptions = {}
+  ): ManagedProcess {
+    assertSpawnable(file, args);
+
+    const maxBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+    const shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_MS;
+
+    const base = baseExecaOptions({
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      ...(options.env === undefined ? {} : { env: options.env }),
+      ...(options.passthroughEnvNames === undefined
+        ? {}
+        : { passthroughEnvNames: options.passthroughEnvNames }),
+      // 0 disables execa's timer. The provider owns every deadline.
+      timeoutMs: 0
+    });
+
+    const subprocess = execa(file, [...args], {
+      ...base,
+      buffer: false,
+      stdin: 'ignore',
+      // On Windows `detached` opens a console for the child instead of creating
+      // a process group, so the tree is collected with `taskkill /T` there.
+      detached: process.platform !== 'win32',
+      // execa's own escalation is redundant with the tree kill below and would
+      // race it; termination is driven entirely by `ManagedProcess.stop`.
+      forceKillAfterDelay: false
+    });
+
+    // Marks the promise as observed: `ExecaManagedProcess` attaches its own
+    // handlers, but the window before that is enough for Node to complain.
+    subprocess.catch(() => undefined);
+
+    return new ExecaManagedProcess(subprocess, shutdownTimeoutMs, maxBytes);
+  }
+
   /**
    * Run a child once and collect what it produced.
    *

@@ -221,7 +221,15 @@ export const claudeStream = {
 /* Process liveness                                                            */
 /* -------------------------------------------------------------------------- */
 
-function isAlive(pid: number): boolean {
+/**
+ * Is this pid still there, right now?
+ *
+ * Exported as well as used by {@link waitForExit} because some assertions are
+ * about the *instant* a call returned — "`stop()` answered `stopped`, and the
+ * descendant was already gone" is a different claim from "the descendant went
+ * away eventually", and only the first one says the cleanup waited.
+ */
+export function isAlive(pid: number): boolean {
   try {
     // Signal 0 performs the permission and existence check without delivering
     // anything. It is the only portable way to ask "is this pid still there?".
