@@ -282,7 +282,9 @@ The default GitHub owner is `Desken-van`, changeable in Settings.
 
 ## Architecture
 
-Full detail in **[docs/architecture.md](docs/architecture.md)**. In short:
+Full detail in **[docs/architecture.md](docs/architecture.md)**. The internal,
+versioned local-model process and inference boundary is documented separately in
+**[docs/local-inference.md](docs/local-inference.md)**. In short:
 
 ```
 Renderer (React)  →  preload bridge  →  Zod-validated IPC  →  services
@@ -459,7 +461,7 @@ cancellation, interruption or changed inputs never grant a pass. There is no
 automatic retry. Current files are checked again before review and publishing.
 This is verification, not Coai review and not live acceptance of a model.
 
-Test suite: **1645 deterministic tests in 65 files, plus one automated Electron
+Test suite: **1790 deterministic tests in 68 files, plus one automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -622,7 +624,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1645 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              1790 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

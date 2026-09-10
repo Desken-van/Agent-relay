@@ -15,6 +15,12 @@ import type { DiagnosticsReport, ToolDiagnostic } from '../shared/domain/diagnos
 import type { ClaudeRoundAssessmentRecord } from '../shared/domain/claude-assessment';
 import type { GitChangeSet, RepositoryInfo, WorktreeInfo } from '../shared/domain/git';
 import type {
+  LocalInferenceCapabilities,
+  LocalInferenceOutcome,
+  LocalInferenceRequest,
+  LocalInferenceState
+} from '../shared/domain/local-inference';
+import type {
   Approval,
   ApprovalAction,
   ApprovalStatus,
@@ -1166,6 +1172,48 @@ export interface ExternalPlanReviewer {
     decisions: readonly PlanReviewDecision[],
     signal?: AbortSignal
   ): Promise<ExternalPlanReviewResolution>;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Local inference                                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A supervised local inference runtime.
+ *
+ * Note how little is here. There is no task, no review, no patch, no retry, no
+ * approval, no publication and no repository — because the runtime owns none of
+ * those, and a port that could express them would be an invitation to move
+ * workflow state out of Agent Relay and into a process it does not control.
+ *
+ * The whole surface is: what state are you in, what can you do, start, prove
+ * you are alive, answer one prompt, stop.
+ *
+ * `infer` never rejects for a runtime-side failure — it returns a discriminated
+ * {@link LocalInferenceOutcome}, so a cancellation or a timeout cannot be handed
+ * back in the same shape as a completion. It *does* throw
+ * {@link InvalidTransitionError} for an operation that is not legal in the
+ * current state, and that throw happens before any process or request.
+ */
+export interface LocalInferenceProvider {
+  /** The current lifecycle state. Cheap, synchronous, and never a probe. */
+  state(): LocalInferenceState;
+  /**
+   * Discovery plus a bounded `--version` probe.
+   *
+   * Read-only and idempotent. It never marks the provider healthy and never
+   * sets `inferenceVerified`: a banner is evidence that a file exists, not that
+   * a model loads.
+   */
+  capabilities(signal?: AbortSignal): Promise<LocalInferenceCapabilities>;
+  /** Launch exactly one runtime and poll it to health. Never self-restarting. */
+  start(signal?: AbortSignal): Promise<LocalInferenceState>;
+  /** One bounded loopback health request. Legal only while healthy. */
+  health(signal?: AbortSignal): Promise<LocalInferenceState>;
+  /** Exactly one completion request. Never retried, never restarted. */
+  infer(request: LocalInferenceRequest, signal?: AbortSignal): Promise<LocalInferenceOutcome>;
+  /** Terminate the runtime tree. Safe and idempotent from every state. */
+  stop(): Promise<LocalInferenceState>;
 }
 
 /* -------------------------------------------------------------------------- */
