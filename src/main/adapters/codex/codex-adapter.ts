@@ -43,6 +43,9 @@ import type {
 import { locateExecutable } from '../process/executable-locator';
 import type { ProcessRunner } from '../process/process-runner';
 import { buildReviewPrompt, buildSpecificationPrompt } from './prompts';
+import { CodexImplementationEvidence } from './implementation-evidence';
+import { parseShellToolRule } from '../../../shared/domain/claude-tool-rules';
+import type { ImplementationRequest, ImplementationResult } from '../../ports';
 
 export interface CodexAdapterOptions {
   /** Explicit path to the codex executable; otherwise the bundled one is used. */
@@ -179,26 +182,36 @@ export class CodexSdkAdapter implements CodexAdapter {
     prompt: string,
     threadOptions: ThreadOptions,
     outputSchema: Record<string, unknown>,
-    context: AgentRunContext
+    context: AgentRunContext,
+    observe?: (event: ThreadEvent) => void
   ): Promise<TurnOutcome> {
     const codex = this.createClient();
     const thread = openThread(codex, threadId, threadOptions);
 
     const messages: string[] = [];
     let failure: string | null = null;
+    let completed = false;
+    const deadline = AbortSignal.timeout(context.timeoutMs);
+    const signal = AbortSignal.any([context.signal, deadline]);
+    const checkAbort = (): void => {
+      if (deadline.aborted) throw new AgentRelayError('TIMEOUT', 'The Codex process timeout expired. Saved work remains in the task worktree.');
+      if (context.signal.aborted) throw new AgentRelayError('CANCELLED', 'The Codex run was stopped.');
+    };
 
     let streamed: { events: AsyncGenerator<ThreadEvent> };
     try {
       streamed = await thread.runStreamed(prompt, {
         outputSchema,
-        signal: context.signal
+        signal
       });
     } catch (error) {
+      checkAbort();
       throw this.toDomainError(error, threadId);
     }
 
     try {
       for await (const event of streamed.events) {
+        observe?.(event);
         switch (event.type) {
           case 'thread.started':
             context.onProgress({
@@ -224,6 +237,7 @@ export class CodexSdkAdapter implements CodexAdapter {
           }
 
           case 'turn.completed':
+            completed = true;
             context.onProgress({
               type: 'progress',
               text: `Codex turn completed (${event.usage.input_tokens} in / ${event.usage.output_tokens} out tokens).`,
@@ -246,8 +260,12 @@ export class CodexSdkAdapter implements CodexAdapter {
         }
       }
     } catch (error) {
+      checkAbort();
       throw this.toDomainError(error, thread.id ?? threadId);
     }
+
+    checkAbort();
+    if (!completed && !failure) failure = 'The stream ended before the turn completed.';
 
     if (failure) {
       throw this.toDomainError(new Error(failure), thread.id ?? threadId);
@@ -335,6 +353,20 @@ export class CodexSdkAdapter implements CodexAdapter {
     };
   }
 
+  async implement(request: ImplementationRequest, context: AgentRunContext): Promise<ImplementationResult> {
+    const evidence = new CodexImplementationEvidence(request.verificationCommands);
+    const result = await this.runTurn(request.sessionId,
+      `${request.prompt}\n\nContinue from the files already present. Inspect the current diff before editing.\nRun a configured verification command as a standalone command after your final edit:\n${request.verificationCommands.map(rule => parseShellToolRule(rule)?.prefix).filter(Boolean).join('\n')}\nDo not commit, publish, discard files, or use MCP tools.`,
+      this.threadOptions(request.model, { workingDirectory: request.worktreePath, sandboxMode: 'workspace-write',
+        approvalPolicy: 'never', networkAccessEnabled: false, webSearchMode: 'disabled' }),
+      { type: 'object', properties: { report: { type: 'string' } }, required: ['report'], additionalProperties: false },
+      context, (event) => evidence.accept(event));
+    let report: unknown;
+    try { report = JSON.parse(result.finalResponse).report; } catch { /* handled below */ }
+    if (typeof report !== 'string' || !report.trim()) throw new AgentRelayError('PARSE_FAILED', 'Codex returned no implementation report.');
+    return { sessionId: result.threadId, finalMessage: redactSecrets(report), assessment: evidence.assessment() };
+  }
+
   async reviewImplementation(
     request: CodexReviewRequest,
     context: AgentRunContext
@@ -369,7 +401,7 @@ export class CodexSdkAdapter implements CodexAdapter {
         'PARSE_FAILED',
         parsed.error ?? 'Codex did not return a usable review.',
         {
-          remediation: 'Use "Review with Codex" again to retry — the thread is preserved.',
+          remediation: 'Use "Run review" again to retry in a fresh review session.',
           details: parsed.raw ? redactSecrets(parsed.raw).slice(0, 2000) : undefined
         }
       );

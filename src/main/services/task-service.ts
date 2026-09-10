@@ -1,4 +1,5 @@
 import { AgentRelayError } from '../../shared/domain/errors';
+import type { ExecutionProvider } from '../../shared/domain/execution-providers';
 import type { Task } from '../../shared/domain/models';
 import type { TaskDetail } from '../../shared/ipc';
 import { codexReviewResultSchema, taskSpecificationSchema } from '../../shared/schemas/codex';
@@ -33,6 +34,8 @@ export interface CreateTaskInput {
    */
   readonly codexModel?: string | null;
   readonly claudeModel?: string | null;
+  readonly implementationProvider?: ExecutionProvider;
+  readonly reviewProvider?: ExecutionProvider;
 }
 
 export interface TaskServiceDeps {
@@ -88,7 +91,9 @@ export class TaskService {
       lastReviewJson: null,
       lastError: null,
       codexModel,
-      claudeModel
+      claudeModel,
+      implementationProvider: input.implementationProvider ?? 'claude',
+      reviewProvider: input.reviewProvider ?? 'codex'
     });
 
     this.deps.events.publishTask(task);

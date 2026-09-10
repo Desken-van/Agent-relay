@@ -218,6 +218,9 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
 
     'workflow:generateSpecification': (input) =>
       app.orchestrator.generateSpecification(input.taskId),
+    'workflow:configureProviders': (input) => app.orchestrator.configureProviders(input),
+    'workflow:implement': (input) => app.orchestrator.sendToClaude(input.taskId, { acceptDirtyWorkingTree: input.acceptDirtyWorkingTree ?? false }),
+    'workflow:review': (input) => app.orchestrator.reviewWithCodex(input.taskId),
     'workflow:approveSpecification': (input) => app.orchestrator.approveSpecification(input.taskId),
     'workflow:sendToClaude': (input) =>
       app.orchestrator.sendToClaude(input.taskId, {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { correctionAction, latestClaudeRoundResult } from '@shared/domain/claude-assessment';
+import { correctionAction, latestImplementationRoundResult as latestClaudeRoundResult } from '@shared/domain/claude-assessment';
+import { canChangeProviders, providerLabel, type ExecutionProvider } from '@shared/domain/execution-providers';
 import type { GitChangeSet } from '@shared/domain/git';
 import type { ApprovalAction, Task } from '@shared/domain/models';
 import type { PlanReviewDecision } from '@shared/domain/plan-review';
@@ -13,6 +14,42 @@ import { ChangesPanel } from './ChangesPanel';
 import { codexModelLabel } from './TasksView';
 import { Card, Empty, Field, Notice, Rounds, Scope, Spinner, StatusBadge } from './primitives';
 import { RelayTimeline } from './RelayTimeline';
+
+export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: boolean; onChanged: () => Promise<void> }): React.JSX.Element {
+  const [implementation, setImplementation] = useState<ExecutionProvider | null>(null);
+  const [review, setReview] = useState<ExecutionProvider | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const claim = useRef(false);
+  const implementationValue = implementation ?? task.implementationProvider;
+  const reviewValue = review ?? task.reviewProvider;
+  const disabled = busy || saving || !canChangeProviders(task.status);
+  return <div className="stack">
+    <Field label="Implementation provider">
+      <select className="input" aria-label="Implementation provider" value={implementationValue} disabled={disabled} onChange={(e) => setImplementation(e.target.value as ExecutionProvider)}>
+        <option value="claude">Claude</option><option value="codex">Codex</option>
+      </select>
+    </Field>
+    <Field label="Review provider">
+      <select className="input" aria-label="Review provider" value={reviewValue} disabled={disabled} onChange={(e) => setReview(e.target.value as ExecutionProvider)}>
+        <option value="codex">Codex</option><option value="claude">Claude</option>
+      </select>
+    </Field>
+    <button type="button" className="btn btn--sm" disabled={disabled || (implementationValue === task.implementationProvider && reviewValue === task.reviewProvider)} onClick={() => {
+      if (claim.current) return;
+      claim.current = true; setSaving(true); setError(null);
+      void (async () => {
+        try {
+          await expect('workflow:configureProviders', { taskId: task.id, expectedRevision: task.providerRevision, implementationProvider: implementationValue, reviewProvider: reviewValue });
+          await onChanged(); setImplementation(null); setReview(null);
+        } catch (err) { setError(err instanceof Error ? err.message : 'Could not update providers.'); }
+        finally { claim.current = false; setSaving(false); }
+      })();
+    }}>{saving ? 'Saving…' : 'Apply providers'}</button>
+    <p className="hint">Changing the executor preserves files and history, but starts a new implementation session. No automatic fallback. Coai settings are separate.</p>
+    {error ? <Notice tone="warn">{error}</Notice> : null}
+  </div>;
+}
 
 export function RunView(): React.JSX.Element {
   const store = useStore();
@@ -87,13 +124,13 @@ export function RunView(): React.JSX.Element {
 
   const sendToClaude = (acceptDirty: boolean): void => {
     setDirtyPrompt(null);
-    void perform('send-claude', 'Claude run failed', async () => {
+    void perform('send-claude', 'Implementation run failed', async () => {
       try {
-        await expect('workflow:sendToClaude', {
+        await expect('workflow:implement', {
           taskId: task.id,
           ...(acceptDirty ? { acceptDirtyWorkingTree: true } : {})
         });
-        notify({ tone: 'success', title: 'Claude finished the implementation round' });
+        notify({ tone: 'success', title: 'Implementation round finished' });
         await loadChanges();
       } catch (error) {
         if (error instanceof ApiError && error.code === 'GIT_DIRTY') {
@@ -234,6 +271,8 @@ export function RunView(): React.JSX.Element {
       {/* ------------------------------ right ------------------------------- */}
       <div className="stack">
         <Card title="Actions">
+          <ProviderControls key={task.id} task={task} busy={anyBusy || running}
+            onChanged={() => refreshDetail(task.id)} />
           <div className="actions">
             <div className="actions__legend">Read-only</div>
             <button
@@ -280,13 +319,13 @@ export function RunView(): React.JSX.Element {
               disabled={anyBusy || running || task.status !== 'READY_FOR_REVIEW'}
               onClick={() =>
                 void perform('review', 'Review failed', async () => {
-                  await expect('workflow:reviewWithCodex', { taskId: task.id });
-                  notify({ tone: 'success', title: 'Codex review complete' });
+                  await expect('workflow:review', { taskId: task.id });
+                  notify({ tone: 'success', title: 'Review complete' });
                   await Promise.all([refreshDetail(task.id), loadChanges()]);
                 })
               }
             >
-              {busy['review'] ? <Spinner /> : <Scope kind="read" />} Review with Codex
+              {busy['review'] ? <Spinner /> : <Scope kind="read" />} Run review · {providerLabel(task.reviewProvider)}
             </button>
 
             <div className="actions__legend">Writes local files</div>
@@ -301,7 +340,7 @@ export function RunView(): React.JSX.Element {
               }
               onClick={() => sendToClaude(false)}
             >
-              {busy['send-claude'] ? <Spinner /> : <Scope kind="local" />} Send to Claude
+              {busy['send-claude'] ? <Spinner /> : <Scope kind="local" />} Run implementation · {providerLabel(task.implementationProvider)}
             </button>
 
             <button
@@ -312,7 +351,7 @@ export function RunView(): React.JSX.Element {
               onClick={() =>
                 void perform('corrections', 'Correction round failed', async () => {
                   await expect('workflow:sendCorrections', { taskId: task.id });
-                  notify({ tone: 'success', title: 'Claude finished the round' });
+                    notify({ tone: 'success', title: 'Implementation round finished' });
                   await Promise.all([refreshDetail(task.id), loadChanges()]);
                 })
               }
@@ -871,7 +910,7 @@ function SpecificationPanel({
 
         <details>
           <summary className="faint" style={{ cursor: 'pointer', fontSize: 12 }}>
-            Implementation prompt sent to Claude
+            Implementation prompt
           </summary>
           <pre className="pre selectable" style={{ marginTop: 8 }}>
             {specification.implementationPrompt}

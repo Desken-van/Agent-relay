@@ -13,6 +13,7 @@
  */
 
 import { z } from 'zod';
+import { executionProviderSchema } from './domain/execution-providers';
 import type { CodexModelCatalogResult } from './domain/codex-catalog';
 import type { DiagnosticsReport } from './domain/diagnostics';
 import type { SerializedError } from './domain/errors';
@@ -272,7 +273,9 @@ export const ipcInputSchemas = {
        * default" apart from an explicit `null` meaning "Tool default".
        */
       codexModel: modelIdSchema.optional(),
-      claudeModel: modelIdSchema.optional()
+      claudeModel: modelIdSchema.optional(),
+      implementationProvider: executionProviderSchema.optional(),
+      reviewProvider: executionProviderSchema.optional()
     })
     .strict(),
 
@@ -282,6 +285,10 @@ export const ipcInputSchemas = {
     .strict(),
 
   'workflow:generateSpecification': byTask,
+  'workflow:configureProviders': z.object({ taskId: z.string().min(1), expectedRevision: z.number().int().min(0),
+    implementationProvider: executionProviderSchema, reviewProvider: executionProviderSchema }).strict(),
+  'workflow:implement': z.object({ taskId: z.string().min(1), acceptDirtyWorkingTree: z.boolean().optional() }).strict(),
+  'workflow:review': byTask,
   'workflow:approveSpecification': byTask,
   'workflow:sendToClaude': z
     .object({
@@ -446,6 +453,9 @@ export interface IpcResponseMap {
   'workflow:generateSpecification': Task;
   'workflow:approveSpecification': Task;
   'workflow:sendToClaude': Task;
+  'workflow:configureProviders': Task;
+  'workflow:implement': Task;
+  'workflow:review': Task;
   'workflow:reviewWithCodex': Task;
   'workflow:sendCorrections': Task;
   'workflow:stop': Task;

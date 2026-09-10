@@ -213,6 +213,7 @@ function lateBound(factories: ReturnType<typeof adapterFactories>): {
 } {
   return {
     codex: {
+      implement: (request, context) => factories.codex().implement(request, context),
       createSpecification: (request, context) =>
         factories.codex().createSpecification(request, context),
       reviewImplementation: (request, context) =>
@@ -220,6 +221,7 @@ function lateBound(factories: ReturnType<typeof adapterFactories>): {
       diagnose: () => factories.codex().diagnose()
     },
     claude: {
+      reviewImplementation: (request, context) => factories.claude().reviewImplementation(request, context),
       run: (request, context) => factories.claude().run(request, context),
       diagnose: () => factories.claude().diagnose()
     },

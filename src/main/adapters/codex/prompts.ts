@@ -22,7 +22,7 @@ export interface SpecificationPromptInput {
 
 export function buildSpecificationPrompt(input: SpecificationPromptInput): string {
   return `You are the SPECIFIER in a two-agent relay. You do not write the code; a separate
-coding agent (Claude Code) will implement whatever you specify, working alone, in an
+coding agent will implement whatever you specify, working alone, in an
 isolated Git worktree, with no ability to ask you follow-up questions.
 
 Repository under discussion: ${input.projectPath}

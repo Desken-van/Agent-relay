@@ -8,7 +8,8 @@ import { toTask, type TaskRow } from '../rows';
 const COLUMNS = `id, project_id, title, original_request, status, current_round, max_rounds,
                  codex_thread_id, claude_session_id, worktree_path, branch_name, base_branch,
                  specification_json, specification_approved_at, last_review_json, last_error,
-                 codex_model, claude_model, created_at, updated_at`;
+                 codex_model, claude_model, implementation_provider, review_provider,
+                 provider_revision, implementation_thread_id, created_at, updated_at`;
 
 /**
  * Persistence for tasks.
@@ -63,13 +64,16 @@ export class SqliteTaskRepository implements TaskRepository {
         `INSERT INTO tasks (id, project_id, title, original_request, status, current_round,
                             max_rounds, codex_thread_id, claude_session_id, worktree_path,
                             branch_name, base_branch, specification_json, specification_approved_at,
-                            last_review_json, last_error, codex_model, claude_model, created_at, updated_at)
+                            last_review_json, last_error, codex_model, claude_model,
+                            implementation_provider, review_provider, provider_revision, implementation_thread_id, created_at, updated_at)
          VALUES (@id, @projectId, @title, @originalRequest, @status, @currentRound,
                  @maxRounds, @codexThreadId, @claudeSessionId, @worktreePath,
                  @branchName, @baseBranch, @specificationJson, @specificationApprovedAt,
-                 @lastReviewJson, @lastError, @codexModel, @claudeModel, @createdAt, @updatedAt)`
+                 @lastReviewJson, @lastError, @codexModel, @claudeModel,
+                 @implementationProvider, @reviewProvider, @providerRevision, @implementationThreadId, @createdAt, @updatedAt)`
       )
-      .run({ ...task, createdAt: now, updatedAt: now });
+      .run({ implementationProvider: 'claude', reviewProvider: 'codex', providerRevision: 0,
+        implementationThreadId: null, ...task, createdAt: now, updatedAt: now });
 
     const created = this.findById(task.id);
     if (!created) throw new AgentRelayError('INTERNAL', 'Task disappeared immediately after insert.');
@@ -103,6 +107,10 @@ export class SqliteTaskRepository implements TaskRepository {
                 last_error = @lastError,
                 codex_model = @codexModel,
                 claude_model = @claudeModel,
+                implementation_provider = @implementationProvider,
+                review_provider = @reviewProvider,
+                provider_revision = @providerRevision,
+                implementation_thread_id = @implementationThreadId,
                 updated_at = @updatedAt
           WHERE id = @id`
       )
@@ -130,5 +138,25 @@ export class SqliteTaskRepository implements TaskRepository {
 
   delete(id: string): void {
     this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
+  }
+
+  changeProviders(id: string, expectedRevision: number, implementation: Task['implementationProvider'], review: Task['reviewProvider']): Task {
+    let result: Task | undefined;
+    this.db.transaction(() => {
+      const task = this.findById(id);
+      if (!task || task.providerRevision !== expectedRevision) {
+        throw new AgentRelayError('VALIDATION_FAILED', 'Provider selection changed. Refresh the task.');
+      }
+      if (task.implementationProvider === implementation && task.reviewProvider === review) { result = task; return; }
+      const revision = expectedRevision + 1;
+      this.db.prepare(`INSERT INTO task_provider_changes VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(id, revision, task.implementationProvider, implementation, task.reviewProvider, review, this.clock.nowIso());
+      result = this.update(id, {
+        implementationProvider: implementation, reviewProvider: review, providerRevision: revision,
+        ...(task.implementationProvider === implementation ? {} : { implementationThreadId: null, claudeSessionId: null })
+      });
+    })();
+    if (!result) throw new AgentRelayError('INTERNAL', 'Provider update produced no task.');
+    return result;
   }
 }
