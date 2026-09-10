@@ -6,8 +6,12 @@
   "type": "module",
   "author": "Agent Relay",
   "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.22.2"
+  },
   "main": "./out/main/index.js",
   "scripts": {
+    "postinstall": "node scripts/build-native.mjs",
     "dev": "node scripts/launch.mjs dev",
     "start": "node scripts/launch.mjs preview",
     "build": "electron-vite build",
@@ -40,6 +44,7 @@
     "eslint-plugin-react-hooks": "^7.0.1",
     "globals": "^16.5.0",
     "jsdom": "^25.0.1",
+    "node-gyp": "^13.0.2",
     "playwright-core": "^1.63.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

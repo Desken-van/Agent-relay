@@ -147,10 +147,15 @@ POSIX, the managed process leads its own process group, so the group is signalle
 and then polled with signal 0 until it is empty; a descendant that ignored
 `SIGTERM` while its parent exited politely is escalated to `SIGKILL` and waited
 for, and a group that still has members when the budget expires is reported as
-unconfirmed. On Windows there is no graceful phase and `taskkill /T /F` is the
-tree-oriented primitive used here. Its result is evidence only when the parent
-was still alive and the tree walk succeeded. A missing parent, partial failure,
-timeout, or any other result is unconfirmed rather than assumed away.
+unconfirmed. On Windows, Agent Relay starts a native launcher first. The
+launcher creates a Job Object with kill-on-close, creates the runtime suspended,
+assigns it to that object, and only then resumes it. Descendants inherit the Job
+Object, so the kernel retains the group even if the runtime parent crashes. The
+launcher does not exit normally until it has terminated the remaining group and
+observed the Job Object empty. Agent Relay requests an explicit stop by closing
+a private control pipe; the launcher then terminates the Job Object, observes it
+empty, and exits. If the launcher itself is terminated, closing its last Job
+Object handle still terminates the contained processes.
 
 Ownership of the process is continuous: it is handed from the current runtime to the outstanding one in the same synchronous step, and held across the wait for the cleanup. Nothing can observe the provider mid-handover, so an explicit `stop` that arrives while an automatic cleanup is still running finds that same process and joins the attempt already in flight rather than starting a second kill. It cannot answer `stopped` while the outcome is still unknown.
 
@@ -223,14 +228,9 @@ reason is `{kind:"unknown"}`; an unfamiliar bounded reason is an explicit
 - Runtime usage fields are optional and are returned as `null` when absent.
 - One provider manages one process and one inference at a time.
 - The lifecycle and inference evidence are process-local and non-durable.
-- Windows tree cleanup is only as good as `taskkill /T`, which walks the tree
-  from a live parent. If the managed process has already exited when cleanup
-  runs — a crash, say — the provider cannot prove that a detached descendant is
-  gone. It now fails closed, retains ownership and refuses a second start, but
-  cannot terminate that orphan by the vanished parent's pid. Full containment
-  of that case requires launching the runtime inside a Windows Job Object; it
-  remains a LOCAL-A acceptance blocker rather than being reported as stopped.
-  POSIX has no such gap: the process group outlives its leader and is checked
-  directly.
+- The Windows launcher is an Agent Relay-owned native executable built during
+  `npm install` and copied beside the main-process bundle. If it is missing, a
+  managed runtime launch fails before the target process starts; there is no
+  fallback to uncontained execution.
 - Deterministic acceptance uses the Agent Relay-owned fake runtime. Running a
   real llama.cpp or Ornith build and model is outside LOCAL-A acceptance.

@@ -197,6 +197,28 @@ describe('local inference process contract: the whole path', () => {
     expect(body.model).toBe('fake-model');
   });
 
+  it.runIf(process.platform === 'win32')(
+    'preserves each configured argument through the native launcher',
+    async () => {
+      const fixedArguments = [
+        '--threads',
+        '1',
+        '--label',
+        'two words',
+        'quote"inside',
+        'trailing\\'
+      ];
+      const built = await harness(
+        { health: 'ok', completion: 'ok' },
+        { fixedArguments }
+      );
+
+      expect((await built.provider.start()).kind).toBe('healthy');
+      const argv = built.runtime.evidence().argv;
+      for (const argument of fixedArguments) expect(argv).toContain(argument);
+    }
+  );
+
   it('carries Ornith-style chat template parameters through unchanged', async () => {
     const built = await harness({ health: 'ok', completion: 'ok' });
     await built.provider.start();
@@ -463,7 +485,7 @@ describe('local inference process contract: inference', () => {
   });
 
   it.runIf(process.platform === 'win32')(
-    'does not claim cleanup after a crashed parent leaves a detached descendant',
+    'contains a detached descendant after its runtime parent crashes',
     async () => {
       const built = await harness({
         health: 'ok',
@@ -480,13 +502,16 @@ describe('local inference process contract: inference', () => {
         expect(outcome.kind).toBe('failed');
         if (outcome.kind === 'completed') return;
         expect(outcome.dispatchOutcome).toBe('unknown');
-        expect(outcome.reason).toMatch(/could not be confirmed terminated/i);
-        expect(isAlive(descendant)).toBe(true);
+        expect(outcome.reason).not.toMatch(/could not be confirmed/i);
+        expect(await waitForExit(descendant)).toBe(true);
         expect(built.provider.state().kind).toBe('failed');
-        await expect(built.provider.start()).rejects.toMatchObject({ code: 'BUSY' });
+
+        expect((await built.provider.start()).kind).toBe('healthy');
+        expect(built.runner.starts).toHaveLength(2);
+        expect((await built.provider.stop()).kind).toBe('stopped');
+        await expectTreeGone(built);
       } finally {
-        // This fixture deliberately creates the orphan that taskkill /T cannot
-        // find once its parent is gone. Clean that exact synthetic pid here.
+        // A failed assertion must never leave the synthetic process behind.
         if (isAlive(descendant)) process.kill(descendant, 'SIGKILL');
         expect(await waitForExit(descendant)).toBe(true);
       }
@@ -577,13 +602,10 @@ describe('local inference process contract: stop', () => {
    * on `SIGTERM` while its child carries on; a supervisor that reads the
    * parent's exit as proof returns `stopped` with a process still running.
    *
-   * The parent is checked at the instant `stop()` answered. The descendant is
-   * given a 250 ms grace, because on Windows the whole cleanup is one
-   * `taskkill /F` and `TerminateProcess` is not synchronous — the pid can
-   * outlive the call that killed it by a few scheduler turns. That grace is far
-   * too short to hide the defect: the descendant this fixture spawns never
-   * exits on its own, so under a parent-only cleanup it is alive for the rest of
-   * the suite, not for a quarter of a second.
+   * Both pids are checked at the instant `stop()` answers. On Windows the
+   * launcher's answer is delayed until the Job Object is empty; on POSIX the
+   * process group is polled. Under a parent-only cleanup the descendant this
+   * fixture spawns remains alive for the rest of the suite.
    */
   it('does not answer stopped while a descendant that ignores SIGTERM is alive', async () => {
     const built = await harness({
@@ -604,9 +626,10 @@ describe('local inference process contract: stop', () => {
   });
 
   it('keeps tree cleanup inside the configured shutdown budget', async () => {
-    // Small, but not smaller than a tree kill honestly costs: on Windows the
-    // whole cleanup is one `taskkill /T /F`, and the budget is what bounds it.
-    // Squeezing it below that does not test the bound, it tests the machine.
+    // Small, but not smaller than a whole-tree cleanup honestly costs. On
+    // Windows the launcher terminates and drains its Job Object; on POSIX the
+    // process group may need escalation. Squeezing the budget below that tests
+    // the machine rather than the bound.
     const built = await harness(
       { health: 'ok', completion: 'ok', spawnDescendant: true },
       { shutdownTimeoutMs: 4_000 }

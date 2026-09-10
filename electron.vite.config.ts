@@ -7,32 +7,39 @@ import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
 const root = import.meta.dirname;
 
 /**
- * Put the SQLite probe script next to the built main bundle.
+ * Put separately executed Agent Relay assets next to the built main bundle.
  *
- * It is deliberately not bundled: it is the entry point of a *separate*
- * process, spawned so a synchronous SQLite query can be killed on a timeout.
- * The adapter looks for it beside its own module, which is the source
- * directory in development and `out/main` in a build — so this copy is what
- * makes the same lookup correct in both, with no environment check anywhere.
+ * They are deliberately not bundled. The SQLite probe is a separate process
+ * so a synchronous query can be killed on timeout. The Windows launcher is a
+ * native executable that owns the Job Object for managed inference runtimes.
+ * Their adapters look beside their own module: the source tree in development
+ * and `out/main` in a build. These copies make the lookup identical in both.
  */
-function copySqliteProbe(): Plugin {
-  const name = 'sqlite-probe.mjs';
+function copyMainProcessAssets(): Plugin {
   return {
-    name: 'agent-relay:copy-sqlite-probe',
+    name: 'agent-relay:copy-main-process-assets',
     closeBundle() {
       const destination = resolve(root, 'out/main');
       mkdirSync(destination, { recursive: true });
+      const name = 'sqlite-probe.mjs';
       copyFileSync(
         resolve(root, 'src/main/adapters/operations', name),
         resolve(destination, name)
       );
+      if (process.platform === 'win32') {
+        const launcher = 'agent-relay-windows-job.exe';
+        copyFileSync(
+          resolve(root, 'build/Release', launcher),
+          resolve(destination, launcher)
+        );
+      }
     }
   };
 }
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin(), copySqliteProbe()],
+    plugins: [externalizeDepsPlugin(), copyMainProcessAssets()],
     resolve: {
       alias: {
         '@shared': resolve(root, 'src/shared'),

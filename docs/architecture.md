@@ -297,6 +297,22 @@ Every child process in the application is created in exactly one place:
   write to, and the run ends as a timeout with no output and nothing to explain
   it. `runInteractive` is the only API that may keep stdin open.
 
+Long-lived local inference has an additional whole-tree containment contract.
+On POSIX it runs in a process group. On Windows, an Agent Relay-owned native
+launcher creates a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, creates
+the runtime suspended, assigns it to that job, and only then resumes it. The
+suspended start closes the race in which a runtime could create an uncontained
+helper before assignment. Descendants inherit the job, so containment survives
+the primary runtime crashing or detaching a helper. The launcher remains alive
+until the primary runtime has exited and the job is empty. Agent Relay requests
+an explicit stop by closing a private control pipe; the launcher terminates the
+job, observes it empty and only then exits, making that exit positive whole-tree
+evidence. If the supervisor or launcher crashes, kill-on-close still terminates
+the remaining members. The launcher is resolved only from Agent
+Relay's own build output or beside the bundled main process. If it is absent,
+launch fails before the configured runtime is created—there is no uncontained
+fallback and no PATH lookup.
+
 One narrow exception to "run once, collect output": `InteractiveProcessRunner`,
 implemented by the same class, keeps stdin open so a line-oriented protocol can
 be driven turn by turn. It exists because `codex app-server` starts shutting
@@ -1494,7 +1510,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1790 deterministic tests in 68 files, plus one routine automated Electron
+1791 deterministic tests in 68 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.

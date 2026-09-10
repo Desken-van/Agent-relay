@@ -74,17 +74,20 @@ Every action button carries a **blast-radius marker**:
 
 | | Needed for | Notes |
 |---|---|---|
-| **Node.js ≥ 22.13** | everything | Required for the built-in `node:sqlite` module |
+| **Node.js ≥ 22.22.2** | everything | Required by `node:sqlite` and the Windows native build toolchain |
 | **Git** | everything | Plus `user.name` / `user.email` before any commit |
 | **Codex** | specification + review | Ships with the app's dependencies; you only need to log in |
 | **Claude Code CLI** | implementation | `winget install --id Anthropic.ClaudeCode -e` |
 | **GitHub CLI (`gh`)** | publishing only | Optional — everything else works without it |
+| **Python + Visual Studio C++ Build Tools** | building from source on Windows | `npm install` uses `node-gyp` to build Agent Relay's Job Object launcher |
 
-The app **starts and stays usable when any of these are missing**, and tells you
-exactly what to install. It does not crash on a bare machine.
-
-There is **no native module and no compile step** — no Visual Studio Build
-Tools, no Python, no `node-gyp`.
+Optional provider tools may be absent: the app stays usable and tells you what
+to install. A source checkout on Windows does have one native build step. It
+builds Agent Relay's small process-containment launcher during `npm install`;
+the production bundle copies that executable beside the main-process bundle.
+The launcher contains managed local-inference runtimes in a Windows Job Object.
+If it is missing, local inference fails before starting a runtime rather than
+falling back to an uncontained process.
 
 ---
 
@@ -461,7 +464,7 @@ cancellation, interruption or changed inputs never grant a pass. There is no
 automatic retry. Current files are checked again before review and publishing.
 This is verification, not Coai review and not live acceptance of a model.
 
-Test suite: **1790 deterministic tests in 68 files, plus one automated Electron
+Test suite: **1791 deterministic tests in 68 files, plus one automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -624,7 +627,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1790 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              1791 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

@@ -4,6 +4,9 @@ dist/
 release/
 .vite/
 
+# node-gyp output for the Agent Relay-owned Windows Job Object launcher.
+build/
+
 # Visual Studio local workspace state and Copilot indexes
 .vs/
 *.log
