@@ -49,6 +49,8 @@ import type {
   TaskRepository
 } from '../ports';
 import { RunRecorder } from './run-recorder';
+import type { VerificationExecutor } from './worktree-verification';
+import { latestVerification, readVerification } from '../../shared/domain/verification';
 
 export interface PublishRequest {
   readonly taskId: string;
@@ -62,6 +64,7 @@ export interface PublishRequest {
 }
 
 export interface PublishServiceDeps {
+  readonly verification?: VerificationExecutor;
   readonly tasks: TaskRepository;
   readonly projects: ProjectRepository;
   readonly approvals: ApprovalRepository;
@@ -223,7 +226,14 @@ export class PublishService {
     // 4. Evidence gate: the latest implementation round has to have proved it
     //    verified the work. Deliberately after the approval is resolved, so the
     //    audit trail records what the user was asked and what came of it.
-    this.assertRoundPublishable(task);
+    const verification = latestVerification(this.deps.runs.listByTask(task.id));
+    if (verification) {
+      const record = readVerification(verification);
+      if (!record.success || !record.data.passed || verification.status !== 'succeeded' || !this.deps.verification ||
+        record.data.identity !== await this.deps.verification.identity({ task, project, settings: this.deps.settings.get() })) {
+        throw new AgentRelayError('VALIDATION_FAILED', 'Verification no longer covers the current files. Run verification and review again.');
+      }
+    } else this.assertRoundPublishable(task);
 
     const settings = this.deps.settings.get();
     const recorder = new RunRecorder(

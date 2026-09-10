@@ -16,6 +16,7 @@ export const TASK_STATUSES = [
   'SPECIFYING',
   'READY_FOR_IMPLEMENTATION',
   'IMPLEMENTING',
+  'VERIFYING',
   'READY_FOR_REVIEW',
   'REVIEWING',
   'CHANGES_REQUESTED',
@@ -30,6 +31,10 @@ export const TASK_STATUSES = [
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 export const WORKFLOW_EVENTS = [
+  'verification_started',
+  'verification_completed',
+  'verification_aborted',
+  'verification_invalidated',
   'specification_started',
   'specification_completed',
   'specification_failed',
@@ -68,6 +73,7 @@ export const TERMINAL_STATUSES: readonly TaskStatus[] = ['COMPLETED', 'FAILED', 
  * meaningful.
  */
 export const BUSY_STATUSES: readonly TaskStatus[] = [
+  'VERIFYING',
   'SPECIFYING',
   'IMPLEMENTING',
   'REVIEWING',
@@ -99,6 +105,7 @@ export const TRANSITIONS: TransitionTable = {
     cancelled: 'CANCELLED'
   },
   READY_FOR_IMPLEMENTATION: {
+    verification_started: 'VERIFYING',
     // Regenerating the spec (e.g. the user did not like it, or parsing failed).
     specification_retry: 'SPECIFYING',
     implementation_started: 'IMPLEMENTING',
@@ -115,6 +122,8 @@ export const TRANSITIONS: TransitionTable = {
     cancelled: 'CANCELLED'
   },
   READY_FOR_REVIEW: {
+    verification_started: 'VERIFYING',
+    verification_invalidated: 'READY_FOR_IMPLEMENTATION',
     review_started: 'REVIEWING',
     cancelled: 'CANCELLED'
   },
@@ -127,16 +136,19 @@ export const TRANSITIONS: TransitionTable = {
     cancelled: 'CANCELLED'
   },
   CHANGES_REQUESTED: {
+    verification_started: 'VERIFYING',
     corrections_sent: 'IMPLEMENTING',
     max_rounds_reached: 'FAILED',
     cancelled: 'CANCELLED'
   },
   APPROVED: {
+    verification_started: 'VERIFYING',
     // Requires an explicitly granted publishing approval; see `assertPublishable`.
     publish_approved: 'READY_TO_PUBLISH',
     cancelled: 'CANCELLED'
   },
   READY_TO_PUBLISH: {
+    verification_started: 'VERIFYING',
     publish_started: 'PUBLISHING',
     // Explicit "I'm done" without opening a pull request.
     publish_completed: 'COMPLETED',
@@ -159,6 +171,11 @@ export const TRANSITIONS: TransitionTable = {
     // A publish step that failed before changing anything remote (e.g. `gh` was
     // logged out) returns to the approved-to-publish state so it can be retried.
     publish_aborted: 'READY_TO_PUBLISH',
+    cancelled: 'CANCELLED'
+  },
+  VERIFYING: {
+    verification_completed: 'READY_FOR_REVIEW',
+    verification_aborted: 'READY_FOR_IMPLEMENTATION',
     cancelled: 'CANCELLED'
   },
   COMPLETED: {},
@@ -258,6 +275,7 @@ export function assertPublishable(
 
 /** Human-readable label used in the UI timeline. */
 export const STATUS_LABELS: Record<TaskStatus, string> = {
+  VERIFYING: 'Verifying existing code',
   DRAFT: 'Draft',
   SPECIFYING: 'Specifying',
   READY_FOR_IMPLEMENTATION: 'Ready for implementation',

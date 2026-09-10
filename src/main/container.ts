@@ -67,6 +67,7 @@ import { ToolDiagnosticsService } from './services/diagnostics-service';
 import { OperationsDiagnosticsService } from './services/operations-diagnostics-service';
 import { OperationsRegistry } from './services/operations-registry';
 import { Orchestrator } from './services/orchestrator';
+import { WorktreeVerification } from './services/worktree-verification';
 import { ProjectService } from './services/project-service';
 import { reconcileInterruptedWork, type ReconciliationPlan } from './services/startup-reconciliation';
 import { PublishService } from './services/publish-service';
@@ -330,6 +331,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   });
 
   const orchestrator = new Orchestrator({
+    verification: new WorktreeVerification(runner),
     projects,
     tasks,
     runs,
@@ -346,6 +348,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   });
 
   const publishService = new PublishService({
+    verification: new WorktreeVerification(runner),
     tasks,
     projects,
     approvals,

@@ -9,6 +9,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Run, RunEvent } from '@shared/domain/models';
+import { readVerification } from '@shared/domain/verification';
 import { call } from '../lib/api';
 import {
   readClaudeAssessment,
@@ -19,6 +20,7 @@ import { useStore } from '../state/store';
 import { agentTone, Empty } from './primitives';
 
 const RUN_LABELS: Record<Run['runType'], string> = {
+  verification: 'Verification · npm run verify',
   specification: 'Specification',
   implementation: 'Implementation',
   review: 'Review',
@@ -128,6 +130,10 @@ function RunStatusTag({ run }: { run: Run }): React.JSX.Element {
  * than being guessed at or thrown over.
  */
 function VerificationTag({ run }: { run: Run }): React.JSX.Element | null {
+  if (run.runType === 'verification') {
+    const record = readVerification(run);
+    return <span className={`tag tag--${record.success && record.data.passed ? 'ok' : 'warn'}`}>snapshot verification {record.success && record.data.passed ? 'passed' : 'unconfirmed'}</span>;
+  }
   const result = readClaudeAssessment(run.structuredResult);
   if (!result.ok) return null;
 
@@ -243,6 +249,7 @@ function RelayNodeBody({ run }: { run: Run }): React.JSX.Element {
 
   return (
     <div className="relay__body">
+      {run.runType === 'verification' ? <VerificationSummary run={run} /> : null}
       {run.finalMessage ? (
         <div className="relay__final selectable">{run.finalMessage}</div>
       ) : null}
@@ -277,4 +284,17 @@ function RelayNodeBody({ run }: { run: Run }): React.JSX.Element {
       )}
     </div>
   );
+}
+
+export function VerificationSummary({ run }: { run: Run }): React.JSX.Element | null {
+  const record = readVerification(run);
+  if (!record.success) return <div className="relay__final">No completed verification evidence. This does not prove a pass.</div>;
+  const value = record.data;
+  return <div className="relay__final selectable">
+    <div>Command: {value.command}</div>
+    <div>Exit: {value.exitCode ?? 'unknown'} · Duration: {value.durationMs} ms</div>
+    <div>Snapshot: {value.identity.slice(0, 16)}…</div>
+    <div>{value.reason ?? 'Passed for the recorded code snapshot.'}</div>
+    <div className="hint">Historical result. Current files are checked again before review and publishing.</div>
+  </div>;
 }

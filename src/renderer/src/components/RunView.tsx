@@ -15,6 +15,32 @@ import { codexModelLabel } from './TasksView';
 import { Card, Empty, Field, Notice, Rounds, Scope, Spinner, StatusBadge } from './primitives';
 import { RelayTimeline } from './RelayTimeline';
 
+export function VerificationControls({ task, busy, onChanged }: { task: Task; busy: boolean; onChanged: () => Promise<void> }): React.JSX.Element {
+  const claim = useRef(false);
+  const [pending, setPending] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const disabled = busy || pending || !task.worktreePath || !task.specificationApprovedAt ||
+    !['READY_FOR_IMPLEMENTATION', 'READY_FOR_REVIEW', 'CHANGES_REQUESTED', 'APPROVED', 'READY_TO_PUBLISH'].includes(task.status);
+  return <div className="stack">
+    <button type="button" className="btn btn--wide" disabled={disabled} onClick={() => {
+      if (claim.current) return;
+      claim.current = true; setPending(true); setMessage(null);
+      void (async () => {
+        try {
+          const result = await expect('workflow:verify', { taskId: task.id });
+          setMessage(result.status === 'READY_FOR_REVIEW' ? 'Verification passed — Run review is available.' : 'Verification did not pass. See Timeline for commands and errors.');
+        } catch (error) { setMessage(error instanceof Error ? error.message : 'Verification outcome could not be confirmed. Refresh the task before retrying.'); }
+        finally {
+          try { await onChanged(); } catch { setMessage('Could not refresh task state. Refresh before retrying.'); }
+          claim.current = false; setPending(false);
+        }
+      })();
+    }}>{pending ? <Spinner /> : <Scope kind="local" />} Run verification</button>
+    <p className="hint">Runs npm run verify in the existing worktree. No AI implementation. Project scripts may write build/test files. Results appear in Timeline; changed code requires verification again.</p>
+    {message ? <Notice tone="info">{message}</Notice> : null}
+  </div>;
+}
+
 export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: boolean; onChanged: () => Promise<void> }): React.JSX.Element {
   const [implementation, setImplementation] = useState<ExecutionProvider | null>(null);
   const [review, setReview] = useState<ExecutionProvider | null>(null);
@@ -329,6 +355,7 @@ export function RunView(): React.JSX.Element {
             </button>
 
             <div className="actions__legend">Writes local files</div>
+            <VerificationControls key={task.id} task={task} busy={anyBusy || running} onChanged={() => refreshDetail(task.id)} />
             <button
               type="button"
               className="btn btn--claude btn--wide"

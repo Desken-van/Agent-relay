@@ -108,6 +108,7 @@ export interface InterruptedWork {
 
 /** The abort event each busy status is recovered with. */
 const RECOVERY_EVENTS: Partial<Record<TaskStatus, WorkflowEvent>> = {
+  VERIFYING: 'verification_aborted',
   SPECIFYING: 'specification_aborted',
   REVIEWING: 'review_aborted',
   PUBLISHING: 'publish_aborted'
