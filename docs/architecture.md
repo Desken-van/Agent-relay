@@ -1555,7 +1555,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1824 deterministic tests in 70 files, plus one routine automated Electron
+1848 deterministic tests in 75 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.
