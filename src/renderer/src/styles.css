@@ -403,6 +403,18 @@ pre,
   border-color: #ffb87e;
 }
 
+.btn--recommended {
+  background: var(--system);
+  border-color: var(--system);
+  color: #071b18;
+  box-shadow: 0 0 0 3px rgba(86, 212, 192, 0.13);
+}
+
+.btn--recommended:hover:not(:disabled) {
+  background: #78e4d3;
+  border-color: #78e4d3;
+}
+
 .btn--danger {
   background: transparent;
   border-color: #6b3030;
@@ -1316,6 +1328,137 @@ pre,
   text-transform: uppercase;
   color: var(--text-faint);
   margin: 6px 0 1px;
+}
+
+/* The workflow guide makes the action rail read as a process, not a button tray. */
+.run-guide {
+  margin: -16px -16px 16px;
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
+  background: #111722;
+}
+
+.run-guide--error {
+  background: rgba(248, 113, 113, 0.055);
+}
+
+.run-guide--warning {
+  background: rgba(251, 191, 36, 0.045);
+}
+
+.run-guide--success {
+  background: rgba(74, 222, 128, 0.04);
+}
+
+.run-steps {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0;
+  padding: 0;
+  margin: 0 0 16px;
+  list-style: none;
+}
+
+.run-step {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-faint);
+  font-size: 10px;
+  text-align: center;
+}
+
+.run-step:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  top: 10px;
+  left: calc(50% + 12px);
+  width: calc(100% - 24px);
+  height: 1px;
+  background: var(--border-strong);
+}
+
+.run-step__mark {
+  z-index: 1;
+  display: grid;
+  width: 21px;
+  height: 21px;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--panel);
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.run-step--done,
+.run-step--current {
+  color: var(--text);
+}
+
+.run-step--done .run-step__mark {
+  border-color: var(--system-dim);
+  color: var(--system);
+}
+
+.run-step--current .run-step__mark {
+  border-color: var(--system);
+  background: var(--system);
+  color: #071b18;
+  box-shadow: 0 0 0 3px rgba(86, 212, 192, 0.12);
+}
+
+.run-guide__facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.run-guide__facts > div {
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(20, 24, 36, 0.72);
+}
+
+.run-guide__facts dt {
+  margin-bottom: 3px;
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.run-guide__facts dd {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.run-guide__facts .run-guide__next {
+  border-color: var(--system-dim);
+  background: rgba(86, 212, 192, 0.07);
+}
+
+.run-guide__next dd {
+  color: var(--text);
+  font-weight: 600;
+}
+
+@media (max-width: 560px) {
+  .run-guide__facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .run-step {
+    font-size: 0;
+  }
 }
 
 .legend {

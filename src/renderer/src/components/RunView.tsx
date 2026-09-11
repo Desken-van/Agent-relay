@@ -4,6 +4,7 @@ import { canChangeProviders, providerLabel, type ExecutionProvider } from '@shar
 import type { GitChangeSet } from '@shared/domain/git';
 import type { ApprovalAction, Task } from '@shared/domain/models';
 import type { PlanReviewDecision } from '@shared/domain/plan-review';
+import { runGuidance, type RunAction, type RunGuidance } from '@shared/domain/run-guidance';
 import { isBusy } from '@shared/domain/workflow';
 import type { PlanReviewDetail, PublishConfirmation } from '@shared/ipc';
 import type { CodexReviewResult, FindingSeverity, TaskSpecification } from '@shared/schemas/codex';
@@ -15,14 +16,40 @@ import { codexModelLabel } from './TasksView';
 import { Card, Empty, Field, Notice, Rounds, Scope, Spinner, StatusBadge } from './primitives';
 import { RelayTimeline } from './RelayTimeline';
 
-export function VerificationControls({ task, busy, onChanged }: { task: Task; busy: boolean; onChanged: () => Promise<void> }): React.JSX.Element {
+function recommendedClass(action: RunAction, guidance: RunGuidance): string {
+  return action === guidance.recommendedAction ? ' btn--recommended' : '';
+}
+
+const FLOW_STEPS = ['Specification', 'Implementation', 'Verification', 'Review', 'Publish'] as const;
+
+export function RunFlowOverview({ guidance }: { guidance: RunGuidance }): React.JSX.Element {
+  return <section className={`run-guide run-guide--${guidance.tone}`} aria-label="Run progress and next action">
+    <ol className="run-steps" aria-label="Task workflow">
+      {FLOW_STEPS.map((step, index) => {
+        const state = guidance.activeStep > index ? 'done' : guidance.activeStep === index ? 'current' : 'upcoming';
+        return <li key={step} className={`run-step run-step--${state}`} aria-current={state === 'current' ? 'step' : undefined}>
+          <span className="run-step__mark">{state === 'done' ? '✓' : index + 1}</span>
+          <span>{step}</span>
+        </li>;
+      })}
+    </ol>
+    <dl className="run-guide__facts">
+      <div><dt>What happened</dt><dd>{guidance.happened}</dd></div>
+      <div><dt>Current stage</dt><dd>{guidance.stage}</dd></div>
+      <div><dt>Result</dt><dd>{guidance.result}</dd></div>
+      <div className="run-guide__next"><dt>Next action</dt><dd>{guidance.next}</dd></div>
+    </dl>
+  </section>;
+}
+
+export function VerificationControls({ task, busy, onChanged, guidance }: { task: Task; busy: boolean; onChanged: () => Promise<void>; guidance?: RunGuidance }): React.JSX.Element {
   const claim = useRef(false);
   const [pending, setPending] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const disabled = busy || pending || !task.worktreePath || !task.specificationApprovedAt ||
     !['READY_FOR_IMPLEMENTATION', 'READY_FOR_REVIEW', 'CHANGES_REQUESTED', 'APPROVED', 'READY_TO_PUBLISH'].includes(task.status);
   return <div className="stack">
-    <button type="button" className="btn btn--wide" disabled={disabled} onClick={() => {
+    <button type="button" className={`btn btn--wide${guidance ? recommendedClass('run_verification', guidance) : ''}`} disabled={disabled} onClick={() => {
       if (claim.current) return;
       claim.current = true; setPending(true); setMessage(null);
       void (async () => {
@@ -145,6 +172,12 @@ export function RunView(): React.JSX.Element {
   }
 
   const { task, project, specification, lastReview } = detail;
+  const guidance = runGuidance(
+    task,
+    detail.runs,
+    specification !== null,
+    correction.kind === 'retry_verification' && correction.enabled
+  );
   const running = isBusy(task.status);
   const anyBusy = Object.values(busy).some(Boolean);
 
@@ -297,13 +330,14 @@ export function RunView(): React.JSX.Element {
       {/* ------------------------------ right ------------------------------- */}
       <div className="stack">
         <Card title="Actions">
+          <RunFlowOverview guidance={guidance} />
           <ProviderControls key={task.id} task={task} busy={anyBusy || running}
             onChanged={() => refreshDetail(task.id)} />
           <div className="actions">
             <div className="actions__legend">Read-only</div>
             <button
               type="button"
-              className="btn btn--primary btn--wide"
+              className={`btn btn--wide${recommendedClass('generate_specification', guidance)}`}
               disabled={anyBusy || running || !canGenerateSpec(task.status)}
               onClick={() =>
                 void perform('spec', 'Specification failed', async () => {
@@ -319,7 +353,7 @@ export function RunView(): React.JSX.Element {
 
             <button
               type="button"
-              className="btn btn--wide"
+              className={`btn btn--wide${recommendedClass('approve_specification', guidance)}`}
               disabled={
                 anyBusy ||
                 running ||
@@ -341,7 +375,7 @@ export function RunView(): React.JSX.Element {
 
             <button
               type="button"
-              className="btn btn--wide"
+              className={`btn btn--wide${recommendedClass('run_review', guidance)}`}
               disabled={anyBusy || running || task.status !== 'READY_FOR_REVIEW'}
               onClick={() =>
                 void perform('review', 'Review failed', async () => {
@@ -355,10 +389,10 @@ export function RunView(): React.JSX.Element {
             </button>
 
             <div className="actions__legend">Writes local files</div>
-            <VerificationControls key={task.id} task={task} busy={anyBusy || running} onChanged={() => refreshDetail(task.id)} />
+            <VerificationControls key={task.id} task={task} busy={anyBusy || running} guidance={guidance} onChanged={() => refreshDetail(task.id)} />
             <button
               type="button"
-              className="btn btn--claude btn--wide"
+              className={`btn btn--wide${recommendedClass('run_implementation', guidance)}`}
               disabled={
                 anyBusy ||
                 running ||
@@ -372,7 +406,7 @@ export function RunView(): React.JSX.Element {
 
             <button
               type="button"
-              className="btn btn--claude btn--wide"
+              className={`btn btn--wide${recommendedClass('send_corrections', guidance)}`}
               disabled={anyBusy || running || !correction.enabled}
               title={correction.disabledReason ?? undefined}
               onClick={() =>
@@ -404,7 +438,7 @@ export function RunView(): React.JSX.Element {
 
             <button
               type="button"
-              className="btn btn--wide"
+              className={`btn btn--wide${recommendedClass('approve_publishing', guidance)}`}
               disabled={anyBusy || task.status !== 'APPROVED'}
               onClick={() =>
                 void perform('approve-publish', 'Could not approve for publishing', async () => {
