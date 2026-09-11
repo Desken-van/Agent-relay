@@ -4,6 +4,7 @@ import { defaultSettings } from '../../src/main/container';
 import { COAI_TOOL_ALLOWLIST } from '../../src/main/adapters/mcp/coai-plan-reviewer';
 import {
   assertExternalPlanReviewSettings,
+  COAI_MCP_TIMEOUT_MAX_MS,
   configuredRuleSources,
   externalPlanReviewConfig
 } from '../../src/main/services/plan-review-configuration';
@@ -106,6 +107,16 @@ describe('external plan-review settings', () => {
     });
     expect(config).not.toHaveProperty('shell');
     expect(config).not.toHaveProperty('env');
+  });
+
+  it('caps MCP calls without shortening the timeout stored for long agent runs', () => {
+    const longAgentTimeout = 90 * 60_000;
+    const long = enabled({ processTimeoutMs: longAgentTimeout });
+    expect(long.processTimeoutMs).toBe(longAgentTimeout);
+    expect(externalPlanReviewConfig(long).timeoutMs).toBe(COAI_MCP_TIMEOUT_MAX_MS);
+
+    const short = enabled({ processTimeoutMs: 5 * 60_000 });
+    expect(externalPlanReviewConfig(short).timeoutMs).toBe(short.processTimeoutMs);
   });
 
   it('binds project rules plus the exact clean conventions revision', () => {

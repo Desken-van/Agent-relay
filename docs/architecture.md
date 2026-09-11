@@ -408,7 +408,10 @@ workflow. Once evidence is bound, the gate is mandatory and cannot be bypassed
 by the normal Approve or implementation entry points. Settings persist an
 explicit MCP executable, fixed argument vector, optional working directory and
 an exact clean conventions revision; authentication remains owned by the MCP
-server. The renderer can only name a task, acknowledge a dirty checkout, or
+server. Agent execution keeps the operator-selected process timeout, while the
+shared Coai server configuration caps MCP calls at the transport's independent
+30-minute ceiling; raising the former cannot make the latter invalid. The
+renderer can only name a task, acknowledge a dirty checkout, or
 submit typed finding decisions. It cannot supply executable paths, rule bytes,
 repository roots or prompts through the operational IPC channels.
 
@@ -1512,7 +1515,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1816 deterministic tests in 70 files, plus one routine automated Electron
+1817 deterministic tests in 70 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.

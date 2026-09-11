@@ -142,6 +142,13 @@ export const COAI_MCP_CAPACITY = {
 } as const;
 
 /**
+ * The stdio MCP boundary deliberately refuses longer calls. Agent execution
+ * may need a much larger budget, so the shared process timeout is capped here
+ * instead of making those two independent workloads impossible to configure.
+ */
+export const COAI_MCP_TIMEOUT_MAX_MS = 30 * 60_000;
+
+/**
  * Everything the two gates share, built once from trusted settings.
  *
  * They differ in exactly two things: the `id` their transport is filed under,
@@ -167,7 +174,7 @@ export function coaiServerConfig(
       ? {}
       : { cwd: settings.coaiMcpWorkingDirectory }),
     allowedTools: coaiToolProfile(settings),
-    timeoutMs: settings.processTimeoutMs,
+    timeoutMs: Math.min(settings.processTimeoutMs, COAI_MCP_TIMEOUT_MAX_MS),
     ...COAI_MCP_CAPACITY
   };
 }

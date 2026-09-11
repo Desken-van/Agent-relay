@@ -20,6 +20,7 @@ import {
 import { CoaiPlanReviewer } from '../../src/main/adapters/mcp/coai-plan-reviewer';
 import {
   COAI_MCP_CAPACITY,
+  COAI_MCP_TIMEOUT_MAX_MS,
   externalPlanReviewConfig
 } from '../../src/main/services/plan-review-configuration';
 import { defaultSettings } from '../../src/main/container';
@@ -284,7 +285,8 @@ describe('the two gates describe one server', () => {
     const value = settings({
       externalPlanReviewEnabled: true,
       externalCodeReviewEnabled: true,
-      coaiMcpWorkingDirectory: 'C:/work'
+      coaiMcpWorkingDirectory: 'C:/work',
+      processTimeoutMs: 90 * 60_000
     });
 
     const plan = externalPlanReviewConfig(value);
@@ -302,7 +304,7 @@ describe('the two gates describe one server', () => {
       expect(config.maxMessageBytes).toBe(COAI_MCP_CAPACITY.maxMessageBytes);
       expect(config.maxContentBytes).toBe(COAI_MCP_CAPACITY.maxContentBytes);
       expect(config.maxContentBlocks).toBe(COAI_MCP_CAPACITY.maxContentBlocks);
-      expect(config.timeoutMs).toBe(value.processTimeoutMs);
+      expect(config.timeoutMs).toBe(COAI_MCP_TIMEOUT_MAX_MS);
       expect(config.executablePath).toBe(value.coaiMcpExecutablePath);
       expect(config.args).toEqual(value.coaiMcpArguments);
       expect(config.cwd).toBe('C:/work');
