@@ -1216,6 +1216,15 @@ export interface LocalInferenceProvider {
   stop(): Promise<LocalInferenceState>;
 }
 
+/** The lifecycle-only surface exposed by LOCAL-B1. Inference stays internal. */
+export interface LocalInferenceLifecycleService {
+  capabilities(): Promise<LocalInferenceCapabilities>;
+  start(): Promise<LocalInferenceState>;
+  state(): LocalInferenceState;
+  health(): Promise<LocalInferenceState>;
+  stop(): Promise<LocalInferenceState>;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Rule evidence                                                              */
 /* -------------------------------------------------------------------------- */

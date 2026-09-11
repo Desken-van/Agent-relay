@@ -1,0 +1,336 @@
+import { describe, expect, it } from 'vitest';
+import type { LocalInferenceProvider, SettingsRepository } from '../../src/main/ports';
+import {
+  assembleLocalInferenceConfig,
+  LOCAL_INFERENCE_APPLICATION_LIMITS,
+  LOCAL_INFERENCE_PROVIDER_ID,
+  LocalInferenceService
+} from '../../src/main/services/local-inference-service';
+import { defaultSettings } from '../../src/main/container';
+import {
+  LOCAL_INFERENCE_CONTRACT_VERSION,
+  LOCAL_INFERENCE_LIMITS,
+  LOCAL_INFERENCE_PROTOCOL,
+  type LocalInferenceCapabilities,
+  type LocalInferenceOutcome,
+  type LocalInferenceRequest,
+  type LocalInferenceState
+} from '../../src/shared/domain/local-inference';
+import type { Settings } from '../../src/shared/domain/models';
+
+class MutableSettings implements SettingsRepository {
+  value = defaultSettings({ dataDir: 'C:\\data', documentsDir: 'C:\\docs' });
+
+  get(): Settings {
+    return this.value;
+  }
+
+  update(patch: Partial<Settings>): Settings {
+    this.value = { ...this.value, ...patch };
+    return this.value;
+  }
+}
+
+class StubProvider implements LocalInferenceProvider {
+  current: LocalInferenceState = { kind: 'stopped' };
+  capabilityCalls = 0;
+  healthCalls = 0;
+  stopCalls = 0;
+  launches = 0;
+  stopAttempts = 0;
+  ownedProcess = false;
+  stopResult: LocalInferenceState = { kind: 'stopped' };
+  startGate: Promise<void> | null = null;
+  stopGate: Promise<void> | null = null;
+  private stopping: Promise<LocalInferenceState> | null = null;
+
+  state(): LocalInferenceState {
+    return this.current;
+  }
+
+  async capabilities(): Promise<LocalInferenceCapabilities> {
+    this.capabilityCalls += 1;
+    return {
+      protocol: LOCAL_INFERENCE_PROTOCOL,
+      contractVersion: LOCAL_INFERENCE_CONTRACT_VERSION,
+      providerId: LOCAL_INFERENCE_PROVIDER_ID,
+      modelId: 'local-model',
+      available: true,
+      unavailableReason: null,
+      executableSource: 'path',
+      runtimeVersion: 'fake-1',
+      supportsChatCompletions: true,
+      supportsStreaming: false,
+      supportsUsageWhenReported: true,
+      supportsChatTemplateParameters: true,
+      inferenceVerified: false
+    };
+  }
+
+  async start(): Promise<LocalInferenceState> {
+    if (this.current.kind !== 'stopped') throw new Error('start is not legal now');
+    this.current = { kind: 'starting', runtimeInstanceId: 'runtime-1' };
+    this.launches += 1;
+    this.ownedProcess = true;
+    if (this.startGate !== null) await this.startGate;
+    if (this.state().kind === 'stopped') return this.current;
+    this.current = { kind: 'healthy', runtimeInstanceId: 'runtime-1' };
+    return this.current;
+  }
+
+  async health(): Promise<LocalInferenceState> {
+    this.healthCalls += 1;
+    if (this.current.kind !== 'healthy') throw new Error('health is not legal now');
+    return this.current;
+  }
+
+  async infer(_request: LocalInferenceRequest): Promise<LocalInferenceOutcome> {
+    throw new Error('LOCAL-B1 does not call infer');
+  }
+
+  stop(): Promise<LocalInferenceState> {
+    this.stopCalls += 1;
+    if (this.stopping === null) {
+      this.stopping = this.attemptStop().finally(() => {
+        this.stopping = null;
+      });
+    }
+    return this.stopping;
+  }
+
+  private async attemptStop(): Promise<LocalInferenceState> {
+    this.stopAttempts += 1;
+    if (this.stopGate !== null) await this.stopGate;
+    this.current = this.stopResult;
+    if (this.current.kind === 'stopped') this.ownedProcess = false;
+    return this.current;
+  }
+}
+
+class HealthCleanupProvider extends StubProvider {
+  cleanupStarts = 0;
+  releaseCleanup!: () => void;
+  private cleanup: Promise<LocalInferenceState> | null = null;
+
+  constructor() {
+    super();
+    this.current = { kind: 'healthy', runtimeInstanceId: 'runtime-1' };
+  }
+
+  override health(): Promise<LocalInferenceState> {
+    this.healthCalls += 1;
+    if (this.current.kind !== 'healthy') return Promise.reject(new Error('health is not legal now'));
+    if (this.cleanup === null) {
+      this.cleanupStarts += 1;
+      this.cleanup = new Promise<void>((resolve) => {
+        this.releaseCleanup = resolve;
+      }).then(() => {
+        this.current = {
+          kind: 'failed',
+          reason: 'The runtime tree could not be confirmed stopped.'
+        };
+        return this.current;
+      });
+    }
+    return this.cleanup;
+  }
+
+  override stop(): Promise<LocalInferenceState> {
+    this.stopCalls += 1;
+    return this.cleanup ?? Promise.reject(new Error('health cleanup was not started'));
+  }
+}
+
+describe('local inference configuration assembly', () => {
+  it('maps only persisted fields and supplies bounded application policy', () => {
+    const settings = new MutableSettings().get().localInference;
+    const config = assembleLocalInferenceConfig({ ...settings, contextLimitTokens: 8 });
+
+    expect(config.providerId).toBe('local-llama-cpp');
+    expect(config).not.toHaveProperty('workingDirectory');
+    expect(config.maxOutputTokens).toBe(8);
+    expect(config.executable).toEqual(settings.executable);
+    expect(config.model).toEqual(settings.model);
+    expect(config.fixedArguments).toEqual(settings.fixedArguments);
+    expect(config.port).toBe(settings.port);
+    expect(config.startupTimeoutMs).toBe(settings.startupTimeoutMs);
+    expect(config.healthTimeoutMs).toBe(settings.healthTimeoutMs);
+    expect(config.inferenceTimeoutMs).toBe(settings.inferenceTimeoutMs);
+    expect(config.shutdownTimeoutMs).toBe(settings.shutdownTimeoutMs);
+    expect(config.maxPromptBytes).toBe(LOCAL_INFERENCE_APPLICATION_LIMITS.maxPromptBytes);
+    expect(config.maxOutputTokens).toBeLessThanOrEqual(config.contextLimitTokens);
+    expect(config.maxPromptBytes).toBeLessThanOrEqual(LOCAL_INFERENCE_LIMITS.promptBytesMax);
+    expect(config.maxRequestBytes).toBeLessThanOrEqual(LOCAL_INFERENCE_LIMITS.requestBytesMax);
+    expect(config.maxResponseBytes).toBeLessThanOrEqual(LOCAL_INFERENCE_LIMITS.responseBytesMax);
+    expect(config.maxCompletionBytes).toBeLessThanOrEqual(LOCAL_INFERENCE_LIMITS.completionBytesMax);
+    expect(config.maxProcessOutputBytes).toBeLessThanOrEqual(
+      LOCAL_INFERENCE_LIMITS.processOutputBytesMax
+    );
+  });
+});
+
+describe('LocalInferenceService ownership and lifecycle delegation', () => {
+  it('is passive for state reads and delegates all explicit operations to one provider', async () => {
+    const settings = new MutableSettings();
+    const providers: StubProvider[] = [];
+    const service = new LocalInferenceService({
+      settings,
+      createProvider: () => {
+        const provider = new StubProvider();
+        providers.push(provider);
+        return provider;
+      }
+    });
+
+    expect(service.state()).toEqual({ kind: 'stopped' });
+    expect(providers).toHaveLength(0);
+    await service.capabilities();
+    await service.start();
+    expect(service.state().kind).toBe('healthy');
+    await service.health();
+    await service.stop();
+    expect(providers).toHaveLength(1);
+    expect(providers[0]?.capabilityCalls).toBe(1);
+    expect(providers[0]?.healthCalls).toBe(1);
+    expect(providers[0]?.stopCalls).toBe(1);
+  });
+
+  it('binds simultaneous starts to one provider so only one runtime can launch', async () => {
+    const settings = new MutableSettings();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const provider = new StubProvider();
+    provider.startGate = gate;
+    let constructions = 0;
+    const service = new LocalInferenceService({
+      settings,
+      createProvider: () => { constructions += 1; return provider; }
+    });
+
+    const first = service.start();
+    const second = service.start();
+    await Promise.resolve();
+    expect(provider.launches).toBe(1);
+    release();
+    const results = await Promise.allSettled([first, second]);
+    expect(results.map((result) => result.status)).toEqual(['fulfilled', 'rejected']);
+    expect(constructions).toBe(1);
+    expect(provider.launches).toBe(1);
+    await service.stop();
+  });
+
+  it('delegates stop during blocked startup before startup is released', async () => {
+    const settings = new MutableSettings();
+    let release!: () => void;
+    const provider = new StubProvider();
+    provider.startGate = new Promise<void>((resolve) => { release = resolve; });
+    const service = new LocalInferenceService({ settings, createProvider: () => provider });
+
+    const starting = service.start();
+    const stopping = service.stop();
+    await Promise.resolve();
+    expect(provider.stopCalls).toBe(1);
+    expect(await stopping).toEqual({ kind: 'stopped' });
+    expect(provider.ownedProcess).toBe(false);
+    release();
+    expect(await starting).toEqual({ kind: 'stopped' });
+  });
+
+  it('delegates concurrent stops to the same provider cleanup', async () => {
+    const settings = new MutableSettings();
+    let release!: () => void;
+    const provider = new StubProvider();
+    provider.stopGate = new Promise<void>((resolve) => { release = resolve; });
+    const service = new LocalInferenceService({ settings, createProvider: () => provider });
+    await service.start();
+
+    const first = service.stop();
+    const second = service.stop();
+    expect(provider.stopCalls).toBe(2);
+    expect(provider.stopAttempts).toBe(1);
+    release();
+    await expect(first).resolves.toEqual({ kind: 'stopped' });
+    await expect(second).resolves.toEqual({ kind: 'stopped' });
+    expect(provider.stopAttempts).toBe(1);
+    expect(service.state()).toEqual({ kind: 'stopped' });
+  });
+
+  it('does not defer health transition validation while startup is blocked', async () => {
+    const settings = new MutableSettings();
+    let release!: () => void;
+    const provider = new StubProvider();
+    provider.startGate = new Promise<void>((resolve) => { release = resolve; });
+    const service = new LocalInferenceService({ settings, createProvider: () => provider });
+
+    const starting = service.start();
+    await expect(service.health()).rejects.toThrow('health is not legal now');
+    expect(provider.healthCalls).toBe(1);
+    const stopping = service.stop();
+    await expect(stopping).resolves.toEqual({ kind: 'stopped' });
+    release();
+    await expect(starting).resolves.toEqual({ kind: 'stopped' });
+  });
+
+  it('routes stop to an in-flight health cleanup and retains uncertain ownership', async () => {
+    const settings = new MutableSettings();
+    const provider = new HealthCleanupProvider();
+    let constructions = 0;
+    const service = new LocalInferenceService({
+      settings,
+      createProvider: () => { constructions += 1; return provider; }
+    });
+
+    const health = service.health();
+    const stopping = service.stop();
+    expect(provider.cleanupStarts).toBe(1);
+    expect(provider.stopCalls).toBe(1);
+    provider.releaseCleanup();
+    await expect(health).resolves.toMatchObject({ kind: 'failed' });
+    await expect(stopping).resolves.toMatchObject({ kind: 'failed' });
+    settings.update({ localInference: { ...settings.get().localInference, port: 19092 } });
+    await service.capabilities();
+    expect(constructions).toBe(1);
+  });
+
+  it('defers changed settings until a confirmed stop releases the provider', async () => {
+    const settings = new MutableSettings();
+    const configs: number[] = [];
+    const providers: StubProvider[] = [];
+    const service = new LocalInferenceService({
+      settings,
+      createProvider: (config) => {
+        configs.push(config.port);
+        const provider = new StubProvider();
+        providers.push(provider);
+        return provider;
+      }
+    });
+
+    await service.start();
+    settings.update({ localInference: { ...settings.get().localInference, port: 19090 } });
+    await service.capabilities();
+    expect(configs).toEqual([8080]);
+    expect(providers[0]?.capabilityCalls).toBe(1);
+    await service.stop();
+    await service.capabilities();
+    expect(configs).toEqual([8080, 19090]);
+  });
+
+  it('retains the owning provider when cleanup is not confirmed', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    provider.stopResult = { kind: 'failed', reason: 'The runtime tree could not be confirmed stopped.' };
+    let constructions = 0;
+    const service = new LocalInferenceService({
+      settings,
+      createProvider: () => { constructions += 1; return provider; }
+    });
+    await service.start();
+    settings.update({ localInference: { ...settings.get().localInference, port: 19091 } });
+
+    expect((await service.stop()).kind).toBe('failed');
+    await service.capabilities();
+    expect(constructions).toBe(1);
+    expect(provider.capabilityCalls).toBe(1);
+  });
+});

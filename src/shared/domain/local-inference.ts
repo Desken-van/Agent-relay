@@ -387,6 +387,67 @@ export type ChatTemplateParameters = z.infer<typeof chatTemplateParametersSchema
 /* Configuration                                                               */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The operator-owned, durable part of the local-inference configuration.
+ *
+ * Process policy (provider identity, working directory and all output/body
+ * ceilings) is intentionally absent. The main process supplies those trusted
+ * values when it assembles a complete {@link LocalInferenceConfig}.
+ */
+export const localInferenceSettingsSchema = z
+  .object({
+    version: z.literal(LOCAL_INFERENCE_CONTRACT_VERSION),
+    executable: localInferenceExecutableSchema,
+    model: localInferenceModelSchema,
+    fixedArguments: z
+      .array(fixedArgumentSchema)
+      .max(
+        LOCAL_INFERENCE_LIMITS.fixedArgumentsMax,
+        `At most ${LOCAL_INFERENCE_LIMITS.fixedArgumentsMax} fixed runtime arguments may be supplied.`
+      ),
+    port: z
+      .number()
+      .int('A port must be a whole number.')
+      .min(1, 'A port must be between 1 and 65535.')
+      .max(65535, 'A port must be between 1 and 65535.'),
+    contextLimitTokens: boundedInt(LOCAL_INFERENCE_LIMITS.contextTokensMax, 'The context limit'),
+    startupTimeoutMs: boundedInt(
+      LOCAL_INFERENCE_LIMITS.startupTimeoutMsMax,
+      'The startup timeout'
+    ),
+    healthTimeoutMs: boundedInt(LOCAL_INFERENCE_LIMITS.healthTimeoutMsMax, 'The health timeout'),
+    inferenceTimeoutMs: boundedInt(
+      LOCAL_INFERENCE_LIMITS.inferenceTimeoutMsMax,
+      'The inference timeout'
+    ),
+    shutdownTimeoutMs: boundedInt(
+      LOCAL_INFERENCE_LIMITS.shutdownTimeoutMsMax,
+      'The shutdown timeout'
+    )
+  })
+  .strict();
+
+export type LocalInferenceSettings = z.infer<typeof localInferenceSettingsSchema>;
+
+/** A fresh shipped default; callers may safely mutate their own copy. */
+export function defaultLocalInferenceSettings(): LocalInferenceSettings {
+  return {
+    version: LOCAL_INFERENCE_CONTRACT_VERSION,
+    executable: { kind: 'discovered', command: LLAMA_SERVER_COMMAND },
+    model: {
+      id: 'local-model',
+      source: { kind: 'runtime_id', runtimeModelId: 'local-model' }
+    },
+    fixedArguments: [],
+    port: 8080,
+    contextLimitTokens: 4096,
+    startupTimeoutMs: 600_000,
+    healthTimeoutMs: 60_000,
+    inferenceTimeoutMs: 1_800_000,
+    shutdownTimeoutMs: 60_000
+  };
+}
+
 export const localInferenceConfigSchema = z
   .object({
     version: z.literal(LOCAL_INFERENCE_CONTRACT_VERSION),

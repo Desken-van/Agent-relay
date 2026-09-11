@@ -8,6 +8,7 @@
  */
 
 import type { SqliteDatabase } from './sqlite';
+import { defaultLocalInferenceSettings } from '../../shared/domain/local-inference';
 
 export interface Migration {
   readonly version: number;
@@ -598,6 +599,16 @@ export const MIGRATIONS: readonly Migration[] = [
           PRIMARY KEY(task_id, revision)
         );
       `);
+    }
+  },
+  {
+    version: 9,
+    name: 'local-inference-settings',
+    up(db) {
+      db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)').run(
+        'localInference',
+        JSON.stringify(defaultLocalInferenceSettings())
+      );
     }
   }
 ];

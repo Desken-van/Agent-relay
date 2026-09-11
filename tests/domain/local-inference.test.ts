@@ -13,14 +13,17 @@ import {
   allowedLocalInferenceEvents,
   canLocalInferenceTransition,
   chatTemplateParametersSchema,
+  defaultLocalInferenceSettings,
   isReservedRuntimeFlag,
   LOCAL_INFERENCE_CONTRACT_VERSION,
   LOCAL_INFERENCE_EVENTS,
   LOCAL_INFERENCE_HOST,
+  LOCAL_INFERENCE_LIMITS,
   LOCAL_INFERENCE_PROTOCOL,
   LOCAL_INFERENCE_STATE_KINDS,
   LOCAL_INFERENCE_TRANSITIONS,
   localInferenceConfigSchema,
+  localInferenceSettingsSchema,
   localInferenceOutcomeSchema,
   localInferenceRequestSchema,
   localInferenceResponseSchema,
@@ -231,6 +234,106 @@ describe('local inference configuration', () => {
     ]) {
       expect(localInferenceConfigSchema.safeParse(config(patch)).success).toBe(false);
     }
+  });
+});
+
+describe('persisted local inference settings', () => {
+  const persisted = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    ...defaultLocalInferenceSettings(),
+    ...overrides
+  });
+
+  it('ships a fresh, harmless version-1 runtime-id default', () => {
+    const first = defaultLocalInferenceSettings();
+    const second = defaultLocalInferenceSettings();
+    expect(first).toEqual({
+      version: 1,
+      executable: { kind: 'discovered', command: 'llama-server' },
+      model: {
+        id: 'local-model',
+        source: { kind: 'runtime_id', runtimeModelId: 'local-model' }
+      },
+      fixedArguments: [],
+      port: 8080,
+      contextLimitTokens: 4096,
+      startupTimeoutMs: 600_000,
+      healthTimeoutMs: 60_000,
+      inferenceTimeoutMs: 1_800_000,
+      shutdownTimeoutMs: 60_000
+    });
+    expect(first).not.toBe(second);
+    expect(first.fixedArguments).not.toBe(second.fixedArguments);
+    expect(first.model).not.toBe(second.model);
+  });
+
+  it('accepts both executable variants and both model-source variants', () => {
+    expect(localInferenceSettingsSchema.safeParse(persisted()).success).toBe(true);
+    expect(
+      localInferenceSettingsSchema.safeParse(
+        persisted({
+          executable: { kind: 'explicit_path', path: EXECUTABLE_PATH },
+          model: { id: 'model-path', source: { kind: 'path', path: MODEL_PATH } }
+        })
+      ).success
+    ).toBe(true);
+  });
+
+  it('rejects unknown keys, unknown versions and unclean or shell-dependent paths', () => {
+    for (const candidate of [
+      persisted({ version: 0 }),
+      persisted({ version: 2 }),
+      { ...persisted(), surprise: true },
+      persisted({ executable: { kind: 'explicit_path', path: 'relative/llama-server' } }),
+      persisted({ executable: { kind: 'explicit_path', path: `${EXECUTABLE_PATH}.cmd` } }),
+      persisted({
+        model: { id: 'model', source: { kind: 'path', path: `${MODEL_PATH}${process.platform === 'win32' ? '\\..\\' : '/../'}other.gguf` } }
+      })
+    ]) {
+      expect(localInferenceSettingsSchema.safeParse(candidate).success).toBe(false);
+    }
+  });
+
+  it('reuses all fixed-argument protections', () => {
+    for (const argument of [
+      '--model',
+      '-m=other',
+      '--model-url=x',
+      '--alias=x',
+      '-a',
+      '--host=0.0.0.0',
+      '--port',
+      '--ctx-size=1',
+      '-c',
+      '--ctx_size=1',
+      'ghp_abcdefghijklmnopqrstuvwxyz0123',
+      'line\nother'
+    ]) {
+      expect(
+        localInferenceSettingsSchema.safeParse(persisted({ fixedArguments: [argument] })).success
+      ).toBe(false);
+    }
+  });
+
+  it('bounds ports, context and every timeout with LOCAL_INFERENCE_LIMITS', () => {
+    const fields = [
+      ['contextLimitTokens', LOCAL_INFERENCE_LIMITS.contextTokensMax],
+      ['startupTimeoutMs', LOCAL_INFERENCE_LIMITS.startupTimeoutMsMax],
+      ['healthTimeoutMs', LOCAL_INFERENCE_LIMITS.healthTimeoutMsMax],
+      ['inferenceTimeoutMs', LOCAL_INFERENCE_LIMITS.inferenceTimeoutMsMax],
+      ['shutdownTimeoutMs', LOCAL_INFERENCE_LIMITS.shutdownTimeoutMsMax]
+    ] as const;
+
+    for (const [field, maximum] of fields) {
+      expect(localInferenceSettingsSchema.safeParse(persisted({ [field]: maximum })).success).toBe(true);
+      for (const invalid of [0, -1, 1.5, maximum + 1]) {
+        expect(localInferenceSettingsSchema.safeParse(persisted({ [field]: invalid })).success).toBe(false);
+      }
+    }
+    for (const port of [0, 65_536, 1.5]) {
+      expect(localInferenceSettingsSchema.safeParse(persisted({ port })).success).toBe(false);
+    }
+    expect(localInferenceSettingsSchema.safeParse(persisted({ port: 1 })).success).toBe(true);
+    expect(localInferenceSettingsSchema.safeParse(persisted({ port: 65_535 })).success).toBe(true);
   });
 });
 

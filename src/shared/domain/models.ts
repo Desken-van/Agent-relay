@@ -12,6 +12,7 @@
 import { z } from 'zod';
 import { TASK_STATUSES } from './workflow';
 import { executionProviderSchema } from './execution-providers';
+import { localInferenceSettingsSchema } from './local-inference';
 
 /** ISO-8601 instant, e.g. `2026-08-10T09:41:12.004Z`. */
 export const isoDateTime = z.string().min(20).max(32);
@@ -314,6 +315,8 @@ export function defaultClaudePermissionRules(): {
 }
 
 export const settingsSchema = z.object({
+  /** Versioned configuration for the process-local managed inference runtime. */
+  localInference: localInferenceSettingsSchema,
   /** Absolute path to the Claude Code executable, or null to auto-discover. */
   claudeExecutablePath: z.string().nullable(),
   /** Absolute path to the Codex executable, or null to use the bundled/PATH one. */

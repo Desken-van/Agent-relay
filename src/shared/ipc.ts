@@ -18,6 +18,10 @@ import type { CodexModelCatalogResult } from './domain/codex-catalog';
 import type { DiagnosticsReport } from './domain/diagnostics';
 import type { SerializedError } from './domain/errors';
 import type { GitChangeSet, ProjectValidation, RepositoryInfo, WorktreeInfo } from './domain/git';
+import type {
+  LocalInferenceCapabilities,
+  LocalInferenceState
+} from './domain/local-inference';
 import {
   APPROVAL_ACTIONS,
   GITHUB_VISIBILITIES,
@@ -214,6 +218,12 @@ const byOperationTarget = z.object({ targetId: z.string().min(1) }).strict();
 export const ipcInputSchemas = {
   'settings:get': empty,
   'settings:update': settingsSchema.partial().strict(),
+
+  'localInference:getCapabilities': empty,
+  'localInference:start': empty,
+  'localInference:getState': empty,
+  'localInference:checkHealth': empty,
+  'localInference:stop': empty,
 
   'diagnostics:run': z.object({ force: z.boolean().optional() }).strict(),
 
@@ -429,6 +439,12 @@ export type IpcInput<C extends IpcChannel> = z.infer<(typeof ipcInputSchemas)[C]
 export interface IpcResponseMap {
   'settings:get': Settings;
   'settings:update': Settings;
+
+  'localInference:getCapabilities': LocalInferenceCapabilities;
+  'localInference:start': LocalInferenceState;
+  'localInference:getState': LocalInferenceState;
+  'localInference:checkHealth': LocalInferenceState;
+  'localInference:stop': LocalInferenceState;
 
   'diagnostics:run': DiagnosticsReport;
 

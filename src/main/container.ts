@@ -17,6 +17,7 @@ import {
   DEFAULT_CLAUDE_VERIFICATION_TOOLS,
   type Settings
 } from '../shared/domain/models';
+import { defaultLocalInferenceSettings } from '../shared/domain/local-inference';
 import { ClaudeCliAdapter } from './adapters/claude/claude-adapter';
 import { CodexSdkAdapter } from './adapters/codex/codex-adapter';
 import { CodexAppServerModelCatalog } from './adapters/codex/codex-model-catalog';
@@ -25,6 +26,10 @@ import { GhGitHubAdapter } from './adapters/github/github-adapter';
 import { CoaiPlanReviewer } from './adapters/mcp/coai-plan-reviewer';
 import { StdioMcpClient } from './adapters/mcp/stdio-mcp-client';
 import { LocalSqliteProbeAdapter } from './adapters/operations/local-sqlite-adapter';
+import {
+  LlamaCppLocalInference,
+  type LocalInferenceProcessRunner
+} from './adapters/local-inference/llama-cpp-local-inference';
 import { ExecaProcessRunner, type ProcessRunner } from './adapters/process/process-runner';
 import { FilesystemRuleSourceReader } from './adapters/rules/filesystem-rule-source';
 import { closeDatabase, openDatabase, type Db } from './db/database';
@@ -60,6 +65,7 @@ import type {
   RunEventRepository,
   RunRepository,
   SettingsRepository,
+  LocalInferenceLifecycleService,
   TaskRepository,
   TaskRuleEvidenceRepository
 } from './ports';
@@ -79,6 +85,10 @@ import { SettingsBoundCodeReviewer } from './services/code-review-provider';
 import { PlanReviewClaims } from './services/plan-review-claims';
 import { PlanReviewGateService } from './services/plan-review-gate';
 import { RuleEvidenceService } from './services/rule-evidence';
+import {
+  LocalInferenceService,
+  type LocalInferenceProviderFactory
+} from './services/local-inference-service';
 
 export interface ApplicationPaths {
   /** Directory holding the SQLite database and worktrees. */
@@ -89,6 +99,7 @@ export interface ApplicationPaths {
 
 export function defaultSettings(paths: ApplicationPaths): Settings {
   return {
+    localInference: defaultLocalInferenceSettings(),
     claudeExecutablePath: process.env.AGENT_RELAY_CLAUDE_PATH ?? null,
     codexExecutablePath: process.env.AGENT_RELAY_CODEX_PATH ?? null,
     ghExecutablePath: process.env.AGENT_RELAY_GH_PATH ?? null,
@@ -119,6 +130,8 @@ export function defaultSettings(paths: ApplicationPaths): Settings {
 export interface Application {
   readonly db: Db;
   readonly settings: SettingsRepository;
+  /** One process-local lifecycle owner for the configured local runtime. */
+  readonly localInference: LocalInferenceLifecycleService;
   readonly projects: ProjectRepository;
   readonly tasks: TaskRepository;
   readonly runs: RunRepository;
@@ -167,6 +180,10 @@ export interface BuildApplicationOptions {
   readonly clock?: Clock;
   readonly ids?: IdGenerator;
   readonly processRunner?: ProcessRunner;
+  /** Separate managed-process seam; ordinary ProcessRunner test doubles need not implement launch(). */
+  readonly localInferenceProcessRunner?: LocalInferenceProcessRunner;
+  /** Test seam for adding fixture-only construction details such as a temporary cwd. */
+  readonly localInferenceProviderFactory?: LocalInferenceProviderFactory;
 }
 
 /**
@@ -259,6 +276,16 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   });
 
   const settings = new SqliteSettingsRepository(db, defaultSettings(options.paths));
+  const localInferenceRunner =
+    options.localInferenceProcessRunner ??
+    (runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner());
+  const createLocalInferenceProvider: LocalInferenceProviderFactory =
+    options.localInferenceProviderFactory ??
+    ((config) => new LlamaCppLocalInference(localInferenceRunner, config));
+  const localInference = new LocalInferenceService({
+    settings,
+    createProvider: createLocalInferenceProvider
+  });
   const projects = new SqliteProjectRepository(db, clock);
   const tasks = new SqliteTaskRepository(db, clock);
   const runs = new SqliteRunRepository(db);
@@ -406,6 +433,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   return {
     db,
     settings,
+    localInference,
     projects,
     tasks,
     runs,

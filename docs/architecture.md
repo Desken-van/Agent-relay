@@ -159,6 +159,23 @@ projects ──┬─< tasks ──┬─< runs ──< run_events
 | `approvals` | Audit trail for `commit` / `push` / `create_repository` / `create_pull_request` |
 | `settings` | Key/value; never holds a credential |
 
+Migration 9 seeds the strict version-1 `localInference` Settings object only
+when absent. One application-scoped lifecycle service lazily constructs the
+llama.cpp-compatible provider from that configuration. Construction is passive:
+restart restores configuration but always begins at `stopped`, with no process
+or HTTP activity. The service retains one provider without serializing its
+lifecycle calls: overlapping operations reach the provider's own state machine,
+which lets stop interrupt startup or join cleanup while preventing a second
+launch. A changed configuration cannot displace the snapshot that owns an active
+or uncertain process; only a confirmed explicit stop releases it for rebinding
+on the next operation.
+
+The typed lifecycle boundary has five strict-empty-input IPC operations:
+capabilities, start, state, explicit health, and stop. Inference, prompts,
+repository data, argv, paths and arbitrary commands are not accepted there.
+There is no renderer lifecycle panel or workflow-provider integration in
+LOCAL-B1.
+
 Session identifiers live in the database rather than in memory. That is the only
 reason the application can resume a Codex thread or a Claude session after a
 restart — verified in `tests/db/repositories.test.ts`.
