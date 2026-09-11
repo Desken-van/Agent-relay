@@ -31,6 +31,11 @@ import {
 import { AgentRelayError, InvalidTransitionError } from '../../shared/domain/errors';
 import type { GitChangeSet } from '../../shared/domain/git';
 import type { Project, Settings, Task } from '../../shared/domain/models';
+import type { VerificationRecord } from '../../shared/domain/verification';
+import {
+  parsePlanReviewDecisions,
+  parsePlanReviewFindings
+} from '../../shared/domain/plan-review';
 import {
   decideReviewOutcome,
   isBusy,
@@ -139,6 +144,55 @@ export class Orchestrator {
     return snapshot === null ? undefined : renderRuleEvidence(snapshot);
   }
 
+  /**
+   * Carry only findings the operator explicitly accepted into every
+   * implementation prompt. Resolve is an audit operation and does not rewrite
+   * the immutable specification, so omitting this bridge would make “Accept
+   * and address” record a promise that the implementing agent never sees.
+   */
+  private acceptedPlanReviewRequirements(taskId: string): string | undefined {
+    const gate = this.deps.planReviews.findByTask(taskId);
+    if (gate === null || gate.status !== 'proceeded' || gate.decisionsJson === null) {
+      return undefined;
+    }
+    const findings = parsePlanReviewFindings(gate.findingsJson);
+    const decisions = parsePlanReviewDecisions(gate.decisionsJson);
+    const accepted = decisions.filter((decision) => decision.action === 'accept');
+    if (accepted.length === 0) return undefined;
+
+    return accepted.map((decision, position) => {
+      const finding = findings[decision.finding];
+      if (finding === undefined) {
+        throw new AgentRelayError(
+          'PARSE_FAILED',
+          'A stored plan-review decision does not identify a stored finding.'
+        );
+      }
+      return [
+        `${position + 1}. ${finding.title}`,
+        `   Why: ${finding.why}`,
+        `   Required correction: ${finding.fix}`,
+        ...(decision.reason.trim().length > 0
+          ? [`   Operator note: ${decision.reason.trim()}`]
+          : [])
+      ].join('\n');
+    }).join('\n\n');
+  }
+
+  private implementationPrompt(task: Task, specification: TaskSpecification): string {
+    if (!task.worktreePath || !task.branchName) {
+      throw new AgentRelayError('INTERNAL', 'The task has no worktree for an implementation prompt.');
+    }
+    return buildImplementationPrompt({
+      specification,
+      worktreePath: task.worktreePath,
+      branchName: task.branchName,
+      originalRequest: task.originalRequest,
+      ruleEvidence: this.ruleEvidenceText(task.id),
+      acceptedPlanReviewRequirements: this.acceptedPlanReviewRequirements(task.id)
+    });
+  }
+
   private applyEvent(task: Task, event: WorkflowEvent, patch: Partial<Task> = {}): Task {
     const status: TaskStatus = transition(task.status, event);
     const updated = this.deps.tasks.update(task.id, { ...patch, status });
@@ -220,14 +274,15 @@ export class Orchestrator {
     } finally { this.endExclusive(taskId); }
   }
 
-  private async assertVerificationCurrent(task: Task): Promise<void> {
+  private async assertVerificationCurrent(task: Task): Promise<VerificationRecord | null> {
     const run = latestVerification(this.deps.runs.listByTask(task.id));
-    if (!run) return;
+    if (!run) return null;
     const record = readVerification(run);
     if (!record.success || !record.data.passed || run.status !== 'succeeded' || !this.deps.verification ||
       record.data.identity !== await this.deps.verification.identity({ task, settings: this.deps.settings.get(), project: this.requireProject(task.projectId) })) {
       throw new AgentRelayError('VALIDATION_FAILED', 'Verification is missing, failed or stale. Choose Run verification before review.');
     }
+    return record.data;
   }
 
   configureProviders(input: { taskId: string; expectedRevision: number; implementationProvider: ExecutionProvider; reviewProvider: ExecutionProvider }): Task {
@@ -552,13 +607,7 @@ export class Orchestrator {
         lastError: null
       });
 
-      const prompt = buildImplementationPrompt({
-        specification,
-        worktreePath,
-        branchName,
-        originalRequest: task.originalRequest,
-        ruleEvidence: this.ruleEvidenceText(task.id)
-      });
+      const prompt = this.implementationPrompt(task, specification);
 
       return await this.runImplementation(task, controller, prompt, {
         runType: 'implementation',
@@ -644,7 +693,7 @@ export class Orchestrator {
             ruleEvidence: this.ruleEvidenceText(task.id)
           });
 
-      return await this.runImplementation(task, controller, `${buildImplementationPrompt({ specification: readSpecification(task), worktreePath: task.worktreePath!, branchName: task.branchName!, originalRequest: task.originalRequest, ruleEvidence: this.ruleEvidenceText(task.id) })}\n\n${prompt}`, {
+      return await this.runImplementation(task, controller, `${this.implementationPrompt(task, readSpecification(task))}\n\n${prompt}`, {
         runType: 'correction',
         recoverableFailure: 'correction_aborted'
       });
@@ -918,8 +967,9 @@ export class Orchestrator {
     if (nextRound > task.maxRounds) throw new AgentRelayError('VALIDATION_FAILED', 'The review round budget is exhausted. Verification does not reset it.');
 
     const controller = this.beginExclusive(taskId);
+    let relayVerification: VerificationRecord | null;
     try {
-      await this.assertVerificationCurrent(task);
+      relayVerification = await this.assertVerificationCurrent(task);
     } catch (error) {
       this.endExclusive(taskId);
       this.applyEvent(this.requireTask(taskId), 'verification_invalidated', { lastError: Orchestrator.describeError(error) });
@@ -960,6 +1010,7 @@ export class Orchestrator {
           changes,
           claudeReport,
           testOutput: extractTestOutput(claudeReport),
+          relayVerification: relayVerification ?? undefined,
           round: task.currentRound,
           maxRounds: task.maxRounds,
           model: task.reviewProvider === 'claude' ? task.claudeModel : task.codexModel

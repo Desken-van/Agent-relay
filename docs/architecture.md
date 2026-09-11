@@ -212,6 +212,18 @@ Rules enforced by [`workflow.ts`](../src/shared/domain/workflow.ts):
 * **Publishing has its own gate.** `assertPublishable()` requires both a granted
   approval *and* a publishable status.
 
+### Verification evidence passed into review
+
+A successful standalone `npm run verify` is stored as a versioned record with
+its command, exit code, duration and exact worktree identity. Before dispatching
+a review, the orchestrator re-computes that identity and rejects a missing,
+failed or stale record. The validated record is then passed through the review
+port and rendered as a dedicated authoritative prompt section. An older
+implementation/correction report remains available as historical context, but
+its earlier verification failure cannot override Relay's current successful
+record. After the reviewer returns, the identity is checked again before its
+verdict is accepted.
+
 ### Recovering from an abrupt exit
 
 A run is written as `running` before an agent is spawned, and the task moves
@@ -425,16 +437,30 @@ workflow. Once evidence is bound, the gate is mandatory and cannot be bypassed
 by the normal Approve or implementation entry points. Settings persist an
 explicit MCP executable, fixed argument vector, optional working directory and
 an exact clean conventions revision; authentication remains owned by the MCP
-server. The renderer can only name a task, acknowledge a dirty checkout, or
+server. Agent execution keeps the operator-selected process timeout, while the
+shared Coai server configuration caps MCP calls at the transport's independent
+30-minute ceiling; raising the former cannot make the latter invalid. The
+renderer can only name a task, acknowledge a dirty checkout, or
 submit typed finding decisions. It cannot supply executable paths, rule bytes,
 repository roots or prompts through the operational IPC channels.
+
+Resolving a round does not rewrite the immutable specification. Findings the
+operator chose **Accept and address** are therefore rendered as a separate,
+additive section in every implementation prompt, together with the suggested
+correction and optional operator note. Rejected findings are not forwarded.
+The section is explicitly unable to relax the specification, worktree boundary,
+or publication rules; it carries a reviewed requirement, not new authority.
 
 The Run screen captures and displays the immutable evidence, prepares the task's
 isolated branch, launches a plan round, and records an accept/reject decision for
 every finding before resolve. A rejected finding requires a reason in the UI,
 the IPC schema and the service. Durable `opening`, `reviewing` and `resolving`
 states are shown as unknown in-flight outcomes and never become automatic retry
-buttons. Live acceptance on 2026-09-07 completed the whole `proceed` journey
+buttons. Coai's documented `status` refusal for a missing repository-and-branch
+session is one narrow exception: it is typed as positive absence evidence and
+may re-arm only an `opening` gate, because `review_plan` is reached only after
+`open` returns. The same evidence from `reviewing` or `resolving` never permits
+a repeat. Live acceptance on 2026-09-07 completed the whole `proceed` journey
 through Coai 0.14.0 and a real Codex reviewer, including five durable findings,
 five decisions and restart read-back. This is evidence for that one path, not a
 claim that provider failure, `revise`, timeout and crash windows are all live-
@@ -1529,7 +1555,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1816 deterministic tests in 70 files, plus one routine automated Electron
+1824 deterministic tests in 70 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.

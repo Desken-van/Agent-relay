@@ -37,6 +37,7 @@ import type {
   OperationTarget,
   OperationTargetConfig
 } from '../shared/domain/operations';
+import type { VerificationRecord } from '../shared/domain/verification';
 import type {
   DiagnosticFailureKind,
   DiagnosticLimits,
@@ -224,6 +225,11 @@ export interface CodexReviewRequest {
   readonly changes: GitChangeSet;
   readonly claudeReport: string;
   readonly testOutput: string;
+  /**
+   * Agent Relay's own successful verification of the exact review snapshot.
+   * This is authoritative over historical verification prose in an agent report.
+   */
+  readonly relayVerification?: VerificationRecord;
   readonly round: number;
   readonly maxRounds: number;
   /** Same snapshotted model as the specification that opened this thread. */
@@ -1157,6 +1163,9 @@ export interface ExternalPlanReviewer {
    * The only reviewer method Agent Relay may call to recover from an unknown
    * outcome: it must be read-only, because `review_plan` and `resolve` are not
    * idempotent and may already have taken effect when their answer was lost.
+   * A provider that can positively establish that no session exists reports
+   * `AgentRelayError` with code `NOT_FOUND`; callers may only use that evidence
+   * to re-arm an `opening` gate, before any plan round could have been sent.
    */
   status(
     subject: ExternalPlanReviewSubject,

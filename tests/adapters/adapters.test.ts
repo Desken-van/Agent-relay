@@ -1214,6 +1214,34 @@ describe('prompt construction', () => {
     expect(prompt).toContain('truncated');
   });
 
+  it('makes a current Relay verification authoritative over an older implementer failure', () => {
+    const identity = 'a'.repeat(64);
+    const prompt = buildReviewPrompt({
+      specification: makeSpecification(),
+      changes: makeChangeSet(),
+      claudeReport: 'npm run verify failed in the implementation sandbox.',
+      testOutput: 'npm run verify failed',
+      relayVerification: {
+        version: 1,
+        command: 'npm run verify',
+        identity,
+        passed: true,
+        exitCode: 0,
+        durationMs: 1234,
+        reason: null
+      },
+      round: 3,
+      maxRounds: 3
+    });
+
+    expect(prompt).toContain('AGENT RELAY VERIFICATION OF THE CURRENT CODE SNAPSHOT');
+    expect(prompt).toContain('Result: PASSED');
+    expect(prompt).toContain('Exit code: 0');
+    expect(prompt).toContain(identity);
+    expect(prompt).toMatch(/treat that\s+statement as historical/);
+    expect(prompt).toMatch(/do not raise a failed-or-missing-verification finding solely/);
+  });
+
   it('gives the implementer the worktree, branch and the do-not-commit rule', () => {
     const prompt = buildImplementationPrompt({
       specification: makeSpecification(),
@@ -1228,6 +1256,21 @@ describe('prompt construction', () => {
     expect(prompt).toContain('Preserve unrelated work');
     expect(prompt).toContain('git commit');
     expect(prompt).toContain('Do NOT create a pull request');
+  });
+
+  it('labels accepted external findings as additive requirements that cannot relax safety', () => {
+    const prompt = buildImplementationPrompt({
+      specification: makeSpecification(),
+      worktreePath: 'C:\\wt\\task-1',
+      branchName: 'agent-relay/task-1',
+      originalRequest: 'please add /health',
+      acceptedPlanReviewRequirements: '1. Serialize concurrent lifecycle calls.'
+    });
+
+    expect(prompt).toContain('USER-ACCEPTED EXTERNAL PLAN-REVIEW REQUIREMENTS');
+    expect(prompt).toContain('Serialize concurrent lifecycle calls.');
+    expect(prompt).toMatch(/do not relax any\s+constraint/);
+    expect(prompt.toLowerCase()).toContain('git commit');
   });
 
   it('groups correction findings by severity and carries the follow-up', () => {

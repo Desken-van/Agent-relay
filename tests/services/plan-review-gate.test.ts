@@ -18,6 +18,7 @@ import type {
   PlanReviewGate
 } from '../../src/shared/domain/plan-review';
 import type { RuleEvidenceSnapshot } from '../../src/shared/domain/rule-evidence';
+import { AgentRelayError } from '../../src/shared/domain/errors';
 import { makeSpecification } from '../helpers/fakes';
 import { createHarness, type Harness } from '../helpers/harness';
 
@@ -462,6 +463,44 @@ describe('durable external plan review gate', () => {
     expect(await value.service.reconcile(task.id)).toMatchObject({ status: 'prepared', lastError: null });
 
     await value.service.review(task.id);
+    expect(value.reviewer.reviewCalls).toHaveLength(1);
+  });
+
+  it('re-arms only an opening gate when the provider proves no session exists', async () => {
+    const value = setup();
+    const { task } = await ready(value);
+    value.reviewer.openError = new Error('answer lost');
+    await expect(value.service.review(task.id)).rejects.toThrow(/lost/);
+
+    value.reviewer.statusError = new AgentRelayError(
+      'NOT_FOUND',
+      'Coai has no session for this repository and branch.'
+    );
+    const recovered = await value.service.reconcile(task.id);
+    expect(recovered).toMatchObject({ status: 'prepared', lastError: null, sessionId: null });
+    expect(value.reviewer.openCalls).toHaveLength(1);
+    expect(value.reviewer.reviewCalls).toHaveLength(0);
+    expect(value.reviewer.statusCalls).toHaveLength(1);
+
+    value.reviewer.statusError = null;
+    value.reviewer.openError = null;
+    await value.service.review(task.id);
+    expect(value.reviewer.openCalls).toHaveLength(2);
+    expect(value.reviewer.reviewCalls).toHaveLength(1);
+  });
+
+  it('never treats a missing session as permission to repeat a dispatched round', async () => {
+    const value = setup();
+    const { task } = await ready(value);
+    value.reviewer.reviewError = new Error('answer lost');
+    await expect(value.service.review(task.id)).rejects.toThrow(/lost/);
+
+    value.reviewer.statusError = new AgentRelayError(
+      'NOT_FOUND',
+      'Coai has no session for this repository and branch.'
+    );
+    await expect(value.service.reconcile(task.id)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(value.harness.planReviewGates.findByTask(task.id)?.status).toBe('reviewing');
     expect(value.reviewer.reviewCalls).toHaveLength(1);
   });
 
@@ -1445,16 +1484,49 @@ describe('durable external plan review gate', () => {
     ).toBe('no_gate');
   });
 
-  it('uses the bound evidence again for implementation and final Codex review', async () => {
+  it('uses bound evidence and accepted findings again for implementation and final Codex review', async () => {
     const value = setup();
     const { task, rules } = await ready(value);
+    value.reviewer.round = {
+      ...value.reviewer.round,
+      findings: [finding('Serialize concurrent lifecycle calls')]
+    };
     await value.service.review(task.id);
-    await resolveCurrent(value, task.id);
+    await resolveCurrent(value, task.id, [{
+      finding: 0,
+      action: 'accept',
+      reason: 'Cover start/start and start/stop races.'
+    }]);
     value.harness.orchestrator.approveSpecification(task.id);
     await value.harness.orchestrator.sendToClaude(task.id);
     await value.harness.orchestrator.reviewWithCodex(task.id);
 
     expect(value.harness.claude.calls[0]?.prompt).toContain(rules.sha256);
+    expect(value.harness.claude.calls[0]?.prompt).toContain('Serialize concurrent lifecycle calls');
+    expect(value.harness.claude.calls[0]?.prompt).toContain('Address it.');
+    expect(value.harness.claude.calls[0]?.prompt).toContain('Cover start/start and start/stop races.');
     expect(value.harness.codex.reviewCalls[0]?.ruleEvidence).toContain(rules.sha256);
+  });
+
+  it('does not turn a rejected external finding into an implementation requirement', async () => {
+    const value = setup();
+    const { task } = await ready(value);
+    value.reviewer.round = {
+      ...value.reviewer.round,
+      findings: [finding('Do not carry this refuted finding')]
+    };
+    await value.service.review(task.id);
+    await resolveCurrent(value, task.id, [{
+      finding: 0,
+      action: 'reject',
+      reason: 'The premise is contradicted by the existing service.'
+    }]);
+    value.harness.orchestrator.approveSpecification(task.id);
+    await value.harness.orchestrator.sendToClaude(task.id);
+
+    const prompt = value.harness.claude.calls[0]?.prompt ?? '';
+    expect(prompt).not.toContain('Do not carry this refuted finding');
+    expect(prompt).not.toContain('The premise is contradicted by the existing service.');
+    expect(prompt).not.toContain('USER-ACCEPTED EXTERNAL PLAN-REVIEW REQUIREMENTS');
   });
 });
