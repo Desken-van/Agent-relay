@@ -174,6 +174,12 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     'settings:get': () => app.settings.get(),
     'settings:update': (input) => app.settings.update(input),
 
+    'localInference:getCapabilities': () => app.localInference.capabilities(),
+    'localInference:start': () => app.localInference.start(),
+    'localInference:getState': () => app.localInference.state(),
+    'localInference:checkHealth': () => app.localInference.health(),
+    'localInference:stop': () => app.localInference.stop(),
+
     'diagnostics:run': (input) => app.diagnostics.run(input.force ?? false),
 
     // Never rejects: an unreachable catalogue comes back as available:false,

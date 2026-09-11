@@ -3,13 +3,16 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import type { Settings } from '../../src/shared/domain/models';
+import { defaultLocalInferenceSettings } from '../../src/shared/domain/local-inference';
 import { SettingsView } from '../../src/renderer/src/components/SettingsView';
 import { installBridge, ok, renderApp, type Bridge } from './harness';
 
 let bridge: Bridge;
+let settings: Settings;
 
 beforeEach(() => {
-  const settings: Settings = {
+  settings = {
+    localInference: defaultLocalInferenceSettings(),
     claudeExecutablePath: null,
     codexExecutablePath: null,
     ghExecutablePath: null,
@@ -64,7 +67,8 @@ describe('external plan-review settings', () => {
     await waitFor(() => expect(bridge.callsTo('settings:update')).toHaveLength(1));
     expect(bridge.callsTo('settings:update')[0]?.input).toMatchObject({
       externalPlanReviewEnabled: true,
-      coaiMcpArguments: ['--stdio', '--verbose']
+      coaiMcpArguments: ['--stdio', '--verbose'],
+      localInference: settings.localInference
     });
   });
 

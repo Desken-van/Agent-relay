@@ -1,19 +1,47 @@
 # Local inference boundary
 
 LOCAL-A adds an internal version-1 provider for one managed,
-llama.cpp-compatible server. It is a foundation, not a workflow integration.
+llama.cpp-compatible server. LOCAL-B1 persists its operator configuration and
+wires one long-lived lifecycle service into the main process. It remains a
+foundation, not a workflow integration.
 Agent Relay remains the sole owner of tasks, reviews, patches, retries,
 approvals, and publication. The runtime loads a model and answers inference
 requests; it owns none of that workflow state.
 
-The provider is not registered in the composition root and is not exposed
-through Settings, the database, IPC, preload, or the renderer. A trusted main
-process caller must construct it with a validated configuration. The contract
-name is `agent-relay.local-inference`, and the only accepted contract version is
-`1`. Versioned configuration, request, response, and outcome schemas reject
-unknown properties and versions.
+The lifecycle service is registered in the composition root and exposed through
+the existing typed IPC/preload bridge. Configuration is saved through the
+existing validated Settings update only; there is still no renderer UI for it.
+The contract name is `agent-relay.local-inference`, and the only accepted
+contract version is `1`. Versioned configuration, request, response, outcome,
+and persisted-settings schemas reject unknown properties and versions.
 
 ## Runtime and model configuration
+
+`Settings.localInference` is one strict version-1 object:
+
+```json
+{
+  "version": 1,
+  "executable": { "kind": "discovered", "command": "llama-server" },
+  "model": {
+    "id": "local-model",
+    "source": { "kind": "runtime_id", "runtimeModelId": "local-model" }
+  },
+  "fixedArguments": [],
+  "port": 8080,
+  "contextLimitTokens": 4096,
+  "startupTimeoutMs": 600000,
+  "healthTimeoutMs": 60000,
+  "inferenceTimeoutMs": 1800000,
+  "shutdownTimeoutMs": 60000
+}
+```
+
+Migration 9 (`local-inference-settings`) inserts this value only when the key is
+absent. Invalid or malformed stored local configuration falls back only this
+field; other valid Settings survive. Provider id `local-llama-cpp`, working
+directory policy, token limits, and byte/output ceilings remain trusted
+application policy and are not persisted operator input.
 
 The executable is either the fixed PATH-discovered command `llama-server` or an
 explicit absolute path. A broken explicit path never falls back to PATH. A model
@@ -68,6 +96,24 @@ Discovery, a version banner, an open port, and process log text never establish
 health or successful inference.
 
 ## Lifecycle
+
+The lifecycle IPC boundary contains exactly `localInference:getCapabilities`,
+`localInference:start`, `localInference:getState`,
+`localInference:checkHealth`, and `localInference:stop`. Each accepts only a
+strict empty object. There is no inference or command channel.
+
+The service retains one provider, but deliberately does not put lifecycle calls
+behind a promise queue. Overlapping calls reach that retained provider so a stop
+can interrupt startup or join cleanup already in flight, and concurrent stops
+share the same stop attempt. The provider owns the synchronization and process
+identity checks that make those overlaps safe. A state read is synchronous and
+passive. Changed Settings are not rebound while a provider is active or cleanup
+is uncertain; the owning snapshot stays in use until an explicit stop returns
+exactly `stopped`, after which the next operation binds the latest configuration.
+
+Configuration is durable; lifecycle state is not. Every application launch
+starts at `{ "kind": "stopped" }` and performs no discovery, version probe,
+launch, health request, inference, retry, fallback, or automatic start.
 
 One discriminated state model contains exactly:
 
@@ -222,17 +268,18 @@ reason is `{kind:"unknown"}`; an unfamiliar bounded reason is an explicit
 
 ## Known limitations
 
-- There is no Settings or database persistence, IPC/preload API, or renderer UI.
+- There is no renderer lifecycle UI; configuration currently has no visible controls.
+- Lifecycle IPC deliberately exposes no inference operation.
 - There is no streaming, tool calling, embeddings, multimodal input, completion
   cache, Context Pack, repository indexing/RAG, patching, or workflow wiring.
 - Prompt bytes are bounded, but there is no tokenizer-based preflight prompt
   token count.
 - Runtime usage fields are optional and are returned as `null` when absent.
 - One provider manages one process and one inference at a time.
-- The lifecycle and inference evidence are process-local and non-durable.
+- Lifecycle and inference evidence are process-local and non-durable; only configuration persists.
 - The Windows launcher is an Agent Relay-owned native executable built during
   `npm install` and copied beside the main-process bundle. If it is missing, a
   managed runtime launch fails before the target process starts; there is no
   fallback to uncontained execution.
-- Deterministic acceptance uses the Agent Relay-owned fake runtime. Running a
-  real llama.cpp or Ornith build and model is outside LOCAL-A acceptance.
+- Deterministic LOCAL-B1 acceptance uses only the Agent Relay-owned fake runtime.
+  Running a real llama.cpp or Ornith build and model remains explicitly deferred.

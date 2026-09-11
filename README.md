@@ -449,6 +449,7 @@ Being precise about what was actually exercised, rather than merely written:
 | **External MCP boundary** | ✅ **Fake-server contract and a real Coai round verified.** The client performs initialization, capability and exact-allowlist discovery, paginated `tools/list`, bounded `tools/call`, and clean shutdown through Agent Relay's single no-shell process runner. Protocol failure, process failure, timeout, cancellation, tool `isError`, and a refusal encoded in successful text remain distinct. An opt-in Electron acceptance test also completed one authenticated Codex plan-review through Coai 0.14.0. |
 | **Project-rule evidence** | 🧪 **Collector contract verified against real temporary Git repositories and filesystems.** It discovers the fixed project-memory locations, reads explicitly selected convention files, refuses symlinks and traversal, records missing or excluded evidence, binds clean convention bytes to an exact Git revision, and hashes a deterministic whole-file snapshot. Opt-in task binding is enforced by the plan-gate row below. |
 | **External plan-review gate** | ✅ **Durable contract and real-provider journey verified.** Settings hold only a fixed executable, argv and explicit convention selection; task IPC accepts identifiers and decisions, never process configuration or rule bytes. The live synthetic journey bound project rules plus four pinned convention files, generated a real specification, proved premature approval was refused, prepared an isolated branch, completed one Coai/Codex review, resolved all five findings, persisted `proceeded`, and read it back after restart. |
+| **Local inference lifecycle** | 🧪 **Backend lifecycle verified with Agent Relay's fake runtime.** A strict version-1 Settings object persists executable/model source, fixed arguments, port, context and timeouts. Five empty-input IPC operations expose capabilities, explicit start, passive state, explicit health and stop through one retained provider whose own state machine coordinates overlapping lifecycle calls. Restart restores configuration but never probes or starts a runtime. There is no renderer lifecycle UI, inference/workflow channel, retry/fallback, or real llama.cpp/Ornith acceptance yet. |
 
 ### Verify saved implementation without an AI round
 
@@ -477,7 +478,7 @@ happened**, **Current stage**, **Result**, and **Next action**; only the
 recommended button receives the strong Agent Relay highlight. A terminal task
 does not suggest an action that its state machine would refuse.
 
-Test suite: **1824 deterministic tests in 70 files, plus one automated Electron
+Test suite: **1848 deterministic tests in 75 files, plus one automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -640,7 +641,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1824 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              1848 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

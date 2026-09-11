@@ -43,6 +43,7 @@ variables. Each adapter declares only the credential variables it owns:
 | Claude Code | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` |
 | `gh` | `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` |
 | `git` | *(none)* |
+| Local inference runtime | *(none)* |
 | Codex | inherits normally — see note below |
 
 So `git` cannot see your GitHub token, and Codex cannot see your Anthropic key.
@@ -102,6 +103,10 @@ window.agentRelay.onEvent(listener)        // read-only push subscription
   hosts (github.com, cli.github.com, docs.anthropic.com, …).
 * `shell:revealPath` accepts only paths inside a registered project, the
   worktrees root, or the projects root.
+* Local inference exposes only five lifecycle operations. Their schemas accept
+  strict empty objects, so executable/model paths, argv, prompts, URLs,
+  credentials and repository data cannot ride on a lifecycle request.
+  Configuration can change only through the validated Settings contract.
 
 ---
 
@@ -120,6 +125,17 @@ Every child process is created in one place, `ExecaProcessRunner`:
   prefix: once anything has been dropped, nothing later is retained. Redaction
   runs per line as the line arrives, before the bound can cut it, so a secret
   straddling the truncation point cannot survive as a fragment.
+
+The local-inference service retains one provider. Provider construction is
+synchronous, while overlapping start, health and stop calls deliberately reach
+that same provider so stop can interrupt startup or join cleanup already in
+flight. The provider's state machine prevents a second launch and preserves
+continuous ownership until termination is proved. A changed configuration
+cannot replace an active, failed or uncertain-cleanup owner; only an explicit
+stop confirmed as `stopped` releases it. The runtime remains loopback-only, refuses
+redirects, scrubs credential-shaped environment variables, uses bounded
+separate output, and on Windows remains contained by the Agent Relay Job Object
+launcher. No runtime is probed or started automatically on application launch.
 
 ### stdout is protocol; stderr never is
 
