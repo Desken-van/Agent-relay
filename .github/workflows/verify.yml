@@ -29,8 +29,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          # package.json pins no engine; 22 is the minimum that provides the
-          # node:sqlite module the database layer is built on.
+          # The latest Node 22 satisfies the source-build minimum documented in
+          # README and provides the node:sqlite module the database uses.
           node-version: '22'
           cache: npm
           cache-dependency-path: package-lock.json

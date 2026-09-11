@@ -14,6 +14,9 @@
  * Output is redacted before it is returned, because callers persist it.
  */
 
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execa, type Options, type ResultPromise } from 'execa';
 import { AgentRelayError } from '../../../shared/domain/errors';
 import { redactSecrets, scrubEnvironment } from '../../../shared/util/redact';
@@ -230,7 +233,7 @@ const DEFAULT_MAX_INPUT_BYTES = 256 * 1024;
  */
 const STDERR_GRACE_MS = 250;
 /**
- * How much of a Windows shutdown budget is held back from `taskkill` itself.
+ * How much of a legacy Windows shutdown budget is held back from `taskkill`.
  *
  * Enough to observe the exit that `taskkill` has already caused, and no more.
  */
@@ -448,13 +451,51 @@ async function waitForPosixGroupGone(pid: number, ms: number): Promise<boolean> 
 /** What a `taskkill /T` attempt established about the tree. */
 type WindowsTreeKill = 'terminated' | 'not_found' | 'unconfirmed';
 
+const WINDOWS_JOB_LAUNCHER = 'agent-relay-windows-job.exe';
+const WINDOWS_JOB_MAX_CONFIRMED_EXIT_CODE = 239;
+
+/** Whether the native launcher's exit is proof that its Job Object was empty. */
+export function windowsJobExitConfirmsEmpty(exit: ManagedProcessExit): boolean {
+  return (
+    !exit.spawnFailed &&
+    exit.signal === null &&
+    exit.exitCode !== null &&
+    exit.exitCode >= 0 &&
+    exit.exitCode <= WINDOWS_JOB_MAX_CONFIRMED_EXIT_CODE
+  );
+}
+
+/**
+ * Locate the Agent Relay-owned launcher built by `scripts/build-native.mjs`.
+ *
+ * In tests this module is loaded from `src/main/adapters/process`, while the
+ * production bundle and its copied launcher sit together under `out/main`.
+ * Nothing is discovered from PATH: substituting another executable here would
+ * turn a process-containment guarantee into an ambient machine setting.
+ */
+function windowsJobLauncher(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    resolve(here, WINDOWS_JOB_LAUNCHER),
+    resolve(here, '..', '..', '..', '..', 'build', 'Release', WINDOWS_JOB_LAUNCHER)
+  ];
+  const launcher = candidates.find((candidate) => existsSync(candidate));
+  if (launcher !== undefined) return launcher;
+  throw new AgentRelayError(
+    'TOOL_MISSING',
+    'The Agent Relay Windows process-containment launcher is not built.',
+    { remediation: 'Run npm install before starting Agent Relay.' }
+  );
+}
+
 /**
  * Kill a process tree on Windows.
  *
- * `taskkill /T` is the only mechanism available: Node's `kill()` maps to
- * `TerminateProcess` for one pid, and a runtime's helper processes would simply
- * carry on. It is spawned here rather than in the caller because this file is
- * the single child-process boundary — and with the same no-shell, hidden-window,
+ * This is the fail-closed legacy path for a ManagedProcess not rooted at Agent
+ * Relay's Job Object launcher. Contained Windows runtimes use a private control
+ * pipe instead and obtain their whole-tree evidence from the launcher exiting.
+ * `taskkill` is spawned here rather than in the caller because this file is the
+ * single child-process boundary — and with the same no-shell, hidden-window,
  * scrubbed-environment rules as everything else.
  *
  * There is deliberately no graceful step before it. Windows has no `SIGTERM`:
@@ -510,7 +551,8 @@ class ExecaManagedProcess implements ManagedProcess {
   constructor(
     private readonly subprocess: ResultPromise,
     private readonly shutdownTimeoutMs: number,
-    maxOutputBytes: number
+    maxOutputBytes: number,
+    private readonly windowsJobContained: boolean
   ) {
     this.pid = subprocess.pid ?? null;
     this.stdoutBuffer = new BoundedBuffer(maxOutputBytes);
@@ -585,8 +627,8 @@ class ExecaManagedProcess implements ManagedProcess {
    * accounted for.
    *
    * The budget is split: half for a polite request, the remainder for force.
-   * On Windows there is no polite request, so the whole budget goes to
-   * `taskkill /T /F` and the fallback single-process kill after it.
+   * On Windows there is no polite request, so the whole budget goes to stopping
+   * the Job Object launcher and observing its exit.
    */
   private async terminate(): Promise<ManagedProcessStopResult> {
     const pid = this.pid;
@@ -608,11 +650,45 @@ class ExecaManagedProcess implements ManagedProcess {
     };
 
     if (process.platform === 'win32') {
-      // `/T` walks the tree from the parent, so its verdict only means anything
-      // while the parent is still there to be walked from. Once the parent has
-      // gone, Windows keeps no record of the relationship and a surviving
-      // grandchild is unreachable by pid — see the limitation in
-      // `docs/local-inference.md`.
+      // The launcher exits normally only after its Job Object is empty. This
+      // remains proof even when the runtime itself crashed first: the kernel,
+      // not a vanished parent pid, retained the descendants.
+      if (this.windowsJobContained && this.settledExit !== null) {
+        return windowsJobExitConfirmsEmpty(this.settledExit)
+          ? { kind: 'stopped', exit: this.settledExit }
+          : {
+              kind: 'unconfirmed',
+              reason: 'The Windows process-containment launcher exited without proving its Job Object empty.'
+            };
+      }
+
+      if (this.windowsJobContained) {
+        // stdin is a private control pipe to the launcher, not the runtime's
+        // stdin. Closing it asks the launcher to terminate its Job Object and
+        // wait until the kernel reports that object empty before exiting.
+        // Therefore the launcher's exit is positive whole-tree evidence and
+        // needs neither taskkill nor a pid-tree reconstruction.
+        try {
+          this.subprocess.stdin?.end();
+        } catch {
+          return {
+            kind: 'unconfirmed',
+            reason: 'The Windows process-containment launcher could not be asked to stop.'
+          };
+        }
+        const exit = await settleWithin(this.exited, remaining());
+        if (exit === null) return notGone;
+        return windowsJobExitConfirmsEmpty(exit)
+          ? { kind: 'stopped', exit }
+          : {
+              kind: 'unconfirmed',
+              reason: 'The Windows process-containment launcher exited without proving its Job Object empty.'
+            };
+      }
+
+      // For a legacy/non-contained handle, `/T` only proves a tree while its
+      // parent is walkable. The Job Object launcher removes that crash gap; the
+      // fallback stays fail-closed for the narrow ManagedProcess abstraction.
       const walkable = this.settledExit === null;
       // Almost the whole budget. Windows has no graceful phase to reserve time
       // for, and `taskkill` walking a tree is the expensive part by a wide
@@ -732,12 +808,18 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
       timeoutMs: 0
     });
 
-    const subprocess = execa(file, [...args], {
+    const windowsContained = process.platform === 'win32';
+    const spawnFile = windowsContained ? windowsJobLauncher() : file;
+    const spawnArgs = windowsContained ? [file, ...args] : [...args];
+    const subprocess = execa(spawnFile, spawnArgs, {
       ...base,
       buffer: false,
-      stdin: 'ignore',
-      // On Windows `detached` opens a console for the child instead of creating
-      // a process group, so the tree is collected with `taskkill /T` there.
+      // On Windows this is a private control pipe consumed by the Job Object
+      // launcher. The configured runtime itself receives NUL from the native
+      // launcher. POSIX runtimes receive /dev/null directly.
+      stdin: windowsContained ? 'pipe' : 'ignore',
+      // On Windows the executable above is Agent Relay's Job Object launcher.
+      // POSIX uses a detached process group for the equivalent containment.
       detached: process.platform !== 'win32',
       // execa's own escalation is redundant with the tree kill below and would
       // race it; termination is driven entirely by `ManagedProcess.stop`.
@@ -748,7 +830,7 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
     // handlers, but the window before that is enough for Node to complain.
     subprocess.catch(() => undefined);
 
-    return new ExecaManagedProcess(subprocess, shutdownTimeoutMs, maxBytes);
+    return new ExecaManagedProcess(subprocess, shutdownTimeoutMs, maxBytes, windowsContained);
   }
 
   /**
