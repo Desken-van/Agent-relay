@@ -74,6 +74,25 @@ describe('run guidance', () => {
     expect(value.result).toContain('cannot safely choose');
   });
 
+  it.each([
+    ['prepare_review', 'prepare_plan_review', 'Prepare isolated review branch'],
+    ['run_review', 'run_plan_review', 'Run external plan review'],
+    ['run_next_review', 'run_plan_review', 'Run next plan-review round'],
+    ['reconcile', 'reconcile_plan_review', 'Reconcile external state'],
+    ['resolve', 'resolve_plan_review', 'Resolve all findings'],
+    ['passed', 'approve_specification', 'Approve specification']
+  ] as const)('guides an externally reviewed specification through %s', (state, action, label) => {
+    const value = runGuidance(
+      task({ status: 'READY_FOR_IMPLEMENTATION' }),
+      [],
+      true,
+      false,
+      state
+    );
+    expect(value.recommendedAction).toBe(action);
+    expect(value.next).toContain(label);
+  });
+
   it('explains that a failed run is closed instead of suggesting a dead button', () => {
     const value = runGuidance(task({
       status: 'FAILED', currentRound: 2, lastError: 'Review round limit reached (2/2).'

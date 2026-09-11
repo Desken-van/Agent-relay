@@ -2,6 +2,10 @@ import type { Run, Task } from './models';
 
 export type RunAction =
   | 'capture_rules'
+  | 'prepare_plan_review'
+  | 'run_plan_review'
+  | 'reconcile_plan_review'
+  | 'resolve_plan_review'
   | 'generate_specification'
   | 'approve_specification'
   | 'run_implementation'
@@ -17,6 +21,13 @@ export type PlanReviewPreparation =
   | 'loading'
   | 'capture_rules'
   | 'ready'
+  | 'prepare_review'
+  | 'run_review'
+  | 'run_next_review'
+  | 'reconcile'
+  | 'resolve'
+  | 'passed'
+  | 'working'
   | 'unavailable';
 
 export type RunGuidanceTone = 'active' | 'success' | 'warning' | 'error';
@@ -88,6 +99,17 @@ export function runGuidance(
           tone: 'warning'
         };
       }
+      if (planReviewPreparation === 'working') {
+        return {
+          happened: 'Agent Relay is completing an External plan review action.',
+          stage: 'Step 1 of 5 · Preparing specification',
+          result: 'The task state may still change.',
+          next: 'Wait for the current action to finish.',
+          recommendedAction: 'none',
+          activeStep: 0,
+          tone: 'active'
+        };
+      }
       if (planReviewPreparation === 'capture_rules') {
         return {
           happened: 'The task was created with external plan review enabled.',
@@ -143,6 +165,90 @@ export function runGuidance(
         };
       }
       if (!task.specificationApprovedAt) {
+        if (planReviewPreparation === 'loading') {
+          return {
+            happened: 'Codex produced a specification and External plan review is enabled.',
+            stage: 'Step 1 of 5 · Checking external review state',
+            result: 'Agent Relay is reading the durable plan-review evidence.',
+            next: 'Wait for the External plan review panel to finish loading.',
+            recommendedAction: 'none',
+            activeStep: 0,
+            tone: 'active'
+          };
+        }
+        if (planReviewPreparation === 'working') {
+          return {
+            happened: 'Agent Relay is completing an External plan review action.',
+            stage: 'Step 1 of 5 · External plan review',
+            result: 'The review gate may still change.',
+            next: 'Wait for the current action to finish.',
+            recommendedAction: 'none',
+            activeStep: 0,
+            tone: 'active'
+          };
+        }
+        if (planReviewPreparation === 'unavailable') {
+          return {
+            happened: 'The specification exists, but its External plan review cannot continue safely.',
+            stage: 'Step 1 of 5 · External plan review is blocked',
+            result: 'The exact review state or evidence could not be established.',
+            next: 'Read the External plan review notice and resolve that problem before approval.',
+            recommendedAction: 'none',
+            activeStep: 0,
+            tone: 'warning'
+          };
+        }
+        if (planReviewPreparation === 'prepare_review') {
+          return {
+            happened: 'Codex produced a specification against the bound project rules.',
+            stage: 'Step 1 of 5 · Prepare external review',
+            result: 'No isolated plan-review branch exists for this specification yet.',
+            next: 'Click “Prepare isolated review branch” in External plan review.',
+            recommendedAction: 'prepare_plan_review',
+            activeStep: 0,
+            tone: 'active'
+          };
+        }
+        if (planReviewPreparation === 'run_review' || planReviewPreparation === 'run_next_review') {
+          const nextRound = planReviewPreparation === 'run_next_review';
+          return {
+            happened: nextRound
+              ? 'The previous external round did not finish the plan-review gate.'
+              : 'The isolated branch is ready for external plan review.',
+            stage: 'Step 1 of 5 · External plan review',
+            result: nextRound
+              ? 'Another plan-review round is available.'
+              : 'No external reviewer has approved this specification yet.',
+            next: nextRound
+              ? 'Click “Run next plan-review round” in External plan review.'
+              : 'Click “Run external plan review” in External plan review.',
+            recommendedAction: 'run_plan_review',
+            activeStep: 0,
+            tone: 'active'
+          };
+        }
+        if (planReviewPreparation === 'reconcile') {
+          return {
+            happened: 'An external call was recorded, but its answer did not reach Agent Relay.',
+            stage: 'Step 1 of 5 · Recover external review state',
+            result: 'The call will not be repeated because it may already have taken effect.',
+            next: 'Click “Reconcile external state” in External plan review.',
+            recommendedAction: 'reconcile_plan_review',
+            activeStep: 0,
+            tone: 'warning'
+          };
+        }
+        if (planReviewPreparation === 'resolve') {
+          return {
+            happened: 'External reviewers returned findings that require decisions.',
+            stage: 'Step 1 of 5 · Resolve plan-review findings',
+            result: 'The specification is not approved until every finding has a decision.',
+            next: 'Choose a decision for every finding, then click “Resolve all findings”.',
+            recommendedAction: 'resolve_plan_review',
+            activeStep: 0,
+            tone: 'warning'
+          };
+        }
         return {
           happened: 'Codex produced a specification.',
           stage: 'Step 1 of 5 · Specification approval',
