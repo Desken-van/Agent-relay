@@ -415,6 +415,13 @@ renderer can only name a task, acknowledge a dirty checkout, or
 submit typed finding decisions. It cannot supply executable paths, rule bytes,
 repository roots or prompts through the operational IPC channels.
 
+Resolving a round does not rewrite the immutable specification. Findings the
+operator chose **Accept and address** are therefore rendered as a separate,
+additive section in every implementation prompt, together with the suggested
+correction and optional operator note. Rejected findings are not forwarded.
+The section is explicitly unable to relax the specification, worktree boundary,
+or publication rules; it carries a reviewed requirement, not new authority.
+
 The Run screen captures and displays the immutable evidence, prepares the task's
 isolated branch, launches a plan round, and records an accept/reject decision for
 every finding before resolve. A rejected finding requires a reason in the UI,
@@ -1519,7 +1526,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1821 deterministic tests in 70 files, plus one routine automated Electron
+1823 deterministic tests in 70 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.
