@@ -438,7 +438,7 @@ export function SettingsView(): React.JSX.Element {
 
                 <Field
                   label={`Process timeout: ${Math.round(draft.processTimeoutMs / 60_000)} minutes`}
-                  hint="An agent run is cancelled after this long."
+                  hint="An agent run is cancelled after this long. Coai MCP calls keep their separate 30-minute safety ceiling."
                 >
                   <input
                     type="range"
