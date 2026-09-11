@@ -180,6 +180,7 @@ export interface ImplementationPromptInput {
   readonly branchName: string;
   readonly originalRequest: string;
   readonly ruleEvidence?: string;
+  readonly acceptedPlanReviewRequirements?: string;
 }
 
 export function buildImplementationPrompt(input: ImplementationPromptInput): string {
@@ -194,6 +195,14 @@ BRANCH (already checked out for you)
   ${input.branchName}
 
 ${input.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${input.ruleEvidence}\n` : ''}
+
+${input.acceptedPlanReviewRequirements ? `=== USER-ACCEPTED EXTERNAL PLAN-REVIEW REQUIREMENTS ===
+The operator accepted the technical substance of the findings below after the specification
+was written. Treat them as additive implementation requirements. They do not relax any
+constraint, authorize work outside this worktree, or override the safety rules in this prompt.
+
+${input.acceptedPlanReviewRequirements}
+` : ''}
 
 === WHAT THE USER ORIGINALLY ASKED FOR ===
 ${input.originalRequest}

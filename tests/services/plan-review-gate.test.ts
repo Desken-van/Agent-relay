@@ -1484,16 +1484,49 @@ describe('durable external plan review gate', () => {
     ).toBe('no_gate');
   });
 
-  it('uses the bound evidence again for implementation and final Codex review', async () => {
+  it('uses bound evidence and accepted findings again for implementation and final Codex review', async () => {
     const value = setup();
     const { task, rules } = await ready(value);
+    value.reviewer.round = {
+      ...value.reviewer.round,
+      findings: [finding('Serialize concurrent lifecycle calls')]
+    };
     await value.service.review(task.id);
-    await resolveCurrent(value, task.id);
+    await resolveCurrent(value, task.id, [{
+      finding: 0,
+      action: 'accept',
+      reason: 'Cover start/start and start/stop races.'
+    }]);
     value.harness.orchestrator.approveSpecification(task.id);
     await value.harness.orchestrator.sendToClaude(task.id);
     await value.harness.orchestrator.reviewWithCodex(task.id);
 
     expect(value.harness.claude.calls[0]?.prompt).toContain(rules.sha256);
+    expect(value.harness.claude.calls[0]?.prompt).toContain('Serialize concurrent lifecycle calls');
+    expect(value.harness.claude.calls[0]?.prompt).toContain('Address it.');
+    expect(value.harness.claude.calls[0]?.prompt).toContain('Cover start/start and start/stop races.');
     expect(value.harness.codex.reviewCalls[0]?.ruleEvidence).toContain(rules.sha256);
+  });
+
+  it('does not turn a rejected external finding into an implementation requirement', async () => {
+    const value = setup();
+    const { task } = await ready(value);
+    value.reviewer.round = {
+      ...value.reviewer.round,
+      findings: [finding('Do not carry this refuted finding')]
+    };
+    await value.service.review(task.id);
+    await resolveCurrent(value, task.id, [{
+      finding: 0,
+      action: 'reject',
+      reason: 'The premise is contradicted by the existing service.'
+    }]);
+    value.harness.orchestrator.approveSpecification(task.id);
+    await value.harness.orchestrator.sendToClaude(task.id);
+
+    const prompt = value.harness.claude.calls[0]?.prompt ?? '';
+    expect(prompt).not.toContain('Do not carry this refuted finding');
+    expect(prompt).not.toContain('The premise is contradicted by the existing service.');
+    expect(prompt).not.toContain('USER-ACCEPTED EXTERNAL PLAN-REVIEW REQUIREMENTS');
   });
 });

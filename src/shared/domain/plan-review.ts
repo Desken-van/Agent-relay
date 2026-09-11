@@ -152,3 +152,8 @@ export function parsePlanReviewFindings(json: string | null): PlanReviewFinding[
   if (json === null) return [];
   return z.array(planReviewFindingSchema).max(256).parse(JSON.parse(json));
 }
+
+export function parsePlanReviewDecisions(json: string | null): PlanReviewDecision[] {
+  if (json === null) return [];
+  return z.array(planReviewDecisionSchema).max(256).parse(JSON.parse(json));
+}

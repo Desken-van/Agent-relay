@@ -1230,6 +1230,21 @@ describe('prompt construction', () => {
     expect(prompt).toContain('Do NOT create a pull request');
   });
 
+  it('labels accepted external findings as additive requirements that cannot relax safety', () => {
+    const prompt = buildImplementationPrompt({
+      specification: makeSpecification(),
+      worktreePath: 'C:\\wt\\task-1',
+      branchName: 'agent-relay/task-1',
+      originalRequest: 'please add /health',
+      acceptedPlanReviewRequirements: '1. Serialize concurrent lifecycle calls.'
+    });
+
+    expect(prompt).toContain('USER-ACCEPTED EXTERNAL PLAN-REVIEW REQUIREMENTS');
+    expect(prompt).toContain('Serialize concurrent lifecycle calls.');
+    expect(prompt).toMatch(/do not relax any\s+constraint/);
+    expect(prompt.toLowerCase()).toContain('git commit');
+  });
+
   it('groups correction findings by severity and carries the follow-up', () => {
     const prompt = buildCorrectionPrompt({
       review: makeReview({
