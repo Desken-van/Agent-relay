@@ -18,6 +18,7 @@ import type {
   PlanReviewGate
 } from '../../src/shared/domain/plan-review';
 import type { RuleEvidenceSnapshot } from '../../src/shared/domain/rule-evidence';
+import { AgentRelayError } from '../../src/shared/domain/errors';
 import { makeSpecification } from '../helpers/fakes';
 import { createHarness, type Harness } from '../helpers/harness';
 
@@ -462,6 +463,44 @@ describe('durable external plan review gate', () => {
     expect(await value.service.reconcile(task.id)).toMatchObject({ status: 'prepared', lastError: null });
 
     await value.service.review(task.id);
+    expect(value.reviewer.reviewCalls).toHaveLength(1);
+  });
+
+  it('re-arms only an opening gate when the provider proves no session exists', async () => {
+    const value = setup();
+    const { task } = await ready(value);
+    value.reviewer.openError = new Error('answer lost');
+    await expect(value.service.review(task.id)).rejects.toThrow(/lost/);
+
+    value.reviewer.statusError = new AgentRelayError(
+      'NOT_FOUND',
+      'Coai has no session for this repository and branch.'
+    );
+    const recovered = await value.service.reconcile(task.id);
+    expect(recovered).toMatchObject({ status: 'prepared', lastError: null, sessionId: null });
+    expect(value.reviewer.openCalls).toHaveLength(1);
+    expect(value.reviewer.reviewCalls).toHaveLength(0);
+    expect(value.reviewer.statusCalls).toHaveLength(1);
+
+    value.reviewer.statusError = null;
+    value.reviewer.openError = null;
+    await value.service.review(task.id);
+    expect(value.reviewer.openCalls).toHaveLength(2);
+    expect(value.reviewer.reviewCalls).toHaveLength(1);
+  });
+
+  it('never treats a missing session as permission to repeat a dispatched round', async () => {
+    const value = setup();
+    const { task } = await ready(value);
+    value.reviewer.reviewError = new Error('answer lost');
+    await expect(value.service.review(task.id)).rejects.toThrow(/lost/);
+
+    value.reviewer.statusError = new AgentRelayError(
+      'NOT_FOUND',
+      'Coai has no session for this repository and branch.'
+    );
+    await expect(value.service.reconcile(task.id)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    expect(value.harness.planReviewGates.findByTask(task.id)?.status).toBe('reviewing');
     expect(value.reviewer.reviewCalls).toHaveLength(1);
   });
 
