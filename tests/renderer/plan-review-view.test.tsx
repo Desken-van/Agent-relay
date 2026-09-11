@@ -83,10 +83,34 @@ afterEach(() => {
 });
 
 describe('the external plan-review panel', () => {
+  it('reports rule binding as the next action and highlights that button', async () => {
+    const onGuidanceStateChanged = vi.fn();
+    render(
+      <PlanReviewPanel
+        task={task()}
+        integrationEnabled
+        onChanged={async () => undefined}
+        onGuidanceStateChanged={onGuidanceStateChanged}
+      />
+    );
+
+    const button = await screen.findByRole('button', { name: /Capture and bind rules/i });
+    await waitFor(() => expect(onGuidanceStateChanged).toHaveBeenLastCalledWith('capture_rules'));
+    expect(button.className).toContain('btn--recommended');
+  });
+
   it('captures rule bytes by task id without accepting renderer-supplied source configuration', async () => {
     bridge.set('planReview:bindRules', () => ok<'planReview:bindRules'>(evidenceDetail));
     const onChanged = vi.fn(async () => undefined);
-    render(<PlanReviewPanel task={task()} integrationEnabled onChanged={onChanged} />);
+    const onGuidanceStateChanged = vi.fn();
+    render(
+      <PlanReviewPanel
+        task={task()}
+        integrationEnabled
+        onChanged={onChanged}
+        onGuidanceStateChanged={onGuidanceStateChanged}
+      />
+    );
 
     fireEvent.click(await screen.findByRole('button', { name: /Capture and bind rules/i }));
 
@@ -95,6 +119,7 @@ describe('the external plan-review panel', () => {
       { channel: 'planReview:bindRules', input: { taskId: 'task-1' } }
     ]);
     expect(onChanged).toHaveBeenCalledOnce();
+    await waitFor(() => expect(onGuidanceStateChanged).toHaveBeenLastCalledWith('ready'));
   });
 
   it('does not retrofit the gate onto an existing task that never opted in', async () => {
