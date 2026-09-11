@@ -144,7 +144,10 @@ export class FakeLocalInferenceRuntime {
     // runtime tree is already PID-confirmed dead; bounded retries make fixture
     // cleanup deterministic under the full parallel suite without hiding a
     // live-process leak.
-    rmSync(this.path, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    // A loaded parallel suite can delay the final Windows handle release for
+    // several seconds even after both PIDs are gone. Keep the retry window
+    // bounded, but long enough to cover that OS-level delay.
+    rmSync(this.path, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 }
 
