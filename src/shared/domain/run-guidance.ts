@@ -1,6 +1,7 @@
 import type { Run, Task } from './models';
 
 export type RunAction =
+  | 'capture_rules'
   | 'generate_specification'
   | 'approve_specification'
   | 'run_implementation'
@@ -10,6 +11,13 @@ export type RunAction =
   | 'approve_publishing'
   | 'publish'
   | 'none';
+
+export type PlanReviewPreparation =
+  | 'not_required'
+  | 'loading'
+  | 'capture_rules'
+  | 'ready'
+  | 'unavailable';
 
 export type RunGuidanceTone = 'active' | 'success' | 'warning' | 'error';
 
@@ -53,10 +61,55 @@ export function runGuidance(
   task: Task,
   runs: readonly Run[],
   hasSpecification: boolean,
-  publishRetryAvailable = false
+  publishRetryAvailable = false,
+  planReviewPreparation: PlanReviewPreparation = 'not_required'
 ): RunGuidance {
   switch (task.status) {
-    case 'DRAFT':
+    case 'DRAFT': {
+      if (planReviewPreparation === 'loading') {
+        return {
+          happened: 'External plan review is enabled for this task.',
+          stage: 'Step 1 of 5 · Preparing specification',
+          result: 'Checking whether the project rules are already bound.',
+          next: 'Wait for the External plan review panel to finish loading.',
+          recommendedAction: 'none',
+          activeStep: 0,
+          tone: 'active'
+        };
+      }
+      if (planReviewPreparation === 'unavailable') {
+        return {
+          happened: 'External plan review is enabled, but its preparation state could not be confirmed.',
+          stage: 'Step 1 of 5 · Specification is blocked',
+          result: 'Agent Relay cannot safely choose the next specification action.',
+          next: 'Read the error in External plan review, then retry or fix its configuration.',
+          recommendedAction: 'none',
+          activeStep: 0,
+          tone: 'warning'
+        };
+      }
+      if (planReviewPreparation === 'capture_rules') {
+        return {
+          happened: 'The task was created with external plan review enabled.',
+          stage: 'Step 1 of 5 · Bind project rules',
+          result: 'No immutable rule snapshot is bound to this task yet.',
+          next: 'Click “Capture and bind rules” in External plan review.',
+          recommendedAction: 'capture_rules',
+          activeStep: 0,
+          tone: 'active'
+        };
+      }
+      if (planReviewPreparation === 'ready') {
+        return {
+          happened: 'The project rules were captured and bound to this task.',
+          stage: 'Step 1 of 5 · Specification',
+          result: 'The specification can now be generated against that rule snapshot.',
+          next: 'Click “Generate specification”.',
+          recommendedAction: 'generate_specification',
+          activeStep: 0,
+          tone: 'active'
+        };
+      }
       return {
         happened: 'The task was created. No specification has been accepted yet.',
         stage: 'Step 1 of 5 · Specification',
@@ -66,6 +119,7 @@ export function runGuidance(
         activeStep: 0,
         tone: 'active'
       };
+    }
     case 'SPECIFYING':
       return {
         happened: 'The specification request was sent to Codex.',

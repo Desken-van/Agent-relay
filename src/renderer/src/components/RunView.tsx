@@ -4,7 +4,12 @@ import { canChangeProviders, providerLabel, type ExecutionProvider } from '@shar
 import type { GitChangeSet } from '@shared/domain/git';
 import type { ApprovalAction, Task } from '@shared/domain/models';
 import type { PlanReviewDecision } from '@shared/domain/plan-review';
-import { runGuidance, type RunAction, type RunGuidance } from '@shared/domain/run-guidance';
+import {
+  runGuidance,
+  type PlanReviewPreparation,
+  type RunAction,
+  type RunGuidance
+} from '@shared/domain/run-guidance';
 import { isBusy } from '@shared/domain/workflow';
 import type { PlanReviewDetail, PublishConfirmation } from '@shared/ipc';
 import type { CodexReviewResult, FindingSeverity, TaskSpecification } from '@shared/schemas/codex';
@@ -109,6 +114,18 @@ export function RunView(): React.JSX.Element {
   const { selectedTaskId, detail, refreshDetail, perform, notify, busy, codexModels, settings } = store;
 
   const [changes, setChanges] = useState<GitChangeSet | null>(null);
+  const [planReviewPreparation, setPlanReviewPreparation] = useState<{
+    readonly taskId: string;
+    readonly state: PlanReviewPreparation;
+  } | null>(null);
+  const updatePlanReviewPreparation = useCallback((state: PlanReviewPreparation): void => {
+    if (!selectedTaskId) return;
+    setPlanReviewPreparation((current) =>
+      current?.taskId === selectedTaskId && current.state === state
+        ? current
+        : { taskId: selectedTaskId, state }
+    );
+  }, [selectedTaskId]);
 
   /**
    * Whether another Claude round can be started, and what to call it.
@@ -172,11 +189,19 @@ export function RunView(): React.JSX.Element {
   }
 
   const { task, project, specification, lastReview } = detail;
+  const planReviewEnabled = settings?.externalPlanReviewEnabled ?? false;
+  const effectivePlanReviewPreparation: PlanReviewPreparation =
+    planReviewEnabled && task.status === 'DRAFT'
+      ? planReviewPreparation?.taskId === task.id
+        ? planReviewPreparation.state
+        : 'loading'
+      : 'not_required';
   const guidance = runGuidance(
     task,
     detail.runs,
     specification !== null,
-    correction.kind === 'retry_verification' && correction.enabled
+    correction.kind === 'retry_verification' && correction.enabled,
+    effectivePlanReviewPreparation
   );
   const running = isBusy(task.status);
   const anyBusy = Object.values(busy).some(Boolean);
@@ -303,8 +328,9 @@ export function RunView(): React.JSX.Element {
         <PlanReviewPanel
           key={task.id}
           task={task}
-          integrationEnabled={settings?.externalPlanReviewEnabled ?? false}
+          integrationEnabled={planReviewEnabled}
           onChanged={() => refreshDetail(task.id)}
+          onGuidanceStateChanged={updatePlanReviewPreparation}
         />
 
         {lastReview ? <ReviewPanel review={lastReview} /> : null}
@@ -493,11 +519,13 @@ const NO_DRAFTS: Record<number, DecisionDraft> = {};
 export function PlanReviewPanel({
   task,
   integrationEnabled,
-  onChanged
+  onChanged,
+  onGuidanceStateChanged
 }: {
   task: Task;
   integrationEnabled: boolean;
   onChanged: () => Promise<void>;
+  onGuidanceStateChanged?: (state: PlanReviewPreparation) => void;
 }): React.JSX.Element | null {
   const [detail, setDetail] = useState<PlanReviewDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -548,6 +576,21 @@ export function PlanReviewPanel({
       active = false;
     };
   }, [task.id]);
+
+  useEffect(() => {
+    if (!onGuidanceStateChanged) return;
+    if (!integrationEnabled || task.status !== 'DRAFT') {
+      onGuidanceStateChanged('not_required');
+    } else if (loading) {
+      onGuidanceStateChanged('loading');
+    } else if (error !== null || detail?.ruleEvidenceProblem) {
+      onGuidanceStateChanged('unavailable');
+    } else if (!detail?.ruleEvidence) {
+      onGuidanceStateChanged('capture_rules');
+    } else {
+      onGuidanceStateChanged('ready');
+    }
+  }, [detail, error, integrationEnabled, loading, onGuidanceStateChanged, task.status]);
 
   const act = async (
     key: string,
@@ -653,7 +696,11 @@ export function PlanReviewPanel({
             </div>
             <button
               type="button"
-              className="btn btn--wide"
+              className={`btn btn--wide${
+                integrationEnabled && !loading && error === null && task.status === 'DRAFT'
+                  ? ' btn--recommended'
+                  : ''
+              }`}
               disabled={!integrationEnabled || busy !== null || task.status !== 'DRAFT'}
               onClick={() => void act('bind', () => expect('planReview:bindRules', { taskId: task.id }))}
             >

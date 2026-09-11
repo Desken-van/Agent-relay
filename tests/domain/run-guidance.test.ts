@@ -49,6 +49,31 @@ describe('run guidance', () => {
     expect(value.next).toContain('without asking an AI to rewrite');
   });
 
+  it('requires external rule binding before it recommends specification generation', () => {
+    const value = runGuidance(task({ status: 'DRAFT' }), [], false, false, 'capture_rules');
+    expect(value.recommendedAction).toBe('capture_rules');
+    expect(value.next).toContain('Capture and bind rules');
+    expect(value.result).toContain('No immutable rule snapshot');
+  });
+
+  it('waits for external review evidence instead of briefly recommending the wrong action', () => {
+    const value = runGuidance(task({ status: 'DRAFT' }), [], false, false, 'loading');
+    expect(value.recommendedAction).toBe('none');
+    expect(value.next).toContain('finish loading');
+  });
+
+  it('recommends specification generation after external rules are bound', () => {
+    const value = runGuidance(task({ status: 'DRAFT' }), [], false, false, 'ready');
+    expect(value.recommendedAction).toBe('generate_specification');
+    expect(value.happened).toContain('captured and bound');
+  });
+
+  it('blocks specification guidance when external review state cannot be read', () => {
+    const value = runGuidance(task({ status: 'DRAFT' }), [], false, false, 'unavailable');
+    expect(value.recommendedAction).toBe('none');
+    expect(value.result).toContain('cannot safely choose');
+  });
+
   it('explains that a failed run is closed instead of suggesting a dead button', () => {
     const value = runGuidance(task({
       status: 'FAILED', currentRound: 2, lastError: 'Review round limit reached (2/2).'
