@@ -656,7 +656,6 @@ export class PlanReviewGateService {
     // call goes out. Everything below is an inference from a snapshot taken at
     // this moment, and none of it may be written if the moment has passed.
     const decidedAgainst = gate.revision;
-    const state = await this.deps.reviewer.status(subject(task, project.localPath), signal);
 
     /**
      * Apply a conclusion, unless the gate moved while the provider was read.
@@ -675,6 +674,22 @@ export class PlanReviewGateService {
       const current = this.deps.gates.findByTask(taskId);
       return current ?? gate;
     };
+
+    let state: ExternalPlanReviewStatus;
+    try {
+      state = await this.deps.reviewer.status(subject(task, project.localPath), signal);
+    } catch (error) {
+      // `opening` is written before `open` is called. A positive provider answer
+      // that no session exists therefore proves both that open did not take
+      // effect and that review_plan was never reached. Re-arming this one phase
+      // can only repeat the provider's idempotent open(repo, branch), never a
+      // plan round. The same answer after `reviewing` or `resolving` proves no
+      // such thing and is deliberately rethrown.
+      if (gate.status === 'opening' && error instanceof AgentRelayError && error.code === 'NOT_FOUND') {
+        return settle({ status: 'prepared', lastError: null });
+      }
+      throw error;
+    }
 
     // Classified before anything is taken from the answer, because "evidence of
     // nothing" has to include the identity the answer claims to speak for. A

@@ -180,6 +180,38 @@ describe('Coai plan reviewer adapter', () => {
     ]);
   });
 
+  it('reports the documented absent-session refusal as typed positive evidence', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('status', {
+      error: 'no session for this repo+branch — call open first'
+    }));
+
+    await expect(
+      new CoaiPlanReviewer(client, config).status({
+        repositoryPath: 'C:\\repo',
+        branch: 'agent/task'
+      })
+    ).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+      message: 'Coai has no session for this repository and branch.'
+    });
+    expect(client.calls).toEqual([
+      { tool: 'status', args: { repoPath: 'C:\\repo', branch: 'agent/task' } }
+    ]);
+  });
+
+  it('does not mistake any other status refusal for an absent session', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('status', { error: 'no session budget' }));
+
+    await expect(
+      new CoaiPlanReviewer(client, config).status({
+        repositoryPath: 'C:\\repo',
+        branch: 'agent/task'
+      })
+    ).rejects.toMatchObject({ code: 'TOOL_FAILED' });
+  });
+
   it('counts running, done and interrupted plan rounds apart', async () => {
     const client = new FakeMcpClient();
     client.responses.push(result('status', statusValue({

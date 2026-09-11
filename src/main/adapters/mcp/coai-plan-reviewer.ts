@@ -118,6 +118,28 @@ const resolutionSchema = z.object({
   instruction: z.string().max(20_000)
 });
 
+const NO_SESSION_REFUSAL = 'no session for this repo+branch — call open first';
+
+/**
+ * Coai's current status contract represents an absent session as a refusal
+ * rather than as a normal status envelope. Recognise only that documented,
+ * exact value; every other refusal keeps failing closed through parseCall.
+ */
+function isNoSessionRefusal(result: ExternalMcpCallResult): boolean {
+  if (result.isError || result.content.length !== 1) return false;
+  try {
+    const value: unknown = JSON.parse(result.content[0]!);
+    return (
+      typeof value === 'object' &&
+      value !== null &&
+      'error' in value &&
+      (value as { error?: unknown }).error === NO_SESSION_REFUSAL
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Either audited profile, and nothing between them.
  *
@@ -208,6 +230,9 @@ export class CoaiPlanReviewer implements ExternalPlanReviewer {
       { repoPath: subject.repositoryPath, branch: subject.branch },
       signal
     );
+    if (isNoSessionRefusal(result)) {
+      throw new AgentRelayError('NOT_FOUND', 'Coai has no session for this repository and branch.');
+    }
     const value = parseCall(result, statusSchema);
     // Required by the provider's contract, so a missing `sessionId` or a
     // missing `rounds` is malformed evidence and fails above — never a default.

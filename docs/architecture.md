@@ -420,7 +420,11 @@ isolated branch, launches a plan round, and records an accept/reject decision fo
 every finding before resolve. A rejected finding requires a reason in the UI,
 the IPC schema and the service. Durable `opening`, `reviewing` and `resolving`
 states are shown as unknown in-flight outcomes and never become automatic retry
-buttons. Live acceptance on 2026-09-07 completed the whole `proceed` journey
+buttons. Coai's documented `status` refusal for a missing repository-and-branch
+session is one narrow exception: it is typed as positive absence evidence and
+may re-arm only an `opening` gate, because `review_plan` is reached only after
+`open` returns. The same evidence from `reviewing` or `resolving` never permits
+a repeat. Live acceptance on 2026-09-07 completed the whole `proceed` journey
 through Coai 0.14.0 and a real Codex reviewer, including five durable findings,
 five decisions and restart read-back. This is evidence for that one path, not a
 claim that provider failure, `revise`, timeout and crash windows are all live-
@@ -1515,7 +1519,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1817 deterministic tests in 70 files, plus one routine automated Electron
+1821 deterministic tests in 70 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.
