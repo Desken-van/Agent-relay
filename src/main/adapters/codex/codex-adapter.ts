@@ -376,6 +376,7 @@ export class CodexSdkAdapter implements CodexAdapter {
       changes: request.changes,
       claudeReport: request.claudeReport,
       testOutput: request.testOutput,
+      relayVerification: request.relayVerification,
       round: request.round,
       maxRounds: request.maxRounds,
       ruleEvidence: request.ruleEvidence

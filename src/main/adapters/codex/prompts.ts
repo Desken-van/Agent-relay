@@ -7,6 +7,7 @@
  */
 
 import type { GitChangeSet } from '../../../shared/domain/git';
+import type { VerificationRecord } from '../../../shared/domain/verification';
 import type { CodexReviewResult, TaskSpecification } from '../../../shared/schemas/codex';
 
 /* -------------------------------------------------------------------------- */
@@ -68,6 +69,7 @@ export interface ReviewPromptInput {
   readonly changes: GitChangeSet;
   readonly claudeReport: string;
   readonly testOutput: string;
+  readonly relayVerification?: VerificationRecord;
   readonly round: number;
   readonly maxRounds: number;
   readonly ruleEvidence?: string;
@@ -92,6 +94,24 @@ export function buildReviewPrompt(input: ReviewPromptInput): string {
     changes.recentCommits.length > 0
       ? changes.recentCommits.map((line) => `  ${line}`).join('\n')
       : '  (no commits — changes are uncommitted in the worktree, which is expected)';
+
+  const relayVerification = input.relayVerification
+    ? `=== AGENT RELAY VERIFICATION OF THE CURRENT CODE SNAPSHOT ===
+Agent Relay itself ran: ${input.relayVerification.command}
+Result: PASSED
+Exit code: ${input.relayVerification.exitCode}
+Duration: ${input.relayVerification.durationMs} ms
+Snapshot identity: ${input.relayVerification.identity}
+
+Agent Relay confirmed immediately before this review that this successful record still
+matches the current task inputs and files. This evidence is authoritative for whether
+the configured verification command passed. If the historical implementer report below
+describes an earlier failed, blocked, or unavailable verification attempt, treat that
+statement as historical: do not raise a failed-or-missing-verification finding solely
+from the older report. You may still report concrete defects in the code or inadequacy
+of the configured verification coverage.
+`
+    : '';
 
   return `You are the REVIEWER in a two-agent relay. You are in READ-ONLY mode: you must not
 modify, create, or delete any file, and you must not run commands that change state.
@@ -119,6 +139,7 @@ ${specification.assumptions.length > 0 ? specification.assumptions.map((a) => ` 
 Tests the specification suggested:
 ${specification.suggestedTests.length > 0 ? specification.suggestedTests.map((t) => `  - ${t}`).join('\n') : '  (none suggested)'}
 
+${relayVerification}
 === WHAT THE IMPLEMENTER REPORTED ===
 ${input.claudeReport.trim() || '(the implementer returned no final report)'}
 

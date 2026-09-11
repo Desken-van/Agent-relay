@@ -31,6 +31,7 @@ import {
 import { AgentRelayError, InvalidTransitionError } from '../../shared/domain/errors';
 import type { GitChangeSet } from '../../shared/domain/git';
 import type { Project, Settings, Task } from '../../shared/domain/models';
+import type { VerificationRecord } from '../../shared/domain/verification';
 import {
   parsePlanReviewDecisions,
   parsePlanReviewFindings
@@ -273,14 +274,15 @@ export class Orchestrator {
     } finally { this.endExclusive(taskId); }
   }
 
-  private async assertVerificationCurrent(task: Task): Promise<void> {
+  private async assertVerificationCurrent(task: Task): Promise<VerificationRecord | null> {
     const run = latestVerification(this.deps.runs.listByTask(task.id));
-    if (!run) return;
+    if (!run) return null;
     const record = readVerification(run);
     if (!record.success || !record.data.passed || run.status !== 'succeeded' || !this.deps.verification ||
       record.data.identity !== await this.deps.verification.identity({ task, settings: this.deps.settings.get(), project: this.requireProject(task.projectId) })) {
       throw new AgentRelayError('VALIDATION_FAILED', 'Verification is missing, failed or stale. Choose Run verification before review.');
     }
+    return record.data;
   }
 
   configureProviders(input: { taskId: string; expectedRevision: number; implementationProvider: ExecutionProvider; reviewProvider: ExecutionProvider }): Task {
@@ -965,8 +967,9 @@ export class Orchestrator {
     if (nextRound > task.maxRounds) throw new AgentRelayError('VALIDATION_FAILED', 'The review round budget is exhausted. Verification does not reset it.');
 
     const controller = this.beginExclusive(taskId);
+    let relayVerification: VerificationRecord | null;
     try {
-      await this.assertVerificationCurrent(task);
+      relayVerification = await this.assertVerificationCurrent(task);
     } catch (error) {
       this.endExclusive(taskId);
       this.applyEvent(this.requireTask(taskId), 'verification_invalidated', { lastError: Orchestrator.describeError(error) });
@@ -1007,6 +1010,7 @@ export class Orchestrator {
           changes,
           claudeReport,
           testOutput: extractTestOutput(claudeReport),
+          relayVerification: relayVerification ?? undefined,
           round: task.currentRound,
           maxRounds: task.maxRounds,
           model: task.reviewProvider === 'claude' ? task.claudeModel : task.codexModel

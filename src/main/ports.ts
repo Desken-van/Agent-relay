@@ -37,6 +37,7 @@ import type {
   OperationTarget,
   OperationTargetConfig
 } from '../shared/domain/operations';
+import type { VerificationRecord } from '../shared/domain/verification';
 import type {
   DiagnosticFailureKind,
   DiagnosticLimits,
@@ -224,6 +225,11 @@ export interface CodexReviewRequest {
   readonly changes: GitChangeSet;
   readonly claudeReport: string;
   readonly testOutput: string;
+  /**
+   * Agent Relay's own successful verification of the exact review snapshot.
+   * This is authoritative over historical verification prose in an agent report.
+   */
+  readonly relayVerification?: VerificationRecord;
   readonly round: number;
   readonly maxRounds: number;
   /** Same snapshotted model as the specification that opened this thread. */

@@ -34,6 +34,10 @@ describe('verification-only workflow', () => {
     expect(JSON.parse(run.structuredResult!)).toMatchObject({identity, command:'npm run verify', passed:true, exitCode:0});
     await h.orchestrator.reviewWithCodex(task.id);
     expect(h.codex.reviewCalls).toHaveLength(1);
+    expect(h.codex.reviewCalls[0]?.relayVerification).toEqual({
+      version: 1, command: 'npm run verify', identity, passed: true,
+      exitCode: 0, durationMs: 15, reason: null
+    });
   });
   it.each(['exit', 'timeout', 'cancelled', 'changed'] as const)('does not open review after %s', async kind => {
     const task = await prepared();
