@@ -195,6 +195,18 @@ Rules enforced by [`workflow.ts`](../src/shared/domain/workflow.ts):
 * **Publishing has its own gate.** `assertPublishable()` requires both a granted
   approval *and* a publishable status.
 
+### Verification evidence passed into review
+
+A successful standalone `npm run verify` is stored as a versioned record with
+its command, exit code, duration and exact worktree identity. Before dispatching
+a review, the orchestrator re-computes that identity and rejects a missing,
+failed or stale record. The validated record is then passed through the review
+port and rendered as a dedicated authoritative prompt section. An older
+implementation/correction report remains available as historical context, but
+its earlier verification failure cannot override Relay's current successful
+record. After the reviewer returns, the identity is checked again before its
+verdict is accepted.
+
 ### Recovering from an abrupt exit
 
 A run is written as `running` before an agent is spawned, and the task moves
@@ -1526,7 +1538,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1823 deterministic tests in 70 files, plus one routine automated Electron
+1824 deterministic tests in 70 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.

@@ -7,6 +7,7 @@ export const verificationRecordSchema = z.object({
   passed: z.boolean(), exitCode: z.number().int().nullable(),
   durationMs: z.number().nonnegative(), reason: z.string().nullable()
 }).refine(value => !value.passed || (value.exitCode === 0 && value.reason === null), 'A pass requires exit zero and no failure reason');
+export type VerificationRecord = z.infer<typeof verificationRecordSchema>;
 export function latestVerification(runs: readonly Run[]): Run | null {
   // A later implementation invalidates the verification, even if files happen
   // to match; its failures must not be hidden by an older successful check.
