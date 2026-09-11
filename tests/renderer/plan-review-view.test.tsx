@@ -138,6 +138,23 @@ describe('the external plan-review panel', () => {
     );
   });
 
+  it('makes review preparation the next action after a bound specification is generated', async () => {
+    bridge.set('planReview:get', () => ok<'planReview:get'>(evidenceDetail));
+    const onGuidanceStateChanged = vi.fn();
+    render(
+      <PlanReviewPanel
+        task={task('READY_FOR_IMPLEMENTATION')}
+        integrationEnabled
+        onChanged={async () => undefined}
+        onGuidanceStateChanged={onGuidanceStateChanged}
+      />
+    );
+
+    const button = await screen.findByRole('button', { name: /Prepare isolated review branch/i });
+    await waitFor(() => expect(onGuidanceStateChanged).toHaveBeenLastCalledWith('prepare_review'));
+    expect(button.className).toContain('btn--recommended');
+  });
+
   it('requires a reason before it submits a rejected finding', async () => {
     const awaiting: PlanReviewDetail = {
       ...evidenceDetail,
@@ -614,11 +631,21 @@ describe('the external plan-review panel', () => {
       ['interrupted', /Run next plan-review round/i]
     ] as const) {
       bridge.set('planReview:get', () => ok<'planReview:get'>(gateWith(status, {}, 'current')));
+      const onGuidanceStateChanged = vi.fn();
       const view = render(
-        <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+        <PlanReviewPanel
+          task={task('READY_FOR_IMPLEMENTATION')}
+          integrationEnabled
+          onChanged={async () => undefined}
+          onGuidanceStateChanged={onGuidanceStateChanged}
+        />
       );
 
-      expect(await screen.findByRole('button', { name: label })).toBeTruthy();
+      const button = await screen.findByRole('button', { name: label });
+      await waitFor(() => expect(onGuidanceStateChanged).toHaveBeenLastCalledWith(
+        status === 'prepared' ? 'run_review' : 'run_next_review'
+      ));
+      expect(button.className).toContain('btn--recommended');
       expect(screen.queryByText(/could not be established/i)).toBeNull();
       if (status === 'interrupted') {
         expect(screen.getByText(/started in the provider and never finished/i)).toBeTruthy();

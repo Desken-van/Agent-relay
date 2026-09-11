@@ -190,8 +190,11 @@ export function RunView(): React.JSX.Element {
 
   const { task, project, specification, lastReview } = detail;
   const planReviewEnabled = settings?.externalPlanReviewEnabled ?? false;
+  const planReviewMayControlNextAction =
+    task.status === 'DRAFT' ||
+    (task.status === 'READY_FOR_IMPLEMENTATION' && !task.specificationApprovedAt);
   const effectivePlanReviewPreparation: PlanReviewPreparation =
-    planReviewEnabled && task.status === 'DRAFT'
+    planReviewMayControlNextAction
       ? planReviewPreparation?.taskId === task.id
         ? planReviewPreparation.state
         : 'loading'
@@ -516,6 +519,42 @@ type DecisionDrafts = {
 /** Shared empty map, so a stale round renders no drafts and no new objects. */
 const NO_DRAFTS: Record<number, DecisionDraft> = {};
 
+function planReviewPreparationState(input: {
+  readonly task: Task;
+  readonly integrationEnabled: boolean;
+  readonly loading: boolean;
+  readonly busy: string | null;
+  readonly error: string | null;
+  readonly detail: PlanReviewDetail | null;
+}): PlanReviewPreparation {
+  const { task, integrationEnabled, loading, busy, error, detail } = input;
+  const awaitingApproval =
+    task.status === 'DRAFT' ||
+    (task.status === 'READY_FOR_IMPLEMENTATION' && !task.specificationApprovedAt);
+  if (!awaitingApproval) return 'not_required';
+  if (loading) return 'loading';
+  if (error !== null || detail === null || detail.ruleEvidenceProblem !== null) return 'unavailable';
+  if (!integrationEnabled) return detail.ruleEvidence ? 'unavailable' : 'not_required';
+  if (busy !== null) return 'working';
+  if (task.status === 'DRAFT') return detail.ruleEvidence ? 'ready' : 'capture_rules';
+  if (!detail.ruleEvidence) return 'not_required';
+
+  const gate = detail.gate;
+  if (gate === null) return 'prepare_review';
+  if (['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status)) return 'reconcile';
+  if (gate.status === 'awaiting_resolve') return 'resolve';
+  if (detail.gateIdentity === 'current') {
+    if (gate.status === 'prepared') return 'run_review';
+    if (gate.status === 'changes_requested' || gate.status === 'interrupted') return 'run_next_review';
+    if (gate.status === 'proceeded') return 'passed';
+  }
+  if (detail.gateIdentity === 'obsolete' &&
+      !['opening', 'reviewing', 'awaiting_resolve', 'resolving', 'failed'].includes(gate.status)) {
+    return 'prepare_review';
+  }
+  return 'unavailable';
+}
+
 export function PlanReviewPanel({
   task,
   integrationEnabled,
@@ -577,20 +616,17 @@ export function PlanReviewPanel({
     };
   }, [task.id]);
 
+  const guidanceState = planReviewPreparationState({
+    task,
+    integrationEnabled,
+    loading,
+    busy,
+    error,
+    detail
+  });
   useEffect(() => {
-    if (!onGuidanceStateChanged) return;
-    if (!integrationEnabled || task.status !== 'DRAFT') {
-      onGuidanceStateChanged('not_required');
-    } else if (loading) {
-      onGuidanceStateChanged('loading');
-    } else if (error !== null || detail?.ruleEvidenceProblem) {
-      onGuidanceStateChanged('unavailable');
-    } else if (!detail?.ruleEvidence) {
-      onGuidanceStateChanged('capture_rules');
-    } else {
-      onGuidanceStateChanged('ready');
-    }
-  }, [detail, error, integrationEnabled, loading, onGuidanceStateChanged, task.status]);
+    onGuidanceStateChanged?.(guidanceState);
+  }, [guidanceState, onGuidanceStateChanged]);
 
   const act = async (
     key: string,
@@ -747,7 +783,7 @@ export function PlanReviewPanel({
         {detail?.ruleEvidence && task.status === 'READY_FOR_IMPLEMENTATION' && gate === null ? (
           <button
             type="button"
-            className="btn btn--wide"
+            className={`btn btn--wide${guidanceState === 'prepare_review' ? ' btn--recommended' : ''}`}
             disabled={!integrationEnabled || busy !== null}
             onClick={() => void act('prepare', () => expect('planReview:prepare', { taskId: task.id }))}
           >
@@ -763,7 +799,7 @@ export function PlanReviewPanel({
             </Notice>
             <button
               type="button"
-              className="btn btn--wide"
+              className={`btn btn--wide${guidanceState === 'prepare_review' ? ' btn--recommended' : ''}`}
               disabled={!integrationEnabled || busy !== null || task.status !== 'READY_FOR_IMPLEMENTATION'}
               onClick={() => void act('prepare', () => expect('planReview:prepare', { taskId: task.id }))}
             >
@@ -827,7 +863,11 @@ export function PlanReviewPanel({
         {gate && identity === 'current' && ['prepared', 'changes_requested', 'interrupted'].includes(gate.status) ? (
           <button
             type="button"
-            className="btn btn--wide"
+            className={`btn btn--wide${
+              guidanceState === 'run_review' || guidanceState === 'run_next_review'
+                ? ' btn--recommended'
+                : ''
+            }`}
             disabled={!integrationEnabled || busy !== null}
             onClick={() => void act('review', () => expect('planReview:review', { taskId: task.id }))}
           >
@@ -846,7 +886,7 @@ export function PlanReviewPanel({
             </Notice>
             <button
               type="button"
-              className="btn btn--wide"
+              className={`btn btn--wide${guidanceState === 'reconcile' ? ' btn--recommended' : ''}`}
               disabled={!integrationEnabled || busy !== null}
               onClick={() => void act('reconcile', () => expect('planReview:reconcile', { taskId: task.id }))}
             >
@@ -909,7 +949,9 @@ export function PlanReviewPanel({
             })}
             <button
               type="button"
-              className="btn btn--primary btn--wide"
+              className={`btn btn--primary btn--wide${
+                guidanceState === 'resolve' ? ' btn--recommended' : ''
+              }`}
               disabled={!integrationEnabled || busy !== null || !allDecided}
               onClick={() => {
                 const payload: PlanReviewDecision[] = findings.map((_, index) => ({
