@@ -325,6 +325,34 @@ End your reply with a short summary of what you changed, the exact verification
 command you ran, and its result.`;
 }
 
+/** Continue an implementation using the output from Relay's own failed check. */
+export function buildVerificationFailurePrompt(input: {
+  readonly command: string;
+  readonly reason: string;
+  readonly output: string;
+}): string {
+  return `Agent Relay independently verified the saved files and the verification failed.
+
+Continue the existing implementation in the same worktree. Do not restart the task or
+rewrite working code. Diagnose and fix the failures shown below, then run the project's
+verification command again.
+
+=== RELAY VERIFICATION COMMAND ===
+${input.command}
+
+=== RELAY VERIFICATION RESULT ===
+${input.reason}
+
+=== STORED COMMAND OUTPUT ===
+${input.output || '(No command output was stored.)'}
+
+The original specification and all earlier safety rules still apply. Do not commit, push,
+touch a remote, edit outside the worktree, or discard unrelated work. If the output reveals
+a real product defect, fix the defect rather than weakening its test.
+
+End with a concise report of the files changed and the exact verification result.`;
+}
+
 export function buildCorrectionPrompt(input: CorrectionPromptInput): string {
   const { review } = input;
 

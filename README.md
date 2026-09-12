@@ -271,6 +271,12 @@ does not send the same findings through another AI correction and consume the
 next review round. A security refusal, or a correction process that actually
 throws or is interrupted, returns to **Send corrections** for a retry.
 
+If Relay's own **Run verification** finishes with a failing exit code, the next
+primary action is **Fix verification failures · &lt;provider&gt;**. Relay sends the
+stored, bounded command output back to the selected implementation provider in
+the same worktree and review round. It does not loop the unchanged command or
+require the operator to copy logs into an external AI session.
+
 If a tool call is refused, what happens depends on what was refused. A blocked
 `git push` or a refusal Agent Relay cannot identify **fails** the round; a
 blocked auxiliary command in a round whose tests ran and passed is a **warning**
@@ -525,7 +531,7 @@ Run details also project publishing guidance from the same effective own-or-
 inherited implementation evidence enforced by the backend, so a review-entry
 continuation does not invent a recovery action after valid publishing approval.
 
-Test suite: **1928 deterministic tests in 80 files, plus one automated Electron
+Test suite: **1931 deterministic tests in 80 files, plus one automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -688,7 +694,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1928 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              1931 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```
