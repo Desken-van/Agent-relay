@@ -125,6 +125,30 @@ describe('verification-only workflow', () => {
     await h.orchestrator.runVerification(task.id);
     expect((await h.orchestrator.sendToClaude(task.id)).currentRound).toBe(3);
   });
+  it('hands failed Relay output to the implementation provider in the same round', async () => {
+    const task = await prepared(); h.tasks.update(task.id, {currentRound:2});
+    result = {
+      ...result, exitCode: 1, failed: true,
+      stdout: 'FAIL tests/widget.test.ts\nexpected enabled but received disabled',
+      stderr: 'TypeError: widget state is stale'
+    };
+    execute = async (_target, _signal, progress) => {
+      progress({type:'log', text:result.stdout});
+      progress({type:'stderr', text:result.stderr});
+      return result;
+    };
+    const failed = await h.orchestrator.runVerification(task.id);
+
+    expect(failed).toMatchObject({status:'READY_FOR_IMPLEMENTATION', currentRound:2});
+    const repaired = await h.orchestrator.sendToClaude(task.id);
+
+    expect(repaired.currentRound).toBe(2);
+    expect(h.claude.calls).toHaveLength(1);
+    expect(h.claude.calls[0]?.prompt).toContain('Agent Relay independently verified');
+    expect(h.claude.calls[0]?.prompt).toContain('FAIL tests/widget.test.ts');
+    expect(h.claude.calls[0]?.prompt).toContain('TypeError: widget state is stale');
+    expect(h.claude.calls[0]?.prompt).toContain('npm run verify failed (exit 1)');
+  });
   it('verification costs no round but a new review after an approval still consumes the next one', async () => {
     const task = await prepared();
     await h.orchestrator.runVerification(task.id); await h.orchestrator.reviewWithCodex(task.id);

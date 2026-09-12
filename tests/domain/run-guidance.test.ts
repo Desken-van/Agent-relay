@@ -73,6 +73,50 @@ describe('run guidance — exactly one action per state', () => {
     expectConsistent(value);
   });
 
+  it('offers an implementation repair after Relay verification failed', () => {
+    const value = runGuidance(task({
+      status: 'READY_FOR_IMPLEMENTATION', currentRound: 2,
+      specificationApprovedAt: '2026-09-11T00:00:00.000Z',
+      implementationProvider: 'codex',
+      lastError: 'npm run verify failed (exit 1). See command output.'
+    }), [
+      run({ id: 'implementation', runType: 'implementation', status: 'succeeded' }),
+      run({
+        id: 'verification', runType: 'verification', agent: 'system', status: 'failed',
+        structuredResult: JSON.stringify({
+          version: 1, command: 'npm run verify', identity: 'a'.repeat(64), passed: false,
+          exitCode: 1, durationMs: 10, reason: 'npm run verify failed (exit 1). See command output.'
+        }),
+        errorMessage: 'npm run verify failed (exit 1). See command output.'
+      })
+    ], true);
+
+    expect(value.action).toMatchObject({
+      key: 'run_implementation', label: 'Fix verification failures · Codex', enabled: true
+    });
+    expect(value.stage).toBe('Step 2 of 5 · Fix verification failures');
+    expectConsistent(value);
+  });
+
+  it('offers another verification after an infrastructure timeout, not an AI repair', () => {
+    const value = runGuidance(task({
+      status: 'READY_FOR_IMPLEMENTATION', currentRound: 2,
+      specificationApprovedAt: '2026-09-11T00:00:00.000Z'
+    }), [
+      run({ id: 'implementation', runType: 'implementation', status: 'succeeded' }),
+      run({
+        id: 'verification', runType: 'verification', agent: 'system', status: 'failed',
+        structuredResult: JSON.stringify({
+          version: 1, command: 'npm run verify', identity: 'a'.repeat(64), passed: false,
+          exitCode: null, durationMs: 10, reason: 'Verification timed out; success was not established.'
+        })
+      })
+    ], true);
+
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification' });
+    expectConsistent(value);
+  });
+
   it('names the selected review provider in the review label', () => {
     const value = runGuidance(task({ status: 'READY_FOR_REVIEW', reviewProvider: 'claude' }), [], true);
     expect(value.action?.label).toBe('Run review · Claude');

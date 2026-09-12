@@ -1,5 +1,6 @@
 import { providerLabel } from './execution-providers';
 import type { ContinuationEntryAction, Run, Task } from './models';
+import { latestVerification, verificationNeedsImplementationRepair } from './verification';
 
 /**
  * The one workflow transition Run → Actions may offer right now.
@@ -302,6 +303,18 @@ export function runGuidance(
           action: action('approve_specification', 'Approve specification'),
           activeStep: 0,
           tone: 'active'
+        });
+      }
+      const verification = latestVerification(runs);
+      if (verificationNeedsImplementationRepair(verification)) {
+        const repairLabel = `Fix verification failures · ${providerLabel(task.implementationProvider)}`;
+        return acting({
+          happened: 'Agent Relay ran verification and the current files did not pass.',
+          stage: 'Step 2 of 5 · Fix verification failures',
+          result: task.lastError ?? verification.errorMessage ?? 'The verification output is saved for the implementation provider.',
+          action: action('run_implementation', repairLabel),
+          activeStep: 1,
+          tone: 'warning'
         });
       }
       if (hasImplementationAttempt(runs)) {
