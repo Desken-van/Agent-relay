@@ -39,6 +39,7 @@ import {
   type ProviderCodeFinding
 } from '../../shared/domain/code-review';
 import type { Task } from '../../shared/domain/models';
+import { TERMINAL_STATUSES } from '../../shared/domain/workflow';
 import { containsSecretShape, redactAndTruncate } from '../../shared/util/redact';
 import {
   unsafeProviderIdentity,
@@ -420,6 +421,7 @@ export class CodeReviewService {
    * describing something that no longer existed by the time it finished.
    */
   async captureSubject(taskId: string): Promise<CodeReviewSubject> {
+    this.assertMutableTask(taskId);
     const { task, worktreePath, baseBranch } = this.requireReviewableTask(taskId);
     const snapshot = await this.buildSnapshot(worktreePath, baseBranch);
     const canonical = canonicalCodeSnapshot(snapshot);
@@ -728,6 +730,7 @@ export class CodeReviewService {
    * implies the call never happened.
    */
   async review(taskId: string, signal?: AbortSignal): Promise<CodeReviewRoundOutcome> {
+    this.assertMutableTask(taskId);
     const release = this.deps.claims.acquire(taskId);
     try {
       return await this.runReview(taskId, signal);
@@ -1204,6 +1207,7 @@ export class CodeReviewService {
    * three answers it can give license three different things.
    */
   async reconcile(taskId: string, signal?: AbortSignal): Promise<CodeReviewRoundOutcome> {
+    this.assertMutableTask(taskId);
     const release = this.deps.claims.acquire(taskId);
     try {
       return await this.runReconcile(taskId, signal);
@@ -1358,6 +1362,7 @@ export class CodeReviewService {
    * nothing.
    */
   markInterrupted(taskId: string, roundId: string, note: string): CodeReviewRound {
+    this.assertMutableTask(taskId);
     const round = this.deps.reviews.findRoundById(roundId);
     if (round === null || round.taskId !== taskId) {
       throw new AgentRelayError('NOT_FOUND', 'No such code review round for this task.');
@@ -1393,6 +1398,7 @@ export class CodeReviewService {
     taskId: string,
     request: DecideCodeFindingRequest
   ): Promise<{ finding: CodeReviewFinding; action: CodeReviewDecisionAction }> {
+    this.assertMutableTask(taskId);
     const reason = request.reason.trim();
     if (reason.length === 0) {
       throw new AgentRelayError(
@@ -1461,6 +1467,18 @@ export class CodeReviewService {
   /* ------------------------------------------------------------------------ */
   /* Helpers                                                                   */
   /* ------------------------------------------------------------------------ */
+
+  private assertMutableTask(taskId: string): Task {
+    const task = this.deps.tasks.findById(taskId);
+    if (task === null) throw new AgentRelayError('NOT_FOUND', `No task with id ${taskId}.`);
+    if (TERMINAL_STATUSES.includes(task.status)) {
+      throw new AgentRelayError(
+        'INVALID_TRANSITION',
+        'This task is closed. Code-review history remains readable, but it cannot be changed.'
+      );
+    }
+    return task;
+  }
 
   /**
    * The scope a reviewer is given.

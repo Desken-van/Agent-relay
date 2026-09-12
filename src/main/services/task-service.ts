@@ -1,7 +1,14 @@
 import { AgentRelayError } from '../../shared/domain/errors';
+import {
+  assessmentPublishRefusal,
+  latestImplementationRoundResult,
+  readClaudeAssessment
+} from '../../shared/domain/claude-assessment';
 import type { ExecutionProvider } from '../../shared/domain/execution-providers';
-import type { Task } from '../../shared/domain/models';
-import type { TaskDetail } from '../../shared/ipc';
+import type { ContinuationEntryAction, Task } from '../../shared/domain/models';
+import { isBusy, type TaskStatus } from '../../shared/domain/workflow';
+import { latestVerification, readVerification } from '../../shared/domain/verification';
+import type { TaskContinuationSummary, TaskDetail } from '../../shared/ipc';
 import { codexReviewResultSchema, taskSpecificationSchema } from '../../shared/schemas/codex';
 import type {
   ApprovalRepository,
@@ -11,6 +18,7 @@ import type {
   ProjectRepository,
   RunRepository,
   SettingsRepository,
+  TaskContinuationRepository,
   TaskRepository
 } from '../ports';
 
@@ -47,6 +55,7 @@ export interface TaskServiceDeps {
   readonly clock: Clock;
   readonly ids: IdGenerator;
   readonly events: EventPublisher;
+  readonly continuations: TaskContinuationRepository;
 }
 
 export class TaskService {
@@ -114,10 +123,29 @@ export class TaskService {
     const project = this.deps.projects.findById(task.projectId);
     if (!project) throw new AgentRelayError('NOT_FOUND', `No project with id ${task.projectId}.`);
 
+    const asContinuation = this.deps.continuations.findByContinuation(taskId);
+    const continuedBy = this.deps.continuations.findBySource(taskId);
+    const sourceClaim = this.deps.continuations.findClaimBySource(taskId);
+    const continuationClaim = this.deps.continuations.findClaimByContinuation(taskId);
+    const runs = this.deps.runs.listByTask(taskId);
+    if (continuationClaim?.effectiveEntryAction && !isBusy(task.status)) {
+      const expected: Record<ContinuationEntryAction, TaskStatus> = {
+        corrections: 'CHANGES_REQUESTED',
+        verification: 'READY_FOR_IMPLEMENTATION',
+        review: 'READY_FOR_REVIEW'
+      };
+      if (task.status !== expected[continuationClaim.effectiveEntryAction]) {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'The continuation entry state is inconsistent. Restart Agent Relay to reconcile it.'
+        );
+      }
+    }
+
     return {
       task,
       project,
-      runs: this.deps.runs.listByTask(taskId),
+      runs,
       approvals: this.deps.approvals.listByTask(taskId),
       specification: parseJson(task.specificationJson, taskSpecificationSchema),
       lastReview: parseJson(task.lastReviewJson, codexReviewResultSchema),
@@ -128,7 +156,45 @@ export class TaskService {
             head: null,
             isLocked: false
           }
-        : null
+        : null,
+      continuationOf: asContinuation ? this.linkSummary(asContinuation.sourceTaskId) : null,
+      continuationEntryAction: continuationClaim?.effectiveEntryAction ?? null,
+      continuedAs: continuedBy ? this.linkSummary(continuedBy.continuationTaskId) : null,
+      continuationCreationStatus: continuedBy ? 'ready' : sourceClaim?.state === 'creating' ? 'creating' : null,
+      effectivePublishRefusal: this.effectivePublishRefusal(taskId, runs)
+    };
+  }
+
+  /** Use the same own-first, inherited-until-superseded evidence rule as PublishService. */
+  private effectivePublishRefusal(taskId: string, runs: TaskDetail['runs']): TaskDetail['effectivePublishRefusal'] {
+    const own = latestImplementationRoundResult(runs);
+    const inheritedId = this.deps.continuations
+      .findByContinuation(taskId)
+      ?.inheritedImplementationRunId;
+    const inherited = own === null && inheritedId
+      ? this.deps.runs.findById(inheritedId)?.structuredResult ?? null
+      : null;
+    const refusal = assessmentPublishRefusal(readClaudeAssessment(own ?? inherited));
+    if (!refusal.blocked) return null;
+    if (own !== null || refusal.code === 'security') return refusal.code;
+
+    const verification = latestVerification(runs);
+    if (verification) {
+      const record = readVerification(verification);
+      if (record.success && record.data.passed && verification.status === 'succeeded') return null;
+    }
+    return refusal.code;
+  }
+
+  /** Bounded, navigable summary of the other side of a continuation link. */
+  private linkSummary(taskId: string): TaskContinuationSummary | null {
+    const linked = this.deps.tasks.findById(taskId);
+    if (!linked) return null;
+    return {
+      taskId: linked.id,
+      title: linked.title,
+      status: linked.status,
+      createdAt: linked.createdAt
     };
   }
 }

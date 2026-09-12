@@ -1,17 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { correctionAction, latestImplementationRoundResult as latestClaudeRoundResult } from '@shared/domain/claude-assessment';
-import { canChangeProviders, providerLabel, type ExecutionProvider } from '@shared/domain/execution-providers';
+import { canChangeProviders, type ExecutionProvider } from '@shared/domain/execution-providers';
 import type { GitChangeSet } from '@shared/domain/git';
-import type { ApprovalAction, Task } from '@shared/domain/models';
+import type { ApprovalAction, Run, Task } from '@shared/domain/models';
 import type { PlanReviewDecision } from '@shared/domain/plan-review';
 import {
   runGuidance,
   type PlanReviewPreparation,
-  type RunAction,
-  type RunGuidance
+  type RunActionKey,
+  type RunGuidance,
+  type RunPrimaryAction
 } from '@shared/domain/run-guidance';
 import { isBusy } from '@shared/domain/workflow';
-import type { PlanReviewDetail, PublishConfirmation } from '@shared/ipc';
+import type { PlanReviewDetail, PublishConfirmation, TaskDetail } from '@shared/ipc';
 import type { CodexReviewResult, FindingSeverity, TaskSpecification } from '@shared/schemas/codex';
 import { ApiError, call, expect } from '../lib/api';
 import { formatDateTime, pluralize } from '../lib/format';
@@ -21,11 +21,14 @@ import { codexModelLabel } from './TasksView';
 import { Card, Empty, Field, Notice, Rounds, Scope, Spinner, StatusBadge } from './primitives';
 import { RelayTimeline } from './RelayTimeline';
 
-function recommendedClass(action: RunAction, guidance: RunGuidance): string {
-  return action === guidance.recommendedAction ? ' btn--recommended' : '';
-}
-
 const FLOW_STEPS = ['Specification', 'Implementation', 'Verification', 'Review', 'Publish'] as const;
+
+export function publishRecoveryFor(
+  detail: Pick<TaskDetail, 'task' | 'effectivePublishRefusal'>
+): false | 'correction' | 'verification' {
+  if (detail.task.status !== 'READY_TO_PUBLISH' || detail.effectivePublishRefusal === null) return false;
+  return detail.effectivePublishRefusal === 'security' ? 'correction' : 'verification';
+}
 
 export function RunFlowOverview({ guidance }: { guidance: RunGuidance }): React.JSX.Element {
   return <section className={`run-guide run-guide--${guidance.tone}`} aria-label="Run progress and next action">
@@ -47,33 +50,71 @@ export function RunFlowOverview({ guidance }: { guidance: RunGuidance }): React.
   </section>;
 }
 
-export function VerificationControls({ task, busy, onChanged, guidance }: { task: Task; busy: boolean; onChanged: () => Promise<void>; guidance?: RunGuidance }): React.JSX.Element {
+/** Blast-radius icon for a primary action, mirrored from what the dispatched channel actually does. */
+const ACTION_SCOPE: Record<RunActionKey, 'read' | 'local' | 'remote'> = {
+  capture_rules: 'read',
+  generate_specification: 'read',
+  prepare_plan_review: 'local',
+  run_plan_review: 'read',
+  reconcile_plan_review: 'read',
+  resolve_plan_review: 'read',
+  approve_specification: 'read',
+  run_implementation: 'local',
+  run_verification: 'local',
+  run_review: 'read',
+  send_corrections: 'local',
+  approve_publishing: 'read',
+  continue_in_new_run: 'local'
+};
+
+/**
+ * The one contextual primary workflow button.
+ *
+ * A single synchronous ref-based claim, checked before any state update, is
+ * what makes a double-click issue exactly one request: React state (`pending`)
+ * only becomes true *after* the first click has already scheduled its async
+ * work, which is too late to stop a second click in the same tick.
+ */
+export function PrimaryActionButton({
+  action,
+  onClick,
+  pending,
+  blocked
+}: {
+  action: RunPrimaryAction;
+  onClick: () => void;
+  pending: boolean;
+  /** True while an unrelated operation (another busy flag, Stop, …) is in flight. */
+  blocked: boolean;
+}): React.JSX.Element {
   const claim = useRef(false);
-  const [pending, setPending] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const disabled = busy || pending || !task.worktreePath || !task.specificationApprovedAt ||
-    !['READY_FOR_IMPLEMENTATION', 'READY_FOR_REVIEW', 'CHANGES_REQUESTED', 'APPROVED', 'READY_TO_PUBLISH'].includes(task.status);
-  return <div className="stack">
-    <button type="button" className={`btn btn--wide${guidance ? recommendedClass('run_verification', guidance) : ''}`} disabled={disabled} onClick={() => {
-      if (claim.current) return;
-      claim.current = true; setPending(true); setMessage(null);
-      void (async () => {
+  return (
+    <button
+      type="button"
+      className="btn btn--wide btn--primary btn--recommended"
+      disabled={!action.enabled || pending || blocked}
+      title={action.disabledReason ?? undefined}
+      onClick={() => {
+        if (claim.current) return;
+        claim.current = true;
         try {
-          const result = await expect('workflow:verify', { taskId: task.id });
-          setMessage(result.status === 'READY_FOR_REVIEW' ? 'Verification passed — Run review is available.' : 'Verification did not pass. See Timeline for commands and errors.');
-        } catch (error) { setMessage(error instanceof Error ? error.message : 'Verification outcome could not be confirmed. Refresh the task before retrying.'); }
-        finally {
-          try { await onChanged(); } catch { setMessage('Could not refresh task state. Refresh before retrying.'); }
-          claim.current = false; setPending(false);
+          onClick();
+        } finally {
+          // Cleared on the next tick rather than in a `finally` inside the
+          // caller's async work: the caller's own `pending` flag covers the
+          // duration of the request, and this ref only needs to survive the
+          // synchronous burst a double-click produces.
+          window.setTimeout(() => { claim.current = false; }, 0);
         }
-      })();
-    }}>{pending ? <Spinner /> : <Scope kind="local" />} Run verification</button>
-    <p className="hint">Runs npm run verify in the existing worktree. No AI implementation. Project scripts may write build/test files. Results appear in Timeline; changed code requires verification again.</p>
-    {message ? <Notice tone="info">{message}</Notice> : null}
-  </div>;
+      }}
+    >
+      {pending ? <Spinner /> : <Scope kind={ACTION_SCOPE[action.key]} />}
+      {action.label}
+    </button>
+  );
 }
 
-export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: boolean; onChanged: () => Promise<void> }): React.JSX.Element {
+export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: boolean; onChanged: (task: Task) => void | Promise<void> }): React.JSX.Element {
   const [implementation, setImplementation] = useState<ExecutionProvider | null>(null);
   const [review, setReview] = useState<ExecutionProvider | null>(null);
   const [saving, setSaving] = useState(false);
@@ -82,6 +123,7 @@ export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: 
   const implementationValue = implementation ?? task.implementationProvider;
   const reviewValue = review ?? task.reviewProvider;
   const disabled = busy || saving || !canChangeProviders(task.status);
+  const differs = implementationValue !== task.implementationProvider || reviewValue !== task.reviewProvider;
   return <div className="stack">
     <Field label="Implementation provider">
       <select className="input" aria-label="Implementation provider" value={implementationValue} disabled={disabled} onChange={(e) => setImplementation(e.target.value as ExecutionProvider)}>
@@ -93,25 +135,74 @@ export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: 
         <option value="codex">Codex</option><option value="claude">Claude</option>
       </select>
     </Field>
-    <button type="button" className="btn btn--sm" disabled={disabled || (implementationValue === task.implementationProvider && reviewValue === task.reviewProvider)} onClick={() => {
-      if (claim.current) return;
-      claim.current = true; setSaving(true); setError(null);
-      void (async () => {
-        try {
-          await expect('workflow:configureProviders', { taskId: task.id, expectedRevision: task.providerRevision, implementationProvider: implementationValue, reviewProvider: reviewValue });
-          await onChanged(); setImplementation(null); setReview(null);
-        } catch (err) { setError(err instanceof Error ? err.message : 'Could not update providers.'); }
-        finally { claim.current = false; setSaving(false); }
-      })();
-    }}>{saving ? 'Saving…' : 'Apply providers'}</button>
+    {/* Absent rather than merely disabled while the selection matches the
+        persisted providers — there is nothing to apply, so there is no
+        control to show. It reappears the moment either selection differs. */}
+    {differs || saving ? (
+      <button type="button" className="btn btn--sm" disabled={disabled} onClick={() => {
+        if (claim.current) return;
+        claim.current = true; setSaving(true); setError(null);
+        void (async () => {
+          try {
+            const updated = await expect('workflow:configureProviders', { taskId: task.id, expectedRevision: task.providerRevision, implementationProvider: implementationValue, reviewProvider: reviewValue });
+            await onChanged(updated); setImplementation(null); setReview(null);
+          } catch (err) { setError(err instanceof Error ? err.message : 'Could not update providers.'); }
+          finally { claim.current = false; setSaving(false); }
+        })();
+      }}>{saving ? 'Saving…' : 'Apply providers'}</button>
+    ) : null}
     <p className="hint">Changing the executor preserves files and history, but starts a new implementation session. No automatic fallback. Coai settings are separate.</p>
     {error ? <Notice tone="warn">{error}</Notice> : null}
   </div>;
 }
 
+function ContinuationLink({ detail, onOpen }: { detail: TaskDetail; onOpen: (taskId: string) => void }): React.JSX.Element | null {
+  const { continuationOf, continuedAs } = detail;
+  if (!continuationOf && !continuedAs) return null;
+  return (
+    <div className="stack stack--tight">
+      {continuationOf ? (
+        <div className="filerow">
+          <span className="tag">continuation of</span>
+          <span className="filerow__path selectable">{continuationOf.title}</span>
+          <button type="button" className="btn btn--sm btn--ghost" onClick={() => onOpen(continuationOf.taskId)}>Open</button>
+        </div>
+      ) : null}
+      {continuedAs ? (
+        <div className="filerow">
+          <span className="tag tag--ok">continued as</span>
+          <span className="filerow__path selectable">{continuedAs.title}</span>
+          <button type="button" className="btn btn--sm btn--ghost" onClick={() => onOpen(continuedAs.taskId)}>Open</button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function CompletedHistory({ runs }: { runs: readonly Run[] }): React.JSX.Element | null {
+  const completed = runs.filter((run) => run.status === 'succeeded');
+  if (completed.length === 0) return null;
+  return (
+    <details aria-label="Completed workflow history">
+      <summary className="faint" style={{ cursor: 'pointer' }}>
+        Completed operations ({completed.length})
+      </summary>
+      <div className="stack stack--tight" style={{ marginTop: 8 }}>
+        {completed.map((run) => (
+          <div className="filerow" key={run.id}>
+            <span className="tag tag--ok">complete</span>
+            <span className="filerow__path">{run.runType.replace(/_/g, ' ')}</span>
+            <span className="filerow__stat faint">round {run.round}</span>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
 export function RunView(): React.JSX.Element {
   const store = useStore();
-  const { selectedTaskId, detail, refreshDetail, perform, notify, busy, codexModels, settings } = store;
+  const { selectedTaskId, detail, refreshDetail, openTaskDetail, acceptTask, perform, notify, busy, codexModels, settings } = store;
 
   const [changes, setChanges] = useState<GitChangeSet | null>(null);
   const [planReviewPreparation, setPlanReviewPreparation] = useState<{
@@ -127,24 +218,23 @@ export function RunView(): React.JSX.Element {
     );
   }, [selectedTaskId]);
 
-  /**
-   * Whether another Claude round can be started, and what to call it.
-   *
-   * Two situations lead here: a review that asked for changes, and a round the
-   * publish gate refused after the reviewer approved it. The second used to be
-   * a dead end in the UI — the orchestrator allowed it, the button did not.
-   */
-  const correction = correctionAction({
-    status: detail?.task.status ?? null,
-    currentRound: detail?.task.currentRound ?? 0,
-    maxRounds: detail?.task.maxRounds ?? 0,
-    latestClaudeStructuredResult: latestClaudeRoundResult(detail?.runs ?? [])
-  });
   const [loadingChanges, setLoadingChanges] = useState(false);
   const [dirtyPrompt, setDirtyPrompt] = useState<string | null>(null);
+  /** Non-null while the one primary action is in flight; names the action key. */
+  const [primaryPending, setPrimaryPending] = useState<RunActionKey | null>(null);
+  const planPrimaryDispatch = useRef<((key: RunActionKey) => void) | null>(null);
+  const registerPlanDispatcher = useCallback((dispatcher: ((key: RunActionKey) => void) | null) => {
+    planPrimaryDispatch.current = dispatcher;
+  }, []);
 
   useEffect(() => {
-    if (selectedTaskId) void refreshDetail(selectedTaskId);
+    // Avoid an immediate second request when the detail already matches the
+    // selection — e.g. right after `workflow:continue` hands the renderer a
+    // full TaskDetail for the task it just switched to.
+    if (selectedTaskId && detail?.task.id !== selectedTaskId) {
+      void refreshDetail(selectedTaskId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTaskId, refreshDetail]);
 
   /** Fetches the change set without touching component state. */
@@ -164,8 +254,6 @@ export function RunView(): React.JSX.Element {
     }
   }, [fetchChanges]);
 
-  // Refresh the diff whenever the task reaches a state where it is meaningful.
-  // State is written only after the request resolves, so this cannot cascade.
   const status = detail?.task.status;
   useEffect(() => {
     if (status !== 'READY_FOR_REVIEW' && status !== 'CHANGES_REQUESTED' && status !== 'APPROVED') {
@@ -179,6 +267,14 @@ export function RunView(): React.JSX.Element {
       active = false;
     };
   }, [status, fetchChanges]);
+
+  // Declared before the early return below so every render calls the same
+  // hooks in the same order, regardless of whether a task is selected yet.
+  const openTask = useCallback((taskId: string) => {
+    void perform('open-linked-task', 'Could not open the linked task', async () => {
+      openTaskDetail(await expect('tasks:get', { taskId }));
+    });
+  }, [openTaskDetail, perform]);
 
   if (!selectedTaskId || !detail) {
     return (
@@ -199,24 +295,46 @@ export function RunView(): React.JSX.Element {
         ? planReviewPreparation.state
         : 'loading'
       : 'not_required';
+
+  // TaskService applies PublishService's own-first/inherited-until-superseded
+  // evidence selection and exposes only the bounded refusal code. The
+  // renderer uses that read model solely to choose recovery guidance; the
+  // backend publication gate remains authoritative.
+  const publishRecovery = publishRecoveryFor(detail);
+
   const guidance = runGuidance(
     task,
     detail.runs,
     specification !== null,
-    correction.kind === 'retry_verification' && correction.enabled,
-    effectivePlanReviewPreparation
+    publishRecovery,
+    effectivePlanReviewPreparation,
+    {
+      lastReviewVerdict: lastReview?.verdict ?? null,
+      continuationTaskId: detail.continuedAs?.taskId ?? null,
+      continuationCreationStatus: detail.continuationCreationStatus,
+      continuationEntryAction: detail.continuationEntryAction,
+      isContinuation: detail.continuationOf !== null
+    }
   );
   const running = isBusy(task.status);
   const anyBusy = Object.values(busy).some(Boolean);
+  // Blocks every OTHER control while any operation is in flight. Does not
+  // include `primaryPending` itself — the button's own `pending` prop already
+  // covers that case, and folding it in here would also disable it the
+  // instant its own click sets `primaryPending`, before `busy`/`running` have
+  // had a chance to catch up.
+  const otherOperationBusy = anyBusy || running;
 
   const sendToClaude = (acceptDirty: boolean): void => {
     setDirtyPrompt(null);
+    setPrimaryPending('run_implementation');
     void perform('send-claude', 'Implementation run failed', async () => {
       try {
-        await expect('workflow:implement', {
+        const updated = await expect('workflow:implement', {
           taskId: task.id,
           ...(acceptDirty ? { acceptDirtyWorkingTree: true } : {})
         });
+        acceptTask(updated);
         notify({ tone: 'success', title: 'Implementation round finished' });
         await loadChanges();
       } catch (error) {
@@ -226,9 +344,113 @@ export function RunView(): React.JSX.Element {
         }
         throw error;
       } finally {
-        await refreshDetail(task.id);
+        setPrimaryPending(null);
       }
     });
+  };
+
+  /** Every non-plan-review primary action: exactly one bounded IPC call, then one read-only refresh. */
+  const dispatchPrimary = (): void => {
+    const action = guidance.action;
+    if (!action || !action.enabled) return;
+    switch (action.key) {
+      case 'generate_specification':
+        setPrimaryPending(action.key);
+        void perform('spec', 'Specification failed', async () => {
+          try {
+            acceptTask(await expect('workflow:generateSpecification', { taskId: task.id }));
+            notify({ tone: 'success', title: 'Codex produced a specification' });
+          } finally {
+            setPrimaryPending(null);
+          }
+        });
+        return;
+      case 'approve_specification':
+        setPrimaryPending(action.key);
+        void perform('approve-spec', 'Could not approve', async () => {
+          try {
+            acceptTask(await expect('workflow:approveSpecification', { taskId: task.id }));
+            notify({ tone: 'success', title: 'Specification approved' });
+          } finally {
+            setPrimaryPending(null);
+          }
+        });
+        return;
+      case 'run_implementation':
+        sendToClaude(false);
+        return;
+      case 'run_verification':
+        setPrimaryPending(action.key);
+        void perform('verify', 'Verification could not be confirmed', async () => {
+          try {
+            const result = await expect('workflow:verify', { taskId: task.id });
+            acceptTask(result);
+            notify({
+              tone: result.status === 'READY_FOR_REVIEW' ? 'success' : 'info',
+              title: result.status === 'READY_FOR_REVIEW' ? 'Verification passed' : 'Verification did not pass'
+            });
+          } finally {
+            setPrimaryPending(null);
+          }
+        });
+        return;
+      case 'run_review':
+        setPrimaryPending(action.key);
+        void perform('review', 'Review failed', async () => {
+          try {
+            acceptTask(await expect('workflow:review', { taskId: task.id }));
+            notify({ tone: 'success', title: 'Review complete' });
+          } finally {
+            await loadChanges();
+            setPrimaryPending(null);
+          }
+        });
+        return;
+      case 'send_corrections':
+        setPrimaryPending(action.key);
+        void perform('corrections', 'Correction round failed', async () => {
+          try {
+            acceptTask(await expect('workflow:sendCorrections', { taskId: task.id }));
+            notify({ tone: 'success', title: 'Implementation round finished' });
+          } finally {
+            await loadChanges();
+            setPrimaryPending(null);
+          }
+        });
+        return;
+      case 'approve_publishing':
+        setPrimaryPending(action.key);
+        void perform('approve-publish', 'Could not approve for publishing', async () => {
+          try {
+            acceptTask(await expect('workflow:approveForPublishing', { taskId: task.id }));
+            notify({ tone: 'success', title: 'Approved for publishing' });
+          } finally {
+            setPrimaryPending(null);
+          }
+        });
+        return;
+      case 'continue_in_new_run':
+        setPrimaryPending(action.key);
+        void perform('continue', 'Could not create the continuation', async () => {
+          try {
+            const continuationDetail = await expect('workflow:continue', { taskId: task.id });
+            notify({ tone: 'success', title: 'Continuation created', body: continuationDetail.task.title });
+            // The response already carries the full detail the renderer
+            // needs; opening it directly avoids a second `tasks:get`.
+            openTaskDetail(continuationDetail);
+          } finally {
+            setPrimaryPending(null);
+          }
+        });
+        return;
+      case 'capture_rules':
+      case 'prepare_plan_review':
+      case 'run_plan_review':
+      case 'reconcile_plan_review':
+      case 'resolve_plan_review':
+        planPrimaryDispatch.current?.(action.key);
+        return;
+    }
   };
 
   return (
@@ -246,6 +468,8 @@ export function RunView(): React.JSX.Element {
             </div>
 
             <div style={{ fontSize: 15, fontWeight: 600 }}>{task.title}</div>
+
+            <ContinuationLink detail={detail} onOpen={openTask} />
 
             <div className="kv">
               <span className="kv__k">Project</span>
@@ -328,14 +552,6 @@ export function RunView(): React.JSX.Element {
           />
         ) : null}
 
-        <PlanReviewPanel
-          key={task.id}
-          task={task}
-          integrationEnabled={planReviewEnabled}
-          onChanged={() => refreshDetail(task.id)}
-          onGuidanceStateChanged={updatePlanReviewPreparation}
-        />
-
         {lastReview ? <ReviewPanel review={lastReview} /> : null}
 
         <Card title="Relay timeline" flush>
@@ -361,123 +577,43 @@ export function RunView(): React.JSX.Element {
         <Card title="Actions">
           <RunFlowOverview guidance={guidance} />
           <ProviderControls key={task.id} task={task} busy={anyBusy || running}
-            onChanged={() => refreshDetail(task.id)} />
-          <div className="actions">
-            <div className="actions__legend">Read-only</div>
-            <button
-              type="button"
-              className={`btn btn--wide${recommendedClass('generate_specification', guidance)}`}
-              disabled={anyBusy || running || !canGenerateSpec(task.status)}
-              onClick={() =>
-                void perform('spec', 'Specification failed', async () => {
-                  await expect('workflow:generateSpecification', { taskId: task.id });
-                  notify({ tone: 'success', title: 'Codex produced a specification' });
-                  await refreshDetail(task.id);
-                })
-              }
-            >
-              {busy['spec'] ? <Spinner /> : <Scope kind="read" />}
-              {specification ? 'Regenerate specification' : 'Generate specification'}
-            </button>
+            onChanged={acceptTask} />
+          <CompletedHistory runs={detail.runs} />
 
-            <button
-              type="button"
-              className={`btn btn--wide${recommendedClass('approve_specification', guidance)}`}
-              disabled={
-                anyBusy ||
-                running ||
-                task.status !== 'READY_FOR_IMPLEMENTATION' ||
-                !specification ||
-                Boolean(task.specificationApprovedAt)
-              }
-              onClick={() =>
-                void perform('approve-spec', 'Could not approve', async () => {
-                  await expect('workflow:approveSpecification', { taskId: task.id });
-                  notify({ tone: 'success', title: 'Specification approved' });
-                  await refreshDetail(task.id);
-                })
-              }
-            >
-              <Scope kind="read" />
-              {task.specificationApprovedAt ? 'Specification approved ✓' : 'Approve specification'}
-            </button>
+          <PlanReviewPanel
+            key={task.id}
+            task={task}
+            integrationEnabled={planReviewEnabled}
+            onChanged={() => refreshDetail(task.id)}
+            onGuidanceStateChanged={updatePlanReviewPreparation}
+            renderPrimary={false}
+            onDispatchReady={registerPlanDispatcher}
+          />
 
-            <button
-              type="button"
-              className={`btn btn--wide${recommendedClass('run_review', guidance)}`}
-              disabled={anyBusy || running || task.status !== 'READY_FOR_REVIEW'}
-              onClick={() =>
-                void perform('review', 'Review failed', async () => {
-                  await expect('workflow:review', { taskId: task.id });
-                  notify({ tone: 'success', title: 'Review complete' });
-                  await Promise.all([refreshDetail(task.id), loadChanges()]);
-                })
-              }
-            >
-              {busy['review'] ? <Spinner /> : <Scope kind="read" />} Run review · {providerLabel(task.reviewProvider)}
-            </button>
+          {guidance.action ? (
+            <div className="actions">
+              <PrimaryActionButton
+                action={guidance.action}
+                pending={primaryPending === guidance.action.key}
+                blocked={otherOperationBusy}
+                onClick={dispatchPrimary}
+              />
+            </div>
+          ) : null}
 
-            <div className="actions__legend">Writes local files</div>
-            <VerificationControls key={task.id} task={task} busy={anyBusy || running} guidance={guidance} onChanged={() => refreshDetail(task.id)} />
-            <button
-              type="button"
-              className={`btn btn--wide${recommendedClass('run_implementation', guidance)}`}
-              disabled={
-                anyBusy ||
-                running ||
-                task.status !== 'READY_FOR_IMPLEMENTATION' ||
-                !task.specificationApprovedAt
-              }
-              onClick={() => sendToClaude(false)}
-            >
-              {busy['send-claude'] ? <Spinner /> : <Scope kind="local" />} Run implementation · {providerLabel(task.implementationProvider)}
-            </button>
-
-            <button
-              type="button"
-              className={`btn btn--wide${recommendedClass('send_corrections', guidance)}`}
-              disabled={anyBusy || running || !correction.enabled}
-              title={correction.disabledReason ?? undefined}
-              onClick={() =>
-                void perform('corrections', 'Correction round failed', async () => {
-                  await expect('workflow:sendCorrections', { taskId: task.id });
-                    notify({ tone: 'success', title: 'Implementation round finished' });
-                  await Promise.all([refreshDetail(task.id), loadChanges()]);
-                })
-              }
-            >
-              {busy['corrections'] ? <Spinner /> : <Scope kind="local" />} {correction.label}
-            </button>
-
-            <div className="actions__legend">Control</div>
+          <div className="actions actions--control">
             <button
               type="button"
               className="btn btn--danger btn--wide"
               disabled={!running && isTerminal(task.status)}
               onClick={() =>
                 void perform('stop', 'Could not stop the task', async () => {
-                  await expect('workflow:stop', { taskId: task.id });
+                  acceptTask(await expect('workflow:stop', { taskId: task.id }));
                   notify({ tone: 'info', title: 'Task stopped' });
-                  await refreshDetail(task.id);
                 })
               }
             >
               Stop task
-            </button>
-
-            <button
-              type="button"
-              className={`btn btn--wide${recommendedClass('approve_publishing', guidance)}`}
-              disabled={anyBusy || task.status !== 'APPROVED'}
-              onClick={() =>
-                void perform('approve-publish', 'Could not approve for publishing', async () => {
-                  await expect('workflow:approveForPublishing', { taskId: task.id });
-                  notify({ tone: 'success', title: 'Approved for publishing' });
-                  await refreshDetail(task.id);
-                })
-              }
-            >
-              <Scope kind="read" /> Approve for publishing
             </button>
           </div>
         </Card>
@@ -518,6 +654,7 @@ type DecisionDrafts = {
 
 /** Shared empty map, so a stale round renders no drafts and no new objects. */
 const NO_DRAFTS: Record<number, DecisionDraft> = {};
+const NO_PLAN_REVIEW_FINDINGS: PlanReviewDetail['findings'] = [];
 
 function planReviewPreparationState(input: {
   readonly task: Task;
@@ -526,8 +663,9 @@ function planReviewPreparationState(input: {
   readonly busy: string | null;
   readonly error: string | null;
   readonly detail: PlanReviewDetail | null;
+  readonly resolutionReady?: boolean;
 }): PlanReviewPreparation {
-  const { task, integrationEnabled, loading, busy, error, detail } = input;
+  const { task, integrationEnabled, loading, busy, error, detail, resolutionReady = false } = input;
   const awaitingApproval =
     task.status === 'DRAFT' ||
     (task.status === 'READY_FOR_IMPLEMENTATION' && !task.specificationApprovedAt);
@@ -542,7 +680,7 @@ function planReviewPreparationState(input: {
   const gate = detail.gate;
   if (gate === null) return 'prepare_review';
   if (['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status)) return 'reconcile';
-  if (gate.status === 'awaiting_resolve') return 'resolve';
+  if (gate.status === 'awaiting_resolve') return resolutionReady ? 'resolve' : 'resolve_blocked';
   if (detail.gateIdentity === 'current') {
     if (gate.status === 'prepared') return 'run_review';
     if (gate.status === 'changes_requested' || gate.status === 'interrupted') return 'run_next_review';
@@ -555,37 +693,42 @@ function planReviewPreparationState(input: {
   return 'unavailable';
 }
 
+/**
+ * External plan review, folded into Run → Actions.
+ *
+ * Renders active status, verdict, findings, decision inputs, the last error
+ * and any evidence problem as passive content, plus — at most — the single
+ * primary button this state calls for. There is no separate card for it: it
+ * lives inside Actions, right alongside the rest of the workflow.
+ *
+ * This component decides its own button from the same durable state
+ * `runGuidance` reads (via {@link planReviewPreparationState}, reported
+ * upward through `onGuidanceStateChanged`), so the two can never disagree —
+ * `RunView` uses that same reported state to know when to suppress its own,
+ * separate primary button rather than duplicating this one. No plan-review
+ * success handler here ever triggers a second plan-review operation.
+ */
 export function PlanReviewPanel({
   task,
   integrationEnabled,
   onChanged,
-  onGuidanceStateChanged
+  onGuidanceStateChanged,
+  renderPrimary = true,
+  onDispatchReady
 }: {
   task: Task;
   integrationEnabled: boolean;
   onChanged: () => Promise<void>;
   onGuidanceStateChanged?: (state: PlanReviewPreparation) => void;
+  renderPrimary?: boolean;
+  onDispatchReady?: (dispatcher: ((key: RunActionKey) => void) | null) => void;
 }): React.JSX.Element | null {
   const [detail, setDetail] = useState<PlanReviewDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
-  // A ref as well as the state: two clicks in one tick see the same rendered
-  // `disabled`, and only a synchronous claim keeps one external call to one
-  // press. It matters most for Reconcile, which talks to the provider.
   const inFlightRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [dirtyPrompt, setDirtyPrompt] = useState(false);
-  // Drafts are stored WITH the round they were typed against, and read back
-  // only for that round. A decision is an answer to finding number N of one
-  // particular round, so it stops meaning anything the moment the round
-  // changes — and two rounds of the same length would accept each other's
-  // answers silently, indices and all.
-  //
-  // Derived during render rather than reset in an effect: there is no external
-  // system to synchronise with here, and clearing state from an effect renders
-  // the stale drafts once before removing them. The revision moves only when
-  // the main process writes the gate, never while the operator is typing, so
-  // editing within one round is untouched.
   const [draftState, setDraftState] = useState<DecisionDrafts>({ roundKey: null, drafts: {} });
   const roundKey = detail?.gate ? `${detail.gate.id}:${detail.gate.revision}` : null;
   const decisions = draftState.roundKey === roundKey ? draftState.drafts : NO_DRAFTS;
@@ -616,19 +759,27 @@ export function PlanReviewPanel({
     };
   }, [task.id]);
 
+  const gate = detail?.gate ?? null;
+  const findings = detail?.findings ?? NO_PLAN_REVIEW_FINDINGS;
+  const allDecided = findings.every((_, index) => {
+    const decision = decisions[index];
+    return decision?.action === 'accept' ||
+      (decision?.action === 'reject' && decision.reason.trim().length > 0);
+  });
   const guidanceState = planReviewPreparationState({
     task,
     integrationEnabled,
     loading,
     busy,
     error,
-    detail
+    detail,
+    resolutionReady: allDecided
   });
   useEffect(() => {
     onGuidanceStateChanged?.(guidanceState);
   }, [guidanceState, onGuidanceStateChanged]);
 
-  const act = async (
+  const act = useCallback(async (
     key: string,
     operation: () => Promise<PlanReviewDetail>
   ): Promise<void> => {
@@ -650,15 +801,10 @@ export function PlanReviewPanel({
         // lying. Both write their durable phase before they dispatch, so a lost
         // answer leaves the gate at `reviewing` or `resolving` in the main
         // process while this panel still holds the `prepared` or
-        // `awaiting_resolve` it rendered before the click — offering the very
-        // button the service will now refuse, and hiding the reconciliation that
-        // is the actual way out. One read-only read-back fixes the display.
-        //
-        // Exactly one, and never the operation itself: `review` and `resolve`
-        // are not idempotent and may already have taken effect. If the read-back
-        // fails too, the original error stands and the stale detail stays as it
-        // is — a screen that admits it does not know beats one that invents an
-        // outcome.
+        // `awaiting_resolve` it rendered before the click. One read-only
+        // read-back fixes the display — never the operation itself, since
+        // `review` and `resolve` are not idempotent and may already have
+        // taken effect.
         if (key === 'review' || key === 'resolve') {
           try {
             setDetail(await expect('planReview:get', { taskId: task.id }));
@@ -671,33 +817,57 @@ export function PlanReviewPanel({
       inFlightRef.current = false;
       setBusy(null);
     }
-  };
+  }, [onChanged, task.id]);
+
+  const dispatchPlanPrimary = useCallback((key: RunActionKey): void => {
+    switch (key) {
+      case 'capture_rules':
+        void act('bind', () => expect('planReview:bindRules', { taskId: task.id }));
+        return;
+      case 'prepare_plan_review':
+        void act('prepare', () => expect('planReview:prepare', {
+          taskId: task.id,
+          ...(dirtyPrompt ? { acceptDirtyWorkingTree: true } : {})
+        }));
+        return;
+      case 'run_plan_review':
+        void act('review', () => expect('planReview:review', { taskId: task.id }));
+        return;
+      case 'reconcile_plan_review':
+        void act('reconcile', () => expect('planReview:reconcile', { taskId: task.id }));
+        return;
+      case 'resolve_plan_review': {
+        if (!gate || !allDecided) return;
+        const payload: PlanReviewDecision[] = findings.map((_, index) => ({
+          finding: index,
+          action: decisions[index]!.action as 'accept' | 'reject',
+          reason: decisions[index]!.reason.trim()
+        }));
+        void act('resolve', () => expect('planReview:resolve', {
+          taskId: task.id,
+          gateId: gate.id,
+          expectedRevision: gate.revision,
+          decisions: payload
+        }));
+        return;
+      }
+      default:
+        return;
+    }
+  }, [act, allDecided, decisions, dirtyPrompt, findings, gate, task.id]);
+  useEffect(() => {
+    onDispatchReady?.(dispatchPlanPrimary);
+    return () => onDispatchReady?.(null);
+  }, [onDispatchReady, dispatchPlanPrimary]);
 
   const corrupt = detail?.ruleEvidenceProblem ?? null;
   if (!integrationEnabled && !detail?.ruleEvidence && corrupt === null) return null;
 
-  const gate = detail?.gate ?? null;
-  const findings = detail?.findings ?? [];
-  const allDecided = findings.every((_, index) => {
-    const decision = decisions[index];
-    return decision?.action === 'accept' ||
-      (decision?.action === 'reject' && decision.reason.trim().length > 0);
-  });
-  // `failed` is included: rows written before the phase was preserved used it
-  // for a lost answer too, and those are exactly the ones needing a read-back.
   const unknownOutcome =
     gate !== null && ['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status);
 
-  // A gate settled against an earlier specification is still the newest row, so
-  // it keeps rendering as though it spoke for the specification on screen. The
-  // main process says which of the four states it is in; this side only asks,
-  // and above all does not fold `unknown` into `obsolete` — one is proof the
-  // review is stale, the other is proof of nothing.
   const identity = detail?.gateIdentity ?? 'no_gate';
   const obsolete = gate !== null && identity === 'obsolete';
-  // The same statuses the service refuses to supersede: each has a dispatched
-  // call whose outcome is unknown, or a finished round awaiting decisions.
-  // Being obsolete does not settle any of that, so it buys no way past them.
   const obsoleteBlocking =
     obsolete &&
     ['opening', 'reviewing', 'awaiting_resolve', 'resolving', 'failed'].includes(gate.status);
@@ -705,288 +875,297 @@ export function PlanReviewPanel({
   const identityUnknown = gate !== null && identity === 'unknown';
 
   return (
-    <Card
-      title="External plan review"
-      actions={gate ? <span className={`tag ${gate.status === 'proceeded' ? 'tag--ok' : gate.status === 'failed' ? 'tag--danger' : 'tag--warn'}`}>{gate.status.replace(/_/g, ' ')}</span> : undefined}
-    >
-      <div className="stack">
-        {loading ? <div className="muted">Loading rule and review evidence…</div> : null}
-        {!integrationEnabled ? (
-          <Notice tone="warn">This task is bound to external review evidence. Re-enable the integration in Settings to continue it.</Notice>
-        ) : null}
-        {error ? <Notice tone="error">{error}</Notice> : null}
-
-        {corrupt !== null ? (
-          <Notice tone="error">
-            <strong>The bound rule evidence cannot be read.</strong> This task is bound to a
-            rule snapshot, but the stored bytes no longer match their recorded hash or no
-            longer parse. Rebinding is refused because the binding is immutable, and Agent
-            Relay will not silently replace evidence a specification was reviewed against.
-            <div className="mono selectable" style={{ marginTop: 6 }}>{corrupt}</div>
-          </Notice>
-        ) : !detail?.ruleEvidence ? (
-          <>
-            <div className="muted">
-              Capture the project&apos;s current rule files and the configured conventions before
-              generating the specification. The resulting bytes and Git identity are immutable.
-            </div>
-            <button
-              type="button"
-              className={`btn btn--wide${
-                integrationEnabled && !loading && error === null && task.status === 'DRAFT'
-                  ? ' btn--recommended'
-                  : ''
-              }`}
-              disabled={!integrationEnabled || busy !== null || task.status !== 'DRAFT'}
-              onClick={() => void act('bind', () => expect('planReview:bindRules', { taskId: task.id }))}
-            >
-              {busy === 'bind' ? <Spinner /> : <Scope kind="read" />} Capture and bind rules
-            </button>
-            {task.status !== 'DRAFT' ? (
-              <Notice tone="info">This existing task did not opt in before specification generation. Its normal workflow remains unchanged.</Notice>
-            ) : null}
-          </>
-        ) : (
-          <>
-            <div className="kv">
-              <span className="kv__k">Evidence</span>
-              <span className="kv__v mono selectable">{detail.ruleEvidence.snapshotSha256}</span>
-              <span className="kv__k">Sources</span>
-              <span className="kv__v">{detail.ruleEvidence.sources.length}</span>
-              <span className="kv__k">Files</span>
-              <span className="kv__v">{detail.ruleEvidence.files.length}</span>
-              <span className="kv__k">Bytes</span>
-              <span className="kv__v">{detail.ruleEvidence.totalBytes.toLocaleString()}</span>
-            </div>
-            <details>
-              <summary className="faint" style={{ cursor: 'pointer' }}>Captured files and omissions</summary>
-              <div className="stack stack--tight" style={{ marginTop: 8 }}>
-                {detail.ruleEvidence.files.map((file) => (
-                  <div className="filerow" key={`${file.sourceId}:${file.path}`}>
-                    <span className="tag">{file.sourceId}</span>
-                    <span className="filerow__path mono selectable">{file.path}</span>
-                    <span className="filerow__stat faint">{file.bytes} B</span>
-                  </div>
-                ))}
-                {detail.ruleEvidence.omitted.map((item) => (
-                  <div className="filerow" key={`${item.sourceId}:${item.path}:${item.reason}`}>
-                    <span className="tag tag--warn">omitted</span>
-                    <span className="filerow__path mono selectable">{item.sourceId}: {item.path}</span>
-                    <span className="filerow__stat faint">{item.reason}</span>
-                  </div>
-                ))}
+    <div className="stack" aria-label="External plan review">
+      <div className="row" style={{ justifyContent: 'space-between' }}>
+        <div className="section-title">External plan review</div>
+        {gate ? <span className={`tag ${gate.status === 'proceeded' ? 'tag--ok' : gate.status === 'failed' ? 'tag--danger' : 'tag--warn'}`}>{gate.status.replace(/_/g, ' ')}</span> : null}
+      </div>
+      {loading ? <div className="muted">Loading rule and review evidence…</div> : null}
+      {!integrationEnabled ? (
+        <Notice tone="warn">This task is bound to external review evidence. Re-enable the integration in Settings to continue it.</Notice>
+      ) : null}
+      {error ? <Notice tone="error">{error}</Notice> : null}
+      {gate && gate.status !== 'awaiting_resolve' ? (
+        <div className="kv" aria-label="External plan review result">
+          <span className="kv__k">Result</span><span className="kv__v">{gate.verdict ?? 'No verdict recorded'}</span>
+          <span className="kv__k">Required action</span><span className="kv__v">{guidanceState.replace(/_/g, ' ')}</span>
+          <span className="kv__k">Reviewers</span><span className="kv__v selectable">{gate.reviewers}</span>
+        </div>
+      ) : null}
+      {gate && gate.status !== 'awaiting_resolve' && findings.length > 0 ? (
+        <details>
+          <summary className="faint" style={{ cursor: 'pointer' }}>
+            Findings ({findings.length})
+          </summary>
+          <div className="stack stack--tight" style={{ marginTop: 8 }}>
+            {findings.map((finding, index) => (
+              <div className="finding" key={`${index}:${finding.title}`}>
+                <div className="finding__head">
+                  <span className={`tag ${finding.severity === 'blocking' || finding.severity === 'major' ? 'tag--danger' : 'tag--warn'}`}>{finding.severity}</span>
+                  <span className="finding__title selectable">{finding.title}</span>
+                </div>
+                <div className="finding__desc selectable">{finding.why}</div>
               </div>
-            </details>
-          </>
-        )}
+            ))}
+          </div>
+        </details>
+      ) : null}
 
-        {detail?.ruleEvidence && task.status === 'READY_FOR_IMPLEMENTATION' && gate === null ? (
-          <button
+      {corrupt !== null ? (
+        <Notice tone="error">
+          <strong>The bound rule evidence cannot be read.</strong> This task is bound to a
+          rule snapshot, but the stored bytes no longer match their recorded hash or no
+          longer parse. Rebinding is refused because the binding is immutable, and Agent
+          Relay will not silently replace evidence a specification was reviewed against.
+          <div className="mono selectable" style={{ marginTop: 6 }}>{corrupt}</div>
+        </Notice>
+      ) : !detail?.ruleEvidence ? (
+        <>
+          <div className="muted">
+            Capture the project&apos;s current rule files and the configured conventions before
+            generating the specification. The resulting bytes and Git identity are immutable.
+          </div>
+          {renderPrimary ? <button
             type="button"
-            className={`btn btn--wide${guidanceState === 'prepare_review' ? ' btn--recommended' : ''}`}
-            disabled={!integrationEnabled || busy !== null}
+            className="btn btn--wide btn--primary btn--recommended"
+            disabled={!integrationEnabled || busy !== null || task.status !== 'DRAFT'}
+            onClick={() => void act('bind', () => expect('planReview:bindRules', { taskId: task.id }))}
+          >
+            {busy === 'bind' ? <Spinner /> : <Scope kind="read" />} Capture and bind rules
+          </button> : null}
+          {task.status !== 'DRAFT' ? (
+            <Notice tone="info">This existing task did not opt in before specification generation. Its normal workflow remains unchanged.</Notice>
+          ) : null}
+        </>
+      ) : (
+        <>
+          <div className="kv">
+            <span className="kv__k">Evidence</span>
+            <span className="kv__v mono selectable">{detail.ruleEvidence.snapshotSha256}</span>
+            <span className="kv__k">Sources</span>
+            <span className="kv__v">{detail.ruleEvidence.sources.length}</span>
+            <span className="kv__k">Files</span>
+            <span className="kv__v">{detail.ruleEvidence.files.length}</span>
+            <span className="kv__k">Bytes</span>
+            <span className="kv__v">{detail.ruleEvidence.totalBytes.toLocaleString()}</span>
+          </div>
+          <details>
+            <summary className="faint" style={{ cursor: 'pointer' }}>Captured files and omissions</summary>
+            <div className="stack stack--tight" style={{ marginTop: 8 }}>
+              {detail.ruleEvidence.files.map((file) => (
+                <div className="filerow" key={`${file.sourceId}:${file.path}`}>
+                  <span className="tag">{file.sourceId}</span>
+                  <span className="filerow__path mono selectable">{file.path}</span>
+                  <span className="filerow__stat faint">{file.bytes} B</span>
+                </div>
+              ))}
+              {detail.ruleEvidence.omitted.map((item) => (
+                <div className="filerow" key={`${item.sourceId}:${item.path}:${item.reason}`}>
+                  <span className="tag tag--warn">omitted</span>
+                  <span className="filerow__path mono selectable">{item.sourceId}: {item.path}</span>
+                  <span className="filerow__stat faint">{item.reason}</span>
+                </div>
+              ))}
+            </div>
+          </details>
+        </>
+      )}
+
+      {renderPrimary && detail?.ruleEvidence && task.status === 'READY_FOR_IMPLEMENTATION' && gate === null ? (
+        <button
+          type="button"
+          className="btn btn--wide btn--primary btn--recommended"
+          disabled={!integrationEnabled || busy !== null}
+          onClick={() => void act('prepare', () => expect('planReview:prepare', { taskId: task.id }))}
+        >
+          {busy === 'prepare' ? <Spinner /> : <Scope kind="local" />} Prepare isolated review branch
+        </button>
+      ) : null}
+
+      {obsoleteSettled ? (
+        <div className="stack stack--tight">
+          <Notice tone="warn">
+            This review settled against an earlier specification. The one on screen now has
+            not been reviewed, so it cannot be approved on the strength of that round.
+          </Notice>
+          {renderPrimary ? <button
+            type="button"
+            className="btn btn--wide btn--primary btn--recommended"
+            disabled={!integrationEnabled || busy !== null || task.status !== 'READY_FOR_IMPLEMENTATION'}
             onClick={() => void act('prepare', () => expect('planReview:prepare', { taskId: task.id }))}
           >
             {busy === 'prepare' ? <Spinner /> : <Scope kind="local" />} Prepare isolated review branch
-          </button>
-        ) : null}
+          </button> : null}
+        </div>
+      ) : null}
 
-        {obsoleteSettled ? (
-          <div className="stack stack--tight">
-            <Notice tone="warn">
-              This review settled against an earlier specification. The one on screen now has
-              not been reviewed, so it cannot be approved on the strength of that round.
-            </Notice>
-            <button
-              type="button"
-              className={`btn btn--wide${guidanceState === 'prepare_review' ? ' btn--recommended' : ''}`}
-              disabled={!integrationEnabled || busy !== null || task.status !== 'READY_FOR_IMPLEMENTATION'}
-              onClick={() => void act('prepare', () => expect('planReview:prepare', { taskId: task.id }))}
-            >
-              {busy === 'prepare' ? <Spinner /> : <Scope kind="local" />} Prepare review for current specification
-            </button>
-          </div>
-        ) : null}
+      {obsoleteBlocking ? (
+        <Notice tone="warn">
+          This review settled against an earlier specification, and its previous round is
+          still outstanding. Finish that round first — regenerating the specification does
+          not close it, and nothing here may start a second one over it.
+        </Notice>
+      ) : null}
 
-        {obsoleteBlocking ? (
-          <Notice tone="warn">
-            This review settled against an earlier specification, and its previous round is
-            still outstanding. Finish that round first — regenerating the specification does
-            not close it, and nothing here may start a second one over it.
-          </Notice>
-        ) : null}
+      {identityUnknown ? (
+        <Notice tone="warn">
+          Whether this review still matches the current specification could not be
+          established, because the bound evidence or the specification itself could not be
+          read. That is not the same as the review being out of date, and Agent Relay will
+          not say it is: nothing here is approved, and preparing a new review would need
+          the evidence that could not be read.
+        </Notice>
+      ) : null}
 
-        {identityUnknown ? (
-          <Notice tone="warn">
-            Whether this review still matches the current specification could not be
-            established, because the bound evidence or the specification itself could not be
-            read. That is not the same as the review being out of date, and Agent Relay will
-            not say it is: nothing here is approved, and preparing a new review would need
-            the evidence that could not be read.
-          </Notice>
-        ) : null}
-
-        {dirtyPrompt ? (
-          <Notice tone="warn">
-            The project checkout is dirty. The isolated task branch can still be based on its
-            current HEAD, but uncommitted project changes are not copied.
+      {dirtyPrompt ? (
+        <Notice tone="warn">
+          The project checkout is dirty. The isolated task branch can still be based on its
+          current HEAD, but uncommitted project changes are not copied.
+          {renderPrimary ? (
             <button
               type="button"
               className="btn btn--sm"
               style={{ marginTop: 8 }}
               disabled={busy !== null}
-              onClick={() => void act('prepare', () => expect('planReview:prepare', {
-                taskId: task.id,
-                acceptDirtyWorkingTree: true
-              }))}
+              onClick={() => dispatchPlanPrimary('prepare_plan_review')}
             >
               Continue with current HEAD
             </button>
-          </Notice>
-        ) : null}
+          ) : ' Click “Prepare isolated review branch” again to continue from the current HEAD.'}
+        </Notice>
+      ) : null}
 
-        {gate?.status === 'interrupted' && identity === 'current' ? (
+      {gate?.status === 'interrupted' && identity === 'current' ? (
+        <Notice tone="warn">
+          A previous round was started in the provider and never finished. It produced no
+          findings and nothing is waiting on decisions, so a new round can be started by
+          hand — nothing will be repeated.
+        </Notice>
+      ) : null}
+
+      {/*
+        Starting a round is offered only when the gate is PROVEN to describe the
+        specification on screen. `obsolete` would review the wrong document, and
+        `unknown` cannot say which document it would review — and a round is
+        non-idempotent, so an unverifiable one is not worth spending. The same
+        fixed label is used for a first round and a next round: the operator is
+        starting the external review either way, and the distinction is already
+        carried by "What happened" and "Result" above.
+      */}
+      {renderPrimary && gate && identity === 'current' && ['prepared', 'changes_requested', 'interrupted'].includes(gate.status) ? (
+        <button
+          type="button"
+          className="btn btn--wide btn--primary btn--recommended"
+          disabled={!integrationEnabled || busy !== null}
+          onClick={() => void act('review', () => expect('planReview:review', { taskId: task.id }))}
+        >
+          {busy === 'review' ? <Spinner /> : <Scope kind="read" />} Run external plan review
+        </button>
+      ) : null}
+
+      {unknownOutcome ? (
+        <div className="stack stack--tight">
           <Notice tone="warn">
-            A previous round was started in the provider and never finished. It produced no
-            findings and nothing is waiting on decisions, so a new round can be started by
-            hand — nothing will be repeated.
+            The external call was recorded as {gate?.status.replace(/_/g, ' ')} and its answer
+            never arrived. Agent Relay will not repeat it: a plan round and a resolution are
+            not idempotent, and either may already have taken effect. Reconciling reads the
+            provider&apos;s own state back without changing it.
           </Notice>
-        ) : null}
-
-        {/*
-          Starting a round is offered only when the gate is PROVEN to describe the
-          specification on screen. `obsolete` would review the wrong document, and
-          `unknown` cannot say which document it would review — and a round is
-          non-idempotent, so an unverifiable one is not worth spending. Both get
-          their own message above instead of a button that means nothing.
-        */}
-        {gate && identity === 'current' && ['prepared', 'changes_requested', 'interrupted'].includes(gate.status) ? (
-          <button
+          {renderPrimary ? <button
             type="button"
-            className={`btn btn--wide${
-              guidanceState === 'run_review' || guidanceState === 'run_next_review'
-                ? ' btn--recommended'
-                : ''
-            }`}
+            className="btn btn--wide btn--primary btn--recommended"
             disabled={!integrationEnabled || busy !== null}
-            onClick={() => void act('review', () => expect('planReview:review', { taskId: task.id }))}
+            onClick={() => void act('reconcile', () => expect('planReview:reconcile', { taskId: task.id }))}
           >
-            {busy === 'review' ? <Spinner /> : <Scope kind="read" />}
-            {gate.status === 'prepared' ? 'Run external plan review' : 'Run next plan-review round'}
-          </button>
-        ) : null}
+            {busy === 'reconcile' ? <Spinner /> : <Scope kind="read" />} Reconcile external state
+          </button> : null}
+        </div>
+      ) : null}
+      {gate?.lastError ? <Notice tone="error">{gate.lastError}</Notice> : null}
 
-        {unknownOutcome ? (
-          <div className="stack stack--tight">
-            <Notice tone="warn">
-              The external call was recorded as {gate?.status.replace(/_/g, ' ')} and its answer
-              never arrived. Agent Relay will not repeat it: a plan round and a resolution are
-              not idempotent, and either may already have taken effect. Reconciling reads the
-              provider&apos;s own state back without changing it.
-            </Notice>
-            <button
-              type="button"
-              className={`btn btn--wide${guidanceState === 'reconcile' ? ' btn--recommended' : ''}`}
-              disabled={!integrationEnabled || busy !== null}
-              onClick={() => void act('reconcile', () => expect('planReview:reconcile', { taskId: task.id }))}
-            >
-              {busy === 'reconcile' ? <Spinner /> : <Scope kind="read" />} Reconcile external state
-            </button>
+      {gate?.status === 'awaiting_resolve' ? (
+        <div className="stack">
+          <Notice tone="warn">
+            The verdict does not approve the plan. Decide every finding, then resolve the
+            external round. Rejecting a finding requires a written reason.
+          </Notice>
+          <div className="kv">
+            <span className="kv__k">Verdict</span><span className="kv__v">{gate.verdict}</span>
+            <span className="kv__k">Gating</span><span className="kv__v">{gate.gatingCount} / threshold {gate.threshold}</span>
+            <span className="kv__k">Reviewers</span><span className="kv__v selectable">{gate.reviewers}</span>
           </div>
-        ) : null}
-        {gate?.lastError ? <Notice tone="error">{gate.lastError}</Notice> : null}
-
-        {gate?.status === 'awaiting_resolve' ? (
-          <div className="stack">
-            <Notice tone="warn">
-              The verdict does not approve the plan. Decide every finding, then resolve the
-              external round. Rejecting a finding requires a written reason.
-            </Notice>
-            <div className="kv">
-              <span className="kv__k">Verdict</span><span className="kv__v">{gate.verdict}</span>
-              <span className="kv__k">Gating</span><span className="kv__v">{gate.gatingCount} / threshold {gate.threshold}</span>
-              <span className="kv__k">Reviewers</span><span className="kv__v selectable">{gate.reviewers}</span>
-            </div>
-            {findings.map((finding, index) => {
-              const decision = decisions[index] ?? { action: '', reason: '' };
-              return (
-                <div className="finding" key={`${index}:${finding.title}`}>
-                  <div className="finding__head">
-                    <span className={`tag ${finding.severity === 'blocking' || finding.severity === 'major' ? 'tag--danger' : 'tag--warn'}`}>{finding.severity}</span>
-                    <span className="finding__title selectable">{finding.title}</span>
-                    <span className="finding__where selectable">{finding.category}{finding.file ? ` · ${finding.file}${finding.line ? `:${finding.line}` : ''}` : ''}</span>
-                  </div>
-                  <div className="finding__desc selectable">{finding.why}</div>
-                  <div className="muted selectable" style={{ marginTop: 6 }}>Suggested: {finding.fix}</div>
-                  <div className="grid-2" style={{ marginTop: 10 }}>
-                    <Field label="Decision">
-                      <select
-                        className="select"
-                        value={decision.action}
-                        onChange={(event) => setDecisions((current) => ({
-                          ...current,
-                          [index]: { ...decision, action: event.target.value as DecisionDraft['action'] }
-                        }))}
-                      >
-                        <option value="">Choose…</option>
-                        <option value="accept">Accept and address</option>
-                        <option value="reject">Reject with reason</option>
-                      </select>
-                    </Field>
-                    <Field label="Reason" hint={decision.action === 'reject' ? 'Required' : 'Optional audit note'}>
-                      <input
-                        className="input"
-                        value={decision.reason}
-                        onChange={(event) => setDecisions((current) => ({
-                          ...current,
-                          [index]: { ...decision, reason: event.target.value }
-                        }))}
-                      />
-                    </Field>
-                  </div>
+          {findings.map((finding, index) => {
+            const decision = decisions[index] ?? { action: '', reason: '' };
+            return (
+              <div className="finding" key={`${index}:${finding.title}`}>
+                <div className="finding__head">
+                  <span className={`tag ${finding.severity === 'blocking' || finding.severity === 'major' ? 'tag--danger' : 'tag--warn'}`}>{finding.severity}</span>
+                  <span className="finding__title selectable">{finding.title}</span>
+                  <span className="finding__where selectable">{finding.category}{finding.file ? ` · ${finding.file}${finding.line ? `:${finding.line}` : ''}` : ''}</span>
                 </div>
-              );
-            })}
-            <button
-              type="button"
-              className={`btn btn--primary btn--wide${
-                guidanceState === 'resolve' ? ' btn--recommended' : ''
-              }`}
-              disabled={!integrationEnabled || busy !== null || !allDecided}
-              onClick={() => {
-                const payload: PlanReviewDecision[] = findings.map((_, index) => ({
-                  finding: index,
-                  action: decisions[index]!.action as 'accept' | 'reject',
-                  reason: decisions[index]!.reason.trim()
-                }));
-                void act('resolve', () => expect('planReview:resolve', {
-                  taskId: task.id,
-                  // The round these answers were written against, so the main
-                  // process can refuse them if it is no longer the current one.
-                  gateId: gate.id,
-                  expectedRevision: gate.revision,
-                  decisions: payload
-                }));
-              }}
-            >
-              {busy === 'resolve' ? <Spinner /> : <Scope kind="read" />} Resolve all findings
-            </button>
-          </div>
-        ) : null}
+                <div className="finding__desc selectable">{finding.why}</div>
+                <div className="muted selectable" style={{ marginTop: 6 }}>Suggested: {finding.fix}</div>
+                <div className="grid-2" style={{ marginTop: 10 }}>
+                  <Field label="Decision">
+                    <select
+                      className="select"
+                      value={decision.action}
+                      onChange={(event) => setDecisions((current) => ({
+                        ...current,
+                        [index]: { ...decision, action: event.target.value as DecisionDraft['action'] }
+                      }))}
+                    >
+                      <option value="">Choose…</option>
+                      <option value="accept">Accept and address</option>
+                      <option value="reject">Reject with reason</option>
+                    </select>
+                  </Field>
+                  <Field label="Reason" hint={decision.action === 'reject' ? 'Required' : 'Optional audit note'}>
+                    <input
+                      className="input"
+                      value={decision.reason}
+                      onChange={(event) => setDecisions((current) => ({
+                        ...current,
+                        [index]: { ...decision, reason: event.target.value }
+                      }))}
+                    />
+                  </Field>
+                </div>
+              </div>
+            );
+          })}
+          {renderPrimary ? <button
+            type="button"
+            className="btn btn--wide btn--primary btn--recommended"
+            disabled={!integrationEnabled || busy !== null || !allDecided}
+            onClick={() => {
+              if (!gate) return;
+              const payload: PlanReviewDecision[] = findings.map((_, index) => ({
+                finding: index,
+                action: decisions[index]!.action as 'accept' | 'reject',
+                reason: decisions[index]!.reason.trim()
+              }));
+              void act('resolve', () => expect('planReview:resolve', {
+                taskId: task.id,
+                gateId: gate.id,
+                expectedRevision: gate.revision,
+                decisions: payload
+              }));
+            }}
+          >
+            {busy === 'resolve' ? <Spinner /> : <Scope kind="read" />} Resolve external plan review
+          </button> : null}
+        </div>
+      ) : null}
 
-        {gate?.status === 'proceeded' && identity === 'current' ? (
-          <Notice tone="info">The exact specification and rule snapshot passed resolution. You may now approve the specification.</Notice>
-        ) : null}
-      </div>
-    </Card>
+      {gate?.status === 'proceeded' && identity === 'current' ? (
+        <Notice tone="info">The exact specification and rule snapshot passed resolution. You may now approve the specification.</Notice>
+      ) : null}
+    </div>
   );
 }
 
 /* -------------------------------------------------------------------------- */
-
-function canGenerateSpec(status: string): boolean {
-  return status === 'DRAFT' || status === 'READY_FOR_IMPLEMENTATION';
-}
 
 function isTerminal(status: string): boolean {
   return status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED';

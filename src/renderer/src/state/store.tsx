@@ -26,6 +26,7 @@ import type { DiagnosticsReport } from '@shared/domain/diagnostics';
 import type { SerializedError } from '@shared/domain/errors';
 import type { Project, Run, RunEvent, Settings, Task } from '@shared/domain/models';
 import type { AppEvent, TaskDetail } from '@shared/ipc';
+import { codexReviewResultSchema, taskSpecificationSchema } from '@shared/schemas/codex';
 import { call, describeError, expect } from '../lib/api';
 
 /**
@@ -74,6 +75,7 @@ type Action =
   | { type: 'task-upserted'; task: Task }
   | { type: 'select-task'; taskId: string | null }
   | { type: 'detail'; detail: TaskDetail | null }
+  | { type: 'open-task-detail'; detail: TaskDetail }
   | { type: 'run-upserted'; run: Run }
   | { type: 'run-event'; event: RunEvent }
   | { type: 'clear-live' }
@@ -141,13 +143,26 @@ function reducer(state: State, action: Action): State {
         ? state.tasks.map((t) => (t.id === action.task.id ? action.task : t))
         : [action.task, ...state.tasks];
 
+      const detail = state.detail && state.detail.task.id === action.task.id
+        ? {
+            ...state.detail,
+            task: action.task,
+            specification: parseStored(action.task.specificationJson, taskSpecificationSchema),
+            lastReview: parseStored(action.task.lastReviewJson, codexReviewResultSchema),
+            worktree: action.task.worktreePath
+              ? {
+                  path: action.task.worktreePath,
+                  branch: action.task.branchName,
+                  head: state.detail.worktree?.head ?? null,
+                  isLocked: state.detail.worktree?.isLocked ?? false
+                }
+              : null
+          }
+        : state.detail;
       return {
         ...state,
         tasks,
-        detail:
-          state.detail && state.detail.task.id === action.task.id
-            ? { ...state.detail, task: action.task }
-            : state.detail
+        detail
       };
     }
 
@@ -156,6 +171,19 @@ function reducer(state: State, action: Action): State {
 
     case 'detail':
       return { ...state, detail: action.detail };
+
+    // Set the selection and its detail together, atomically, so a caller that
+    // already has a fresh `TaskDetail` in hand (e.g. the result of
+    // `workflow:continue`) can open it without an immediate second
+    // `tasks:get` round trip and without a render showing a null detail for
+    // the newly selected id in between.
+    case 'open-task-detail':
+      return {
+        ...state,
+        selectedTaskId: action.detail.task.id,
+        detail: action.detail,
+        liveEvents: {}
+      };
 
     case 'run-upserted': {
       if (!state.detail || state.detail.task.id !== action.run.taskId) return state;
@@ -204,11 +232,25 @@ function reducer(state: State, action: Action): State {
   }
 }
 
+function parseStored<T>(raw: string | null, schema: { safeParse(value: unknown): { success: boolean; data?: T } }): T | null {
+  if (!raw) return null;
+  try {
+    const parsed = schema.safeParse(JSON.parse(raw));
+    return parsed.success && parsed.data !== undefined ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface StoreValue extends State {
   readonly selectedProject: Project | null;
   setSection(section: Section): void;
   selectProject(projectId: string | null): void;
   selectTask(taskId: string | null): void;
+  /** Select and display an already-fetched task detail, e.g. after `workflow:continue`. */
+  openTaskDetail(detail: TaskDetail): void;
+  /** Apply a task returned by a workflow IPC call without issuing another read. */
+  acceptTask(task: Task): void;
   refreshProjects(): Promise<void>;
   refreshTasks(projectId: string): Promise<void>;
   refreshDetail(taskId: string): Promise<void>;
@@ -371,6 +413,8 @@ export function StoreProvider({ children }: { children: ReactNode }): React.JSX.
       setSection: (section) => dispatch({ type: 'section', section }),
       selectProject: (projectId) => dispatch({ type: 'select-project', projectId }),
       selectTask: (taskId) => dispatch({ type: 'select-task', taskId }),
+      openTaskDetail: (detail) => dispatch({ type: 'open-task-detail', detail }),
+      acceptTask: (task) => dispatch({ type: 'task-upserted', task }),
       refreshProjects,
       refreshTasks,
       refreshDetail,

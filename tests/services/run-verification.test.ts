@@ -39,6 +39,26 @@ describe('verification-only workflow', () => {
       exitCode: 0, durationMs: 15, reason: null
     });
   });
+  it('prepares local dependencies before capturing and executing verification', async () => {
+    const calls: string[] = [];
+    h.dispose();
+    h = createHarness({
+      worktreeDependencies: {
+        prepare: async ({ repositoryPath, worktreePath }) => {
+          calls.push(`${repositoryPath} -> ${worktreePath}`);
+        }
+      },
+      verification: {
+        identity: async () => { calls.push('identity'); return identity; },
+        execute: async () => { calls.push('execute'); return result; }
+      }
+    });
+    const task = await prepared();
+
+    await h.orchestrator.runVerification(task.id);
+
+    expect(calls).toEqual(['C:\\repo -> ' + task.worktreePath, 'identity', 'execute', 'identity']);
+  });
   it.each(['exit', 'timeout', 'cancelled', 'changed'] as const)('does not open review after %s', async kind => {
     const task = await prepared();
     execute = async () => {

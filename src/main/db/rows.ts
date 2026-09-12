@@ -8,7 +8,15 @@
  */
 
 import { AgentRelayError } from '../../shared/domain/errors';
-import type { Approval, Project, Run, RunEvent, Task } from '../../shared/domain/models';
+import type {
+  Approval,
+  Project,
+  Run,
+  RunEvent,
+  Task,
+  TaskContinuation,
+  ContinuationClaim
+} from '../../shared/domain/models';
 import {
   OPERATION_ENVIRONMENTS,
   parseTargetConfig,
@@ -180,6 +188,60 @@ export function toApproval(row: ApprovalRow): Approval {
     details: row.details,
     requestedAt: row.requested_at,
     resolvedAt: row.resolved_at
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* TaskContinuation                                                            */
+/* -------------------------------------------------------------------------- */
+
+export interface TaskContinuationRow {
+  id: string;
+  source_task_id: string;
+  continuation_task_id: string;
+  entry_action: string;
+  inherited_verification_run_id: string | null;
+  inherited_implementation_run_id: string | null;
+  inherited_review_run_id: string | null;
+  created_at: string;
+}
+
+export function toTaskContinuation(row: TaskContinuationRow): TaskContinuation {
+  return {
+    id: row.id,
+    sourceTaskId: row.source_task_id,
+    continuationTaskId: row.continuation_task_id,
+    entryAction: row.entry_action as TaskContinuation['entryAction'],
+    inheritedVerificationRunId: row.inherited_verification_run_id,
+    inheritedImplementationRunId: row.inherited_implementation_run_id,
+    inheritedReviewRunId: row.inherited_review_run_id,
+    createdAt: row.created_at
+  };
+}
+
+export interface ContinuationClaimRow {
+  source_task_id: string;
+  claim_id: string;
+  worktree_path: string;
+  state: string;
+  continuation_task_id: string | null;
+  validated_identity: string | null;
+  effective_entry_action: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export function toContinuationClaim(row: ContinuationClaimRow): ContinuationClaim {
+  return {
+    sourceTaskId: row.source_task_id,
+    claimId: row.claim_id,
+    worktreePath: row.worktree_path,
+    state: row.state as ContinuationClaim['state'],
+    continuationTaskId: row.continuation_task_id,
+    validatedIdentity: row.validated_identity,
+    effectiveEntryAction: row.effective_entry_action as ContinuationClaim['effectiveEntryAction'],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
   };
 }
 

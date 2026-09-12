@@ -338,6 +338,30 @@ async function reviewOnce(value: ReturnType<typeof setup>): Promise<CodeReviewRo
 }
 
 describe('the code-review subject', () => {
+  it('keeps terminal task review history readable but refuses every mutating IPC operation', async () => {
+    const value = setup();
+    value.harness.tasks.update(value.task.id, { status: 'FAILED' });
+
+    expect((await value.service.subjectIdentity(value.task.id)).identity).toBe('no_subject');
+    await expect(value.service.captureSubject(value.task.id)).rejects.toThrow(/closed/i);
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/closed/i);
+    await expect(value.service.reconcile(value.task.id)).rejects.toThrow(/closed/i);
+    await expect(value.service.decide(value.task.id, {
+      findingId: 'missing-finding',
+      action: 'accept',
+      reason: 'Historical decision must remain immutable.',
+      expectedRevision: 0,
+      actor: 'operator',
+      source: 'test'
+    })).rejects.toThrow(/closed/i);
+
+    expect(value.snapshots.calls).toHaveLength(0);
+    expect(value.reviewer.beginCalls).toHaveLength(0);
+    expect(value.reviewer.calls).toHaveLength(0);
+    expect(value.reviews.latestSubject(value.task.id)).toBeNull();
+    expect(value.reviews.listRounds(value.task.id)).toEqual([]);
+  });
+
   it('captures without staging, committing or otherwise touching the worktree', async () => {
     const value = setup();
     await value.service.captureSubject(value.task.id);

@@ -46,6 +46,7 @@ import type {
   RunEventRepository,
   RunRepository,
   SettingsRepository,
+  TaskContinuationRepository,
   TaskRepository
 } from '../ports';
 import { RunRecorder } from './run-recorder';
@@ -77,6 +78,7 @@ export interface PublishServiceDeps {
   readonly clock: Clock;
   readonly ids: IdGenerator;
   readonly events: EventPublisher;
+  readonly continuations?: TaskContinuationRepository;
 }
 
 const ACTION_HEADLINES: Record<ApprovalAction, string> = {
@@ -177,8 +179,16 @@ export class PublishService {
    * earlier denial stays in the run history either way; nothing here rewrites it.
    */
   private assertRoundPublishable(task: Task): void {
+    const ownRuns = this.deps.runs.listByTask(task.id);
+    const ownImplementation = latestClaudeRoundResult(ownRuns);
+    const inheritedImplementationId = this.deps.continuations
+      ?.findByContinuation(task.id)
+      ?.inheritedImplementationRunId;
+    const inheritedImplementation = !ownImplementation && inheritedImplementationId
+      ? this.deps.runs.findById(inheritedImplementationId)?.structuredResult ?? null
+      : null;
     const refusal = assessmentPublishRefusal(
-      readClaudeAssessment(latestClaudeRoundResult(this.deps.runs.listByTask(task.id)))
+      readClaudeAssessment(ownImplementation ?? inheritedImplementation)
     );
     if (!refusal.blocked) return;
 
@@ -187,10 +197,35 @@ export class PublishService {
     });
   }
 
+  /** A test pass may replace missing/failed verification, never a security denial. */
+  private assertNoSecurityRefusal(task: Task): void {
+    const ownRuns = this.deps.runs.listByTask(task.id);
+    const ownImplementation = latestClaudeRoundResult(ownRuns);
+    const inheritedImplementationId = !ownImplementation
+      ? this.deps.continuations?.findByContinuation(task.id)?.inheritedImplementationRunId
+      : null;
+    const inheritedImplementation = inheritedImplementationId
+      ? this.deps.runs.findById(inheritedImplementationId)?.structuredResult ?? null
+      : null;
+    const refusal = assessmentPublishRefusal(
+      readClaudeAssessment(ownImplementation ?? inheritedImplementation)
+    );
+    if (refusal.blocked && refusal.code === 'security') {
+      throw new AgentRelayError('VALIDATION_FAILED', PUBLISH_REFUSAL_MESSAGES.security, {
+        remediation: PUBLISH_REFUSAL_REMEDIATIONS.security
+      });
+    }
+  }
+
   async execute(request: PublishRequest): Promise<PublishOutcome> {
     const task = this.requireTask(request.taskId);
     const project = this.requireProject(task.projectId);
     const confirmation = this.prepare(request);
+
+    // Reject terminal/stale callers before writing even a pending approval.
+    // A closed source that already has a continuation must remain byte-for-byte
+    // unchanged by every publication attempt.
+    assertPublishable(task.status, true, request.action);
 
     // 1. Record the request before asking, so the audit trail exists even if the
     //    application dies while the dialog is open.
@@ -221,13 +256,22 @@ export class PublishService {
 
     // 3. Domain gate: even with an approval, the task must be in a publishable
     //    state. Belt and braces against a UI that got ahead of itself.
-    assertPublishable(task.status, true, request.action);
-
     // 4. Evidence gate: the latest implementation round has to have proved it
     //    verified the work. Deliberately after the approval is resolved, so the
     //    audit trail records what the user was asked and what came of it.
-    const verification = latestVerification(this.deps.runs.listByTask(task.id));
+    const ownRuns = this.deps.runs.listByTask(task.id);
+    const ownVerification = latestVerification(ownRuns);
+    const ownCodeMutation = ownRuns.some(
+      (run) => run.runType === 'implementation' || run.runType === 'correction'
+    );
+    const inheritedVerificationId = !ownVerification && !ownCodeMutation
+      ? this.deps.continuations?.findByContinuation(task.id)?.inheritedVerificationRunId
+      : null;
+    const verification = ownVerification ?? (inheritedVerificationId
+      ? this.deps.runs.findById(inheritedVerificationId)
+      : null);
     if (verification) {
+      this.assertNoSecurityRefusal(task);
       const record = readVerification(verification);
       if (!record.success || !record.data.passed || verification.status !== 'succeeded' || !this.deps.verification ||
         record.data.identity !== await this.deps.verification.identity({ task, project, settings: this.deps.settings.get() })) {

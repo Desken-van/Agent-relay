@@ -34,7 +34,8 @@ describe('migration 9', () => {
       { version: 6, name: 'plan-review-gate-revision' },
       { version: 7, name: 'code-review-evidence' },
       { version: 8, name: 'task-provider-routing' },
-      { version: 9, name: 'local-inference-settings' }
+      { version: 9, name: 'local-inference-settings' },
+      { version: 10, name: 'task-continuations' }
     ]);
 
     const db = createSqliteDatabase(':memory:');
@@ -55,7 +56,7 @@ describe('migration 9', () => {
       'localInference',
       JSON.stringify(existing)
     );
-    expect(runMigrations(db)).toBe(1);
+    expect(runMigrations(db)).toBe(2);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };

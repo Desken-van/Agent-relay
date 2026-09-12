@@ -59,8 +59,9 @@ export class SqliteTaskRepository implements TaskRepository {
 
   create(task: NewTask): Task {
     const now = this.clock.nowIso();
-    this.db
-      .prepare(
+    try {
+      this.db
+        .prepare(
         `INSERT INTO tasks (id, project_id, title, original_request, status, current_round,
                             max_rounds, codex_thread_id, claude_session_id, worktree_path,
                             branch_name, base_branch, specification_json, specification_approved_at,
@@ -72,8 +73,11 @@ export class SqliteTaskRepository implements TaskRepository {
                  @lastReviewJson, @lastError, @codexModel, @claudeModel,
                  @implementationProvider, @reviewProvider, @providerRevision, @implementationThreadId, @createdAt, @updatedAt)`
       )
-      .run({ implementationProvider: 'claude', reviewProvider: 'codex', providerRevision: 0,
-        implementationThreadId: null, ...task, createdAt: now, updatedAt: now });
+        .run({ implementationProvider: 'claude', reviewProvider: 'codex', providerRevision: 0,
+          implementationThreadId: null, ...task, createdAt: now, updatedAt: now });
+    } catch (error) {
+      throwWorktreeConflict(error, task.worktreePath);
+    }
 
     const created = this.findById(task.id);
     if (!created) throw new AgentRelayError('INTERNAL', 'Task disappeared immediately after insert.');
@@ -88,8 +92,9 @@ export class SqliteTaskRepository implements TaskRepository {
 
     const next: Task = { ...existing, ...patch, updatedAt: this.clock.nowIso() };
 
-    this.db
-      .prepare(
+    try {
+      this.db
+        .prepare(
         `UPDATE tasks
             SET title = @title,
                 original_request = @originalRequest,
@@ -114,7 +119,10 @@ export class SqliteTaskRepository implements TaskRepository {
                 updated_at = @updatedAt
           WHERE id = @id`
       )
-      .run(next);
+        .run(next);
+    } catch (error) {
+      throwWorktreeConflict(error, next.worktreePath);
+    }
 
     return next;
   }
@@ -159,4 +167,16 @@ export class SqliteTaskRepository implements TaskRepository {
     if (!result) throw new AgentRelayError('INTERNAL', 'Provider update produced no task.');
     return result;
   }
+}
+
+function throwWorktreeConflict(error: unknown, worktreePath: string | null): never {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes('tasks.worktree_path') || message.includes('idx_tasks_worktree_active')) {
+    throw new AgentRelayError(
+      'WORKTREE_CONFLICT',
+      'Another active task already owns this worktree.',
+      { details: worktreePath ?? undefined, cause: error }
+    );
+  }
+  throw error;
 }

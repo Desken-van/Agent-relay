@@ -13,13 +13,17 @@ import { SqlitePlanReviewGateRepository } from '../../src/main/db/repositories/p
 import { SqliteRunEventRepository } from '../../src/main/db/repositories/run-event-repository';
 import { SqliteRunRepository } from '../../src/main/db/repositories/run-repository';
 import { SqliteSettingsRepository } from '../../src/main/db/repositories/settings-repository';
+import { SqliteTaskContinuationRepository } from '../../src/main/db/repositories/task-continuation-repository';
 import { SqliteTaskRepository } from '../../src/main/db/repositories/task-repository';
 import { SqliteTaskRuleEvidenceRepository } from '../../src/main/db/repositories/task-rule-evidence-repository';
 import { closeDatabase, openDatabase, type Db } from '../../src/main/db/database';
+import { SqliteTransactionRunner } from '../../src/main/db/transaction-runner';
 import { FixedClock, SequentialIdGenerator } from '../../src/main/infra/clock';
 import { InMemoryEventPublisher } from '../../src/main/services/event-bus';
+import { ContinuationService } from '../../src/main/services/continuation-service';
 import { Orchestrator } from '../../src/main/services/orchestrator';
 import type { VerificationExecutor } from '../../src/main/services/worktree-verification';
+import type { WorktreeDependencyPreparer } from '../../src/main/services/worktree-dependencies';
 import { ProjectService } from '../../src/main/services/project-service';
 import { PublishService } from '../../src/main/services/publish-service';
 import { TaskService } from '../../src/main/services/task-service';
@@ -30,7 +34,8 @@ import {
   FakeCodexAdapter,
   FakeGitAdapter,
   FakeGitHubAdapter,
-  RecordingConfirmationService
+  RecordingConfirmationService,
+  makeReview
 } from './fakes';
 
 export interface Harness {
@@ -47,12 +52,14 @@ export interface Harness {
   readonly tasks: SqliteTaskRepository;
   readonly taskRuleEvidence: SqliteTaskRuleEvidenceRepository;
   readonly planReviewGates: SqlitePlanReviewGateRepository;
+  readonly taskContinuations: SqliteTaskContinuationRepository;
   readonly runs: SqliteRunRepository;
   readonly runEvents: SqliteRunEventRepository;
   readonly approvals: SqliteApprovalRepository;
   readonly settings: SqliteSettingsRepository;
   readonly orchestrator: Orchestrator;
   readonly publishService: PublishService;
+  readonly continuationService: ContinuationService;
   readonly projectService: ProjectService;
   readonly taskService: TaskService;
   readonly worktreesRoot: string;
@@ -62,7 +69,12 @@ export interface Harness {
 }
 
 export function createHarness(
-  options: { confirmAnswer?: boolean; settings?: Partial<Settings>; verification?: VerificationExecutor } = {}
+  options: {
+    confirmAnswer?: boolean;
+    settings?: Partial<Settings>;
+    verification?: VerificationExecutor;
+    worktreeDependencies?: WorktreeDependencyPreparer;
+  } = {}
 ): Harness {
   const tempRoot = mkdtempSync(join(tmpdir(), 'agent-relay-test-'));
   const db = openDatabase({ file: ':memory:' });
@@ -88,6 +100,7 @@ export function createHarness(
   const tasks = new SqliteTaskRepository(db, clock);
   const taskRuleEvidence = new SqliteTaskRuleEvidenceRepository(db);
   const planReviewGates = new SqlitePlanReviewGateRepository(db, clock);
+  const taskContinuations = new SqliteTaskContinuationRepository(db, clock);
   const runs = new SqliteRunRepository(db);
   const runEvents = new SqliteRunEventRepository(db);
   const approvals = new SqliteApprovalRepository(db);
@@ -98,8 +111,26 @@ export function createHarness(
   const github = new FakeGitHubAdapter();
   const confirmation = new RecordingConfirmationService(options.confirmAnswer ?? true);
 
+  const runtime: { orchestrator?: Orchestrator } = {};
+  const continuationService = new ContinuationService({
+    tasks,
+    projects,
+    runs,
+    settings,
+    ruleEvidence: taskRuleEvidence,
+    planReviews: planReviewGates,
+    continuations: taskContinuations,
+    transactions: new SqliteTransactionRunner(db),
+    verification: options.verification,
+    clock,
+    ids,
+    events,
+    isSourceBusy: (taskId) => runtime.orchestrator?.isRunning(taskId) ?? false
+  });
+
   const orchestrator = new Orchestrator({
     verification: options.verification,
+    worktreeDependencies: options.worktreeDependencies,
     projects,
     tasks,
     runs,
@@ -112,7 +143,14 @@ export function createHarness(
     ids,
     events,
     ruleEvidence: taskRuleEvidence,
-    planReviews: planReviewGates
+    planReviews: planReviewGates,
+    continuations: taskContinuations,
+    continuationGuard: {
+      prepareFirstAction: (...args) => continuationService.prepareFirstAction(...args),
+      retargetFirstActionToVerification: (...args) =>
+        continuationService.retargetFirstActionToVerification(...args),
+      assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId)
+    }
   });
 
   const publishService = new PublishService({
@@ -128,7 +166,8 @@ export function createHarness(
     confirmation,
     clock,
     ids,
-    events
+    events,
+    continuations: taskContinuations
   });
 
   const projectService = new ProjectService({
@@ -141,6 +180,8 @@ export function createHarness(
     events
   });
 
+  runtime.orchestrator = orchestrator;
+
   const taskService = new TaskService({
     tasks,
     projects,
@@ -149,7 +190,8 @@ export function createHarness(
     settings,
     clock,
     ids,
-    events
+    events,
+    continuations: taskContinuations
   });
 
   return {
@@ -166,12 +208,14 @@ export function createHarness(
     tasks,
     taskRuleEvidence,
     planReviewGates,
+    taskContinuations,
     runs,
     runEvents,
     approvals,
     settings,
     orchestrator,
     publishService,
+    continuationService,
     projectService,
     taskService,
     worktreesRoot,
@@ -233,4 +277,21 @@ export async function runToReview(harness: Harness): Promise<{ project: Project;
   const task = harness.tasks.findById(created.id);
   if (!task) throw new Error('task disappeared');
   return { project, task };
+}
+
+export async function runToFailedRoundExhaustion(
+  harness: Harness,
+  options: { maxRounds?: number } = {}
+): Promise<{ project: Project; task: Task }> {
+  const maxRounds = options.maxRounds ?? 1;
+  const { project, task: afterImplementation } = await runToReview(harness);
+  harness.tasks.update(afterImplementation.id, { maxRounds });
+
+  await harness.orchestrator.runVerification(afterImplementation.id);
+  harness.codex.reviewQueue.push(makeReview({ verdict: 'changes_requested', summary: 'Needs one more pass.' }));
+  const reviewed = await harness.orchestrator.reviewWithCodex(afterImplementation.id);
+  if (reviewed.status !== 'FAILED') {
+    throw new Error(`Expected the task to fail on round exhaustion, got ${reviewed.status}.`);
+  }
+  return { project, task: reviewed };
 }

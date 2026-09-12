@@ -214,7 +214,7 @@ describe('publishing is blocked outside the publishable states', () => {
     }
   );
 
-  it('still records the user\'s answer even when the state gate then rejects', async () => {
+  it('rejects a terminal or stale caller before asking or changing its approval history', async () => {
     const { task } = await runToReview(harness);
     harness.tasks.update(task.id, { status: 'APPROVED' });
 
@@ -222,9 +222,9 @@ describe('publishing is blocked outside the publishable states', () => {
       harness.publishService.execute({ taskId: task.id, action: 'commit' })
     ).rejects.toThrow();
 
-    // The approval was granted by the user but the domain refused to proceed.
     const approvals = harness.approvals.listByTask(task.id);
-    expect(approvals[0]?.status).toBe('granted');
+    expect(approvals).toEqual([]);
+    expect(harness.confirmation.requests).toEqual([]);
     expect(harness.git.commits).toHaveLength(0);
   });
 });

@@ -42,6 +42,7 @@ import { SqliteProjectRepository } from './db/repositories/project-repository';
 import { SqliteRunEventRepository } from './db/repositories/run-event-repository';
 import { SqliteRunRepository } from './db/repositories/run-repository';
 import { SqliteSettingsRepository } from './db/repositories/settings-repository';
+import { SqliteTaskContinuationRepository } from './db/repositories/task-continuation-repository';
 import { SqliteTaskRepository } from './db/repositories/task-repository';
 import { SqliteTaskRuleEvidenceRepository } from './db/repositories/task-rule-evidence-repository';
 import { SystemClock, UuidGenerator } from './infra/clock';
@@ -66,14 +67,17 @@ import type {
   RunRepository,
   SettingsRepository,
   LocalInferenceLifecycleService,
+  TaskContinuationRepository,
   TaskRepository,
   TaskRuleEvidenceRepository
 } from './ports';
 import { ToolDiagnosticsService } from './services/diagnostics-service';
+import { ContinuationService, reconcileContinuationClaims } from './services/continuation-service';
 import { OperationsDiagnosticsService } from './services/operations-diagnostics-service';
 import { OperationsRegistry } from './services/operations-registry';
 import { Orchestrator } from './services/orchestrator';
 import { WorktreeVerification } from './services/worktree-verification';
+import { LocalWorktreeDependencyPreparer } from './services/worktree-dependencies';
 import { ProjectService } from './services/project-service';
 import { reconcileInterruptedWork, type ReconciliationPlan } from './services/startup-reconciliation';
 import { PublishService } from './services/publish-service';
@@ -139,6 +143,7 @@ export interface Application {
   readonly approvals: ApprovalRepository;
   readonly taskRuleEvidence: TaskRuleEvidenceRepository;
   readonly planReviewGates: PlanReviewGateRepository;
+  readonly taskContinuations: TaskContinuationRepository;
   readonly codeReviews: CodeReviewRepository;
   /**
    * INT-D-A: the durable code-review foundation.
@@ -153,6 +158,7 @@ export interface Application {
   readonly projectService: ProjectService;
   readonly taskService: TaskService;
   readonly orchestrator: Orchestrator;
+  readonly continuationService: ContinuationService;
   readonly publishService: PublishService;
   readonly diagnostics: ToolDiagnosticsService;
   /** The Operations registry. Read-only: it can inspect, never change. */
@@ -293,6 +299,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   const approvals = new SqliteApprovalRepository(db);
   const taskRuleEvidence = new SqliteTaskRuleEvidenceRepository(db);
   const planReviewGates = new SqlitePlanReviewGateRepository(db, clock);
+  const taskContinuations = new SqliteTaskContinuationRepository(db, clock);
   const planReviewClaims = new PlanReviewClaims();
   const codeReviews = new SqliteCodeReviewRepository(db, clock);
   const codeReviewClaims = new CodeReviewClaims();
@@ -333,6 +340,11 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     // trace left, and nothing else will ever clear it.
     operationDiagnostics: operationDiagnosticRuns
   });
+  reconcileContinuationClaims({
+    tasks,
+    continuations: taskContinuations,
+    transactions: new SqliteTransactionRunner(db)
+  });
 
   const adapters = lateBound(adapterFactories(settings, runner));
 
@@ -354,11 +366,31 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     settings,
     clock,
     ids,
-    events: options.events
+    events: options.events,
+    continuations: taskContinuations
+  });
+
+  const runtime: { orchestrator?: Orchestrator } = {};
+  const verification = new WorktreeVerification(runner);
+  const continuationService = new ContinuationService({
+    tasks,
+    projects,
+    runs,
+    settings,
+    ruleEvidence: taskRuleEvidence,
+    planReviews: planReviewGates,
+    continuations: taskContinuations,
+    transactions: new SqliteTransactionRunner(db),
+    verification,
+    clock,
+    ids,
+    events: options.events,
+    isSourceBusy: (taskId) => runtime.orchestrator?.isRunning(taskId) ?? false
   });
 
   const orchestrator = new Orchestrator({
-    verification: new WorktreeVerification(runner),
+    verification,
+    worktreeDependencies: new LocalWorktreeDependencyPreparer(runner),
     projects,
     tasks,
     runs,
@@ -371,8 +403,17 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     ids,
     events: options.events,
     ruleEvidence: taskRuleEvidence,
-    planReviews: planReviewGates
+    planReviews: planReviewGates,
+    continuations: taskContinuations,
+    continuationGuard: {
+      prepareFirstAction: (...args) => continuationService.prepareFirstAction(...args),
+      retargetFirstActionToVerification: (...args) =>
+        continuationService.retargetFirstActionToVerification(...args),
+      assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId)
+    }
   });
+
+  runtime.orchestrator = orchestrator;
 
   const publishService = new PublishService({
     verification: new WorktreeVerification(runner),
@@ -387,7 +428,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     confirmation: options.confirmation,
     clock,
     ids,
-    events: options.events
+    events: options.events,
+    continuations: taskContinuations
   });
 
   // One long-lived instance: the cache only earns its keep if it outlives a
@@ -441,6 +483,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     approvals,
     taskRuleEvidence,
     planReviewGates,
+    taskContinuations,
     codeReviews,
     codeReview,
     operationTargets,
@@ -448,6 +491,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     projectService,
     taskService,
     orchestrator,
+    continuationService,
     publishService,
     diagnostics,
     operations,

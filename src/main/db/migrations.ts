@@ -610,6 +610,70 @@ export const MIGRATIONS: readonly Migration[] = [
         JSON.stringify(defaultLocalInferenceSettings())
       );
     }
+  },
+  {
+    version: 10,
+    name: 'task-continuations',
+    up(db) {
+      // The immutable link between a closed, review-round-exhausted task and
+      // the task that continues it. `source_task_id` and `continuation_task_id`
+      // are each UNIQUE rather than merely indexed: at most one continuation
+      // per source and at most one source per continuation is a database
+      // guarantee, not a service-level convention a second writer could miss.
+      //
+      // `inherited_*_run_id` name a run belonging to the SOURCE task, never the
+      // continuation's own history — the continuation's own runs table starts
+      // empty by design, so these are how a safety gate reading the
+      // continuation's evidence finds the source run it is trusting without
+      // that row ever being reparented or copied.
+      db.exec(`
+        CREATE TABLE task_continuations (
+          id                             TEXT PRIMARY KEY,
+          source_task_id                 TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+          continuation_task_id           TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+          entry_action                   TEXT NOT NULL CHECK (entry_action IN ('corrections','verification','review')),
+          inherited_verification_run_id  TEXT REFERENCES runs(id) ON DELETE SET NULL,
+          inherited_implementation_run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+          inherited_review_run_id        TEXT REFERENCES runs(id) ON DELETE SET NULL,
+          created_at                     TEXT NOT NULL
+        );
+        CREATE INDEX idx_task_continuations_source ON task_continuations(source_task_id);
+        CREATE INDEX idx_task_continuations_continuation ON task_continuations(continuation_task_id);
+
+        CREATE TABLE task_continuation_claims (
+          source_task_id       TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+          claim_id             TEXT NOT NULL UNIQUE,
+          worktree_path        TEXT NOT NULL UNIQUE,
+          state                TEXT NOT NULL CHECK (state IN ('creating','awaiting_first_action')),
+          continuation_task_id TEXT UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+          validated_identity   TEXT,
+          effective_entry_action TEXT CHECK (effective_entry_action IN ('corrections','verification','review')),
+          created_at           TEXT NOT NULL,
+          updated_at           TEXT NOT NULL,
+          CHECK (
+            (state = 'creating' AND continuation_task_id IS NULL AND validated_identity IS NULL AND effective_entry_action IS NULL) OR
+            (state = 'awaiting_first_action' AND continuation_task_id IS NOT NULL AND validated_identity IS NOT NULL AND effective_entry_action IS NOT NULL)
+          )
+        );
+        CREATE INDEX idx_task_continuation_claims_continuation
+          ON task_continuation_claims(continuation_task_id);
+      `);
+
+      // At most one non-terminal task may own a given worktree path. This was
+      // previously only an application-level check made when a *new* worktree
+      // was about to be created (`listActiveWorktreePaths`); a continuation
+      // reuses an existing path directly, without going through that call, so
+      // the invariant now has to hold at the database itself. Partial and
+      // scoped to non-terminal statuses: the source stays FAILED (terminal)
+      // and keeps its own worktree_path value for its own audit trail, and
+      // only the continuation — the one non-terminal task now pointing at that
+      // path — is covered by the index.
+      db.exec(`
+        CREATE UNIQUE INDEX idx_tasks_worktree_active
+          ON tasks(worktree_path)
+          WHERE worktree_path IS NOT NULL AND status NOT IN ('COMPLETED','FAILED','CANCELLED');
+      `);
+    }
   }
 ];
 
