@@ -12,11 +12,28 @@ import {
   settingsSaveState,
   type Settings
 } from '@shared/domain/models';
+import {
+  chatTemplateParametersSchema,
+  localInferenceSettingsSchema,
+  type LocalInferenceSettings
+} from '@shared/domain/local-inference';
 import { containsSecretShape } from '@shared/util/redact';
 import { call, expect } from '../lib/api';
 import { formatDateTime } from '../lib/format';
 import { useStore } from '../state/store';
+import { LocalInferenceLifecyclePanel } from './LocalInferenceLifecyclePanel';
 import { Card, Field, Notice, Spinner, ToolDot } from './primitives';
+
+/** A unique value JSON.parse can never produce, so a parse failure is unambiguous. */
+const JSON_PARSE_FAILED = Symbol('json-parse-failed');
+
+function parseJsonOrFailure(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return JSON_PARSE_FAILED;
+  }
+}
 
 const TOOL_TITLES: Record<string, string> = {
   codex: 'Codex',
@@ -41,6 +58,14 @@ export function SettingsView(): React.JSX.Element {
   const [verificationText, setVerificationText] = useState<string | null>(null);
   const [mcpArgumentsText, setMcpArgumentsText] = useState<string | null>(null);
   const [conventionPathsText, setConventionPathsText] = useState<string | null>(null);
+  const [fixedArgumentsText, setFixedArgumentsText] = useState<string | null>(null);
+  const [chatTemplateParametersText, setChatTemplateParametersText] = useState<string | null>(null);
+  // Set only while the raw JSON textarea holds text that does not parse into a
+  // valid chat-template parameter map. `draft.localInference` keeps its last
+  // good value in the meantime, so a typo cannot corrupt the rest of the form.
+  const [chatTemplateParametersJsonError, setChatTemplateParametersJsonError] = useState<
+    string | null
+  >(null);
 
   const tools: ToolDiagnostic[] = diagnostics
     ? [diagnostics.codex, diagnostics.claude, diagnostics.git, diagnostics.github]
@@ -147,6 +172,31 @@ export function SettingsView(): React.JSX.Element {
     return problems;
   }, [draft]);
 
+  const setLocalInference = (next: LocalInferenceSettings): void => set('localInference', next);
+
+  /**
+   * Local-inference validation, in the user's own words.
+   *
+   * Uses the shared schema directly, so the form can never accept something
+   * main-process validation would refuse. A JSON parse failure in the raw
+   * chat-template textarea is tracked separately, since a failed parse never
+   * reaches the draft at all.
+   */
+  const localInferenceProblems = useMemo<string[]>(() => {
+    if (!draft) return [];
+    const problems: string[] = [];
+    if (chatTemplateParametersJsonError) problems.push(chatTemplateParametersJsonError);
+
+    const validated = localInferenceSettingsSchema.safeParse(draft.localInference);
+    if (!validated.success) {
+      for (const issue of validated.error.issues) {
+        const path = issue.path.join('.');
+        problems.push(path ? `${path}: ${issue.message}` : issue.message);
+      }
+    }
+    return problems;
+  }, [draft, chatTemplateParametersJsonError]);
+
   /**
    * **Reset**: put the permission rules back to the shipped defaults.
    *
@@ -188,6 +238,9 @@ export function SettingsView(): React.JSX.Element {
     setVerificationText(cleared.verificationText);
     setMcpArgumentsText(null);
     setConventionPathsText(null);
+    setFixedArgumentsText(null);
+    setChatTemplateParametersText(null);
+    setChatTemplateParametersJsonError(null);
   };
 
   /**
@@ -202,8 +255,14 @@ export function SettingsView(): React.JSX.Element {
   const saveState = settingsSaveState({
     saved: settings,
     draft,
-    blockingProblems: verificationProblems.length + externalReviewProblems.length
+    blockingProblems:
+      verificationProblems.length + externalReviewProblems.length + localInferenceProblems.length
   });
+
+  const localInferenceUnsaved =
+    settings !== null &&
+    draft !== null &&
+    JSON.stringify(settings.localInference) !== JSON.stringify(draft.localInference);
 
   return (
     <div className="content--split" style={{ display: 'grid' }}>
@@ -284,6 +343,305 @@ export function SettingsView(): React.JSX.Element {
                 </Field>
               </div>
             </Card>
+
+            <Card title="Local inference">
+              <div className="stack">
+                <label className="row" style={{ alignItems: 'flex-start' }}>
+                  <input
+                    type="checkbox"
+                    checked={draft.localInference.enabled}
+                    onChange={(event) =>
+                      setLocalInference({ ...draft.localInference, enabled: event.target.checked })
+                    }
+                  />
+                  <span>
+                    <strong>Enable local inference</strong>
+                    <span className="muted" style={{ display: 'block', marginTop: 3 }}>
+                      Off by default. No executable is discovered, launched or contacted while
+                      disabled — the lifecycle panel below stays inert.
+                    </span>
+                  </span>
+                </label>
+
+                <Field label="Executable" hint="Discover llama-server on PATH, or name an absolute path explicitly.">
+                  <select
+                    className="input"
+                    value={draft.localInference.executable.kind}
+                    onChange={(event) =>
+                      setLocalInference({
+                        ...draft.localInference,
+                        executable:
+                          event.target.value === 'discovered'
+                            ? { kind: 'discovered', command: 'llama-server' }
+                            : { kind: 'explicit_path', path: '' }
+                      })
+                    }
+                  >
+                    <option value="discovered">Discover llama-server on PATH</option>
+                    <option value="explicit_path">Explicit executable path</option>
+                  </select>
+                </Field>
+                {draft.localInference.executable.kind === 'explicit_path' ? (
+                  <Field label="Executable path">
+                    <input
+                      className="input input--mono"
+                      value={draft.localInference.executable.path}
+                      onChange={(event) =>
+                        setLocalInference({
+                          ...draft.localInference,
+                          executable: { kind: 'explicit_path', path: event.target.value }
+                        })
+                      }
+                    />
+                  </Field>
+                ) : null}
+
+                <Field label="Model id" hint="The stable identity used in --alias and in every request/response. Never a path.">
+                  <input
+                    className="input input--mono"
+                    value={draft.localInference.model.id}
+                    onChange={(event) =>
+                      setLocalInference({
+                        ...draft.localInference,
+                        model: { ...draft.localInference.model, id: event.target.value }
+                      })
+                    }
+                  />
+                </Field>
+                <Field label="Model source" hint="Where the runtime finds the weights.">
+                  <select
+                    className="input"
+                    value={draft.localInference.model.source.kind}
+                    onChange={(event) =>
+                      setLocalInference({
+                        ...draft.localInference,
+                        model: {
+                          ...draft.localInference.model,
+                          source:
+                            event.target.value === 'path'
+                              ? { kind: 'path', path: '' }
+                              : { kind: 'runtime_id', runtimeModelId: '' }
+                        }
+                      })
+                    }
+                  >
+                    <option value="path">Model file path</option>
+                    <option value="runtime_id">Runtime-resolved identifier</option>
+                  </select>
+                </Field>
+                {draft.localInference.model.source.kind === 'path' ? (
+                  <Field label="Model path">
+                    <input
+                      className="input input--mono"
+                      value={draft.localInference.model.source.path}
+                      onChange={(event) =>
+                        setLocalInference({
+                          ...draft.localInference,
+                          model: {
+                            ...draft.localInference.model,
+                            source: { kind: 'path', path: event.target.value }
+                          }
+                        })
+                      }
+                    />
+                  </Field>
+                ) : (
+                  <Field label="Runtime model identifier">
+                    <input
+                      className="input input--mono"
+                      value={draft.localInference.model.source.runtimeModelId}
+                      onChange={(event) =>
+                        setLocalInference({
+                          ...draft.localInference,
+                          model: {
+                            ...draft.localInference.model,
+                            source: { kind: 'runtime_id', runtimeModelId: event.target.value }
+                          }
+                        })
+                      }
+                    />
+                  </Field>
+                )}
+
+                <Field
+                  label="Fixed runtime arguments"
+                  hint="One argv entry per line. Never shell-parsed. Model, alias, host, port and context flags are owned by Agent Relay and cannot be overridden here."
+                >
+                  <textarea
+                    className="input input--mono"
+                    rows={3}
+                    spellCheck={false}
+                    value={fixedArgumentsText ?? draft.localInference.fixedArguments.join('\n')}
+                    onChange={(event) => {
+                      setFixedArgumentsText(event.target.value);
+                      setLocalInference({
+                        ...draft.localInference,
+                        fixedArguments: event.target.value
+                          .split('\n')
+                          .map((line) => line.trim())
+                          .filter((line) => line.length > 0)
+                      });
+                    }}
+                  />
+                </Field>
+
+                <Field label="Port" hint="Loopback only (127.0.0.1); the host is never configurable.">
+                  <input
+                    type="number"
+                    className="input"
+                    value={draft.localInference.port}
+                    onChange={(event) =>
+                      setLocalInference({ ...draft.localInference, port: Number(event.target.value) })
+                    }
+                  />
+                </Field>
+                <Field label="Context size (tokens)">
+                  <input
+                    type="number"
+                    className="input"
+                    value={draft.localInference.contextLimitTokens}
+                    onChange={(event) =>
+                      setLocalInference({
+                        ...draft.localInference,
+                        contextLimitTokens: Number(event.target.value)
+                      })
+                    }
+                  />
+                </Field>
+                <Field label="Default max output tokens" hint="May not exceed the context size.">
+                  <input
+                    type="number"
+                    className="input"
+                    value={draft.localInference.requestDefaults.maxOutputTokens}
+                    onChange={(event) =>
+                      setLocalInference({
+                        ...draft.localInference,
+                        requestDefaults: {
+                          ...draft.localInference.requestDefaults,
+                          maxOutputTokens: Number(event.target.value)
+                        }
+                      })
+                    }
+                  />
+                </Field>
+
+                <Field label="Startup timeout (ms)">
+                  <input
+                    type="number"
+                    className="input"
+                    value={draft.localInference.startupTimeoutMs}
+                    onChange={(event) =>
+                      setLocalInference({
+                        ...draft.localInference,
+                        startupTimeoutMs: Number(event.target.value)
+                      })
+                    }
+                  />
+                </Field>
+                <Field label="Health timeout (ms)">
+                  <input
+                    type="number"
+                    className="input"
+                    value={draft.localInference.healthTimeoutMs}
+                    onChange={(event) =>
+                      setLocalInference({
+                        ...draft.localInference,
+                        healthTimeoutMs: Number(event.target.value)
+                      })
+                    }
+                  />
+                </Field>
+                <Field label="Inference timeout (ms)">
+                  <input
+                    type="number"
+                    className="input"
+                    value={draft.localInference.inferenceTimeoutMs}
+                    onChange={(event) =>
+                      setLocalInference({
+                        ...draft.localInference,
+                        inferenceTimeoutMs: Number(event.target.value)
+                      })
+                    }
+                  />
+                </Field>
+                <Field label="Stop timeout (ms)">
+                  <input
+                    type="number"
+                    className="input"
+                    value={draft.localInference.shutdownTimeoutMs}
+                    onChange={(event) =>
+                      setLocalInference({
+                        ...draft.localInference,
+                        shutdownTimeoutMs: Number(event.target.value)
+                      })
+                    }
+                  />
+                </Field>
+
+                <Field
+                  label="Default chat-template parameters"
+                  hint={
+                    'A flat JSON object of strings, numbers or booleans, e.g. Ornith: ' +
+                    '{"enable_thinking": false, "preserve_thinking": false}. Empty {} sends none.'
+                  }
+                >
+                  <textarea
+                    className="input input--mono"
+                    rows={3}
+                    spellCheck={false}
+                    value={
+                      chatTemplateParametersText ??
+                      JSON.stringify(draft.localInference.requestDefaults.chatTemplateParameters)
+                    }
+                    onChange={(event) => {
+                      const raw = event.target.value;
+                      setChatTemplateParametersText(raw);
+                      // A blank or whitespace-only textarea is the empty map,
+                      // not a JSON parse failure — clearing every configured
+                      // parameter must not require typing a literal "{}".
+                      const candidate = raw.trim().length === 0 ? {} : parseJsonOrFailure(raw);
+                      if (candidate === JSON_PARSE_FAILED) {
+                        setChatTemplateParametersJsonError(
+                          'Chat-template parameters must be valid JSON.'
+                        );
+                        return;
+                      }
+                      const validated = chatTemplateParametersSchema.safeParse(candidate);
+                      if (!validated.success) {
+                        setChatTemplateParametersJsonError(
+                          'Chat-template parameters must be a flat object of strings, numbers or booleans.'
+                        );
+                        return;
+                      }
+                      setChatTemplateParametersJsonError(null);
+                      setLocalInference({
+                        ...draft.localInference,
+                        requestDefaults: {
+                          ...draft.localInference.requestDefaults,
+                          chatTemplateParameters: validated.data
+                        }
+                      });
+                    }}
+                  />
+                </Field>
+
+                {localInferenceProblems.length > 0 ? (
+                  <Notice tone="error">
+                    <strong>Local inference settings cannot be saved.</strong>
+                    <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+                      {localInferenceProblems.map((problem) => (
+                        <li key={problem}>{problem}</li>
+                      ))}
+                    </ul>
+                  </Notice>
+                ) : null}
+              </div>
+            </Card>
+
+            <LocalInferenceLifecyclePanel
+              enabled={settings?.localInference.enabled ?? false}
+              unsaved={localInferenceUnsaved}
+            />
 
             <Card title="Locations">
               <div className="stack">

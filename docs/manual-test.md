@@ -598,6 +598,90 @@ intentionally not purchased merely to prove the harness corrections.
 
 ---
 
+## 14. Local inference — future real llama.cpp/Ornith acceptance *(not run)*
+
+**This checklist has not been executed.** Every automated local-inference test
+in this repository — domain, database, service, adapter, renderer, startup,
+wiring, IPC-contract and Electron E2E suites — uses only
+`tests/fixtures/fake-local-inference-runtime.mjs`. None of them load a model,
+run a real llama.cpp/Ornith build, download anything, or spend provider quota,
+and nothing in the current renderer can invoke inference at all — the
+lifecycle panel exposes only capabilities/start/state/health/stop. This
+section exists so that claim stays checkable, and so a future acceptance run
+against a *real* runtime has a checklist rather than starting from nothing.
+
+**Prerequisites**, all supplied by the operator, none downloaded or installed
+by this checklist:
+
+- An existing `llama-server` (or Ornith) binary already present on the machine,
+  at a path you choose.
+- An existing GGUF model file already present on the machine, at a path you
+  choose. This checklist contains no download or install command for either.
+- A throwaway `AGENT_RELAY_DATA_DIR` profile, exactly as in the Cleanup section
+  below.
+- Explicit approval to spend the time and machine resources a real model load
+  takes; a llama.cpp startup with weight loading is not instant.
+
+**Configure, using the real Settings UI:**
+
+1. Launch the app against the throwaway profile.
+2. Open **Settings → Local inference**.
+3. Enable local inference.
+4. Set **Executable** to *Explicit executable path* and enter the absolute path
+   to your real `llama-server`/Ornith binary.
+5. Set **Model source** to *Model file path* and enter the absolute path to
+   your real GGUF file; give it a stable **Model id**.
+6. Leave the port at its default, or choose one you know is free.
+7. **Expect** Save to be enabled once every field validates, and disabled with a
+   clear reason if the executable/model paths are malformed, a fixed argument
+   collides with a reserved flag, or the default output cap exceeds the context
+   size — exactly the same validation the fake-runtime automated tests already
+   exercise, now against paths that happen to be real.
+8. Save.
+
+**Exercise the lifecycle, watching for loopback-only traffic:**
+
+1. In **Local inference lifecycle**, press **Check capabilities**. **Expect**
+   `available: yes`, a real `--version` banner in `Runtime version`, and
+   `inference verified: no` — a version banner is not evidence of a working
+   model.
+2. Press **Start runtime**. **Expect** the state to reach **Healthy** once the
+   model has finished loading — this can take from seconds to minutes
+   depending on the model's size; the configured startup timeout must be large
+   enough to cover it.
+3. While it is starting, confirm with an OS tool (Task Manager, `netstat`,
+   or equivalent) that the process is listening only on `127.0.0.1` at the
+   configured port, never on `0.0.0.0` or any other interface.
+4. Press **Check health** and **expect** it to stay **Healthy**.
+5. Press **Stop**. **Expect** the state to reach **Stopped**, and confirm with
+   an OS process tool that the runtime process (and any helper process it
+   spawned) has actually exited — not merely that the UI says so.
+
+**Restart and confirm no automatic activity:**
+
+1. Close and relaunch the app against the same profile.
+2. **Expect** Settings to show the same real executable/model paths, and the
+   lifecycle panel to read **Stopped** from a single passive `getState` call —
+   no automatic capability check, health check, or start.
+
+**Internal chat-template default verification** *(requires reading application
+logs or an internal build with temporary tracing; there is no renderer UI for
+this because inference itself is not renderer-exposed)*: with a
+`requestDefaults.chatTemplateParameters` map configured (e.g. an
+Ornith-specific `{"enable_thinking": false, "preserve_thinking": false}`),
+confirm that a real inference call made through a future internal caller (not
+yet wired to any workflow) includes `chat_template_kwargs` with exactly those
+values, and that clearing the configured map back to `{}` omits
+`chat_template_kwargs` from the request entirely. This step is explicitly
+deferred until an internal caller exists — LOCAL-B2 adds no such caller.
+
+Record the result of a completed run — model, runtime version banner, start
+duration, and pass/fail per step — in a dated subsection below once this is
+actually executed. Until then, this section is exploratory-checklist only, not
+evidence of anything having run.
+
+---
+
 ## Cleanup
 
 ```powershell

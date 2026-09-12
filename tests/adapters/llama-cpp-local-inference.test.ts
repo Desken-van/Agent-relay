@@ -517,6 +517,39 @@ describe('local inference request', () => {
     });
   });
 
+  it('omits chat_template_kwargs when the configured default is empty', async () => {
+    const { provider, calls } = await started(() => json(completion()), {
+      defaultChatTemplateParameters: {}
+    });
+    await provider.infer(request());
+
+    expect('chat_template_kwargs' in JSON.parse(String(posts(calls)[0]?.init.body))).toBe(false);
+  });
+
+  it('applies the configured default only when the request supplies none, false and zero intact', async () => {
+    const { provider, calls } = await started(() => json(completion()), {
+      defaultChatTemplateParameters: { enable_thinking: false, preserve_thinking: false, budget: 0 }
+    });
+    await provider.infer(request());
+
+    expect(JSON.parse(String(posts(calls)[0]?.init.body)).chat_template_kwargs).toEqual({
+      enable_thinking: false,
+      preserve_thinking: false,
+      budget: 0
+    });
+  });
+
+  it('lets a request-supplied map override the configured default entirely', async () => {
+    const { provider, calls } = await started(() => json(completion()), {
+      defaultChatTemplateParameters: { enable_thinking: false }
+    });
+    await provider.infer(request({ chatTemplateParameters: { style: 'concise' } }));
+
+    expect(JSON.parse(String(posts(calls)[0]?.init.body)).chat_template_kwargs).toEqual({
+      style: 'concise'
+    });
+  });
+
   it('refuses an invalid request before dispatching or moving state', async () => {
     const { provider, calls } = await started(() => json(completion()));
     const before = calls.length;

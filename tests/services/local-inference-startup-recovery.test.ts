@@ -47,6 +47,10 @@ describe('local inference startup recovery', () => {
     const first = start();
     const custom = {
       ...first.settings.get().localInference,
+      // Enabled on purpose: the claim under test is that startup never probes,
+      // launches or auto-starts *even when the operator has opted in* — a
+      // disabled configuration proving the same thing would be a weaker test.
+      enabled: true,
       executable: { kind: 'explicit_path' as const, path: 'C:\\tools\\llama-server.exe' },
       model: {
         id: 'restart-model',

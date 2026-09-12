@@ -160,21 +160,30 @@ projects ──┬─< tasks ──┬─< runs ──< run_events
 | `settings` | Key/value; never holds a credential |
 
 Migration 9 seeds the strict version-1 `localInference` Settings object only
-when absent. One application-scoped lifecycle service lazily constructs the
-llama.cpp-compatible provider from that configuration. Construction is passive:
-restart restores configuration but always begins at `stopped`, with no process
-or HTTP activity. The service retains one provider without serializing its
-lifecycle calls: overlapping operations reach the provider's own state machine,
-which lets stop interrupt startup or join cleanup while preventing a second
-launch. A changed configuration cannot displace the snapshot that owns an active
-or uncertain process; only a confirmed explicit stop releases it for rebinding
-on the next operation.
+when absent; migration 11 is forward-only and upgrades a pre-existing row to
+add the opt-in `enabled` flag and `requestDefaults` (default output token cap,
+default chat-template parameters) without touching its existing executable,
+model, argument, port, context or timeout values. One application-scoped
+lifecycle service lazily constructs the llama.cpp-compatible provider from that
+configuration — but only when `enabled` is true; while disabled and no provider
+is retained, every operation but `stop` returns the existing DTO shapes with an
+explicit disabled reason and constructs nothing. Construction is otherwise
+passive: restart restores configuration but always begins at `stopped` (or the
+disabled DTO), with no process or HTTP activity. The service retains one
+provider without serializing its lifecycle calls: overlapping operations reach
+the provider's own state machine, which lets stop interrupt startup or join
+cleanup while preventing a second launch. A changed or disabled configuration
+cannot displace the snapshot that owns an active or uncertain process; only a
+confirmed explicit stop releases it for rebinding on the next operation.
 
 The typed lifecycle boundary has five strict-empty-input IPC operations:
 capabilities, start, state, explicit health, and stop. Inference, prompts,
-repository data, argv, paths and arbitrary commands are not accepted there.
-There is no renderer lifecycle panel or workflow-provider integration in
-LOCAL-B1.
+repository data, argv, paths and arbitrary commands are not accepted there, and
+none of that is exposed by the renderer either. The Settings screen exposes the
+persisted fields above and a lifecycle panel drives those five operations,
+always against *saved* settings; it opens by calling only `getState`, computes
+one state-derived primary action, and there is still no workflow-provider
+integration, automatic startup, or inference UI.
 
 Session identifiers live in the database rather than in memory. That is the only
 reason the application can resume a Codex thread or a Claude session after a

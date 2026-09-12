@@ -18,8 +18,16 @@ import {
 } from '../../src/shared/domain/local-inference';
 import type { Settings } from '../../src/shared/domain/models';
 
+function enabledDefaults(): Settings {
+  const settings = defaultSettings({ dataDir: 'C:\\data', documentsDir: 'C:\\docs' });
+  return { ...settings, localInference: { ...settings.localInference, enabled: true } };
+}
+
 class MutableSettings implements SettingsRepository {
-  value = defaultSettings({ dataDir: 'C:\\data', documentsDir: 'C:\\docs' });
+  // Lifecycle operations are only exercised through a provider when local
+  // inference is enabled; these tests are about provider ownership and
+  // delegation, not the disabled short-circuit, so they opt in up front.
+  value = enabledDefaults();
 
   get(): Settings {
     return this.value;
@@ -166,6 +174,75 @@ describe('local inference configuration assembly', () => {
     expect(config.maxProcessOutputBytes).toBeLessThanOrEqual(
       LOCAL_INFERENCE_LIMITS.processOutputBytesMax
     );
+  });
+
+  it('maps requestDefaults into the assembled config', () => {
+    const settings = new MutableSettings().get().localInference;
+    const config = assembleLocalInferenceConfig({
+      ...settings,
+      requestDefaults: { maxOutputTokens: 777, chatTemplateParameters: { enable_thinking: false } }
+    });
+    expect(config.maxOutputTokens).toBe(777);
+    expect(config.defaultChatTemplateParameters).toEqual({ enable_thinking: false });
+  });
+});
+
+describe('LocalInferenceService disabled behaviour', () => {
+  it('performs no provider construction and returns a disabled DTO when disabled and unbound', async () => {
+    const settings = new MutableSettings();
+    settings.update({ localInference: { ...settings.get().localInference, enabled: false } });
+    let constructions = 0;
+    const service = new LocalInferenceService({
+      settings,
+      createProvider: () => {
+        constructions += 1;
+        return new StubProvider();
+      }
+    });
+
+    expect(service.state()).toEqual({
+      kind: 'unavailable',
+      reason: 'Local inference is disabled in Settings.'
+    });
+    const capabilities = await service.capabilities();
+    expect(capabilities.available).toBe(false);
+    expect(capabilities.unavailableReason).toBe('Local inference is disabled in Settings.');
+    expect((await service.start()).kind).toBe('unavailable');
+    expect((await service.health()).kind).toBe('unavailable');
+    expect(await service.stop()).toEqual({ kind: 'stopped' });
+    expect(constructions).toBe(0);
+  });
+
+  it('keeps delegating to a retained provider even after settings become disabled', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    let constructions = 0;
+    const service = new LocalInferenceService({
+      settings,
+      createProvider: () => {
+        constructions += 1;
+        return provider;
+      }
+    });
+
+    await service.start();
+    expect(service.state().kind).toBe('healthy');
+
+    settings.update({ localInference: { ...settings.get().localInference, enabled: false } });
+    // Still bound to the same active provider: health must still reach it,
+    // not the disabled short-circuit.
+    await service.health();
+    expect(provider.healthCalls).toBe(1);
+    expect(constructions).toBe(1);
+
+    expect(await service.stop()).toEqual({ kind: 'stopped' });
+    // Now unbound and disabled: the next call must not construct a provider.
+    expect(service.state()).toEqual({
+      kind: 'unavailable',
+      reason: 'Local inference is disabled in Settings.'
+    });
+    await service.capabilities();
+    expect(constructions).toBe(1);
   });
 });
 

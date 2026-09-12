@@ -23,8 +23,8 @@ function tempDatabase(): { root: string; file: string } {
 
 const defaults = () => defaultSettings({ dataDir: 'C:\\data', documentsDir: 'C:\\docs' });
 
-describe('migration 9', () => {
-  it('is appended after unchanged migrations 1 through 8 and seeds only an absent row', () => {
+describe('migrations 9 and 11', () => {
+  it('are appended after unchanged migrations and 11 seeds/upgrades the local-inference row', () => {
     expect(MIGRATIONS.map(({ version, name }) => ({ version, name }))).toEqual([
       { version: 1, name: 'initial-schema' },
       { version: 2, name: 'task-model-selection' },
@@ -35,7 +35,8 @@ describe('migration 9', () => {
       { version: 7, name: 'code-review-evidence' },
       { version: 8, name: 'task-provider-routing' },
       { version: 9, name: 'local-inference-settings' },
-      { version: 10, name: 'task-continuations' }
+      { version: 10, name: 'task-continuations' },
+      { version: 11, name: 'local-inference-request-defaults' }
     ]);
 
     const db = createSqliteDatabase(':memory:');
@@ -51,12 +52,15 @@ describe('migration 9', () => {
       );
     }
 
+    // A row already in the current shape (as if migration 9 had already run
+    // under a build that already had request defaults): 9 and 11 both leave
+    // it untouched.
     const existing = { ...defaultLocalInferenceSettings(), port: 23456 };
     db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run(
       'localInference',
       JSON.stringify(existing)
     );
-    expect(runMigrations(db)).toBe(2);
+    expect(runMigrations(db)).toBe(3);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };
@@ -69,6 +73,86 @@ describe('migration 9', () => {
     };
     expect(JSON.parse(seeded.value)).toEqual(defaultLocalInferenceSettings());
     closeDatabase(fresh);
+  });
+
+  it('upgrades a genuine pre-B2 legacy row while preserving unrelated settings', () => {
+    const db = createSqliteDatabase(':memory:');
+    db.exec(`CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
+    )`);
+    for (const migration of MIGRATIONS.slice(0, 10)) {
+      migration.up(db);
+      db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+        migration.version,
+        migration.name,
+        '2026-09-11T00:00:00.000Z'
+      );
+    }
+
+    const legacy = {
+      version: 1,
+      executable: { kind: 'explicit_path', path: 'C:\\tools\\llama-server.exe' },
+      model: { id: 'legacy-model', source: { kind: 'path', path: 'C:\\models\\legacy.gguf' } },
+      fixedArguments: ['--threads', '4'],
+      port: 18080,
+      contextLimitTokens: 2048,
+      startupTimeoutMs: 10_000,
+      healthTimeoutMs: 2_000,
+      inferenceTimeoutMs: 20_000,
+      shutdownTimeoutMs: 5_000
+    };
+    db.prepare('UPDATE settings SET value = ? WHERE key = ?').run(
+      JSON.stringify(legacy),
+      'localInference'
+    );
+    db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run(
+      'githubOwner',
+      JSON.stringify('kept-across-migration')
+    );
+
+    expect(runMigrations(db)).toBe(1);
+
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
+      value: string;
+    };
+    const upgraded = JSON.parse(row.value);
+    expect(upgraded.executable).toEqual(legacy.executable);
+    expect(upgraded.model).toEqual(legacy.model);
+    expect(upgraded.fixedArguments).toEqual(legacy.fixedArguments);
+    expect(upgraded.port).toBe(legacy.port);
+    expect(upgraded.contextLimitTokens).toBe(legacy.contextLimitTokens);
+    expect(upgraded.startupTimeoutMs).toBe(legacy.startupTimeoutMs);
+    expect(upgraded.enabled).toBe(false);
+    expect(upgraded.requestDefaults).toEqual({ maxOutputTokens: 2048, chatTemplateParameters: {} });
+
+    const owner = db.prepare('SELECT value FROM settings WHERE key = ?').get('githubOwner') as {
+      value: string;
+    };
+    expect(JSON.parse(owner.value)).toBe('kept-across-migration');
+    db.close();
+  });
+
+  it('falls back to the shipped default for a malformed legacy row rather than leaving it broken', () => {
+    const db = createSqliteDatabase(':memory:');
+    db.exec(`CREATE TABLE schema_migrations (
+      version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
+    )`);
+    for (const migration of MIGRATIONS.slice(0, 10)) {
+      migration.up(db);
+      db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+        migration.version,
+        migration.name,
+        '2026-09-11T00:00:00.000Z'
+      );
+    }
+    db.prepare('UPDATE settings SET value = ? WHERE key = ?').run('{not valid json', 'localInference');
+
+    expect(runMigrations(db)).toBe(1);
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
+      value: string;
+    };
+    expect(JSON.parse(row.value)).toEqual(defaultLocalInferenceSettings());
+    db.close();
   });
 });
 

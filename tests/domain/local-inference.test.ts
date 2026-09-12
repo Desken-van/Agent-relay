@@ -30,6 +30,7 @@ import {
   localInferenceStateSchema,
   localInferenceTransition,
   modelArgumentFor,
+  upgradeLegacyLocalInferenceSettings,
   type LocalInferenceEvent,
   type LocalInferenceStateKind
 } from '../../src/shared/domain/local-inference';
@@ -53,6 +54,7 @@ function config(overrides: Record<string, unknown> = {}): Record<string, unknown
     fixedArguments: ['--threads', '4'],
     contextLimitTokens: 8192,
     maxOutputTokens: 512,
+    defaultChatTemplateParameters: {},
     maxPromptBytes: 100_000,
     maxRequestBytes: 200_000,
     maxResponseBytes: 400_000,
@@ -248,6 +250,7 @@ describe('persisted local inference settings', () => {
     const second = defaultLocalInferenceSettings();
     expect(first).toEqual({
       version: 1,
+      enabled: false,
       executable: { kind: 'discovered', command: 'llama-server' },
       model: {
         id: 'local-model',
@@ -259,11 +262,60 @@ describe('persisted local inference settings', () => {
       startupTimeoutMs: 600_000,
       healthTimeoutMs: 60_000,
       inferenceTimeoutMs: 1_800_000,
-      shutdownTimeoutMs: 60_000
+      shutdownTimeoutMs: 60_000,
+      requestDefaults: {
+        maxOutputTokens: 4096,
+        chatTemplateParameters: {}
+      }
     });
     expect(first).not.toBe(second);
     expect(first.fixedArguments).not.toBe(second.fixedArguments);
     expect(first.model).not.toBe(second.model);
+    expect(first.requestDefaults).not.toBe(second.requestDefaults);
+    expect(first.requestDefaults.chatTemplateParameters).not.toBe(
+      second.requestDefaults.chatTemplateParameters
+    );
+  });
+
+  it('bounds and cross-validates the default output token cap', () => {
+    expect(
+      localInferenceSettingsSchema.safeParse(
+        persisted({ requestDefaults: { maxOutputTokens: 4097, chatTemplateParameters: {} }, contextLimitTokens: 4096 })
+      ).success
+    ).toBe(false);
+    expect(
+      localInferenceSettingsSchema.safeParse(
+        persisted({ requestDefaults: { maxOutputTokens: 4096, chatTemplateParameters: {} }, contextLimitTokens: 4096 })
+      ).success
+    ).toBe(true);
+    expect(
+      localInferenceSettingsSchema.safeParse(
+        persisted({ requestDefaults: { maxOutputTokens: 0, chatTemplateParameters: {} } })
+      ).success
+    ).toBe(false);
+  });
+
+  it('preserves false and zero in the default chat-template parameter map', () => {
+    const parsed = localInferenceSettingsSchema.parse(
+      persisted({
+        requestDefaults: {
+          maxOutputTokens: 4096,
+          chatTemplateParameters: { enable_thinking: false, preserve_thinking: false, budget: 0 }
+        }
+      })
+    );
+    expect(parsed.requestDefaults.chatTemplateParameters).toEqual({
+      enable_thinking: false,
+      preserve_thinking: false,
+      budget: 0
+    });
+  });
+
+  it('rejects an object missing the new required fields', () => {
+    const { enabled: _enabled, ...withoutEnabled } = persisted();
+    expect(localInferenceSettingsSchema.safeParse(withoutEnabled).success).toBe(false);
+    const { requestDefaults: _requestDefaults, ...withoutRequestDefaults } = persisted();
+    expect(localInferenceSettingsSchema.safeParse(withoutRequestDefaults).success).toBe(false);
   });
 
   it('accepts both executable variants and both model-source variants', () => {
@@ -334,6 +386,63 @@ describe('persisted local inference settings', () => {
     }
     expect(localInferenceSettingsSchema.safeParse(persisted({ port: 1 })).success).toBe(true);
     expect(localInferenceSettingsSchema.safeParse(persisted({ port: 65_535 })).success).toBe(true);
+  });
+});
+
+describe('upgradeLegacyLocalInferenceSettings', () => {
+  it('leaves a row already in the current shape unchanged', () => {
+    const current = defaultLocalInferenceSettings();
+    expect(upgradeLegacyLocalInferenceSettings(current)).toEqual(current);
+  });
+
+  it('upgrades a pre-B2 legacy row, keeping every existing value and adding safe defaults', () => {
+    const legacy = {
+      version: 1,
+      executable: { kind: 'explicit_path', path: EXECUTABLE_PATH },
+      model: { id: 'legacy-model', source: { kind: 'path', path: MODEL_PATH } },
+      fixedArguments: ['--threads', '4'],
+      port: 18080,
+      contextLimitTokens: 2048,
+      startupTimeoutMs: 10_000,
+      healthTimeoutMs: 2_000,
+      inferenceTimeoutMs: 20_000,
+      shutdownTimeoutMs: 5_000
+    };
+
+    const upgraded = upgradeLegacyLocalInferenceSettings(legacy);
+    expect(upgraded.executable).toEqual(legacy.executable);
+    expect(upgraded.model).toEqual(legacy.model);
+    expect(upgraded.fixedArguments).toEqual(legacy.fixedArguments);
+    expect(upgraded.port).toBe(legacy.port);
+    expect(upgraded.contextLimitTokens).toBe(legacy.contextLimitTokens);
+    expect(upgraded.startupTimeoutMs).toBe(legacy.startupTimeoutMs);
+    expect(upgraded.healthTimeoutMs).toBe(legacy.healthTimeoutMs);
+    expect(upgraded.inferenceTimeoutMs).toBe(legacy.inferenceTimeoutMs);
+    expect(upgraded.shutdownTimeoutMs).toBe(legacy.shutdownTimeoutMs);
+    expect(upgraded.enabled).toBe(false);
+    expect(upgraded.requestDefaults).toEqual({ maxOutputTokens: 2048, chatTemplateParameters: {} });
+  });
+
+  it('clamps the migrated default output cap to min(4096, context limit)', () => {
+    const legacy = {
+      version: 1,
+      executable: { kind: 'discovered', command: 'llama-server' },
+      model: { id: 'm', source: { kind: 'runtime_id', runtimeModelId: 'm' } },
+      fixedArguments: [],
+      port: 8080,
+      contextLimitTokens: 32_768,
+      startupTimeoutMs: 10_000,
+      healthTimeoutMs: 2_000,
+      inferenceTimeoutMs: 20_000,
+      shutdownTimeoutMs: 5_000
+    };
+    expect(upgradeLegacyLocalInferenceSettings(legacy).requestDefaults.maxOutputTokens).toBe(4096);
+  });
+
+  it('falls back to the shipped default for malformed or unrecognisable data', () => {
+    for (const bad of [undefined, null, 'not an object', { version: 1 }, { surprise: true }]) {
+      expect(upgradeLegacyLocalInferenceSettings(bad)).toEqual(defaultLocalInferenceSettings());
+    }
   });
 });
 
