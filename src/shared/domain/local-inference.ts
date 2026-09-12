@@ -388,6 +388,28 @@ export type ChatTemplateParameters = z.infer<typeof chatTemplateParametersSchema
 /* -------------------------------------------------------------------------- */
 
 /**
+ * Caller-adjustable defaults for a request, when the settings UI has no
+ * per-request caller to ask.
+ *
+ * Deliberately narrow: the only two things the existing request contract lets
+ * a caller vary are `maxOutputTokens` and `chatTemplateParameters`, so those
+ * are the only two an operator may set a default for. Adding a default for a
+ * field the request contract does not have (temperature, sampling, seed,
+ * streaming, tools) would be a default for nothing.
+ */
+export const localInferenceRequestDefaultsSchema = z
+  .object({
+    maxOutputTokens: boundedInt(
+      LOCAL_INFERENCE_LIMITS.outputTokensMax,
+      'The default output token cap'
+    ),
+    chatTemplateParameters: chatTemplateParametersSchema
+  })
+  .strict();
+
+export type LocalInferenceRequestDefaults = z.infer<typeof localInferenceRequestDefaultsSchema>;
+
+/**
  * The operator-owned, durable part of the local-inference configuration.
  *
  * Process policy (provider identity, working directory and all output/body
@@ -397,6 +419,8 @@ export type ChatTemplateParameters = z.infer<typeof chatTemplateParametersSchema
 export const localInferenceSettingsSchema = z
   .object({
     version: z.literal(LOCAL_INFERENCE_CONTRACT_VERSION),
+    /** Opt-in. A managed runtime is never discovered, launched or contacted while false. */
+    enabled: z.boolean(),
     executable: localInferenceExecutableSchema,
     model: localInferenceModelSchema,
     fixedArguments: z
@@ -423,9 +447,19 @@ export const localInferenceSettingsSchema = z
     shutdownTimeoutMs: boundedInt(
       LOCAL_INFERENCE_LIMITS.shutdownTimeoutMsMax,
       'The shutdown timeout'
-    )
+    ),
+    requestDefaults: localInferenceRequestDefaultsSchema
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.requestDefaults.maxOutputTokens > value.contextLimitTokens) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['requestDefaults', 'maxOutputTokens'],
+        message: 'The default output token cap may not exceed the context limit.'
+      });
+    }
+  });
 
 export type LocalInferenceSettings = z.infer<typeof localInferenceSettingsSchema>;
 
@@ -433,6 +467,7 @@ export type LocalInferenceSettings = z.infer<typeof localInferenceSettingsSchema
 export function defaultLocalInferenceSettings(): LocalInferenceSettings {
   return {
     version: LOCAL_INFERENCE_CONTRACT_VERSION,
+    enabled: false,
     executable: { kind: 'discovered', command: LLAMA_SERVER_COMMAND },
     model: {
       id: 'local-model',
@@ -444,8 +479,75 @@ export function defaultLocalInferenceSettings(): LocalInferenceSettings {
     startupTimeoutMs: 600_000,
     healthTimeoutMs: 60_000,
     inferenceTimeoutMs: 1_800_000,
-    shutdownTimeoutMs: 60_000
+    shutdownTimeoutMs: 60_000,
+    requestDefaults: {
+      maxOutputTokens: 4096,
+      chatTemplateParameters: {}
+    }
   };
+}
+
+/**
+ * The version-1 shape as it existed before request defaults were added
+ * (LOCAL-B1's shipped shape). Frozen here for migration 11's upgrade path so
+ * that migration keeps upgrading the same legacy rows the same way regardless
+ * of how the current schema goes on to change.
+ */
+const legacyLocalInferenceSettingsV1Schema = z
+  .object({
+    version: z.literal(LOCAL_INFERENCE_CONTRACT_VERSION),
+    executable: localInferenceExecutableSchema,
+    model: localInferenceModelSchema,
+    fixedArguments: z
+      .array(fixedArgumentSchema)
+      .max(LOCAL_INFERENCE_LIMITS.fixedArgumentsMax),
+    port: z.number().int().min(1).max(65535),
+    contextLimitTokens: boundedInt(LOCAL_INFERENCE_LIMITS.contextTokensMax, 'The context limit'),
+    startupTimeoutMs: boundedInt(
+      LOCAL_INFERENCE_LIMITS.startupTimeoutMsMax,
+      'The startup timeout'
+    ),
+    healthTimeoutMs: boundedInt(LOCAL_INFERENCE_LIMITS.healthTimeoutMsMax, 'The health timeout'),
+    inferenceTimeoutMs: boundedInt(
+      LOCAL_INFERENCE_LIMITS.inferenceTimeoutMsMax,
+      'The inference timeout'
+    ),
+    shutdownTimeoutMs: boundedInt(
+      LOCAL_INFERENCE_LIMITS.shutdownTimeoutMsMax,
+      'The shutdown timeout'
+    )
+  })
+  .strict();
+
+/**
+ * Upgrade a persisted local-inference settings row to the current version-1
+ * shape, for migration 11.
+ *
+ * A row already in the current shape is returned unchanged. A row in the
+ * pre-existing legacy shape keeps every executable/model/argument/port/
+ * context/timeout value untouched and gains `enabled: false` plus request
+ * defaults that reproduce the previous fixed behaviour: 4096 tokens (or the
+ * context limit, if smaller) and no chat-template parameters. Anything else —
+ * malformed JSON already parsed to a non-object, or an unrecognised shape —
+ * falls back to the shipped default rather than being carried forward broken.
+ */
+export function upgradeLegacyLocalInferenceSettings(raw: unknown): LocalInferenceSettings {
+  const current = localInferenceSettingsSchema.safeParse(raw);
+  if (current.success) return current.data;
+
+  const legacy = legacyLocalInferenceSettingsV1Schema.safeParse(raw);
+  if (!legacy.success) return defaultLocalInferenceSettings();
+
+  const upgraded = {
+    ...legacy.data,
+    enabled: false,
+    requestDefaults: {
+      maxOutputTokens: Math.min(4096, legacy.data.contextLimitTokens),
+      chatTemplateParameters: {}
+    }
+  };
+  const parsed = localInferenceSettingsSchema.safeParse(upgraded);
+  return parsed.success ? parsed.data : defaultLocalInferenceSettings();
 }
 
 export const localInferenceConfigSchema = z
@@ -473,6 +575,12 @@ export const localInferenceConfigSchema = z
 
     contextLimitTokens: boundedInt(LOCAL_INFERENCE_LIMITS.contextTokensMax, 'The context limit'),
     maxOutputTokens: boundedInt(LOCAL_INFERENCE_LIMITS.outputTokensMax, 'The output token cap'),
+    /**
+     * Configured chat-template parameters applied when a request supplies
+     * none of its own. Defaults to empty, which is silently omitted from the
+     * wire request rather than sent as `{}` — see the adapter.
+     */
+    defaultChatTemplateParameters: chatTemplateParametersSchema.default({}),
 
     maxPromptBytes: boundedInt(LOCAL_INFERENCE_LIMITS.promptBytesMax, 'The prompt byte limit'),
     maxRequestBytes: boundedInt(LOCAL_INFERENCE_LIMITS.requestBytesMax, 'The request byte limit'),

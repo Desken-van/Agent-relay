@@ -8,6 +8,7 @@
 
 import {
   LOCAL_INFERENCE_CONTRACT_VERSION,
+  LOCAL_INFERENCE_PROTOCOL,
   parseLocalInferenceConfig,
   type LocalInferenceCapabilities,
   type LocalInferenceConfig,
@@ -22,9 +23,11 @@ import type {
 
 export const LOCAL_INFERENCE_PROVIDER_ID = 'local-llama-cpp';
 
+/** Bounded and safe; never a path, never provider-side detail. */
+const LOCAL_INFERENCE_DISABLED_REASON = 'Local inference is disabled in Settings.';
+
 /** Trusted application policy; none of these fields is operator-configurable. */
 export const LOCAL_INFERENCE_APPLICATION_LIMITS = {
-  maxOutputTokens: 4096,
   maxPromptBytes: 1 * 1024 * 1024,
   maxRequestBytes: 2 * 1024 * 1024,
   maxResponseBytes: 2 * 1024 * 1024,
@@ -44,10 +47,10 @@ export function assembleLocalInferenceConfig(
     fixedArguments: settings.fixedArguments,
     port: settings.port,
     contextLimitTokens: settings.contextLimitTokens,
-    maxOutputTokens: Math.min(
-      LOCAL_INFERENCE_APPLICATION_LIMITS.maxOutputTokens,
-      settings.contextLimitTokens
-    ),
+    // The request contract's rule — a request may only lower this, never
+    // raise it — is preserved by the adapter; this is only ever the ceiling.
+    maxOutputTokens: Math.min(settings.requestDefaults.maxOutputTokens, settings.contextLimitTokens),
+    defaultChatTemplateParameters: settings.requestDefaults.chatTemplateParameters,
     maxPromptBytes: LOCAL_INFERENCE_APPLICATION_LIMITS.maxPromptBytes,
     maxRequestBytes: LOCAL_INFERENCE_APPLICATION_LIMITS.maxRequestBytes,
     maxResponseBytes: LOCAL_INFERENCE_APPLICATION_LIMITS.maxResponseBytes,
@@ -77,18 +80,28 @@ export class LocalInferenceService implements LocalInferenceLifecycleService {
 
   /** Cheap and passive: no provider construction, discovery or HTTP. */
   state(): LocalInferenceState {
-    return this.provider?.state() ?? { kind: 'stopped' };
+    if (this.provider !== null) return this.provider.state();
+    return this.options.settings.get().localInference.enabled
+      ? { kind: 'stopped' }
+      : { kind: 'unavailable', reason: LOCAL_INFERENCE_DISABLED_REASON };
   }
 
   capabilities(): Promise<LocalInferenceCapabilities> {
+    if (this.isDisabledAndUnbound()) return Promise.resolve(this.disabledCapabilities());
     return this.bindProvider().capabilities();
   }
 
   start(): Promise<LocalInferenceState> {
+    if (this.isDisabledAndUnbound()) {
+      return Promise.resolve({ kind: 'unavailable', reason: LOCAL_INFERENCE_DISABLED_REASON });
+    }
     return this.bindProvider().start();
   }
 
   health(): Promise<LocalInferenceState> {
+    if (this.isDisabledAndUnbound()) {
+      return Promise.resolve({ kind: 'unavailable', reason: LOCAL_INFERENCE_DISABLED_REASON });
+    }
     return this.bindProvider().health();
   }
 
@@ -108,6 +121,30 @@ export class LocalInferenceService implements LocalInferenceLifecycleService {
       }
       return stopped;
     });
+  }
+
+  /** No provider is retained, and Settings currently forbid constructing one. */
+  private isDisabledAndUnbound(): boolean {
+    return this.provider === null && !this.options.settings.get().localInference.enabled;
+  }
+
+  private disabledCapabilities(): LocalInferenceCapabilities {
+    const settings = this.options.settings.get().localInference;
+    return {
+      protocol: LOCAL_INFERENCE_PROTOCOL,
+      contractVersion: LOCAL_INFERENCE_CONTRACT_VERSION,
+      providerId: LOCAL_INFERENCE_PROVIDER_ID,
+      modelId: settings.model.id,
+      available: false,
+      unavailableReason: LOCAL_INFERENCE_DISABLED_REASON,
+      executableSource: null,
+      runtimeVersion: null,
+      supportsChatCompletions: true,
+      supportsStreaming: false,
+      supportsUsageWhenReported: true,
+      supportsChatTemplateParameters: true,
+      inferenceVerified: false
+    };
   }
 
   private bindProvider(): LocalInferenceProvider {

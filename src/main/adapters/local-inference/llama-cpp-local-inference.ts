@@ -1042,6 +1042,15 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
       parsed.maxOutputTokens ?? this.config.maxOutputTokens,
       this.config.maxOutputTokens
     );
+    // A request's own map always wins. Absent that, the configured default is
+    // used only when it actually has something in it — an empty default is
+    // sent as no `chat_template_kwargs` at all, not as `{}`, so a runtime that
+    // treats the field's mere presence as meaningful never sees one.
+    const effectiveChatTemplateParameters =
+      parsed.chatTemplateParameters ??
+      (Object.keys(this.config.defaultChatTemplateParameters).length > 0
+        ? this.config.defaultChatTemplateParameters
+        : undefined);
     const bodyText = JSON.stringify({
       model: this.config.model.id,
       messages: parsed.messages.map((message) => ({
@@ -1053,9 +1062,9 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
       max_tokens: maxTokens,
       // Present only when supplied. `false` and `0` travel unchanged: they are
       // values, and a template parameter that means "off" has to arrive as off.
-      ...(parsed.chatTemplateParameters === undefined
+      ...(effectiveChatTemplateParameters === undefined
         ? {}
-        : { chat_template_kwargs: parsed.chatTemplateParameters })
+        : { chat_template_kwargs: effectiveChatTemplateParameters })
     });
 
     const requestBytes = Buffer.byteLength(bodyText, 'utf8');

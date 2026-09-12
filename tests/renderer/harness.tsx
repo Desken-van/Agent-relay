@@ -92,6 +92,29 @@ export function installBridge(handlers: Partial<Record<IpcChannel, Handler>> = {
       ok<'codex:listModels'>({ available: false, models: [], detail: 'not used' }),
     'operations:listTargets': () => ok<'operations:listTargets'>([]),
     'operations:listDiagnostics': () => ok<'operations:listDiagnostics'>([]),
+    // The lifecycle panel calls only `getState` on mount; a sane, inert
+    // default lets every test that merely renders Settings (without caring
+    // about the lifecycle panel) skip stubbing these five explicitly.
+    'localInference:getState': () => ok<'localInference:getState'>({ kind: 'stopped' }),
+    'localInference:getCapabilities': () =>
+      ok<'localInference:getCapabilities'>({
+        protocol: 'agent-relay.local-inference',
+        contractVersion: 1,
+        providerId: 'local-llama-cpp',
+        modelId: 'local-model',
+        available: false,
+        unavailableReason: 'not used',
+        executableSource: null,
+        runtimeVersion: null,
+        supportsChatCompletions: true,
+        supportsStreaming: false,
+        supportsUsageWhenReported: true,
+        supportsChatTemplateParameters: true,
+        inferenceVerified: false
+      }),
+    'localInference:start': () => ok<'localInference:start'>({ kind: 'stopped' }),
+    'localInference:checkHealth': () => ok<'localInference:checkHealth'>({ kind: 'stopped' }),
+    'localInference:stop': () => ok<'localInference:stop'>({ kind: 'stopped' }),
     ...handlers
   };
 

@@ -8,7 +8,10 @@
  */
 
 import type { SqliteDatabase } from './sqlite';
-import { defaultLocalInferenceSettings } from '../../shared/domain/local-inference';
+import {
+  defaultLocalInferenceSettings,
+  upgradeLegacyLocalInferenceSettings
+} from '../../shared/domain/local-inference';
 
 export interface Migration {
   readonly version: number;
@@ -673,6 +676,32 @@ export const MIGRATIONS: readonly Migration[] = [
           ON tasks(worktree_path)
           WHERE worktree_path IS NOT NULL AND status NOT IN ('COMPLETED','FAILED','CANCELLED');
       `);
+    }
+  },
+  {
+    version: 11,
+    name: 'local-inference-request-defaults',
+    up(db) {
+      // Nothing to upgrade on a fresh install: migration 9 above seeds a row
+      // through `defaultLocalInferenceSettings()`, which by the time this
+      // build runs already returns the complete current shape.
+      const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as
+        | { value: string }
+        | undefined;
+      if (row === undefined) return;
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(row.value);
+      } catch {
+        parsed = undefined;
+      }
+
+      const upgraded = upgradeLegacyLocalInferenceSettings(parsed);
+      db.prepare('UPDATE settings SET value = ? WHERE key = ?').run(
+        JSON.stringify(upgraded),
+        'localInference'
+      );
     }
   }
 ];

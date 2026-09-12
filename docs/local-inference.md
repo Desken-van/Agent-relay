@@ -1,19 +1,23 @@
 # Local inference boundary
 
 LOCAL-A adds an internal version-1 provider for one managed,
-llama.cpp-compatible server. LOCAL-B1 persists its operator configuration and
-wires one long-lived lifecycle service into the main process. It remains a
-foundation, not a workflow integration.
-Agent Relay remains the sole owner of tasks, reviews, patches, retries,
-approvals, and publication. The runtime loads a model and answers inference
-requests; it owns none of that workflow state.
+llama.cpp-compatible server. LOCAL-B1 persisted its operator configuration and
+wired one long-lived lifecycle service into the main process. LOCAL-B2 adds an
+opt-in `enabled` flag and request defaults to that persisted configuration, and
+exposes both the configuration and the lifecycle service through a renderer
+Settings section and lifecycle panel. It remains a foundation, not a workflow
+integration: Agent Relay remains the sole owner of tasks, reviews, patches,
+retries, approvals, and publication. The runtime loads a model and answers
+inference requests; it owns none of that workflow state, and nothing in this
+boundary calls it automatically.
 
 The lifecycle service is registered in the composition root and exposed through
 the existing typed IPC/preload bridge. Configuration is saved through the
-existing validated Settings update only; there is still no renderer UI for it.
-The contract name is `agent-relay.local-inference`, and the only accepted
-contract version is `1`. Versioned configuration, request, response, outcome,
-and persisted-settings schemas reject unknown properties and versions.
+existing validated Settings update; the renderer never gains its own
+filesystem-discovery or executable-picker channel. The contract name is
+`agent-relay.local-inference`, and the only accepted contract version is `1`.
+Versioned configuration, request, response, outcome, and persisted-settings
+schemas reject unknown properties and versions.
 
 ## Runtime and model configuration
 
@@ -22,6 +26,7 @@ and persisted-settings schemas reject unknown properties and versions.
 ```json
 {
   "version": 1,
+  "enabled": false,
   "executable": { "kind": "discovered", "command": "llama-server" },
   "model": {
     "id": "local-model",
@@ -33,14 +38,37 @@ and persisted-settings schemas reject unknown properties and versions.
   "startupTimeoutMs": 600000,
   "healthTimeoutMs": 60000,
   "inferenceTimeoutMs": 1800000,
-  "shutdownTimeoutMs": 60000
+  "shutdownTimeoutMs": 60000,
+  "requestDefaults": {
+    "maxOutputTokens": 4096,
+    "chatTemplateParameters": {}
+  }
 }
 ```
 
-Migration 9 (`local-inference-settings`) inserts this value only when the key is
-absent. Invalid or malformed stored local configuration falls back only this
-field; other valid Settings survive. Provider id `local-llama-cpp`, working
-directory policy, token limits, and byte/output ceilings remain trusted
+`enabled` defaults to `false`: a fresh install, and every upgraded legacy row,
+opts in to nothing. While disabled, `getState`/`getCapabilities`/`start`/
+`checkHealth` construct no provider, discover no executable, launch no process
+and send no HTTP request — they return the existing state/capability DTO shapes
+with a bounded, explicit disabled reason. `stop` remains passive. `requestDefaults`
+carries the only two caller-adjustable defaults the existing request contract
+has: `maxOutputTokens` (bounded by, and never exceeding, `contextLimitTokens`)
+and `chatTemplateParameters` (the same flat, primitive-valued map described
+below, defaulting to `{}` so generic llama.cpp behaviour is unchanged until an
+operator configures it — an Ornith deployment might set
+`{"enable_thinking": false, "preserve_thinking": false}`).
+
+Migration 9 (`local-inference-settings`) inserts a fresh default row only when
+the key is absent. Migration 11 (`local-inference-request-defaults`) is
+forward-only and upgrades a pre-existing row: a row already in the current
+shape is left untouched; a row in the legacy pre-B2 shape keeps every existing
+executable/model/argument/port/context/timeout value and gains
+`enabled: false` plus `requestDefaults` (`maxOutputTokens` set to
+`min(4096, contextLimitTokens)`, `chatTemplateParameters` set to `{}`);
+malformed or unrecognisable data falls back to the shipped default rather than
+being carried forward broken, and unrelated Settings keys are untouched either
+way. Provider id `local-llama-cpp`, working directory policy, token/byte
+ceilings other than `requestDefaults`, and process policy remain trusted
 application policy and are not persisted operator input.
 
 The executable is either the fixed PATH-discovered command `llama-server` or an
@@ -112,8 +140,42 @@ is uncertain; the owning snapshot stays in use until an explicit stop returns
 exactly `stopped`, after which the next operation binds the latest configuration.
 
 Configuration is durable; lifecycle state is not. Every application launch
-starts at `{ "kind": "stopped" }` and performs no discovery, version probe,
-launch, health request, inference, retry, fallback, or automatic start.
+starts at `{ "kind": "stopped" }` (or the disabled `unavailable` DTO, when
+`enabled` is false) and performs no discovery, version probe, launch, health
+request, inference, retry, fallback, or automatic start.
+
+### Renderer Settings and lifecycle panel
+
+The Settings screen's "Local inference" card exposes every field above:
+enabled state, executable discovery versus an explicit absolute path, model id
+and source, one fixed argument per line (never shell-parsed), port, context
+size, all four timeouts, the default max output tokens, and a raw JSON textarea
+for the default chat-template parameter map. Fixed arguments and the
+chat-template map are kept as raw text alongside the parsed draft so partially
+typed content never jumps or disappears; a blank chat-template textarea is
+normalised to `{}` rather than treated as an invalid-JSON failure. The complete
+draft — including an untouched `localInference` — is submitted through the
+existing `settings:update` channel; there is no separate local-inference
+settings or discovery channel, and main-process validation is authoritative
+regardless of what the form already checked.
+
+A separate "Local inference lifecycle" card uses only the five bounded IPC
+operations. Opening it calls `getState` and nothing else — no automatic
+capability check, start, poll, retry, or restart. It shows four facts (What
+happened, Current state, Result, Next action) and renders exactly one
+state-derived primary button: capability checking while stopped with no or
+unavailable evidence, Start once capabilities report available, health
+checking while healthy, a passive `getState` refresh for starting/inferring/
+stopping, and a disabled "cleanup required" label for failed/cancelled/
+timed-out states (Stop is the only way out of those, never a silent retry). The
+button is disabled whenever local-inference edits are unsaved or the saved
+configuration is disabled, in both cases with an explanatory reason rather than
+being hidden. A synchronous claim (checked before any request, not only via the
+disabled attribute) collapses a burst of clicks into one IPC call. Stop is
+rendered as a separate control only for starting/healthy/inferring/failed/
+cancelled/timed-out states, and is disabled only while another stop is already
+in flight — a pending Start, capability check, or health check never blocks
+Stop, so it can still interrupt them.
 
 One discriminated state model contains exactly:
 
@@ -268,8 +330,8 @@ reason is `{kind:"unknown"}`; an unfamiliar bounded reason is an explicit
 
 ## Known limitations
 
-- There is no renderer lifecycle UI; configuration currently has no visible controls.
-- Lifecycle IPC deliberately exposes no inference operation.
+- Lifecycle IPC deliberately exposes no inference operation, and the renderer
+  has no prompt input, task workflow integration, or automatic startup.
 - There is no streaming, tool calling, embeddings, multimodal input, completion
   cache, Context Pack, repository indexing/RAG, patching, or workflow wiring.
 - Prompt bytes are bounded, but there is no tokenizer-based preflight prompt
@@ -281,5 +343,7 @@ reason is `{kind:"unknown"}`; an unfamiliar bounded reason is an explicit
   `npm install` and copied beside the main-process bundle. If it is missing, a
   managed runtime launch fails before the target process starts; there is no
   fallback to uncontained execution.
-- Deterministic LOCAL-B1 acceptance uses only the Agent Relay-owned fake runtime.
-  Running a real llama.cpp or Ornith build and model remains explicitly deferred.
+- Deterministic LOCAL-B1/LOCAL-B2 acceptance uses only the Agent Relay-owned
+  fake runtime and a temporary profile/port. Running a real llama.cpp or Ornith
+  build and model remains explicitly deferred — see `docs/manual-test.md` for
+  the not-yet-run manual checklist.

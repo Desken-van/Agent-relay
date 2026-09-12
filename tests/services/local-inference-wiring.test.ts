@@ -73,6 +73,7 @@ describe('composition-root local inference wiring', () => {
     app.settings.update({
       localInference: {
         ...app.settings.get().localInference,
+        enabled: true,
         executable: { kind: 'explicit_path', path: FAKE_LOCAL_INFERENCE_RUNTIME },
         model: { id: 'wired-model', source: { kind: 'runtime_id', runtimeModelId: 'wired-source' } },
         fixedArguments: ['--threads', '2'],
