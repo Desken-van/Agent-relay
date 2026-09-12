@@ -50,7 +50,7 @@ afterEach(async () => {
   for (const item of open.splice(0)) {
     await item.app.localInference.stop().catch(() => undefined);
     item.app.close();
-    item.runtime.cleanup();
+    await item.runtime.cleanup();
   }
 });
 

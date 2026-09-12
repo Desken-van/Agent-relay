@@ -74,11 +74,12 @@ const okDiagnostic = (tool: ToolDiagnostic['tool']): ToolDiagnostic => ({
 export class FakeCodexAdapter implements CodexAdapter {
   implementationCalls: ImplementationRequest[] = [];
   implementationError: Error | null = null;
+  implementationResult: ImplementationResult | null = null;
   async implement(request: ImplementationRequest, context: AgentRunContext): Promise<ImplementationResult> {
     this.implementationCalls.push(request);
     context.onProgress({ type: 'started', text: 'Implementation started', data: { threadId: 'codex-implementation-1' } });
     if (this.implementationError) throw this.implementationError;
-    return { sessionId: 'codex-implementation-1', finalMessage: 'Implemented and verified.', assessment: {
+    return this.implementationResult ?? { sessionId: 'codex-implementation-1', finalMessage: 'Implemented and verified.', assessment: {
       version: 1, disposition: 'pass', verificationStatus: 'passed', publishBlock: 'none', reasonCodes: [], denials: [],
       verification: { tool: 'Codex', command: 'npm test', matchedRule: 'Bash(npm test:*)', toolUseSequence: 1 }
     } };

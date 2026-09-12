@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { canChangeProviders, type ExecutionProvider } from '@shared/domain/execution-providers';
+import { canChangeProviders, providerLabel, type ExecutionProvider } from '@shared/domain/execution-providers';
 import type { GitChangeSet } from '@shared/domain/git';
 import type { ApprovalAction, Run, Task } from '@shared/domain/models';
 import type { PlanReviewDecision } from '@shared/domain/plan-review';
@@ -124,36 +124,44 @@ export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: 
   const reviewValue = review ?? task.reviewProvider;
   const disabled = busy || saving || !canChangeProviders(task.status);
   const differs = implementationValue !== task.implementationProvider || reviewValue !== task.reviewProvider;
-  return <div className="stack">
-    <Field label="Implementation provider">
-      <select className="input" aria-label="Implementation provider" value={implementationValue} disabled={disabled} onChange={(e) => setImplementation(e.target.value as ExecutionProvider)}>
-        <option value="claude">Claude</option><option value="codex">Codex</option>
-      </select>
-    </Field>
-    <Field label="Review provider">
-      <select className="input" aria-label="Review provider" value={reviewValue} disabled={disabled} onChange={(e) => setReview(e.target.value as ExecutionProvider)}>
-        <option value="codex">Codex</option><option value="claude">Claude</option>
-      </select>
-    </Field>
-    {/* Absent rather than merely disabled while the selection matches the
-        persisted providers — there is nothing to apply, so there is no
-        control to show. It reappears the moment either selection differs. */}
-    {differs || saving ? (
-      <button type="button" className="btn btn--sm" disabled={disabled} onClick={() => {
-        if (claim.current) return;
-        claim.current = true; setSaving(true); setError(null);
-        void (async () => {
-          try {
-            const updated = await expect('workflow:configureProviders', { taskId: task.id, expectedRevision: task.providerRevision, implementationProvider: implementationValue, reviewProvider: reviewValue });
-            await onChanged(updated); setImplementation(null); setReview(null);
-          } catch (err) { setError(err instanceof Error ? err.message : 'Could not update providers.'); }
-          finally { claim.current = false; setSaving(false); }
-        })();
-      }}>{saving ? 'Saving…' : 'Apply providers'}</button>
-    ) : null}
-    <p className="hint">Changing the executor preserves files and history, but starts a new implementation session. No automatic fallback. Coai settings are separate.</p>
-    {error ? <Notice tone="warn">{error}</Notice> : null}
-  </div>;
+  return <details className="provider-controls" aria-label="AI provider settings">
+    <summary>
+      <span>AI providers</span>
+      <span className="provider-controls__summary">
+        {providerLabel(task.implementationProvider)} implements · {providerLabel(task.reviewProvider)} reviews
+      </span>
+    </summary>
+    <div className="stack provider-controls__body">
+      <Field label="Implementation provider">
+        <select className="input" aria-label="Implementation provider" value={implementationValue} disabled={disabled} onChange={(e) => setImplementation(e.target.value as ExecutionProvider)}>
+          <option value="claude">Claude</option><option value="codex">Codex</option>
+        </select>
+      </Field>
+      <Field label="Review provider">
+        <select className="input" aria-label="Review provider" value={reviewValue} disabled={disabled} onChange={(e) => setReview(e.target.value as ExecutionProvider)}>
+          <option value="codex">Codex</option><option value="claude">Claude</option>
+        </select>
+      </Field>
+      {/* Absent rather than merely disabled while the selection matches the
+          persisted providers — there is nothing to apply, so there is no
+          control to show. It reappears the moment either selection differs. */}
+      {differs || saving ? (
+        <button type="button" className="btn btn--sm" disabled={disabled} onClick={() => {
+          if (claim.current) return;
+          claim.current = true; setSaving(true); setError(null);
+          void (async () => {
+            try {
+              const updated = await expect('workflow:configureProviders', { taskId: task.id, expectedRevision: task.providerRevision, implementationProvider: implementationValue, reviewProvider: reviewValue });
+              await onChanged(updated); setImplementation(null); setReview(null);
+            } catch (err) { setError(err instanceof Error ? err.message : 'Could not update providers.'); }
+            finally { claim.current = false; setSaving(false); }
+          })();
+        }}>{saving ? 'Saving…' : 'Apply providers'}</button>
+      ) : null}
+      <p className="hint">Changing the executor preserves files and history, but starts a new implementation session. No automatic fallback. Coai settings are separate.</p>
+      {error ? <Notice tone="warn">{error}</Notice> : null}
+    </div>
+  </details>;
 }
 
 function ContinuationLink({ detail, onOpen }: { detail: TaskDetail; onOpen: (taskId: string) => void }): React.JSX.Element | null {
@@ -576,12 +584,12 @@ export function RunView(): React.JSX.Element {
       <div className="stack">
         <Card title="Actions">
           <RunFlowOverview guidance={guidance} />
-          <ProviderControls key={task.id} task={task} busy={anyBusy || running}
+          <ProviderControls key={`providers-${task.id}`} task={task} busy={anyBusy || running}
             onChanged={acceptTask} />
           <CompletedHistory runs={detail.runs} />
 
           <PlanReviewPanel
-            key={task.id}
+            key={`plan-review-${task.id}`}
             task={task}
             integrationEnabled={planReviewEnabled}
             onChanged={() => refreshDetail(task.id)}

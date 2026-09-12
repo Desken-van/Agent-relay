@@ -9,7 +9,8 @@
  */
 
 import { createServer } from 'node:http';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -138,16 +139,27 @@ export class FakeLocalInferenceRuntime {
     return this.requests().filter((request) => request.path === '/v1/chat/completions');
   }
 
-  cleanup(): void {
+  async cleanup(): Promise<void> {
     // Windows can keep a just-exited process's working directory busy for a
     // handful of scheduler turns while its pipe handles finish closing. The
     // runtime tree is already PID-confirmed dead; bounded retries make fixture
     // cleanup deterministic under the full parallel suite without hiding a
     // live-process leak.
-    // A loaded parallel suite can delay the final Windows handle release for
-    // several seconds even after both PIDs are gone. Keep the retry window
-    // bounded, but long enough to cover that OS-level delay.
-    rmSync(this.path, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    // Do not use rmSync retries here. A synchronous retry loop blocks the same
+    // event loop that Execa's final pipe-close callbacks need, which can turn a
+    // harmless Windows handle-release delay into a deterministic EBUSY under a
+    // loaded parallel suite. Yield between bounded retries instead.
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      try {
+        await rm(this.path, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (!['EBUSY', 'ENOTEMPTY', 'EPERM'].includes(code ?? '') || Date.now() >= deadline) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
   }
 }
 

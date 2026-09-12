@@ -10,7 +10,9 @@ if (!container) {
   throw new Error('The #root element is missing from index.html.');
 }
 
-createRoot(container).render(
+const root = createRoot(container);
+
+root.render(
   <StrictMode>
     <StoreProvider>
       {/*
@@ -24,3 +26,11 @@ createRoot(container).render(
     </StoreProvider>
   </StrictMode>
 );
+
+// electron-vite can replace this entry module while the desktop dev server is
+// running. Explicitly unmount the previous root before replacement so a stale
+// Actions tree cannot remain beside the new one (most visibly as duplicated
+// provider selectors). Production builds never enter this branch.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => root.unmount());
+}

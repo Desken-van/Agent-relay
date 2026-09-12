@@ -96,7 +96,7 @@ afterEach(async () => {
   for (const built of open.splice(0)) {
     // Never left to the operating system: every test must end with no process.
     await built.provider.stop().catch(() => undefined);
-    built.runtime.cleanup();
+    await built.runtime.cleanup();
   }
 });
 
@@ -842,7 +842,7 @@ describe('local inference process contract: the configured address is not negoti
 
   afterEach(async () => {
     for (const server of servers.splice(0)) await server.close();
-    for (const runtime of runtimes.splice(0)) runtime.cleanup();
+    for (const runtime of runtimes.splice(0)) await runtime.cleanup();
   });
 
   /** Server B: the address the provider was never configured to talk to. */

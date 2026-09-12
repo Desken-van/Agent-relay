@@ -194,6 +194,7 @@ Thirteen states, one transition table, one function that applies it.
 DRAFT → SPECIFYING → READY_FOR_IMPLEMENTATION → IMPLEMENTING
       → READY_FOR_REVIEW → REVIEWING → { APPROVED | CHANGES_REQUESTED | FAILED }
 CHANGES_REQUESTED → IMPLEMENTING (correction round)
+IMPLEMENTING → READY_FOR_IMPLEMENTATION (saved correction lacks verification proof)
 APPROVED → READY_TO_PUBLISH → PUBLISHING → COMPLETED
 any non-terminal → CANCELLED
 ```
@@ -223,6 +224,17 @@ implementation/correction report remains available as historical context, but
 its earlier verification failure cannot override Relay's current successful
 record. After the reviewer returns, the identity is checked again before its
 verdict is accepted.
+
+A completed Codex or Claude correction whose files were saved, has no security
+refusal, but whose process assessment cannot prove verification uses
+`correction_unverified`, not
+`correction_aborted`. It returns to `READY_FOR_IMPLEMENTATION`; the existing run
+history then projects **Run verification** as the sole next action. This preserves
+the work and the consumed correction round while preventing an AI sandbox or
+telemetry limitation from silently spending another round on the same findings.
+`correction_aborted` is reserved for a security refusal or a thrown, cancelled
+or startup-reconciled correction whose attempt did not return normally, and
+therefore still restores `CHANGES_REQUESTED` so that attempt can be retried.
 
 ### Recovering from an abrupt exit
 
@@ -1627,7 +1639,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1923 deterministic tests in 80 files, plus one routine automated Electron
+1928 deterministic tests in 80 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.

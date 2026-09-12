@@ -2,10 +2,21 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createHarness, type Harness } from '../helpers/harness';
 import { AgentRelayError } from '../../src/shared/domain/errors';
 import { latestImplementationRoundResult } from '../../src/shared/domain/claude-assessment';
-import { makeReview } from '../helpers/fakes';
+import { runGuidance } from '../../src/shared/domain/run-guidance';
+import { makeReview, passingVerificationEvidence } from '../helpers/fakes';
 
 let h: Harness;
-beforeEach(() => { h = createHarness(); });
+beforeEach(() => {
+  h = createHarness({
+    verification: {
+      identity: async () => 'a'.repeat(64),
+      execute: async () => ({
+        command: 'npm run verify', exitCode: 0, stdout: 'passed', stderr: '', failed: false,
+        timedOut: false, cancelled: false, durationMs: 10
+      })
+    }
+  });
+});
 afterEach(() => h.dispose());
 async function prepared() {
   const p = h.createProject(); const t = h.createTask(p.id);
@@ -83,6 +94,87 @@ describe('explicit provider routing', () => {
     expect(h.codex.implementationCalls[0]?.prompt).toContain('Add a /health route');
     expect(h.codex.implementationCalls[0]?.prompt).toContain('Add the missing test.');
     expect(h.claude.calls).toHaveLength(1);
+  });
+  it('hands a saved but unverified Codex correction to Relay verification without spending another round', async () => {
+    const t = await prepared(); select(t.id, 'codex');
+    await h.orchestrator.sendToClaude(t.id);
+    h.codex.reviewQueue = [makeReview({ verdict: 'changes_requested', followUpPrompt: 'Fix the race.' })];
+    await h.orchestrator.reviewWithCodex(t.id);
+    h.codex.implementationResult = {
+      sessionId: 'codex-implementation-1',
+      finalMessage: 'The correction was saved, but verification could not run in the sandbox.',
+      assessment: {
+        version: 1,
+        disposition: 'fail',
+        verificationStatus: 'failed',
+        publishBlock: 'verification',
+        reasonCodes: ['verification_failed'],
+        denials: [],
+        verification: {
+          tool: 'Codex', command: 'npm run verify', matchedRule: 'Bash(npm run verify:*)', toolUseSequence: 1
+        }
+      }
+    };
+
+    const corrected = await h.orchestrator.sendCorrections(t.id);
+
+    expect(corrected).toMatchObject({
+      status: 'READY_FOR_IMPLEMENTATION',
+      currentRound: 2,
+      lastError: expect.stringMatching(/Run verification in Agent Relay/)
+    });
+    expect(h.codex.implementationCalls).toHaveLength(2);
+    expect(runGuidance(corrected, h.runs.listByTask(t.id), true).action).toMatchObject({
+      key: 'run_verification', label: 'Run verification'
+    });
+
+    const verified = await h.orchestrator.runVerification(t.id);
+    expect(verified).toMatchObject({ status: 'READY_FOR_REVIEW', currentRound: 2, lastError: null });
+    expect(h.codex.implementationCalls).toHaveLength(2);
+  });
+  it('keeps an interrupted Codex correction retryable from the same review', async () => {
+    const t = await prepared(); select(t.id, 'codex');
+    await h.orchestrator.sendToClaude(t.id);
+    h.codex.reviewQueue = [makeReview({ verdict: 'changes_requested', followUpPrompt: 'Fix the race.' })];
+    await h.orchestrator.reviewWithCodex(t.id);
+    h.codex.implementationError = new AgentRelayError('TIMEOUT', 'The correction process stopped early.');
+
+    await expect(h.orchestrator.sendCorrections(t.id)).rejects.toThrow(/stopped early/);
+
+    expect(h.tasks.findById(t.id)).toMatchObject({ status: 'CHANGES_REQUESTED', currentRound: 2 });
+    expect(h.codex.implementationCalls).toHaveLength(2);
+  });
+  it('also hands a normally completed but unverified Claude correction to Relay verification', async () => {
+    const t = await prepared();
+    await h.orchestrator.sendToClaude(t.id);
+    h.codex.reviewQueue = [makeReview({ verdict: 'changes_requested', followUpPrompt: 'Fix the race.' })];
+    await h.orchestrator.reviewWithCodex(t.id);
+    h.claude.evidence = { ...passingVerificationEvidence(), toolExecutions: [] };
+
+    const corrected = await h.orchestrator.sendCorrections(t.id);
+
+    expect(corrected).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 2 });
+    expect(runGuidance(corrected, h.runs.listByTask(t.id), true).action?.key).toBe('run_verification');
+    expect(h.claude.calls).toHaveLength(2);
+  });
+  it('does not let Relay verification hide a Codex security refusal', async () => {
+    const t = await prepared(); select(t.id, 'codex');
+    await h.orchestrator.sendToClaude(t.id);
+    h.codex.reviewQueue = [makeReview({ verdict: 'changes_requested', followUpPrompt: 'Remove the unsafe command.' })];
+    await h.orchestrator.reviewWithCodex(t.id);
+    h.codex.implementationResult = {
+      sessionId: 'codex-implementation-1',
+      finalMessage: 'Stopped after observing an unsafe command.',
+      assessment: {
+        version: 1, disposition: 'fail', verificationStatus: 'unknown', publishBlock: 'security',
+        reasonCodes: ['CODEX_SECURITY'], denials: [], verification: null
+      }
+    };
+
+    const corrected = await h.orchestrator.sendCorrections(t.id);
+
+    expect(corrected).toMatchObject({ status: 'CHANGES_REQUESTED', currentRound: 2 });
+    expect(runGuidance(corrected, h.runs.listByTask(t.id), true).action?.key).toBe('send_corrections');
   });
   it('rejects provider changes after approval', async () => {
     const t = await prepared(); await h.orchestrator.sendToClaude(t.id); await h.orchestrator.reviewWithCodex(t.id);
