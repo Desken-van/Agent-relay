@@ -263,6 +263,14 @@ cannot be hidden by a later test pass. Corrections run on the same session with
 a prompt explaining that the change was approved but its checks did not pass. A
 new review and a new publish approval are required afterwards.
 
+The same Relay-owned recovery applies when a Codex or Claude correction returns
+normally, saves files and has no security refusal, but cannot prove verification
+inside its sandbox. Agent Relay
+keeps the correction and its round number, then offers **Run verification** — it
+does not send the same findings through another AI correction and consume the
+next review round. A security refusal, or a correction process that actually
+throws or is interrupted, returns to **Send corrections** for a retry.
+
 If a tool call is refused, what happens depends on what was refused. A blocked
 `git push` or a refusal Agent Relay cannot identify **fails** the round; a
 blocked auxiliary command in a round whose tests ran and passed is a **warning**
@@ -490,8 +498,12 @@ The Actions panel presents the workflow as five ordered steps and derives one
 primary action from a single durable-state projection. Its summary answers
 **What happened**, **Current stage**, **Result**, and **Next action**; the latter
 is the exact primary-button label. Unavailable transitions are absent, completed
-operations are compact history, provider selectors remain secondary, and **Stop
-task** stays separate and destructive. External Plan Review status, findings,
+operations are compact history, provider selectors live in one collapsed
+**AI providers** section, and **Stop task** stays separate and destructive.
+The provider and plan-review children use distinct reconciliation keys, and the
+development entry point unmounts its React root before hot replacement, so an
+update cannot leave a duplicate provider section on screen. External Plan Review
+status, findings,
 errors, decisions and its one required transition are shown in this same panel.
 
 When the final review requests changes after the bounded round budget is spent,
@@ -513,7 +525,7 @@ Run details also project publishing guidance from the same effective own-or-
 inherited implementation evidence enforced by the backend, so a review-entry
 continuation does not invent a recovery action after valid publishing approval.
 
-Test suite: **1923 deterministic tests in 80 files, plus one automated Electron
+Test suite: **1928 deterministic tests in 80 files, plus one automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -676,7 +688,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1923 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              1928 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

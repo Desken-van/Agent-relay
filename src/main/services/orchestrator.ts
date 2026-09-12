@@ -753,7 +753,8 @@ export class Orchestrator {
 
       return await this.runImplementation(task, controller, `${this.implementationPrompt(task, readSpecification(task))}\n\n${prompt}`, {
         runType: 'correction',
-        recoverableFailure: 'correction_aborted'
+        recoverableFailure: 'correction_aborted',
+        unverifiedFailure: 'correction_unverified'
       });
     } catch (error) {
       this.recordFailureIfStillRunning(taskId, error, 'correction_aborted');
@@ -825,7 +826,12 @@ export class Orchestrator {
   }
 
   private async runImplementation(task: Task, controller: AbortController, prompt: string,
-    options: { runType: 'implementation' | 'correction'; recoverableFailure: WorkflowEvent }): Promise<Task> {
+    options: {
+      runType: 'implementation' | 'correction';
+      recoverableFailure: WorkflowEvent;
+      /** Normal return with saved files but no trustworthy verification proof. */
+      unverifiedFailure?: WorkflowEvent;
+    }): Promise<Task> {
     const settings = this.deps.settings.get();
     const project = this.requireProject(task.projectId);
     const worktreePath = task.worktreePath;
@@ -849,13 +855,23 @@ export class Orchestrator {
       });
       const checked = readClaudeAssessment(JSON.stringify({ assessment: result.assessment }));
       const failed = !checked.ok || checked.assessment.disposition !== 'pass' || checked.assessment.publishBlock !== 'none' || checked.assessment.verificationStatus !== 'passed';
-      const error = failed ? 'Implementation saved, but this Codex run did not prove verification passed. Check the run and verification commands before retrying.' : null;
+      const error = failed
+        ? 'Changes were saved, but this Codex run did not prove verification passed. Run verification in Agent Relay to check the current files.'
+        : null;
+      const failureEvent = failed && checked.ok && checked.assessment.publishBlock !== 'security'
+        ? (options.unverifiedFailure ?? options.recoverableFailure)
+        : options.recoverableFailure;
       handle.finish({ status: failed ? 'failed' : 'succeeded', finalMessage: result.finalMessage,
         errorMessage: error ?? undefined, structuredResult: { provider: 'codex', providerRevision: task.providerRevision,
           sessionId: result.sessionId, assessment: result.assessment } });
-      return this.applyEvent(this.requireTask(task.id), failed ? options.recoverableFailure : 'implementation_completed', {
-        implementationThreadId: result.sessionId ?? this.requireTask(task.id).implementationThreadId, lastError: error
-      });
+      return this.applyEvent(
+        this.requireTask(task.id),
+        failed ? failureEvent : 'implementation_completed',
+        {
+          implementationThreadId: result.sessionId ?? this.requireTask(task.id).implementationThreadId,
+          lastError: error
+        }
+      );
     } catch (error) {
       handle.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: Orchestrator.describeError(error) });
       throw error;
@@ -867,7 +883,11 @@ export class Orchestrator {
     task: Task,
     controller: AbortController,
     prompt: string,
-    options: { runType: 'implementation' | 'correction'; recoverableFailure: WorkflowEvent }
+    options: {
+      runType: 'implementation' | 'correction';
+      recoverableFailure: WorkflowEvent;
+      unverifiedFailure?: WorkflowEvent;
+    }
   ): Promise<Task> {
     const worktreePath = task.worktreePath;
     const branchName = task.branchName;
@@ -982,7 +1002,10 @@ export class Orchestrator {
       });
 
       if (failed) {
-        return this.applyEvent(this.requireTask(task.id), options.recoverableFailure, {
+        const failureEvent = assessment.publishBlock !== 'security'
+          ? (options.unverifiedFailure ?? options.recoverableFailure)
+          : options.recoverableFailure;
+        return this.applyEvent(this.requireTask(task.id), failureEvent, {
           claudeSessionId: result.sessionId ?? task.claudeSessionId,
           lastError: failureMessage
         });

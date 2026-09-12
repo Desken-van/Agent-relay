@@ -44,6 +44,7 @@ export const WORKFLOW_EVENTS = [
   'implementation_completed',
   'implementation_failed',
   'implementation_aborted',
+  'correction_unverified',
   'correction_aborted',
   'review_started',
   'review_approved',
@@ -116,8 +117,13 @@ export const TRANSITIONS: TransitionTable = {
     implementation_failed: 'FAILED',
     // Recoverable failure during the first implementation round.
     implementation_aborted: 'READY_FOR_IMPLEMENTATION',
+    // A correction completed and its files were saved, but the AI process did
+    // not prove them verified. Keep the work and hand proof to Relay's own
+    // verification runner instead of spending another correction round.
+    correction_unverified: 'READY_FOR_IMPLEMENTATION',
     // Recoverable failure during a correction round — back to the review result
-    // so the same corrections can be re-sent.
+    // so the same corrections can be re-sent. This is only for an interrupted
+    // or thrown run whose correction attempt did not complete normally.
     correction_aborted: 'CHANGES_REQUESTED',
     cancelled: 'CANCELLED'
   },

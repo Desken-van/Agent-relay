@@ -1609,6 +1609,34 @@ pre,
   margin-bottom: 6px;
 }
 
+.provider-controls {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.provider-controls > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  cursor: pointer;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.provider-controls__summary {
+  color: var(--text-faint);
+  font-size: 12px;
+  font-weight: 500;
+  text-align: right;
+}
+
+.provider-controls__body {
+  padding: 4px 14px 14px;
+}
+
 /* ------------------------------------------------------------------ */
 /* Operations                                                          */
 /* ------------------------------------------------------------------ */

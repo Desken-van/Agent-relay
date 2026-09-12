@@ -146,6 +146,7 @@ describe('workflow state machine', () => {
     it('allows every busy state to recover to a retryable state', () => {
       expect(transition('SPECIFYING', 'specification_aborted')).toBe('DRAFT');
       expect(transition('IMPLEMENTING', 'implementation_aborted')).toBe('READY_FOR_IMPLEMENTATION');
+      expect(transition('IMPLEMENTING', 'correction_unverified')).toBe('READY_FOR_IMPLEMENTATION');
       expect(transition('IMPLEMENTING', 'correction_aborted')).toBe('CHANGES_REQUESTED');
       expect(transition('REVIEWING', 'review_aborted')).toBe('READY_FOR_REVIEW');
       expect(transition('PUBLISHING', 'publish_aborted')).toBe('READY_TO_PUBLISH');
