@@ -39,11 +39,20 @@ missing or malformed verification cannot fall back to an older success. Historic
 results remain visible with command, exit code, duration and snapshot digest.
 They are not displayed as proof that the current files still match.
 
+A failed verification is also actionable evidence. The next primary action becomes
+**Fix verification failures · &lt;provider&gt;**. That resumes the selected implementation
+provider in the existing worktree and passes it the bounded, redacted output stored
+for the failed verification. This repair does not consume another review round. A
+later implementation invalidates the failed snapshot, so the resulting files must be
+verified again before review.
+
 ## UI
 
 Run → Actions → Writes local files → **Run verification**. While the request is
 pending the button is disabled; repeated clicks do not submit another request.
 The main-process exclusion is authoritative. Result and output are under
 Relay Timeline → **Verification · npm run verify**. After a pass use **Run review**.
+After a failure use **Fix verification failures · &lt;provider&gt;**, then verify the
+changed files again.
 No additional Claude permission or Coai setting is required for this fixed
 command. This path does not grant publication approval or run Coai.

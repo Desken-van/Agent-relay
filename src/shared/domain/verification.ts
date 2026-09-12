@@ -22,3 +22,10 @@ export function readVerification(run: Run) {
   try { return verificationRecordSchema.safeParse(JSON.parse(run.structuredResult ?? 'null')); }
   catch { return verificationRecordSchema.safeParse(null); }
 }
+
+/** Only a completed command with a non-zero exit supplies actionable repair output. */
+export function verificationNeedsImplementationRepair(run: Run | null): run is Run {
+  if (!run || run.runType !== 'verification' || run.status !== 'failed') return false;
+  const record = readVerification(run);
+  return record.success && record.data.exitCode !== null && record.data.exitCode !== 0;
+}

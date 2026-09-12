@@ -53,6 +53,7 @@ import { buildBranchName, buildWorktreeDirName, isValidBranchName } from '../../
 import {
   buildCorrectionPrompt,
   buildImplementationPrompt,
+  buildVerificationFailurePrompt,
   buildVerificationRetryPrompt
 } from '../adapters/codex/prompts';
 import type {
@@ -87,10 +88,27 @@ import {
 import { renderRuleEvidence } from './rule-evidence';
 import { join } from 'node:path';
 import { canChangeProviders, executionProviderSchema, type ExecutionProvider } from '../../shared/domain/execution-providers';
-import { latestVerification, readVerification } from '../../shared/domain/verification';
+import {
+  latestVerification,
+  readVerification,
+  verificationNeedsImplementationRepair
+} from '../../shared/domain/verification';
 import type { VerificationExecutor } from './worktree-verification';
 import type { WorktreeDependencyPreparer } from './worktree-dependencies';
 import type { ProtectedContinuationAction } from './continuation-service';
+import { redactSecrets } from '../../shared/util/redact';
+
+const MAX_VERIFICATION_REPAIR_OUTPUT_CHARS = 64_000;
+
+function storedRunEventText(payload: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    if (!parsed || typeof parsed !== 'object' || !('text' in parsed)) return null;
+    return typeof parsed.text === 'string' ? parsed.text : null;
+  } catch {
+    return null;
+  }
+}
 
 export interface ContinuationActionGuard {
   prepareFirstAction(
@@ -207,6 +225,28 @@ export class Orchestrator {
       ruleEvidence: this.ruleEvidenceText(task.id),
       acceptedPlanReviewRequirements: this.acceptedPlanReviewRequirements(task.id)
     });
+  }
+
+  /** Build a bounded continuation prompt from Relay's newest failed verification. */
+  private verificationFailurePrompt(taskId: string): string | null {
+    const run = latestVerification(this.deps.runs.listByTask(taskId));
+    if (!verificationNeedsImplementationRepair(run)) return null;
+
+    const record = readVerification(run);
+    const command = record.success ? record.data.command : 'npm run verify';
+    const reason = record.success
+      ? record.data.reason ?? run.errorMessage ?? 'Verification failed.'
+      : run.errorMessage ?? 'The stored verification result could not be read.';
+    const stored = this.deps.runEvents.listByRun(run.id)
+      .map((event) => storedRunEventText(event.payload))
+      .filter((text): text is string => text !== null && text.length > 0)
+      .join('\n');
+    const safe = redactSecrets(stored);
+    const output = safe.length <= MAX_VERIFICATION_REPAIR_OUTPUT_CHARS
+      ? safe
+      : `…[earlier verification output omitted]\n${safe.slice(-MAX_VERIFICATION_REPAIR_OUTPUT_CHARS)}`;
+
+    return buildVerificationFailurePrompt({ command, reason, output });
   }
 
   private applyEvent(task: Task, event: WorkflowEvent, patch: Partial<Task> = {}): Task {
@@ -653,6 +693,10 @@ export class Orchestrator {
         throw new AgentRelayError('INTERNAL', 'The task has no worktree after creation.');
       }
 
+      // Read this before recording another implementation run. A later write
+      // attempt deliberately invalidates the preceding verification snapshot.
+      const verificationRepair = this.verificationFailurePrompt(taskId);
+
       task = this.applyEvent(task, 'implementation_started', {
         // Verification recovery can return a later round here; never reset its budget.
         currentRound: Math.max(1, task.currentRound),
@@ -660,7 +704,9 @@ export class Orchestrator {
       });
       completeContinuationStart?.();
 
-      const prompt = this.implementationPrompt(task, specification);
+      const prompt = [this.implementationPrompt(task, specification), verificationRepair]
+        .filter((part): part is string => part !== null)
+        .join('\n\n');
 
       return await this.runImplementation(task, controller, prompt, {
         runType: 'implementation',
