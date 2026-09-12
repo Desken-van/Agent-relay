@@ -30,7 +30,9 @@ import type {
   RunEventType,
   RunStatus,
   Settings,
-  Task
+  Task,
+  TaskContinuation,
+  ContinuationClaim
 } from '../shared/domain/models';
 import type {
   OperationEnvironment,
@@ -127,6 +129,45 @@ export interface TaskRepository {
   delete(id: string): void;
 }
 
+/** `createdAt` is owned by the repository and never supplied by a caller. */
+export type NewTaskContinuation = Omit<TaskContinuation, 'createdAt'>;
+
+/**
+ * Persistence for the immutable source ↔ continuation link.
+ *
+ * There is deliberately no `update`: the link records a decision made once,
+ * at creation, and nothing about it is ever revised afterwards.
+ */
+export interface TaskContinuationRepository {
+  findBySource(sourceTaskId: string): TaskContinuation | null;
+  findByContinuation(continuationTaskId: string): TaskContinuation | null;
+  /**
+   * @throws when a link already exists for this source or this continuation —
+   * the UNIQUE constraints are the final arbiter under concurrent callers, and
+   * a caller racing another must treat that as "someone else already created
+   * it" and re-read with {@link findBySource} rather than retry the insert.
+   */
+  create(link: NewTaskContinuation): TaskContinuation;
+  findClaimBySource(sourceTaskId: string): ContinuationClaim | null;
+  findClaimByContinuation(continuationTaskId: string): ContinuationClaim | null;
+  listClaims(): ContinuationClaim[];
+  acquireClaim(input: {
+    sourceTaskId: string;
+    claimId: string;
+    worktreePath: string;
+  }): ContinuationClaim;
+  bindClaim(input: {
+    sourceTaskId: string;
+    claimId: string;
+    continuationTaskId: string;
+    validatedIdentity: string;
+    effectiveEntryAction: TaskContinuation['entryAction'];
+  }): ContinuationClaim;
+  retargetClaimToVerification(sourceTaskId: string, claimId: string, validatedIdentity: string): ContinuationClaim;
+  releaseClaim(sourceTaskId: string, claimId: string): void;
+  deleteClaim(sourceTaskId: string): void;
+}
+
 export type NewRun = Omit<Run, 'finishedAt' | 'finalMessage' | 'structuredResult' | 'errorMessage'>;
 
 export interface RunRepository {
@@ -190,6 +231,14 @@ export interface AgentRunContext {
   readonly signal: AbortSignal;
   readonly timeoutMs: number;
   onProgress(event: AgentProgressEvent): void;
+  /**
+   * Persist a provider conversation as soon as the provider identifies it.
+   *
+   * A process can time out, exhaust its turn budget, or crash after opening a
+   * resumable conversation but before returning its final result. Waiting for
+   * the result would lose the only identifier that lets a retry continue it.
+   */
+  onSessionId?(sessionId: string): void;
 }
 
 export interface CodexSpecificationRequest {

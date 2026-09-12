@@ -237,6 +237,10 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     'workflow:sendCorrections': (input) => app.orchestrator.sendCorrections(input.taskId),
     'workflow:stop': (input) => app.orchestrator.stop(input.taskId),
     'workflow:approveForPublishing': (input) => app.orchestrator.approveForPublishing(input.taskId),
+    'workflow:continue': async (input) => {
+      const { task } = await app.continuationService.create(input.taskId);
+      return app.taskService.detail(task.id);
+    },
 
     'planReview:get': (input) => planReviewDetail(input.taskId),
     'planReview:bindRules': async (input) => {

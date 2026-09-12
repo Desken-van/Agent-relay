@@ -67,6 +67,7 @@ import type {
   RunEventRepository,
   RunRepository,
   SettingsRepository,
+  TaskContinuationRepository,
   TaskRepository,
   TaskRuleEvidenceRepository
 } from '../ports';
@@ -88,9 +89,22 @@ import { join } from 'node:path';
 import { canChangeProviders, executionProviderSchema, type ExecutionProvider } from '../../shared/domain/execution-providers';
 import { latestVerification, readVerification } from '../../shared/domain/verification';
 import type { VerificationExecutor } from './worktree-verification';
+import type { WorktreeDependencyPreparer } from './worktree-dependencies';
+import type { ProtectedContinuationAction } from './continuation-service';
+
+export interface ContinuationActionGuard {
+  prepareFirstAction(
+    taskId: string,
+    action: ProtectedContinuationAction,
+    observedIdentity?: string
+  ): Promise<() => void>;
+  retargetFirstActionToVerification(taskId: string, reason: string): Promise<boolean>;
+  assertSpecificationAllowed(taskId: string): void;
+}
 
 export interface OrchestratorDeps {
   readonly verification?: VerificationExecutor;
+  readonly worktreeDependencies?: WorktreeDependencyPreparer;
   readonly projects: ProjectRepository;
   readonly tasks: TaskRepository;
   readonly runs: RunRepository;
@@ -104,6 +118,8 @@ export interface OrchestratorDeps {
   readonly events: EventPublisher;
   readonly ruleEvidence: TaskRuleEvidenceRepository;
   readonly planReviews: PlanReviewGateRepository;
+  readonly continuationGuard?: ContinuationActionGuard;
+  readonly continuations?: TaskContinuationRepository;
 }
 
 export class Orchestrator {
@@ -251,12 +267,23 @@ export class Orchestrator {
     const controller = this.beginExclusive(taskId);
     let handle: ReturnType<RunRecorder['start']> | undefined;
     let identity = '';
+    let completeContinuationStart: (() => void) | undefined;
     try {
+      await this.deps.worktreeDependencies?.prepare({
+        repositoryPath: project.localPath,
+        worktreePath: task.worktreePath
+      });
       identity = await executor.identity({ task, settings, project });
       if (controller.signal.aborted) throw new AgentRelayError('CANCELLED', 'Verification cancelled before execution.');
+      completeContinuationStart = await this.deps.continuationGuard?.prepareFirstAction(
+        taskId,
+        'verification',
+        identity
+      );
       task = this.requireTask(taskId);
       task = this.applyEvent(task, 'verification_started', { lastError: null, lastReviewJson: null });
       handle = this.recorder(settings).start({ taskId, agent: 'system', runType: 'verification', round: task.currentRound });
+      completeContinuationStart?.();
       const result = await executor.execute({ task, settings, project }, controller.signal, event => handle!.append(event));
       const after = await executor.identity({ task: this.requireTask(taskId), settings: this.deps.settings.get(), project: this.requireProject(task.projectId) });
       const passed = result.exitCode === 0 && !result.failed && !result.timedOut && !result.cancelled && !controller.signal.aborted && after === identity;
@@ -274,8 +301,19 @@ export class Orchestrator {
     } finally { this.endExclusive(taskId); }
   }
 
+  private effectiveVerificationRun(taskId: string) {
+    const ownRuns = this.deps.runs.listByTask(taskId);
+    const ownVerification = latestVerification(ownRuns);
+    if (ownVerification) return ownVerification;
+    if (ownRuns.some((run) => run.runType === 'implementation' || run.runType === 'correction')) return null;
+    const inheritedId = this.deps.continuations
+      ?.findByContinuation(taskId)
+      ?.inheritedVerificationRunId;
+    return inheritedId ? this.deps.runs.findById(inheritedId) : null;
+  }
+
   private async assertVerificationCurrent(task: Task): Promise<VerificationRecord | null> {
-    const run = latestVerification(this.deps.runs.listByTask(task.id));
+    const run = this.effectiveVerificationRun(task.id);
     if (!run) return null;
     const record = readVerification(run);
     if (!record.success || !record.data.passed || run.status !== 'succeeded' || !this.deps.verification ||
@@ -326,6 +364,16 @@ export class Orchestrator {
 
   async generateSpecification(taskId: string): Promise<Task> {
     let task = this.requireTask(taskId);
+    if (this.inFlight.has(taskId)) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'This task already has an agent running. Stop it before starting another operation.'
+      );
+    }
+    if (task.status !== 'DRAFT' && task.status !== 'READY_FOR_IMPLEMENTATION') {
+      throw new InvalidTransitionError(task.status, 'specification_started');
+    }
+    this.deps.continuationGuard?.assertSpecificationAllowed(taskId);
     const project = this.requireProject(task.projectId);
     const settings = this.deps.settings.get();
 
@@ -589,6 +637,10 @@ export class Orchestrator {
 
     const controller = this.beginExclusive(taskId);
     try {
+      const completeContinuationStart = await this.deps.continuationGuard?.prepareFirstAction(
+        taskId,
+        'implementation'
+      );
       // Worktree creation happens before the state moves to IMPLEMENTING, so a
       // Git failure leaves the task retryable rather than stuck.
       task = await this.ensureWorktree(task, project, settings, {
@@ -606,6 +658,7 @@ export class Orchestrator {
         currentRound: Math.max(1, task.currentRound),
         lastError: null
       });
+      completeContinuationStart?.();
 
       const prompt = this.implementationPrompt(task, specification);
 
@@ -672,11 +725,16 @@ export class Orchestrator {
 
     const controller = this.beginExclusive(taskId);
     try {
+      const completeContinuationStart = await this.deps.continuationGuard?.prepareFirstAction(
+        taskId,
+        'corrections'
+      );
       const nextRound = task.currentRound + 1;
       task = this.applyEvent(task, 'corrections_sent', {
         currentRound: nextRound,
         lastError: null
       });
+      completeContinuationStart?.();
 
       const prompt = recovering
         ? buildVerificationRetryPrompt({
@@ -768,12 +826,13 @@ export class Orchestrator {
 
   private async runImplementation(task: Task, controller: AbortController, prompt: string,
     options: { runType: 'implementation' | 'correction'; recoverableFailure: WorkflowEvent }): Promise<Task> {
-    if (task.implementationProvider === 'claude') return this.runClaude(task, controller, prompt, options);
     const settings = this.deps.settings.get();
     const project = this.requireProject(task.projectId);
     const worktreePath = task.worktreePath;
     if (!worktreePath || !task.branchName) throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree.');
     assertSafeWorktreePath({ worktreePath, worktreesRoot: settings.worktreesRoot, repositoryPath: project.localPath });
+    await this.deps.worktreeDependencies?.prepare({ repositoryPath: project.localPath, worktreePath });
+    if (task.implementationProvider === 'claude') return this.runClaude(task, controller, prompt, options);
     if (!this.deps.codex.implement) throw new AgentRelayError('TOOL_MISSING', 'This Codex adapter does not support implementation.');
     const configured = resolveVerificationConfig(settings.claudeVerificationTools, settings.claudeVerificationTools);
     if (!configured.ok) throw new AgentRelayError('VALIDATION_FAILED', 'Configure valid verification commands in Settings.');
@@ -861,7 +920,13 @@ export class Orchestrator {
         {
           signal: controller.signal,
           timeoutMs: settings.processTimeoutMs,
-          onProgress: (event) => handle.append(event)
+          onProgress: (event) => handle.append(event),
+          onSessionId: (sessionId) => {
+            const current = this.requireTask(task.id);
+            if (current.claudeSessionId !== sessionId) {
+              this.patchTask(task.id, { claudeSessionId: sessionId });
+            }
+          }
         }
       );
 
@@ -961,18 +1026,28 @@ export class Orchestrator {
     // Verification itself costs no round. A NEW review after a completed review
     // still does: externally corrected files must not bypass the review budget.
     const priorReview = this.deps.runs.findLatestByType(taskId, 'review');
-    const nextRound = latestVerification(this.deps.runs.listByTask(taskId)) &&
+    const nextRound = this.effectiveVerificationRun(taskId) &&
       priorReview?.status === 'succeeded' && priorReview.round >= task.currentRound
       ? priorReview.round + 1 : Math.max(1, task.currentRound);
     if (nextRound > task.maxRounds) throw new AgentRelayError('VALIDATION_FAILED', 'The review round budget is exhausted. Verification does not reset it.');
 
     const controller = this.beginExclusive(taskId);
     let relayVerification: VerificationRecord | null;
+    let completeContinuationStart: (() => void) | undefined;
     try {
+      completeContinuationStart = await this.deps.continuationGuard?.prepareFirstAction(taskId, 'review');
       relayVerification = await this.assertVerificationCurrent(task);
     } catch (error) {
+      const message = Orchestrator.describeError(error);
+      const current = this.requireTask(taskId);
+      const alreadyRetargeted = current.status === 'READY_FOR_IMPLEMENTATION';
+      const retargeted = alreadyRetargeted || (completeContinuationStart !== undefined
+        ? await this.deps.continuationGuard?.retargetFirstActionToVerification(taskId, message) ?? false
+        : false);
       this.endExclusive(taskId);
-      this.applyEvent(this.requireTask(taskId), 'verification_invalidated', { lastError: Orchestrator.describeError(error) });
+      if (!retargeted) {
+        this.applyEvent(this.requireTask(taskId), 'verification_invalidated', { lastError: message });
+      }
       throw error;
     }
     const handle = this.recorder(settings).start({
@@ -984,6 +1059,7 @@ export class Orchestrator {
 
     try {
       task = this.applyEvent(task, 'review_started', { lastError: null, currentRound: nextRound });
+      completeContinuationStart?.();
 
       handle.append({ type: 'log', text: 'Collecting Git changes from the worktree…' });
       const changes = await this.deps.git.collectChanges(worktreePath, baseBranch, {
@@ -1095,7 +1171,10 @@ export class Orchestrator {
       return task;
     }
 
-    return this.applyEvent(task, 'cancelled', { lastError: 'Stopped by the user.' });
+    const stopped = this.applyEvent(task, 'cancelled', { lastError: 'Stopped by the user.' });
+    const continuation = this.deps.continuations?.findByContinuation(taskId);
+    if (continuation) this.deps.continuations?.deleteClaim(continuation.sourceTaskId);
+    return stopped;
   }
 
   async collectChanges(taskId: string): Promise<GitChangeSet> {

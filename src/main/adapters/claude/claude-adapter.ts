@@ -83,7 +83,6 @@ export { destructiveToolDenyRules };
 const AUTH_HINTS = [
   'not logged in',
   'please run /login',
-  'authentication',
   'unauthorized',
   'invalid api key',
   'no api key',
@@ -214,6 +213,7 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
     // arguments follow unchanged.
     const launch = launchFor(this.claudePath());
     const state = createStreamState();
+    let reportedSessionId = request.sessionId;
 
     const args: string[] = [
       ...launch.prefixArgs,
@@ -278,6 +278,17 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
         for (const event of consumeLine(line, state)) {
           context.onProgress(event);
         }
+        // The init envelope arrives long before the final result. Hand its id
+        // to the orchestrator immediately so a timeout, max-turn exit or crash
+        // cannot turn a resumable conversation into an orphan.
+        if (
+          state.sessionId !== null &&
+          state.sessionId !== reportedSessionId &&
+          state.sessionId.length < 256
+        ) {
+          reportedSessionId = state.sessionId;
+          context.onSessionId?.(state.sessionId);
+        }
       }
     });
 
@@ -303,7 +314,23 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
     if (result.exitCode !== 0) {
       const output = `${result.stdout}\n${result.stderr}`.trim();
 
-      if (looksLikeAuthFailure(output)) {
+      if (finalized.numTurns !== null && finalized.numTurns >= request.maxTurns) {
+        throw new AgentRelayError(
+          'TOOL_FAILED',
+          `Claude reached the configured maximum of ${request.maxTurns} turns before returning a usable result.`,
+          {
+            remediation:
+              'Retry to continue the preserved Claude session, or raise Claude maximum turns in Settings.',
+            details: finalized.sessionId ? `session ${finalized.sessionId}` : undefined
+          }
+        );
+      }
+
+      // Protocol stdout contains repository text and tool output. It is not an
+      // authentication channel: a source file merely mentioning that word used
+      // to produce the false “not authenticated” diagnosis. A session id is
+      // also positive proof that Claude got past authentication.
+      if (finalized.sessionId === null && looksLikeAuthFailure(result.stderr)) {
         throw new AgentRelayError('TOOL_UNAUTHENTICATED', 'Claude Code is not authenticated.', {
           remediation: 'Run `claude` in a terminal and complete the login flow, then retry.',
           details: output.slice(0, 1000)

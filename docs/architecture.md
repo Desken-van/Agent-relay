@@ -466,6 +466,67 @@ five decisions and restart read-back. This is evidence for that one path, not a
 claim that provider failure, `revise`, timeout and crash windows are all live-
 accepted; those remain INT-G scope.
 
+### Authoritative Run actions and linked continuations
+
+`runGuidance` is the authoritative projection for **Run → Actions**. It maps the
+Task status plus the current External Plan Review identity/phase and continuation
+entry metadata to the four guidance strings and zero or one `RunPrimaryAction`.
+When an action exists, `Next action` is assigned from the descriptor's label;
+the renderer does not keep another label or recommendation table. `RunView`
+renders one primary control and exhaustively dispatches its key to one bounded
+IPC operation. Plan-review preparation, review, reconciliation and resolution
+remain separate calls and are never chained. Provider configuration and Stop
+are structurally separate controls.
+
+Migration 10 adds `task_continuations`, a one-to-one immutable source/continuation
+relationship, and a partial unique index allowing only one non-terminal Task per
+non-null worktree path. The relationship records the initially selected entry
+action and explicit inherited implementation, verification and review run ids;
+source runs are neither copied nor reparented. `TaskDetail` exposes bounded link
+summaries in both directions, plus an in-progress/ready creation status so an IPC
+timeout can be recovered by reopening the source or retrying the idempotent call.
+
+`task_continuation_claims` is the durable, process-wide worktree lease. A
+`creating` claim is committed before asynchronous checkout identity validation.
+The identity is sampled a second time immediately before the creation
+transaction; a mismatch changes the new task and bound claim to verification
+entry in that same transaction, before a renderer can observe the result.
+Task creation, cloned immutable rule/settled plan evidence, the relationship and
+binding the claim to `awaiting_first_action` then commit in one SQLite
+transaction. A retry returns the existing linked task. Startup deletes orphaned
+`creating` claims (no related writes can have committed) and inconsistent or
+terminal bound claims, while retaining a valid continuation waiting for its
+first action. Concurrent service instances follow the durable claim until it
+either produces the link or is released; they do not guess that a legitimate
+identity read must finish inside a short wall-clock timeout.
+
+The lease remains held until that first corrections, verification, or review
+action recomputes checkout identity and durably enters its busy state. A mismatch
+before corrections/review atomically changes the effective pending entry to
+verification and fails before a provider is dispatched. The historical chosen
+entry remains on the relationship; the claim's effective entry is the sole
+active override until consumed, after which Task status is authoritative.
+Specification regeneration is not a protected first action and is refused while
+this lease is pending, before a run row, provider call, or Task mutation.
+Cancelling before dispatch releases the lease. The partial worktree index then
+governs the ordinary lifecycle: FAILED, CANCELLED and COMPLETED release active
+ownership, including crash-recovered continuations and continuation chains.
+
+Inherited verification is eligible only until the continuation records a newer
+implementation, correction or verification. Review and publication recompute
+the current `WorktreeVerification` identity immediately before dispatch; stale,
+malformed or failed evidence rejects before reviewer, commit, push or GitHub
+work. Inherited review rows never count against the fresh budget, which begins at
+round zero and uses the currently validated `Settings.maxReviewRounds`.
+`TaskDetail.effectivePublishRefusal` applies the publication service's same
+own-first/inherited-until-superseded implementation selector, keeping Run
+guidance from treating an intentionally empty continuation run history as
+missing evidence. A newer successful, current Agent Relay verification may
+replace an inherited verification/configuration/telemetry refusal, but never an
+inherited security refusal. Closed source-task code-review history remains
+readable; capture, dispatch, reconciliation and finding decisions all reject
+before writing or contacting a reviewer.
+
 ### External code-review evidence — INT-D-A backend foundation
 
 **Status: backend only.** There is no renderer, no correction loop and no live
@@ -1046,7 +1107,18 @@ claude --print --output-format stream-json --verbose
   correlated by `tool_use.id` and numbered in invocation order, results with
   their `is_error` flag, denials with the command that was refused, and whether
   the stream was complete. `isError` on the result means only that the CLI
-  reported a failure.
+   reported a failure.
+* The session id is persisted from the first envelope that carries it, before
+  the process finishes. Max-turn exhaustion is detected before generic process
+  failure and points the retry at that preserved session. Authentication is
+  inferred only from stderr before any session was established; protocol stdout
+  may contain arbitrary repository text and is never authentication evidence.
+* Before implementation and verification, the composition root's worktree
+  dependency preparer may reuse the registered checkout's existing
+  `node_modules`. It creates only an ignored local link, only while package and
+  lock manifests match, and never runs a package manager or reaches the network.
+  Existing worktree-owned dependencies are left alone; missing or incompatible
+  dependencies fail with an actionable message before an agent starts.
 
 ### Round policy
 
@@ -1555,7 +1627,7 @@ as themselves rather than folded into a green tick or defaulted to `0`.
 
 ## 8. Testing strategy
 
-1848 deterministic tests in 75 files, plus one routine automated Electron
+1923 deterministic tests in 80 files, plus one routine automated Electron
 acceptance journey, none of which contact a model or remote service. A separate opt-in live
 Electron suite contacts the configured reviewer and is excluded from
 `npm run verify` so ordinary verification cannot consume provider quota.

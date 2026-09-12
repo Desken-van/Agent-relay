@@ -62,7 +62,7 @@ dialog owned by the main process.
 |--------|---------|
 | **Projects** | Register an existing Git repository, or create a new project folder. Shows live validation: branch, cleanliness, remote, commit identity. |
 | **Tasks** | Describe a task in plain language and set its review-round budget. |
-| **Run** | The workflow timeline — Codex on the left lane, Claude on the right, Agent Relay in the middle — plus live logs, the specification, review findings by severity, changed files, the diff, and the action buttons. |
+| **Run** | The workflow timeline plus live logs, specification, findings, changed files, and one state-derived primary action. External Plan Review lives inside **Run → Actions** rather than in a second action card. |
 | **Settings** | Diagnostics for Codex / Claude Code / Git / GitHub CLI, executable paths, roots, and limits. |
 
 Every action button carries a **blast-radius marker**:
@@ -256,8 +256,10 @@ result the stream contradicted, a call whose result never arrived, a chained
 command Agent Relay will not take apart — the round fails rather than being given
 the benefit of the doubt.
 
-If a round is approved by Codex and then refused by the publish gate, the same
-button becomes **Retry verification**: Claude runs again on the same session with
+If a round is approved by Codex and then refused by the publish gate, **Run
+verification** rechecks the preserved worktree without silently launching an
+implementation provider. A security denial still requires a new correction and
+cannot be hidden by a later test pass. Corrections run on the same session with
 a prompt explaining that the change was approved but its checks did not pass. A
 new review and a new publish approval are required afterwards.
 
@@ -351,6 +353,13 @@ the only reason a task survives a restart:
 | `codex_thread_id` | the Codex thread id, from the `thread.started` event | `codex.resumeThread(id)` for the review and for regenerating a spec |
 | `claude_session_id` | the Claude session id, parsed from the `stream-json` output | `claude --resume <id>` for every correction round |
 
+The Claude id is stored as soon as the opening stream envelope identifies the
+session, not after the process returns. If Claude reaches its maximum-turn limit,
+times out, or exits later, the next retry can therefore resume the same session.
+Authentication failures are classified only from Claude's diagnostic channel
+before a session opens; repository text in protocol stdout is never treated as
+evidence that the user is logged out.
+
 So a correction round continues the *same* Claude conversation — it still has
 the context of what it built — and a review continues the same Codex thread that
 wrote the specification.
@@ -376,6 +385,11 @@ For each task, on the first *Send to Claude*:
    inside the root, not equal to or inside the repository, not a filesystem root.
 5. No other live task may own the same directory.
 6. `git worktree add -b <branch> <path> <base>` creates both atomically.
+7. For a Node project, Agent Relay makes dependencies available before
+   implementation or verification. An existing worktree `node_modules` is kept;
+   otherwise the registered checkout's installed dependencies are linked only
+   when the package manifests match and Git proves `node_modules` is ignored.
+   This is local-only: Agent Relay never downloads packages implicitly.
 
 Claude runs with its working directory set to that worktree and nowhere else.
 Your checkout is only ever read.
@@ -473,12 +487,33 @@ challenge test coverage or the code itself, but must not turn that historical
 failure into a current failed-verification finding.
 
 The Actions panel presents the workflow as five ordered steps and derives one
-recommended action from durable task state. Its summary answers **What
-happened**, **Current stage**, **Result**, and **Next action**; only the
-recommended button receives the strong Agent Relay highlight. A terminal task
-does not suggest an action that its state machine would refuse.
+primary action from a single durable-state projection. Its summary answers
+**What happened**, **Current stage**, **Result**, and **Next action**; the latter
+is the exact primary-button label. Unavailable transitions are absent, completed
+operations are compact history, provider selectors remain secondary, and **Stop
+task** stays separate and destructive. External Plan Review status, findings,
+errors, decisions and its one required transition are shown in this same panel.
 
-Test suite: **1848 deterministic tests in 75 files, plus one automated Electron
+When the final review requests changes after the bounded round budget is spent,
+the failed run offers **Continue in a new run**. The new linked run reuses the
+same branch, worktree, approved specification, provider/session context and
+applicable immutable evidence, but starts with a fresh Settings-bounded review
+budget. Creation starts no model, verification, Git or publishing operation.
+Both task screens link to the other run, and duplicate/retried requests recover
+the same continuation.
+
+A durable database lease owns the shared worktree from continuation validation
+through creation and the first protected action. Identity is sampled again at
+the final creation boundary, and that first action revalidates it once more
+before dispatch; changed files atomically retarget the task and lease to
+**Run verification**. At most one non-terminal task may own a worktree. Terminal
+status releases that active ownership, allowing an exhausted continuation to be
+continued again without rewriting any earlier run's immutable history.
+Run details also project publishing guidance from the same effective own-or-
+inherited implementation evidence enforced by the backend, so a review-entry
+continuation does not invent a recovery action after valid publishing approval.
+
+Test suite: **1923 deterministic tests in 80 files, plus one automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -641,7 +676,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1848 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              1923 deterministic tests + 1 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

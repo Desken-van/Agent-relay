@@ -11,15 +11,16 @@ describe('run flow overview', () => {
       happened: 'Verification passed for the current code snapshot.',
       stage: 'Step 4 of 5 · Review',
       result: 'The verified files are ready for the selected reviewer.',
-      next: 'Click “Run review”.',
-      recommendedAction: 'run_review', activeStep: 3, tone: 'success'
+      next: 'Run review · Codex',
+      action: { key: 'run_review', label: 'Run review · Codex', enabled: true, disabledReason: null },
+      activeStep: 3, tone: 'success'
     }} />);
 
     expect(screen.getByText('What happened')).toBeTruthy();
     expect(screen.getByText('Current stage')).toBeTruthy();
     expect(screen.getByText('Result')).toBeTruthy();
     expect(screen.getByText('Next action')).toBeTruthy();
-    expect(screen.getByText('Click “Run review”.')).toBeTruthy();
+    expect(screen.getByText('Run review · Codex')).toBeTruthy();
     expect(screen.getByText('Review').closest('li')?.getAttribute('aria-current')).toBe('step');
   });
 });

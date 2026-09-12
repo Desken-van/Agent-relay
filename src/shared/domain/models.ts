@@ -238,6 +238,68 @@ export type ApprovalAction = (typeof APPROVAL_ACTIONS)[number];
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 
 /* -------------------------------------------------------------------------- */
+/* TaskContinuation                                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which durable state a continuation begins in, decided once from the
+ * source's evidence at creation time and never recomputed afterwards.
+ *
+ *  - `corrections`  — an unresolved changes-requested review still describes
+ *                      the unchanged, verified worktree.
+ *  - `review`       — current verification is reusable and no applicable
+ *                      review is outstanding.
+ *  - `verification` — verification is absent, malformed, failed, or stale.
+ */
+export const CONTINUATION_ENTRY_ACTIONS = ['corrections', 'verification', 'review'] as const;
+export type ContinuationEntryAction = (typeof CONTINUATION_ENTRY_ACTIONS)[number];
+
+/**
+ * The immutable link between a closed, review-round-exhausted task and the
+ * linked task that continues it.
+ *
+ * One row per source and one row per continuation — never more, which is
+ * exactly what lets both sides be looked up with a single unique read
+ * instead of a query that has to decide which of several rows is current.
+ */
+export const taskContinuationSchema = z
+  .object({
+    id: idSchema,
+    sourceTaskId: idSchema,
+    continuationTaskId: idSchema,
+    entryAction: z.enum(CONTINUATION_ENTRY_ACTIONS),
+    /** The source run whose verification identity the continuation inherits, if any. */
+    inheritedVerificationRunId: idSchema.nullable(),
+    /** The source implementation/correction evidence inherited until new code is written. */
+    inheritedImplementationRunId: idSchema.nullable(),
+    /** The source run whose review result the continuation inherits, if any. */
+    inheritedReviewRunId: idSchema.nullable(),
+    createdAt: isoDateTime
+  })
+  .strict();
+export type TaskContinuation = z.infer<typeof taskContinuationSchema>;
+
+/**
+ * Durable ownership held from the first continuation eligibility read until
+ * the continuation's first protected action has durably entered its busy
+ * state. A row in `creating` is an interrupted pre-commit attempt; a row in
+ * `awaiting_first_action` is a live continuation that has not dispatched yet.
+ */
+export const CONTINUATION_CLAIM_STATES = ['creating', 'awaiting_first_action'] as const;
+export const continuationClaimSchema = z.object({
+  sourceTaskId: idSchema,
+  claimId: idSchema,
+  worktreePath: z.string().min(1),
+  state: z.enum(CONTINUATION_CLAIM_STATES),
+  continuationTaskId: idSchema.nullable(),
+  validatedIdentity: z.string().min(1).nullable(),
+  effectiveEntryAction: z.enum(CONTINUATION_ENTRY_ACTIONS).nullable(),
+  createdAt: isoDateTime,
+  updatedAt: isoDateTime
+}).strict();
+export type ContinuationClaim = z.infer<typeof continuationClaimSchema>;
+
+/* -------------------------------------------------------------------------- */
 /* Settings                                                                    */
 /* -------------------------------------------------------------------------- */
 

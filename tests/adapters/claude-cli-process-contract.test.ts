@@ -586,6 +586,55 @@ describe('a process that exits non-zero', () => {
     expect(error.remediation).toMatch(/complete the login flow/i);
   });
 
+  it('does not mistake repository authentication prose for a login failure after a session opened', async () => {
+    const tree = worktree((path) => ({
+      actions: [
+        { event: claudeStream.init(path) },
+        {
+          event: {
+            type: 'assistant',
+            session_id: '{{sessionId}}',
+            message: { content: [{ type: 'text', text: 'Updating authentication handling in the repository.' }] }
+          }
+        },
+        { event: claudeStream.result({ text: 'Maximum turns reached', numTurns: 5, isError: true }) }
+      ],
+      exit: 1
+    }));
+    const sessionIds: string[] = [];
+    const { context } = recordingContext();
+
+    const error = await failureOf(
+      fakeClaudeAdapter().run(fakeClaudeRequest(tree, { maxTurns: 5 }), {
+        ...context,
+        onSessionId: (sessionId) => sessionIds.push(sessionId)
+      })
+    );
+
+    expect(error.code).toBe('TOOL_FAILED');
+    expect(error.message).toMatch(/maximum of 5 turns/i);
+    expect(error.message).not.toMatch(/not authenticated/i);
+    expect(error.remediation).toMatch(/preserved Claude session/i);
+    expect(sessionIds).toEqual(['fake-session']);
+  });
+
+  it('does not call a later diagnostic an authentication failure after a session opened', async () => {
+    const tree = worktree((path) => ({
+      actions: [
+        { event: claudeStream.init(path) },
+        { stderr: 'Invalid API key was mentioned by a command that failed.\n' }
+      ],
+      exit: 2
+    }));
+
+    const error = await failureOf(
+      fakeClaudeAdapter().run(fakeClaudeRequest(tree), recordingContext().context)
+    );
+
+    expect(error.code).toBe('TOOL_FAILED');
+    expect(error.message).toMatch(/exited with code 2/);
+  });
+
   it('names the model that was asked for, and starts no second process', async () => {
     const tree = worktree(() => ({
       actions: [{ stderr: 'unknown model\n' }],

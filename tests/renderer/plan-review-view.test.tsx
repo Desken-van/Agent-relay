@@ -203,7 +203,7 @@ describe('the external plan-review panel', () => {
     );
 
     fireEvent.change(await screen.findByLabelText('Decision'), { target: { value: 'reject' } });
-    const resolveButton = screen.getByRole('button', { name: /Resolve all findings/i });
+    const resolveButton = screen.getByRole('button', { name: /Resolve external plan review/i });
     expect(resolveButton).toHaveProperty('disabled', true);
 
     fireEvent.change(screen.getByLabelText(/^Reason/), {
@@ -317,7 +317,7 @@ describe('the external plan-review panel', () => {
 
     expect(await screen.findByText(/still executing a plan round/i)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
-    expect(screen.queryByRole('button', { name: /Run next plan-review round/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
   });
 
   it('says plainly when the provider answered for another session', async () => {
@@ -335,7 +335,7 @@ describe('the external plan-review panel', () => {
 
     expect(await screen.findByText(/different session/i)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
-    expect(screen.queryByRole('button', { name: /Run next plan-review round/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
   });
 
   it('lets an interrupted round be restarted by hand and says why', async () => {
@@ -345,7 +345,7 @@ describe('the external plan-review panel', () => {
     );
 
     expect(await screen.findByText(/started in the provider and never finished/i)).toBeTruthy();
-    expect(screen.getByRole('button', { name: /Run next plan-review round/i })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Run external plan review/i })).toBeTruthy();
     // Not a repeat of a finished round: there is no reconciliation to offer here,
     // because the outcome of the previous one is already known to be nothing.
     expect(screen.queryByRole('button', { name: /Reconcile external state/i })).toBeNull();
@@ -388,7 +388,7 @@ describe('the external plan-review panel', () => {
       <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
     );
 
-    const resolveButton = await screen.findByRole('button', { name: /Resolve all findings/i });
+    const resolveButton = await screen.findByRole('button', { name: /Resolve external plan review/i });
     bridge.set('planReview:get', () => ok<'planReview:get'>(gateWith('resolving')));
     fireEvent.click(resolveButton);
 
@@ -451,7 +451,7 @@ describe('the external plan-review panel', () => {
     fireEvent.change(screen.getByLabelText(/^Reason/), {
       target: { value: 'Round A reason, wrong round.' }
     });
-    expect(screen.getByRole('button', { name: /Resolve all findings/i })).toHaveProperty(
+    expect(screen.getByRole('button', { name: /Resolve external plan review/i })).toHaveProperty(
       'disabled',
       false
     );
@@ -462,11 +462,11 @@ describe('the external plan-review panel', () => {
     // do not carry over — and with them gone the new round cannot be resolved
     // by an idle click on a button that still looked ready.
     bridge.set('planReview:resolve', () => ok<'planReview:resolve'>(round(1, 'Round B finding')));
-    await burstClick(screen.getByRole('button', { name: /Resolve all findings/i }), 1);
+    await burstClick(screen.getByRole('button', { name: /Resolve external plan review/i }), 1);
 
     expect(await screen.findByText(/Round B finding/)).toBeTruthy();
     expect((screen.getByLabelText(/^Reason/) as HTMLTextAreaElement).value).toBe('');
-    expect(screen.getByRole('button', { name: /Resolve all findings/i })).toHaveProperty(
+    expect(screen.getByRole('button', { name: /Resolve external plan review/i })).toHaveProperty(
       'disabled',
       true
     );
@@ -479,7 +479,7 @@ describe('the external plan-review panel', () => {
     );
 
     expect(await screen.findByText(/You may now approve the specification/i)).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /Prepare review for current specification/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Prepare isolated review branch/i })).toBeNull();
     expect(screen.queryByText(/settled against an earlier specification/i)).toBeNull();
   });
 
@@ -506,7 +506,7 @@ describe('the external plan-review panel', () => {
     );
 
     const prepare = await screen.findByRole('button', {
-      name: /Prepare review for current specification/i
+      name: /Prepare isolated review branch/i
     });
     // Two presses in one tick: the synchronous claim, not the disabled attribute,
     // is what keeps a local Git mutation to one request.
@@ -528,7 +528,7 @@ describe('the external plan-review panel', () => {
       );
 
       expect(await screen.findByText(/its previous round is still outstanding/i)).toBeTruthy();
-      expect(screen.queryByRole('button', { name: /Prepare review for current specification/i })).toBeNull();
+      expect(screen.queryByRole('button', { name: /Prepare isolated review branch/i })).toBeNull();
       expect(screen.queryByRole('button', { name: /Prepare isolated review branch/i })).toBeNull();
       expect(screen.queryByText(/You may now approve the specification/i)).toBeNull();
       expect(bridge.callsTo('planReview:prepare')).toHaveLength(0);
@@ -549,7 +549,7 @@ describe('the external plan-review panel', () => {
     // evidence that could not be read.
     expect(screen.queryByText(/settled against an earlier specification/i)).toBeNull();
     expect(screen.queryByText(/You may now approve the specification/i)).toBeNull();
-    expect(screen.queryByRole('button', { name: /Prepare review for current specification/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Prepare isolated review branch/i })).toBeNull();
     expect(screen.queryByRole('button', { name: /Prepare isolated review branch/i })).toBeNull();
     expect(bridge.callsTo('planReview:prepare')).toHaveLength(0);
   });
@@ -582,12 +582,12 @@ describe('the external plan-review panel', () => {
       );
 
       expect(
-        await screen.findAllByRole('button', { name: /Prepare review for current specification/i })
+        await screen.findAllByRole('button', { name: /Prepare isolated review branch/i })
       ).toHaveLength(1);
       // Starting a round here would review the specification the gate already
       // belongs to, not the one on screen.
       expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
-      expect(screen.queryByRole('button', { name: /Run next plan-review round/i })).toBeNull();
+      expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
       view.unmount();
     }
   });
@@ -603,8 +603,8 @@ describe('the external plan-review panel', () => {
       // it would be reviewing. The honest warning is the only thing on offer.
       expect(await screen.findByText(/could not be established/i)).toBeTruthy();
       expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
-      expect(screen.queryByRole('button', { name: /Run next plan-review round/i })).toBeNull();
-      expect(screen.queryByRole('button', { name: /Prepare review for current specification/i })).toBeNull();
+      expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
+      expect(screen.queryByRole('button', { name: /Prepare isolated review branch/i })).toBeNull();
       expect(screen.queryByText(/You may now approve the specification/i)).toBeNull();
       expect(bridge.callsTo('planReview:review')).toHaveLength(0);
       expect(bridge.callsTo('planReview:prepare')).toHaveLength(0);
@@ -627,8 +627,8 @@ describe('the external plan-review panel', () => {
   it('keeps the round-start action and its explanation for a verified gate', async () => {
     for (const [status, label] of [
       ['prepared', /Run external plan review/i],
-      ['changes_requested', /Run next plan-review round/i],
-      ['interrupted', /Run next plan-review round/i]
+      ['changes_requested', /Run external plan review/i],
+      ['interrupted', /Run external plan review/i]
     ] as const) {
       bridge.set('planReview:get', () => ok<'planReview:get'>(gateWith(status, {}, 'current')));
       const onGuidanceStateChanged = vi.fn();

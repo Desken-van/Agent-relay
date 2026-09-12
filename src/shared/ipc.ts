@@ -17,6 +17,7 @@ import { executionProviderSchema } from './domain/execution-providers';
 import type { CodexModelCatalogResult } from './domain/codex-catalog';
 import type { DiagnosticsReport } from './domain/diagnostics';
 import type { SerializedError } from './domain/errors';
+import type { PublishRefusalCode } from './domain/claude-assessment';
 import type { GitChangeSet, ProjectValidation, RepositoryInfo, WorktreeInfo } from './domain/git';
 import type {
   LocalInferenceCapabilities,
@@ -27,6 +28,7 @@ import {
   GITHUB_VISIBILITIES,
   modelIdSchema,
   type Approval,
+  type ContinuationEntryAction,
   type Project,
   type Run,
   type RunEvent,
@@ -74,6 +76,17 @@ export type IpcResult<T> = { readonly ok: true; readonly data: T } | { readonly 
 /* Composite read models                                                       */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Enough of the linked task to navigate to it and show its state, without
+ * recursively embedding a full {@link TaskDetail} on either side of the link.
+ */
+export interface TaskContinuationSummary {
+  readonly taskId: string;
+  readonly title: string;
+  readonly status: Task['status'];
+  readonly createdAt: string;
+}
+
 export interface TaskDetail {
   readonly task: Task;
   readonly project: Project;
@@ -82,6 +95,20 @@ export interface TaskDetail {
   readonly specification: TaskSpecification | null;
   readonly lastReview: CodexReviewResult | null;
   readonly worktree: WorktreeInfo | null;
+  /** Set when this task was itself created by "Continue in a new run". */
+  readonly continuationOf: TaskContinuationSummary | null;
+  /**
+   * The persisted entry action this task was created with, when it is a
+   * continuation. Drives the action projection's "Run verification" override
+   * for a continuation whose inherited verification needs recomputing.
+   */
+  readonly continuationEntryAction: ContinuationEntryAction | null;
+  /** Set once a continuation of this (necessarily FAILED) task exists. */
+  readonly continuedAs: TaskContinuationSummary | null;
+  /** Lets a source screen recover honestly when creation committed late or is still in flight. */
+  readonly continuationCreationStatus: 'creating' | 'ready' | null;
+  /** Backend-effective own-or-inherited implementation evidence; null means it permits publishing. */
+  readonly effectivePublishRefusal: PublishRefusalCode | null;
 }
 
 /** Exactly what the user is shown before any GitHub- or repo-mutating action. */
@@ -316,6 +343,12 @@ export const ipcInputSchemas = {
   'workflow:sendCorrections': byTask,
   'workflow:stop': byTask,
   'workflow:approveForPublishing': byTask,
+  // Strict on purpose: the source task id and nothing else. A worktree,
+  // branch, specification, provider, evidence, review result, command or
+  // requested budget is never accepted from the renderer — every one of
+  // those is resolved from the source task's own durable state, inside the
+  // main process, by the continuation service.
+  'workflow:continue': byTask,
 
   'planReview:get': byTask,
   'planReview:bindRules': byTask,
@@ -478,6 +511,11 @@ export interface IpcResponseMap {
   'workflow:sendCorrections': Task;
   'workflow:stop': Task;
   'workflow:approveForPublishing': Task;
+  /**
+   * The full continuation `TaskDetail`, so the renderer can select and
+   * display it without an immediate second `tasks:get` round trip.
+   */
+  'workflow:continue': TaskDetail;
 
   'planReview:get': PlanReviewDetail;
   'planReview:bindRules': PlanReviewDetail;

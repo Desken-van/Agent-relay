@@ -127,6 +127,63 @@ describe('implementation stage', () => {
     expect(task.currentRound).toBe(1);
   });
 
+  it('keeps a session announced before a failed Claude result so retry can resume it', async () => {
+    const project = harness.createProject();
+    const task = harness.createTask(project.id);
+    await harness.orchestrator.generateSpecification(task.id);
+    harness.orchestrator.approveSpecification(task.id);
+    harness.claude.onRun = (_request, context) => context.onSessionId?.('claude-interrupted-session');
+    harness.claude.error = new AgentRelayError('TOOL_FAILED', 'Claude reached its turn limit.');
+
+    await expect(harness.orchestrator.sendToClaude(task.id)).rejects.toThrow(/turn limit/);
+
+    const after = harness.tasks.findById(task.id);
+    expect(after).toMatchObject({
+      status: 'READY_FOR_IMPLEMENTATION',
+      claudeSessionId: 'claude-interrupted-session'
+    });
+    harness.claude.error = null;
+    await harness.orchestrator.sendToClaude(task.id);
+    expect(harness.claude.calls[1]?.sessionId).toBe('claude-interrupted-session');
+  });
+
+  it('prepares worktree dependencies before starting the implementation provider', async () => {
+    const prepared: string[] = [];
+    harness.dispose();
+    harness = createHarness({
+      worktreeDependencies: {
+        prepare: async ({ repositoryPath, worktreePath }) => {
+          prepared.push(`${repositoryPath} -> ${worktreePath}`);
+        }
+      }
+    });
+
+    const { task } = await runToReview(harness);
+
+    expect(prepared).toEqual(['C:\\repo -> ' + task.worktreePath]);
+    expect(harness.claude.calls).toHaveLength(1);
+  });
+
+  it('keeps implementation retryable when worktree dependencies cannot be prepared', async () => {
+    harness.dispose();
+    harness = createHarness({
+      worktreeDependencies: {
+        prepare: async () => {
+          throw new AgentRelayError('TOOL_MISSING', 'Project dependencies are not installed.');
+        }
+      }
+    });
+    const project = harness.createProject();
+    const task = harness.createTask(project.id);
+    await harness.orchestrator.generateSpecification(task.id);
+    harness.orchestrator.approveSpecification(task.id);
+
+    await expect(harness.orchestrator.sendToClaude(task.id)).rejects.toThrow(/dependencies are not installed/);
+
+    expect(harness.claude.calls).toHaveLength(0);
+    expect(harness.tasks.findById(task.id)?.status).toBe('READY_FOR_IMPLEMENTATION');
+  });
+
   it('includes the specification in the prompt sent to Claude', async () => {
     await runToReview(harness);
     const prompt = harness.claude.calls[0]?.prompt ?? '';

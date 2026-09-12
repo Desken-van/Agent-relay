@@ -606,7 +606,7 @@ describe('code-review relational integrity', () => {
 
 describe('the code-review migration', () => {
   it('is forward-only and lands at version 7', () => {
-    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(MIGRATIONS[6]?.name).toBe('code-review-evidence');
     expect(MIGRATIONS[7]?.name).toBe('task-provider-routing');
     expect(MIGRATIONS[8]?.name).toBe('local-inference-settings');
@@ -647,7 +647,7 @@ describe('the code-review migration', () => {
             version: number;
           }[]
         ).map((row) => row.version);
-        expect(applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        expect(applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
         // The pre-existing row survived the upgrade untouched.
         expect(upgraded.prepare('SELECT name FROM projects WHERE id = ?').get('p1')).toEqual({
