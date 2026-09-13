@@ -309,6 +309,33 @@ pre,
   }
 }
 
+/*
+ * Run screen: a wide main column (Actions, then the full-width Relay
+ * timeline) beside a narrower context sidebar. DOM order already matches the
+ * required stacking order (Actions, timeline, then the sidebar sections), so
+ * collapsing to one column below the breakpoint needs no `order` overrides.
+ */
+.run-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(360px, 30vw, 440px);
+  gap: 20px;
+  align-items: start;
+}
+
+.run-layout__main,
+.run-layout__side {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+@media (max-width: 1180px) {
+  .run-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Primitives                                                          */
 /* ------------------------------------------------------------------ */
@@ -345,6 +372,34 @@ pre,
   margin-left: auto;
   display: flex;
   gap: 6px;
+}
+
+/* A collapsible Card's title becomes this button; the chevron is purely
+   decorative (`aria-hidden`) — the real state lives in the button's own
+   `aria-expanded`. */
+.card__toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.card__chevron {
+  flex: none;
+  color: var(--text-faint);
+  font-size: 10px;
+  transition: transform 0.15s ease;
+}
+
+.card__chevron--open {
+  transform: rotate(90deg);
 }
 
 .card__body {
@@ -881,45 +936,35 @@ pre,
 }
 
 /* ------------------------------------------------------------------ */
-/* The relay spine — the centrepiece                                   */
+/* The relay timeline — the centrepiece                                */
 /* ------------------------------------------------------------------ */
 
 .relay {
-  position: relative;
-  padding: 6px 0 12px;
-}
-
-/* The spine itself. */
-.relay::before {
-  content: '';
-  position: absolute;
-  left: 50%;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  margin-left: -1px;
-  background: linear-gradient(
-    180deg,
-    transparent 0%,
-    var(--border-strong) 6%,
-    var(--border-strong) 94%,
-    transparent 100%
-  );
-}
-
-.relay__node {
-  position: relative;
-  display: grid;
-  grid-template-columns: 1fr 44px 1fr;
-  align-items: start;
-  margin-bottom: 14px;
-}
-
-.relay__marker {
-  grid-column: 2;
   display: flex;
-  justify-content: center;
-  padding-top: 14px;
+  flex-direction: column;
+  gap: 10px;
+  padding: 2px 0 4px;
+}
+
+/* Full-width cards in chronological order. Colour still encodes who acted —
+   a 3px agent-coloured left border plus the coloured agent tag in the header
+   — without the old two-lane layout that clipped headers at half width. */
+.relay__node {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.relay__node--codex {
+  border-left-color: var(--codex-dim);
+}
+.relay__node--claude {
+  border-left-color: var(--claude-dim);
+}
+.relay__node--system {
+  border-left-color: var(--system-dim);
 }
 
 .relay__dot {
@@ -929,7 +974,7 @@ pre,
   border: 2px solid var(--bg);
   background: var(--border-strong);
   box-shadow: 0 0 0 3px var(--bg);
-  z-index: 1;
+  flex: none;
 }
 
 .relay__dot--codex {
@@ -955,36 +1000,14 @@ pre,
   }
 }
 
-/* Codex on the left lane, Claude on the right, system centred-left. */
-.relay__card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-
-.relay__node--left .relay__card {
-  grid-column: 1;
-}
-.relay__node--right .relay__card {
-  grid-column: 3;
-}
-
-.relay__node--left .relay__card {
-  border-left: 2px solid var(--codex-dim);
-}
-.relay__node--right .relay__card {
-  border-right: 2px solid var(--claude-dim);
-}
-.relay__node--system .relay__card {
-  border-left: 2px solid var(--system-dim);
-}
-
+/* Wraps rather than clips: round, status, both verification tags and the
+   duration can all be present at once, and none of them may be hidden. */
 .relay__head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 9px;
-  padding: 10px 13px;
+  gap: 8px 10px;
+  padding: 10px 14px;
   cursor: pointer;
   background: var(--bg-elevated);
   border: none;
@@ -1024,28 +1047,52 @@ pre,
   border-top: 1px solid var(--border);
 }
 
-.relay__final {
+/* One labelled subsection of an expanded run — Verification evidence,
+   Outcome, Error or Events — kept visually distinct instead of blended into
+   a single block. Outcome and Error flow with the page's own scroll (no
+   internal max-height): once a run is expanded, that text is meant to be
+   fully readable, not clipped behind a second, easily-missed scrollbar. Only
+   the event log — which can genuinely run to thousands of lines — keeps a
+   bounded default, and even that is user-controlled (see `.logs--full`). */
+.relay__section {
   padding: 11px 13px;
-  font-size: 12.5px;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  max-height: 320px;
-  overflow: auto;
   border-bottom: 1px solid var(--border);
 }
 
-.relay__error {
-  padding: 11px 13px;
-  font-size: 12px;
-  color: #f5a9a9;
-  background: rgba(248, 113, 113, 0.06);
+.relay__section:last-child {
+  border-bottom: none;
+}
+
+.relay__section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.relay__final {
+  font-size: 12.5px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
-/* Live log stream inside a node. */
+.relay__error {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: rgba(248, 113, 113, 0.06);
+  font-size: 12px;
+  color: #f5a9a9;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Live log stream inside a node. Bounded by default — a run can carry
+   thousands of events — but "Show full event log" (aria-expanded on its own
+   toggle) switches to `.logs--full`, which drops the cap entirely so the
+   whole log reads via the page's own scroll instead of a cramped inner one. */
 .logs {
-  max-height: 340px;
+  max-height: 480px;
   overflow: auto;
   background: #0a0c11;
   font-family: var(--mono);
@@ -1053,12 +1100,39 @@ pre,
   line-height: 1.65;
 }
 
+.logs--full {
+  max-height: none;
+  overflow: visible;
+}
+
 .logs__line {
   display: grid;
   grid-template-columns: 62px 82px minmax(0, 1fr);
-  gap: 10px;
-  padding: 2px 12px;
+  gap: 4px 10px;
+  padding: 4px 12px;
   border-bottom: 1px solid rgba(38, 45, 64, 0.4);
+}
+
+/* `contents` on desktop lets `.logs__time`/`.logs__type` sit directly in the
+   parent's compact time/type columns. Under the breakpoint the row becomes a
+   single column, and switching this to a flex row makes time+type one line
+   that sits above the message — which becomes its own full-width row. */
+.logs__meta {
+  display: contents;
+}
+
+@media (max-width: 640px) {
+  .logs__line {
+    grid-template-columns: 1fr;
+    gap: 2px;
+    padding: 6px 12px;
+  }
+
+  .logs__meta {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
 }
 
 .logs__line:hover {
