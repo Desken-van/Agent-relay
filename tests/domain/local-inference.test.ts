@@ -24,7 +24,9 @@ import {
   LOCAL_INFERENCE_TRANSITIONS,
   localInferenceConfigSchema,
   localInferenceSettingsSchema,
+  localInferenceMessageSchema,
   localInferenceOutcomeSchema,
+  localInferencePromptSchema,
   localInferenceRequestSchema,
   localInferenceResponseSchema,
   localInferenceStateSchema,
@@ -569,6 +571,37 @@ describe('local inference request', () => {
       request({ chatTemplateParameters: { enable_thinking: false } })
     );
     expect(parsed.chatTemplateParameters).toEqual({ enable_thinking: false });
+  });
+});
+
+describe('local inference prompt', () => {
+  it('rejects an empty prompt', () => {
+    expect(localInferencePromptSchema.safeParse('').success).toBe(false);
+  });
+
+  it('accepts up to the shared message-content ceiling and rejects one character past it', () => {
+    expect(
+      localInferencePromptSchema.safeParse('x'.repeat(LOCAL_INFERENCE_LIMITS.messageContentMax))
+        .success
+    ).toBe(true);
+    expect(
+      localInferencePromptSchema.safeParse('x'.repeat(LOCAL_INFERENCE_LIMITS.messageContentMax + 1))
+        .success
+    ).toBe(false);
+  });
+
+  it('preserves Unicode prompt text unchanged', () => {
+    const prompt = '你好，世界 🌍 — café';
+    expect(localInferencePromptSchema.parse(prompt)).toBe(prompt);
+  });
+
+  it('applies exactly the same rule as one message\'s content', () => {
+    const cases = ['', 'a', 'x'.repeat(LOCAL_INFERENCE_LIMITS.messageContentMax + 1)];
+    for (const value of cases) {
+      expect(localInferencePromptSchema.safeParse(value).success).toBe(
+        localInferenceMessageSchema.shape.content.safeParse(value).success
+      );
+    }
   });
 });
 

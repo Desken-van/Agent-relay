@@ -179,6 +179,7 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     'localInference:getState': () => app.localInference.state(),
     'localInference:checkHealth': () => app.localInference.health(),
     'localInference:stop': () => app.localInference.stop(),
+    'localInference:runTestInference': (input) => app.localInference.runTestInference(input.prompt),
 
     'diagnostics:run': (input) => app.diagnostics.run(input.force ?? false),
 

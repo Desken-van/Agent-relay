@@ -82,7 +82,11 @@ describe('composition-root local inference wiring', () => {
         startupTimeoutMs: 20_000,
         healthTimeoutMs: 5_000,
         inferenceTimeoutMs: 20_000,
-        shutdownTimeoutMs: 10_000
+        shutdownTimeoutMs: 10_000,
+        requestDefaults: {
+          maxOutputTokens: 321,
+          chatTemplateParameters: { enable_thinking: false, custom_flag: 'wired-value' }
+        }
       }
     });
 
@@ -101,6 +105,37 @@ describe('composition-root local inference wiring', () => {
     expect(runtime.requests()).toHaveLength(requestsAfterStart);
     expect((await app.localInference.health()).kind).toBe('healthy');
     expect(runtime.requests()).toHaveLength(requestsAfterStart + 1);
+
+    // One manual smoke-test inference, after explicit start and before stop.
+    // The fake runtime's completion is distinctive so the recorded request and
+    // the returned response cannot be confused with any other fixture reply.
+    runtime.scenario({
+      health: 'ok',
+      spawnDescendant: true,
+      completionText: 'Wired completion text.',
+      responseId: 'chatcmpl-wired-1'
+    });
+    const outcome = await app.localInference.runTestInference('Say something wired.');
+    expect(outcome.kind).toBe('completed');
+    if (outcome.kind !== 'completed') throw new Error('expected a completed outcome');
+    expect(outcome.response.completion).toBe('Wired completion text.');
+    expect(outcome.response.providerId).toBe('local-llama-cpp');
+    expect(outcome.response.modelId).toBe('wired-model');
+    expect(outcome.response.finishReason).toEqual({ kind: 'stop' });
+    expect(outcome.response.durationMs).toBeGreaterThanOrEqual(0);
+    expect(app.localInference.state().kind).toBe('healthy');
+
+    const completionRequests = runtime.completionRequests();
+    expect(completionRequests).toHaveLength(1);
+    const completionBody = JSON.parse(completionRequests[0]?.body ?? '{}') as Record<string, unknown>;
+    expect(completionBody).toMatchObject({
+      model: 'wired-model',
+      stream: false,
+      n: 1,
+      max_tokens: 321,
+      chat_template_kwargs: { enable_thinking: false, custom_flag: 'wired-value' },
+      messages: [{ role: 'user', content: 'Say something wired.' }]
+    });
 
     const evidence = runtime.evidence();
     expect(evidence.argv).toEqual([

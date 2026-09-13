@@ -1274,13 +1274,22 @@ export interface LocalInferenceProvider {
   stop(): Promise<LocalInferenceState>;
 }
 
-/** The lifecycle-only surface exposed by LOCAL-B1. Inference stays internal. */
+/**
+ * The lifecycle surface exposed by LOCAL-B1, plus LOCAL-B3's one manual
+ * smoke-test operation.
+ *
+ * `runTestInference` accepts only prompt text — never a request id, a message
+ * array, a token override or template parameters. It builds exactly one
+ * version-1 request from the saved configuration and delegates once to the
+ * retained provider; the caller cannot widen or replace any configured bound.
+ */
 export interface LocalInferenceLifecycleService {
   capabilities(): Promise<LocalInferenceCapabilities>;
   start(): Promise<LocalInferenceState>;
   state(): LocalInferenceState;
   health(): Promise<LocalInferenceState>;
   stop(): Promise<LocalInferenceState>;
+  runTestInference(prompt: string): Promise<LocalInferenceOutcome>;
 }
 
 /* -------------------------------------------------------------------------- */

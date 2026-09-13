@@ -7,6 +7,7 @@ import {
   LocalInferenceService
 } from '../../src/main/services/local-inference-service';
 import { defaultSettings } from '../../src/main/container';
+import { SequentialIdGenerator } from '../../src/main/infra/clock';
 import {
   LOCAL_INFERENCE_CONTRACT_VERSION,
   LOCAL_INFERENCE_LIMITS,
@@ -17,6 +18,11 @@ import {
   type LocalInferenceState
 } from '../../src/shared/domain/local-inference';
 import type { Settings } from '../../src/shared/domain/models';
+
+/** A fresh deterministic id source for tests that do not care about its output. */
+function testIds(): SequentialIdGenerator {
+  return new SequentialIdGenerator('svc-test');
+}
 
 function enabledDefaults(): Settings {
   const settings = defaultSettings({ dataDir: 'C:\\data', documentsDir: 'C:\\docs' });
@@ -50,6 +56,10 @@ class StubProvider implements LocalInferenceProvider {
   stopResult: LocalInferenceState = { kind: 'stopped' };
   startGate: Promise<void> | null = null;
   stopGate: Promise<void> | null = null;
+  /** Every request `infer` actually received, in order. */
+  readonly inferCalls: LocalInferenceRequest[] = [];
+  /** Overrides the outcome the next `infer` call returns. */
+  inferOutcome: LocalInferenceOutcome | null = null;
   private stopping: Promise<LocalInferenceState> | null = null;
 
   state(): LocalInferenceState {
@@ -92,8 +102,28 @@ class StubProvider implements LocalInferenceProvider {
     return this.current;
   }
 
-  async infer(_request: LocalInferenceRequest): Promise<LocalInferenceOutcome> {
-    throw new Error('LOCAL-B1 does not call infer');
+  async infer(request: LocalInferenceRequest): Promise<LocalInferenceOutcome> {
+    if (this.current.kind !== 'healthy') throw new Error('infer is not legal now');
+    this.inferCalls.push(request);
+    if (this.inferOutcome !== null) return this.inferOutcome;
+    return {
+      kind: 'completed',
+      version: LOCAL_INFERENCE_CONTRACT_VERSION,
+      response: {
+        version: LOCAL_INFERENCE_CONTRACT_VERSION,
+        requestId: request.requestId,
+        providerId: LOCAL_INFERENCE_PROVIDER_ID,
+        modelId: 'local-model',
+        runtimeVersion: 'fake-1',
+        runtimeInstanceId: 'runtime-1',
+        durationMs: 5,
+        completion: 'stub completion',
+        promptTokens: 3,
+        completionTokens: 2,
+        runtimeResponseId: null,
+        finishReason: { kind: 'stop' }
+      }
+    };
   }
 
   stop(): Promise<LocalInferenceState> {
@@ -197,7 +227,8 @@ describe('LocalInferenceService disabled behaviour', () => {
       createProvider: () => {
         constructions += 1;
         return new StubProvider();
-      }
+      },
+      ids: testIds()
     });
 
     expect(service.state()).toEqual({
@@ -222,7 +253,8 @@ describe('LocalInferenceService disabled behaviour', () => {
       createProvider: () => {
         constructions += 1;
         return provider;
-      }
+      },
+      ids: testIds()
     });
 
     await service.start();
@@ -256,7 +288,8 @@ describe('LocalInferenceService ownership and lifecycle delegation', () => {
         const provider = new StubProvider();
         providers.push(provider);
         return provider;
-      }
+      },
+      ids: testIds()
     });
 
     expect(service.state()).toEqual({ kind: 'stopped' });
@@ -281,7 +314,8 @@ describe('LocalInferenceService ownership and lifecycle delegation', () => {
     let constructions = 0;
     const service = new LocalInferenceService({
       settings,
-      createProvider: () => { constructions += 1; return provider; }
+      createProvider: () => { constructions += 1; return provider; },
+      ids: testIds()
     });
 
     const first = service.start();
@@ -301,7 +335,7 @@ describe('LocalInferenceService ownership and lifecycle delegation', () => {
     let release!: () => void;
     const provider = new StubProvider();
     provider.startGate = new Promise<void>((resolve) => { release = resolve; });
-    const service = new LocalInferenceService({ settings, createProvider: () => provider });
+    const service = new LocalInferenceService({ settings, createProvider: () => provider, ids: testIds() });
 
     const starting = service.start();
     const stopping = service.stop();
@@ -318,7 +352,7 @@ describe('LocalInferenceService ownership and lifecycle delegation', () => {
     let release!: () => void;
     const provider = new StubProvider();
     provider.stopGate = new Promise<void>((resolve) => { release = resolve; });
-    const service = new LocalInferenceService({ settings, createProvider: () => provider });
+    const service = new LocalInferenceService({ settings, createProvider: () => provider, ids: testIds() });
     await service.start();
 
     const first = service.stop();
@@ -337,7 +371,7 @@ describe('LocalInferenceService ownership and lifecycle delegation', () => {
     let release!: () => void;
     const provider = new StubProvider();
     provider.startGate = new Promise<void>((resolve) => { release = resolve; });
-    const service = new LocalInferenceService({ settings, createProvider: () => provider });
+    const service = new LocalInferenceService({ settings, createProvider: () => provider, ids: testIds() });
 
     const starting = service.start();
     await expect(service.health()).rejects.toThrow('health is not legal now');
@@ -354,7 +388,8 @@ describe('LocalInferenceService ownership and lifecycle delegation', () => {
     let constructions = 0;
     const service = new LocalInferenceService({
       settings,
-      createProvider: () => { constructions += 1; return provider; }
+      createProvider: () => { constructions += 1; return provider; },
+      ids: testIds()
     });
 
     const health = service.health();
@@ -380,7 +415,8 @@ describe('LocalInferenceService ownership and lifecycle delegation', () => {
         const provider = new StubProvider();
         providers.push(provider);
         return provider;
-      }
+      },
+      ids: testIds()
     });
 
     await service.start();
@@ -400,7 +436,8 @@ describe('LocalInferenceService ownership and lifecycle delegation', () => {
     let constructions = 0;
     const service = new LocalInferenceService({
       settings,
-      createProvider: () => { constructions += 1; return provider; }
+      createProvider: () => { constructions += 1; return provider; },
+      ids: testIds()
     });
     await service.start();
     settings.update({ localInference: { ...settings.get().localInference, port: 19091 } });
@@ -409,5 +446,106 @@ describe('LocalInferenceService ownership and lifecycle delegation', () => {
     await service.capabilities();
     expect(constructions).toBe(1);
     expect(provider.capabilityCalls).toBe(1);
+  });
+});
+
+describe('LocalInferenceService.runTestInference', () => {
+  it('constructs no provider and returns a bounded structured failure when disabled and unbound', async () => {
+    const settings = new MutableSettings();
+    settings.update({ localInference: { ...settings.get().localInference, enabled: false } });
+    let constructions = 0;
+    const service = new LocalInferenceService({
+      settings,
+      createProvider: () => {
+        constructions += 1;
+        return new StubProvider();
+      },
+      ids: testIds()
+    });
+
+    const outcome = await service.runTestInference('hello');
+
+    expect(constructions).toBe(0);
+    expect(outcome).toMatchObject({
+      kind: 'failed',
+      version: LOCAL_INFERENCE_CONTRACT_VERSION,
+      dispatchOutcome: 'not_dispatched',
+      reason: 'Local inference is disabled in Settings.'
+    });
+    if (outcome.kind !== 'failed') throw new Error('expected a failed outcome');
+    expect(outcome.requestId.length).toBeGreaterThan(0);
+  });
+
+  it('builds exactly one version-1 request with a generated id and one user message, and delegates once', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    provider.current = { kind: 'healthy', runtimeInstanceId: 'runtime-1' };
+    const ids = new SequentialIdGenerator('req');
+    const service = new LocalInferenceService({ settings, createProvider: () => provider, ids });
+
+    const outcome = await service.runTestInference('Say something short.');
+
+    expect(provider.inferCalls).toHaveLength(1);
+    expect(provider.inferCalls[0]).toEqual({
+      version: LOCAL_INFERENCE_CONTRACT_VERSION,
+      requestId: 'req-000001',
+      messages: [{ role: 'user', content: 'Say something short.' }]
+    });
+    expect(outcome.kind).toBe('completed');
+  });
+
+  it('supplies no request-level output-token cap or chat-template override', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    provider.current = { kind: 'healthy', runtimeInstanceId: 'runtime-1' };
+    const service = new LocalInferenceService({ settings, createProvider: () => provider, ids: testIds() });
+
+    await service.runTestInference('hi');
+
+    const request = provider.inferCalls[0];
+    expect(request).not.toHaveProperty('maxOutputTokens');
+    expect(request).not.toHaveProperty('chatTemplateParameters');
+  });
+
+  it('preserves Unicode prompt text unchanged in the built message', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    provider.current = { kind: 'healthy', runtimeInstanceId: 'runtime-1' };
+    const service = new LocalInferenceService({ settings, createProvider: () => provider, ids: testIds() });
+    const prompt = '你好，世界 🌍 — café';
+
+    await service.runTestInference(prompt);
+
+    expect(provider.inferCalls[0]?.messages).toEqual([{ role: 'user', content: prompt }]);
+  });
+
+  it('sends no completion request and rejects when the retained provider is not Healthy', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    // Left at its default `stopped` state: never started.
+    const service = new LocalInferenceService({ settings, createProvider: () => provider, ids: testIds() });
+
+    await expect(service.runTestInference('hi')).rejects.toThrow('infer is not legal now');
+    expect(provider.inferCalls).toHaveLength(0);
+  });
+
+  it('delegates to the same provider a prior lifecycle call already bound, without constructing another', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    let constructions = 0;
+    const service = new LocalInferenceService({
+      settings,
+      createProvider: () => {
+        constructions += 1;
+        return provider;
+      },
+      ids: testIds()
+    });
+
+    await service.start();
+    await service.runTestInference('hi');
+
+    expect(constructions).toBe(1);
+    expect(provider.inferCalls).toHaveLength(1);
   });
 });

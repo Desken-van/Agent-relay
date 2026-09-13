@@ -103,9 +103,14 @@ window.agentRelay.onEvent(listener)        // read-only push subscription
   hosts (github.com, cli.github.com, docs.anthropic.com, …).
 * `shell:revealPath` accepts only paths inside a registered project, the
   worktrees root, or the projects root.
-* Local inference exposes only five lifecycle operations. Their schemas accept
-  strict empty objects, so executable/model paths, argv, prompts, URLs,
-  credentials and repository data cannot ride on a lifecycle request.
+* Local inference exposes six operations: five lifecycle operations whose
+  schemas accept strict empty objects — so executable/model paths, argv,
+  prompts, URLs, credentials and repository data cannot ride on a lifecycle
+  request — plus one additive `runTestInference` operation whose schema
+  accepts nothing but a bounded, non-empty `{prompt: string}`. That channel
+  still rejects a request id, a message array, a token or template override,
+  model/provider identity, a path, a URL, host/port, repository data, argv or
+  a command; it can only ever ask for one manual test completion.
   Configuration can change only through the validated Settings contract.
 
 ---
@@ -136,6 +141,20 @@ stop confirmed as `stopped` releases it. The runtime remains loopback-only, refu
 redirects, scrubs credential-shaped environment variables, uses bounded
 separate output, and on Windows remains contained by the Agent Relay Job Object
 launcher. No runtime is probed or started automatically on application launch.
+
+The one manual test-inference operation is bounded the same way every other
+completion is: one non-streaming request, the saved model id, the saved
+output-token cap and chat-template defaults, and the existing prompt/request/
+response/completion byte ceilings and inference timeout — a renderer-supplied
+prompt can never raise or replace any of them. It is legal only while the
+provider is `healthy`; every other state rejects it before a request is sent.
+The completion the renderer renders is exactly the string the adapter already
+validated and redacted through `parseCompletion` — a credential-shaped
+provider reply is displayed as `[redacted]`, never re-derived or re-rendered
+from raw evidence. Neither the prompt nor the completion nor the outcome is
+ever written to Settings, SQLite, task/run history, or an application log; the
+renderer keeps both only in volatile component state, so a component unmount
+or an application restart leaves nothing behind.
 
 ### stdout is protocol; stderr never is
 

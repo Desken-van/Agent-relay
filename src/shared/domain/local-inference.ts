@@ -666,6 +666,18 @@ export const localInferenceMessageSchema = z
 export type LocalInferenceMessage = z.infer<typeof localInferenceMessageSchema>;
 
 /**
+ * A manual smoke-test prompt, bound by the same content rule as one message.
+ *
+ * Deliberately not a second contract: the manual test button sends exactly one
+ * `{role: 'user', content: prompt}` message, so the prompt it collects must
+ * accept nothing {@link localInferenceMessageSchema} would refuse and nothing
+ * it would not — an empty prompt, or one past the shared content ceiling.
+ */
+export const localInferencePromptSchema = localInferenceMessageSchema.shape.content;
+
+export type LocalInferencePrompt = z.infer<typeof localInferencePromptSchema>;
+
+/**
  * One inference request.
  *
  * Note what is absent and cannot be added without changing this schema: tools,
