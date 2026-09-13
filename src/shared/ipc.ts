@@ -19,8 +19,10 @@ import type { DiagnosticsReport } from './domain/diagnostics';
 import type { SerializedError } from './domain/errors';
 import type { PublishRefusalCode } from './domain/claude-assessment';
 import type { GitChangeSet, ProjectValidation, RepositoryInfo, WorktreeInfo } from './domain/git';
+import { localInferencePromptSchema } from './domain/local-inference';
 import type {
   LocalInferenceCapabilities,
+  LocalInferenceOutcome,
   LocalInferenceState
 } from './domain/local-inference';
 import {
@@ -251,6 +253,12 @@ export const ipcInputSchemas = {
   'localInference:getState': empty,
   'localInference:checkHealth': empty,
   'localInference:stop': empty,
+  // Additive to the five lifecycle operations above. Strict on purpose: a
+  // prompt and nothing else. No request id, no messages array, no token or
+  // template override, no model/provider identity, no path, URL, host, port,
+  // repository data or argv — every one of those is resolved from durable,
+  // main-process-only state, exactly like the lifecycle channels above it.
+  'localInference:runTestInference': z.object({ prompt: localInferencePromptSchema }).strict(),
 
   'diagnostics:run': z.object({ force: z.boolean().optional() }).strict(),
 
@@ -478,6 +486,7 @@ export interface IpcResponseMap {
   'localInference:getState': LocalInferenceState;
   'localInference:checkHealth': LocalInferenceState;
   'localInference:stop': LocalInferenceState;
+  'localInference:runTestInference': LocalInferenceOutcome;
 
   'diagnostics:run': DiagnosticsReport;
 

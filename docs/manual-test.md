@@ -598,17 +598,23 @@ intentionally not purchased merely to prove the harness corrections.
 
 ---
 
-## 14. Local inference — future real llama.cpp/Ornith acceptance *(not run)*
+## 14. Local inference — real llama.cpp/Ornith acceptance
 
-**This checklist has not been executed.** Every automated local-inference test
-in this repository — domain, database, service, adapter, renderer, startup,
-wiring, IPC-contract and Electron E2E suites — uses only
+**Status recorded 2026-09-12.** An operator reported that a real Ornith
+**lifecycle** acceptance run succeeded while bound and contacted on loopback.
+No run date, model, or version details beyond that report were supplied, and
+none are independently verified in this document. **Real inference
+acceptance — pressing "Run test inference" against a real runtime and model —
+was not run and remains pending until this change merges.** Every automated
+local-inference test in this repository — domain, database, service, adapter,
+renderer, startup, wiring, IPC-contract and Electron E2E suites, including the
+one manual smoke-test inference the renderer now exposes — uses only
 `tests/fixtures/fake-local-inference-runtime.mjs`. None of them load a model,
-run a real llama.cpp/Ornith build, download anything, or spend provider quota,
-and nothing in the current renderer can invoke inference at all — the
-lifecycle panel exposes only capabilities/start/state/health/stop. This
-section exists so that claim stays checkable, and so a future acceptance run
-against a *real* runtime has a checklist rather than starting from nothing.
+run a real llama.cpp/Ornith build, download anything, or spend provider quota.
+This section exists so both claims — the reported lifecycle success and the
+still-pending real inference run — stay checkable, and so a future acceptance
+run against a *real* runtime and model has a checklist rather than starting
+from nothing.
 
 **Prerequisites**, all supplied by the operator, none downloaded or installed
 by this checklist:
@@ -653,7 +659,18 @@ by this checklist:
    or equivalent) that the process is listening only on `127.0.0.1` at the
    configured port, never on `0.0.0.0` or any other interface.
 4. Press **Check health** and **expect** it to stay **Healthy**.
-5. Press **Stop**. **Expect** the state to reach **Stopped**, and confirm with
+5. With the state **Healthy**, type a short prompt into **Test inference
+   prompt** and press **Run test inference**. **Expect** the button to have
+   been disabled until the prompt was non-empty; expect exactly one completion
+   and no automatic capability check, start, health check, or restart around
+   it. **Expect** rendered **Completion**, **Finish reason**, **Duration**, and
+   **Provider/model** values; confirm with an OS network tool that exactly one
+   request reached `127.0.0.1` at the configured port and nowhere else.
+6. Confirm with the model runtime's own logs (or an OS tool) that the request
+   used the saved model id, `stream:false`, `n:1`, the saved default output
+   token cap, and — if configured — the saved `chat_template_kwargs` values;
+   see the internal verification note below for the no-default case.
+7. Press **Stop**. **Expect** the state to reach **Stopped**, and confirm with
    an OS process tool that the runtime process (and any helper process it
    spawned) has actually exited — not merely that the UI says so.
 
@@ -664,21 +681,22 @@ by this checklist:
    lifecycle panel to read **Stopped** from a single passive `getState` call —
    no automatic capability check, health check, or start.
 
-**Internal chat-template default verification** *(requires reading application
-logs or an internal build with temporary tracing; there is no renderer UI for
-this because inference itself is not renderer-exposed)*: with a
-`requestDefaults.chatTemplateParameters` map configured (e.g. an
-Ornith-specific `{"enable_thinking": false, "preserve_thinking": false}`),
-confirm that a real inference call made through a future internal caller (not
-yet wired to any workflow) includes `chat_template_kwargs` with exactly those
-values, and that clearing the configured map back to `{}` omits
-`chat_template_kwargs` from the request entirely. This step is explicitly
-deferred until an internal caller exists — LOCAL-B2 adds no such caller.
+**Chat-template default verification**: with a
+`requestDefaults.chatTemplateParameters` map configured in Settings (e.g. an
+Ornith-specific `{"enable_thinking": false, "preserve_thinking": false}`) and
+saved, press **Run test inference** and confirm — with the model runtime's own
+logs or an OS network capture, since the renderer never shows the raw request
+body — that the request included `chat_template_kwargs` with exactly those
+values. Then clear the configured map back to `{}`, save, and confirm a
+further test inference's request omits `chat_template_kwargs` entirely rather
+than sending it as `{}`.
 
-Record the result of a completed run — model, runtime version banner, start
-duration, and pass/fail per step — in a dated subsection below once this is
-actually executed. Until then, this section is exploratory-checklist only, not
-evidence of anything having run.
+Record the result of a completed real-inference run — model, runtime version
+banner, start duration, test-inference prompt/finish-reason/duration, and
+pass/fail per step — in a dated subsection below once this checklist is
+actually executed against a real runtime. Until then, this checklist is
+exploratory only with respect to real inference: the operator-reported
+lifecycle result above is the one piece of it that has actually run.
 
 ---
 

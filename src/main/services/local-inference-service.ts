@@ -12,10 +12,13 @@ import {
   parseLocalInferenceConfig,
   type LocalInferenceCapabilities,
   type LocalInferenceConfig,
+  type LocalInferenceOutcome,
+  type LocalInferenceRequest,
   type LocalInferenceSettings,
   type LocalInferenceState
 } from '../../shared/domain/local-inference';
 import type {
+  IdGenerator,
   LocalInferenceLifecycleService,
   LocalInferenceProvider,
   SettingsRepository
@@ -70,6 +73,8 @@ export type LocalInferenceProviderFactory = (
 export interface LocalInferenceServiceOptions {
   readonly settings: SettingsRepository;
   readonly createProvider: LocalInferenceProviderFactory;
+  /** Generates the request id for a manual test inference. Never reused. */
+  readonly ids: IdGenerator;
 }
 
 export class LocalInferenceService implements LocalInferenceLifecycleService {
@@ -121,6 +126,40 @@ export class LocalInferenceService implements LocalInferenceLifecycleService {
       }
       return stopped;
     });
+  }
+
+  /**
+   * One manual smoke-test completion.
+   *
+   * Accepts only prompt text at this application boundary. Builds exactly one
+   * version-1 request — a generated request id and one `{role: 'user',
+   * content: prompt}` message, with no request-level token or template
+   * override — and delegates it exactly once to the retained provider. The
+   * saved `requestDefaults` already assembled into the bound configuration
+   * remain the only source of those limits.
+   *
+   * Disabled and unbound short-circuits before a provider is constructed or a
+   * request id is generated, exactly like every other lifecycle method here.
+   * An enabled, bound provider still enforces its own Healthy-only transition
+   * and returns a structured failure for every other state.
+   */
+  runTestInference(prompt: string): Promise<LocalInferenceOutcome> {
+    if (this.isDisabledAndUnbound()) {
+      return Promise.resolve({
+        kind: 'failed',
+        version: LOCAL_INFERENCE_CONTRACT_VERSION,
+        requestId: this.options.ids.next(),
+        reason: LOCAL_INFERENCE_DISABLED_REASON,
+        dispatchOutcome: 'not_dispatched'
+      });
+    }
+
+    const request: LocalInferenceRequest = {
+      version: LOCAL_INFERENCE_CONTRACT_VERSION,
+      requestId: this.options.ids.next(),
+      messages: [{ role: 'user', content: prompt }]
+    };
+    return this.bindProvider().infer(request);
   }
 
   /** No provider is retained, and Settings currently forbid constructing one. */

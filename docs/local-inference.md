@@ -5,11 +5,16 @@ llama.cpp-compatible server. LOCAL-B1 persisted its operator configuration and
 wired one long-lived lifecycle service into the main process. LOCAL-B2 adds an
 opt-in `enabled` flag and request defaults to that persisted configuration, and
 exposes both the configuration and the lifecycle service through a renderer
-Settings section and lifecycle panel. It remains a foundation, not a workflow
-integration: Agent Relay remains the sole owner of tasks, reviews, patches,
-retries, approvals, and publication. The runtime loads a model and answers
-inference requests; it owns none of that workflow state, and nothing in this
-boundary calls it automatically.
+Settings section and lifecycle panel. LOCAL-B3 adds exactly one bounded manual
+smoke-test action — a volatile prompt field and a "Run test inference" button —
+on top of that same lifecycle panel, so an operator can send one real
+completion request through the already-configured provider without leaving the
+lifecycle boundary. It remains a foundation, not a workflow integration: Agent
+Relay remains the sole owner of tasks, reviews, patches, retries, approvals,
+and publication. The runtime loads a model and answers inference requests; it
+owns none of that workflow state, and nothing in this boundary calls it
+automatically — including the manual test action itself, which is never
+dispatched except in direct response to that one button.
 
 The lifecycle service is registered in the composition root and exposed through
 the existing typed IPC/preload bridge. Configuration is saved through the
@@ -128,7 +133,25 @@ health or successful inference.
 The lifecycle IPC boundary contains exactly `localInference:getCapabilities`,
 `localInference:start`, `localInference:getState`,
 `localInference:checkHealth`, and `localInference:stop`. Each accepts only a
-strict empty object. There is no inference or command channel.
+strict empty object. There is no command channel.
+
+One additive operation, `localInference:runTestInference`, accepts a strict
+`{prompt: string}` and nothing else — no request id, no message array, no
+token or template override, no model/provider identity, no path, URL,
+host/port, repository data, argv or command. Its response is the existing
+version-1 `LocalInferenceOutcome`. The main process builds the request: the
+current contract version, a generated request id, and exactly one
+`{role: 'user', content: prompt}` message, with no request-level
+`maxOutputTokens` or `chatTemplateParameters`, so the saved `requestDefaults`
+already assembled into the bound configuration remain authoritative. It
+delegates exactly once to the retained provider's existing `infer` method —
+the same bounded, non-streaming, one-choice, loopback-only operation every
+other caller of that method already gets, with the same prompt/request/
+response/completion byte ceilings and inference timeout. A disabled or unbound
+service constructs no provider and returns a bounded structured failure
+without dispatching anything; an enabled provider still enforces its existing
+Healthy-only transition, so a call while stopped, starting, inferring,
+stopping, or in a terminal state is refused before any request is sent.
 
 The service retains one provider, but deliberately does not put lifecycle calls
 behind a promise queue. Overlapping calls reach that retained provider so a stop
@@ -159,23 +182,60 @@ existing `settings:update` channel; there is no separate local-inference
 settings or discovery channel, and main-process validation is authoritative
 regardless of what the form already checked.
 
-A separate "Local inference lifecycle" card uses only the five bounded IPC
-operations. Opening it calls `getState` and nothing else — no automatic
-capability check, start, poll, retry, or restart. It shows four facts (What
-happened, Current state, Result, Next action) and renders exactly one
-state-derived primary button: capability checking while stopped with no or
-unavailable evidence, Start once capabilities report available, health
-checking while healthy, a passive `getState` refresh for starting/inferring/
-stopping, and a disabled "cleanup required" label for failed/cancelled/
-timed-out states (Stop is the only way out of those, never a silent retry). The
-button is disabled whenever local-inference edits are unsaved or the saved
-configuration is disabled, in both cases with an explanatory reason rather than
-being hidden. A synchronous claim (checked before any request, not only via the
-disabled attribute) collapses a burst of clicks into one IPC call. Stop is
-rendered as a separate control only for starting/healthy/inferring/failed/
-cancelled/timed-out states, and is disabled only while another stop is already
-in flight — a pending Start, capability check, or health check never blocks
-Stop, so it can still interrupt them.
+A separate "Local inference lifecycle" card uses the six bounded IPC
+operations above. Opening it calls `getState` and nothing else — no automatic
+capability check, start, poll, retry, inference, or restart. It shows four
+facts (What happened, Current state, Result, Next action) and renders exactly
+one state-derived primary lifecycle button: capability checking while stopped
+with no or unavailable evidence, Start once capabilities report available,
+health checking while healthy, a passive `getState` refresh for
+starting/inferring/stopping, and a disabled "cleanup required" label for
+failed/cancelled/timed-out states (Stop is the only way out of those, never a
+silent retry). The lifecycle button is disabled whenever local-inference edits
+are unsaved or the saved configuration is disabled, in both cases with an
+explanatory reason rather than being hidden. A synchronous shared claim
+(checked before any request, not only via the disabled attribute) collapses a
+burst of clicks into one IPC call and prevents the lifecycle button,
+capability check, passive refresh, Stop, and test inference from dispatching
+concurrently with one another. Stop remains a separate control for
+starting/healthy/inferring/failed/cancelled/timed-out states, but the same
+panel-wide claim disables and guards it while any panel action is unresolved;
+while Stop is unresolved, it likewise blocks every other panel action. The
+provider's backend cancellation and Stop synchronization remain intact for
+defensive non-renderer races even though the renderer serializes its controls.
+
+Below the lifecycle controls, the same card always renders a labelled prompt
+textarea and a "Run test inference" button, in every state. Both stay visible
+so the card layout does not shift depending on lifecycle state, but the
+button — and the *validity* gate on the prompt — activate only once the saved
+configuration is enabled, has no unsaved edits, the state is exactly
+`healthy`, no panel action is pending, and the prompt is non-empty and within
+the shared message-content bound; a concise reason is shown when it is not.
+The textarea's own enabled/disabled state is deliberately independent of
+prompt *content* — it stays enabled and editable through the same
+enabled/saved/healthy/idle conditions regardless of whether the current text is
+empty or too long, so an operator can always focus it to type a first prompt,
+or edit an oversized paste back down, rather than being locked out by the very
+validation that is supposed to guide them. One click sends exactly `{prompt}`
+to `runTestInference` and nothing else — it never triggers a capability check,
+Start, health check, retry, fallback, or restart. A completed outcome renders
+four separate labelled values from the response DTO: Completion, Finish
+reason, Duration (milliseconds), and Provider/model identity. Every typed
+finish-reason variant is mapped to its own honest label, including `other`
+(with its bounded reason text) and `unknown` — neither is ever presented as
+`stop`. A failed, cancelled, or timed-out outcome, or a rejected/thrown IPC
+call, renders an explicit "Failure reason" instead, using only the
+outcome's own bounded/redacted `reason` or a defensively redacted, bounded
+serialized error message; an untyped rejected bridge promise is reduced to a
+fixed allowlisted transport-failure reason — never a raw response body, path,
+argv, stack trace, or error `details` — and is never presented as a completion. The completion text
+shown is exactly the string the adapter's `parseCompletion` already validated
+and redacted; the renderer does not re-derive, re-validate, or bypass that
+redaction, so a credential-shaped fake completion is shown as `[redacted]`.
+The prompt and the rendered result live only in this component's own state —
+never the global store, the Settings draft, localStorage, sessionStorage, task
+history, run events, SQLite, or a console log — so unmounting the panel or
+restarting the application leaves no trace of either.
 
 One discriminated state model contains exactly:
 
@@ -330,20 +390,29 @@ reason is `{kind:"unknown"}`; an unfamiliar bounded reason is an explicit
 
 ## Known limitations
 
-- Lifecycle IPC deliberately exposes no inference operation, and the renderer
-  has no prompt input, task workflow integration, or automatic startup.
+- The only inference surface is the one manual, single-shot smoke-test button
+  described above. There is no task workflow integration, no automatic
+  startup or automatic inference, and mounting the renderer, opening Settings,
+  or checking state never dispatches one on its own.
 - There is no streaming, tool calling, embeddings, multimodal input, completion
-  cache, Context Pack, repository indexing/RAG, patching, or workflow wiring.
+  cache, Context Pack, repository indexing/RAG, patching, retries, fallback
+  models, or workflow wiring. A non-completed test inference is never retried
+  automatically.
 - Prompt bytes are bounded, but there is no tokenizer-based preflight prompt
   token count.
 - Runtime usage fields are optional and are returned as `null` when absent.
-- One provider manages one process and one inference at a time.
-- Lifecycle and inference evidence are process-local and non-durable; only configuration persists.
+- One provider manages one process and one inference at a time; the manual
+  test action shares that same single-inference-at-a-time constraint.
+- Lifecycle and inference evidence, including the manual test prompt and its
+  result, are process-local and non-durable; only configuration persists.
 - The Windows launcher is an Agent Relay-owned native executable built during
   `npm install` and copied beside the main-process bundle. If it is missing, a
   managed runtime launch fails before the target process starts; there is no
   fallback to uncontained execution.
-- Deterministic LOCAL-B1/LOCAL-B2 acceptance uses only the Agent Relay-owned
-  fake runtime and a temporary profile/port. Running a real llama.cpp or Ornith
-  build and model remains explicitly deferred — see `docs/manual-test.md` for
-  the not-yet-run manual checklist.
+- Deterministic LOCAL-B1/LOCAL-B2/LOCAL-B3 acceptance uses only the Agent
+  Relay-owned fake runtime and a temporary profile/port. An operator reported
+  that a real Ornith **lifecycle** run succeeded while bound and contacted on
+  loopback (recorded 2026-09-12; run date, model, and version were not
+  supplied and are not independently verified here). Real **inference**
+  acceptance through this manual test action was not run and remains pending
+  until this change merges — see `docs/manual-test.md`.

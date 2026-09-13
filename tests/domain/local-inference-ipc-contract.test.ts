@@ -6,12 +6,14 @@ import {
 } from '../../src/shared/ipc';
 import {
   LOCAL_INFERENCE_CONTRACT_VERSION,
+  LOCAL_INFERENCE_LIMITS,
   LOCAL_INFERENCE_PROTOCOL,
   type LocalInferenceCapabilities,
+  type LocalInferenceOutcome,
   type LocalInferenceState
 } from '../../src/shared/domain/local-inference';
 
-const CHANNELS = [
+const LIFECYCLE_CHANNELS = [
   'localInference:getCapabilities',
   'localInference:start',
   'localInference:getState',
@@ -19,14 +21,16 @@ const CHANNELS = [
   'localInference:stop'
 ] as const;
 
+const ALL_CHANNELS = [...LIFECYCLE_CHANNELS, 'localInference:runTestInference'] as const;
+
 describe('local-inference IPC contract', () => {
-  it('contains exactly the five lifecycle channels', () => {
+  it('contains exactly the five lifecycle channels plus the one additive prompt channel', () => {
     expect(IPC_CHANNELS.filter((channel) => channel.startsWith('localInference:')).sort()).toEqual(
-      [...CHANNELS].sort()
+      [...ALL_CHANNELS].sort()
     );
   });
 
-  it('accepts only strict empty objects on every channel', () => {
+  it('accepts only strict empty objects on every lifecycle channel', () => {
     const smuggled = [
       { executable: 'C:\\tools\\llama-server.exe' },
       { argv: ['--port', '9'] },
@@ -39,12 +43,59 @@ describe('local-inference IPC contract', () => {
       { command: 'run anything' }
     ];
 
-    for (const channel of CHANNELS) {
+    for (const channel of LIFECYCLE_CHANNELS) {
       expect(ipcInputSchemas[channel].safeParse({}).success).toBe(true);
       for (const input of smuggled) {
         expect(ipcInputSchemas[channel].safeParse(input).success).toBe(false);
       }
     }
+  });
+
+  describe('localInference:runTestInference', () => {
+    const schema = ipcInputSchemas['localInference:runTestInference'];
+
+    it('accepts only a bounded, non-empty prompt', () => {
+      expect(schema.safeParse({ prompt: 'Say something short.' }).success).toBe(true);
+      expect(schema.safeParse({ prompt: 'ok' }).success).toBe(true);
+    });
+
+    it('rejects a missing, empty or oversized prompt', () => {
+      expect(schema.safeParse({}).success).toBe(false);
+      expect(schema.safeParse({ prompt: '' }).success).toBe(false);
+      expect(
+        schema.safeParse({ prompt: 'x'.repeat(LOCAL_INFERENCE_LIMITS.messageContentMax + 1) }).success
+      ).toBe(false);
+      expect(
+        schema.safeParse({ prompt: 'x'.repeat(LOCAL_INFERENCE_LIMITS.messageContentMax) }).success
+      ).toBe(true);
+    });
+
+    it('rejects unknown properties and every other channel is not allowed to smuggle', () => {
+      const smuggled = [
+        { prompt: 'hi', requestId: 'req-1' },
+        { prompt: 'hi', messages: [{ role: 'user', content: 'hi' }] },
+        { prompt: 'hi', maxOutputTokens: 999_999 },
+        { prompt: 'hi', chatTemplateParameters: { enable_thinking: true } },
+        { prompt: 'hi', model: 'other-model' },
+        { prompt: 'hi', executable: 'C:\\tools\\llama-server.exe' },
+        { prompt: 'hi', path: 'C:\\models\\model.gguf' },
+        { prompt: 'hi', host: '0.0.0.0' },
+        { prompt: 'hi', url: 'http://elsewhere' },
+        { prompt: 'hi', repository: 'C:\\repo' },
+        { prompt: 'hi', argv: ['--port', '9'] },
+        { prompt: 'hi', command: 'run anything' },
+        { prompt: 'hi', token: 'not-a-real-token' }
+      ];
+      for (const input of smuggled) {
+        expect(schema.safeParse(input).success).toBe(false);
+      }
+    });
+
+    it('rejects a non-string prompt', () => {
+      expect(schema.safeParse({ prompt: 123 }).success).toBe(false);
+      expect(schema.safeParse({ prompt: null }).success).toBe(false);
+      expect(schema.safeParse({ prompt: ['hi'] }).success).toBe(false);
+    });
   });
 
   it('declares the existing capability and state DTOs as responses', () => {
@@ -73,5 +124,17 @@ describe('local-inference IPC contract', () => {
     > = [state];
     expect(capabilityResponse).toBe(capabilities);
     expect(stateResponses).toEqual([state]);
+  });
+
+  it('maps localInference:runTestInference to the existing version-1 LocalInferenceOutcome', () => {
+    const outcome: LocalInferenceOutcome = {
+      kind: 'failed',
+      version: LOCAL_INFERENCE_CONTRACT_VERSION,
+      requestId: 'req-1',
+      reason: 'boom',
+      dispatchOutcome: 'not_dispatched'
+    };
+    const response: IpcResponseMap['localInference:runTestInference'] = outcome;
+    expect(response).toBe(outcome);
   });
 });

@@ -290,7 +290,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     ((config) => new LlamaCppLocalInference(localInferenceRunner, config));
   const localInference = new LocalInferenceService({
     settings,
-    createProvider: createLocalInferenceProvider
+    createProvider: createLocalInferenceProvider,
+    ids
   });
   const projects = new SqliteProjectRepository(db, clock);
   const tasks = new SqliteTaskRepository(db, clock);

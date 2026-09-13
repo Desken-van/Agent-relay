@@ -176,14 +176,39 @@ cleanup while preventing a second launch. A changed or disabled configuration
 cannot displace the snapshot that owns an active or uncertain process; only a
 confirmed explicit stop releases it for rebinding on the next operation.
 
-The typed lifecycle boundary has five strict-empty-input IPC operations:
-capabilities, start, state, explicit health, and stop. Inference, prompts,
-repository data, argv, paths and arbitrary commands are not accepted there, and
-none of that is exposed by the renderer either. The Settings screen exposes the
-persisted fields above and a lifecycle panel drives those five operations,
-always against *saved* settings; it opens by calling only `getState`, computes
-one state-derived primary action, and there is still no workflow-provider
-integration, automatic startup, or inference UI.
+The typed lifecycle boundary has five strict-empty-input IPC operations —
+capabilities, start, state, explicit health, and stop — plus one additive,
+strict-prompt-only operation, `runTestInference`, whose input schema accepts
+nothing but `{prompt: string}` and whose response is the existing version-1
+`LocalInferenceOutcome`. Repository data, argv, paths, model/host/port
+identity and arbitrary commands are not accepted on any of the six channels,
+and none of that is exposed by the renderer either. The Settings screen
+exposes the persisted fields above and a lifecycle panel drives those six
+operations, always against *saved* settings; it opens by calling only
+`getState`, computes one state-derived primary action, and there is still no
+workflow-provider integration or automatic startup.
+
+`runTestInference` is a manual, one-shot smoke test, not a second inference
+channel: the lifecycle service accepts only prompt text, builds exactly one
+version-1 request — a generated request id and a single `{role: 'user',
+content: prompt}` message, with no request-level token or template override —
+and delegates it once to the retained provider, so the saved output-token cap
+and chat-template defaults already assembled into that provider's
+configuration remain the only source of those limits. It is available only
+while the retained provider reports `healthy`; a disabled or unbound service
+constructs nothing and returns a bounded structured failure, and an enabled
+provider in any other state (starting, inferring, stopping, stopped, or a
+terminal state) rejects the call through its existing transition guard before
+any request is sent. The renderer's synchronous, panel-wide in-flight claim
+keeps capabilities, Start, health, passive refresh, Stop, and test inference
+from overlapping one another. This UI serialization does not change the
+provider's defensive backend ability to cancel an inference or synchronize
+Stop with non-renderer races.
+
+The prompt and its rendered result live only in the panel's own component
+state — never Settings, SQLite, task/run history, application logs, or
+browser storage — so both are gone on unmount and never reappear after a
+restart.
 
 Session identifiers live in the database rather than in memory. That is the only
 reason the application can resume a Codex thread or a Claude session after a

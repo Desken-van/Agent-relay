@@ -1,31 +1,44 @@
 /**
- * The Local inference lifecycle panel (LOCAL-B2).
+ * The Local inference lifecycle panel (LOCAL-B2 + LOCAL-B3).
  *
- * Exposes exactly the five bounded IPC operations that already exist:
- * getCapabilities, start, getState, checkHealth and stop. Nothing here can
- * name a prompt, an executable, a path, a host or a request — those channels
- * accept only a strict empty object, and this panel never asks for more.
+ * Exposes the five bounded lifecycle IPC operations — getCapabilities, start,
+ * getState, checkHealth and stop — plus one manual smoke-test operation,
+ * `runTestInference`, which accepts only `{prompt}`. Nothing here can name an
+ * executable, a path, a host or a request id; those still travel as strict
+ * empty objects, and the prompt channel accepts nothing else either.
  *
  * On mount it calls `getState` and nothing else: no automatic capability
- * check, no automatic start, no polling, no retry. Every other call is a
- * direct response to an operator clicking a button.
+ * check, no automatic start, no automatic inference, no polling, no retry.
+ * Every other call is a direct response to an operator clicking a button.
  *
  * Lifecycle operations always act on *saved* settings — this component takes
  * `enabled` and `unsaved` as props computed from the store's saved settings
- * and the Settings draft, never from anything it reads itself.
+ * and the Settings draft, never from anything it reads itself. The prompt and
+ * its result live only in this component's own state: never the global
+ * store, Settings, or any browser storage, so both vanish on unmount or
+ * restart.
  */
 
 import { useEffect, useRef, useState } from 'react';
 import { call } from '../lib/api';
-import type {
-  LocalInferenceCapabilities,
-  LocalInferenceState,
-  LocalInferenceStateKind
+import {
+  localInferencePromptSchema,
+  type LocalInferenceCapabilities,
+  type LocalInferenceFinishReason,
+  type LocalInferenceResponse,
+  type LocalInferenceState,
+  type LocalInferenceStateKind
 } from '@shared/domain/local-inference';
-import { Card, Notice, Spinner } from './primitives';
+import { redactAndTruncate } from '@shared/util/redact';
+import { Card, Field, Notice, Spinner } from './primitives';
 
-type PrimaryOperation = 'capabilities' | 'start' | 'health' | 'refresh';
-type PendingOperation = PrimaryOperation | 'stop' | null;
+/** Bounded so a defensively-redacted IPC error message still fits on screen. */
+const IPC_ERROR_MESSAGE_MAX = 500;
+const IPC_TRANSPORT_FAILURE_REASON =
+  'The local inference request failed before a typed response was received.';
+
+type PanelOperation = 'capabilities' | 'start' | 'health' | 'refresh' | 'inference' | 'stop';
+type PendingOperation = PanelOperation | null;
 
 /** What the primary button currently offers, independent of pending/unsaved overlays. */
 type BaseAction =
@@ -184,6 +197,44 @@ function describeCapabilities(capabilities: LocalInferenceCapabilities): string 
   return parts.join(' · ');
 }
 
+/**
+ * Every typed finish-reason variant, honestly. `unknown` and `other` are
+ * distinct labels rather than being folded into `stop` — a caller reading
+ * "stop" here must be able to trust that the runtime actually said so.
+ */
+function describeFinishReason(reason: LocalInferenceFinishReason): string {
+  switch (reason.kind) {
+    case 'stop':
+      return 'Stop (the runtime reported a normal end)';
+    case 'length':
+      return 'Length (the output token limit was reached)';
+    case 'content_filter':
+      return 'Content filter';
+    case 'tool_calls':
+      return 'Tool calls';
+    case 'other':
+      return `Other — ${reason.reason}`;
+    case 'unknown':
+      return 'Unknown (the runtime did not report a finish reason)';
+    default:
+      return 'Unknown';
+  }
+}
+
+/**
+ * What the test-inference panel has to show, once an attempt has been made.
+ *
+ * `outcome_failure` covers the contract's own failed/cancelled/timed_out
+ * outcomes, whose `reason` is already bounded and redacted by the adapter.
+ * `ipc_error` covers either a structured IPC failure (redacted and truncated
+ * defensively) or a rejected/thrown bridge call, which receives only a fixed,
+ * allowlisted reason because its untyped message is not safe to render.
+ */
+type TestInferenceDisplay =
+  | { readonly kind: 'completed'; readonly response: LocalInferenceResponse }
+  | { readonly kind: 'outcome_failure'; readonly reason: string }
+  | { readonly kind: 'ipc_error'; readonly reason: string };
+
 export interface LocalInferenceLifecyclePanelProps {
   /** The *saved* enabled flag — never the unsaved draft. */
   readonly enabled: boolean;
@@ -199,17 +250,22 @@ export function LocalInferenceLifecyclePanel({
   const [capabilities, setCapabilities] = useState<LocalInferenceCapabilities | null>(null);
   const [whatHappened, setWhatHappened] = useState<string>('No lifecycle action taken yet.');
   const [result, setResult] = useState<string>('—');
-  const [primaryPending, setPrimaryPending] = useState<PrimaryOperation | null>(null);
-  const [stopPending, setStopPending] = useState(false);
-  // A synchronous claim, checked and set before any state update or await, so
-  // a burst of clicks inside one tick still issues exactly one IPC call —
+  const [pending, setPending] = useState<PendingOperation>(null);
+  // One synchronous panel-wide claim, checked and set before any state update
+  // or await. A burst of clicks inside one tick still issues exactly one IPC
+  // call, and Stop cannot overlap another panel action (or vice versa).
   // `disabled` alone only takes effect on the next render.
-  const primaryPendingRef = useRef<PrimaryOperation | null>(null);
-  const stopPendingRef = useRef(false);
-  // Every lifecycle response is tagged with the action order. If Stop starts
-  // after Start/Health/Refresh, the older response must not overwrite the
-  // newer stop result when it eventually arrives.
+  const pendingRef = useRef<PendingOperation>(null);
+  // Every state-changing response is tagged with the action order. Renderer
+  // actions are serialized, but this also protects against any stale answer
+  // from a future non-UI caller changing the interaction model.
   const stateOperationEpochRef = useRef(0);
+
+  // The manual smoke-test prompt and its most recent outcome. Component state
+  // only: never the global store, Settings, or any browser storage, so both
+  // are gone on unmount and never come back on restart.
+  const [prompt, setPrompt] = useState('');
+  const [testInference, setTestInference] = useState<TestInferenceDisplay | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -224,19 +280,46 @@ export function LocalInferenceLifecyclePanel({
     // Mount-only: opening the panel reads state once and never again on its own.
   }, []);
 
-  const pending: PendingOperation = stopPending ? 'stop' : primaryPending;
   const primary = projectPrimaryAction({ enabled, unsaved, state, capabilities, pending });
   const showStop =
-    primaryPending === 'start' ||
+    pending !== null ||
     (state !== null && STOP_APPLICABLE_KINDS.includes(state.kind));
-  const stopDisabled = stopPending;
+  const stopDisabled = pending !== null;
+
+  // The prompt editor's own enabling condition is deliberately independent of
+  // prompt *content*: an operator must be able to focus the field and type a
+  // first prompt, and must be able to edit or clear an invalid one, whenever
+  // the runtime is actually usable. Only "Run test inference" additionally
+  // requires a valid, non-empty prompt — see `promptValid` below.
+  const promptEditable =
+    enabled && !unsaved && state !== null && state.kind === 'healthy' && pending === null;
+  const promptValid = localInferencePromptSchema.safeParse(prompt).success;
+  const inferenceDisabled = !promptEditable || !promptValid;
+
+  function inferenceUnavailableReason(): string | null {
+    // The `!enabled` and `unsaved` cases are already explained elsewhere on
+    // this card (the disabled-settings Notice and the primary action's own
+    // "Next action" reason); repeating the same sentence here would only be a
+    // second copy of the same text, not new information.
+    if (!enabled || unsaved) return null;
+    if (state === null || state.kind !== 'healthy') {
+      return 'The runtime must be Healthy to run a test inference.';
+    }
+    if (pending !== null) return null;
+    if (!promptValid) {
+      return prompt.length === 0
+        ? 'Enter a prompt to run a test inference.'
+        : 'The prompt is too long.';
+    }
+    return null;
+  }
 
   async function runPrimary(): Promise<void> {
     if (primary.kind === null || primary.disabled) return;
-    if (primaryPendingRef.current !== null || stopPendingRef.current) return;
+    if (pendingRef.current !== null) return;
     const operation = primary.kind;
-    primaryPendingRef.current = operation;
-    setPrimaryPending(operation);
+    pendingRef.current = operation;
+    setPending(operation);
     const epoch = ++stateOperationEpochRef.current;
     try {
       if (operation === 'capabilities') {
@@ -299,19 +382,78 @@ export function LocalInferenceLifecyclePanel({
         }
       }
     } finally {
-      if (primaryPendingRef.current === operation) {
-        primaryPendingRef.current = null;
-        setPrimaryPending(null);
+      if (pendingRef.current === operation) {
+        pendingRef.current = null;
+        setPending(null);
+      }
+    }
+  }
+
+  /**
+   * One manual smoke-test request. It shares the panel-wide claim with every
+   * lifecycle action, so a burst of clicks across any controls dispatches at
+   * most one operation at a time.
+   */
+  async function runInference(): Promise<void> {
+    if (inferenceDisabled) return;
+    if (pendingRef.current !== null) return;
+    const operation: PanelOperation = 'inference';
+    pendingRef.current = operation;
+    setPending(operation);
+    const epoch = ++stateOperationEpochRef.current;
+    const submittedPrompt = prompt;
+    try {
+      const response = await call('localInference:runTestInference', { prompt: submittedPrompt });
+      if (epoch !== stateOperationEpochRef.current) return;
+      if (response.ok) {
+        const outcome = response.data;
+        if (outcome.kind === 'completed') {
+          setTestInference({ kind: 'completed', response: outcome.response });
+          // Mirrors the transition the provider itself just made: an
+          // inference that completes returns the provider to `healthy`.
+          setState({ kind: 'healthy', runtimeInstanceId: outcome.response.runtimeInstanceId });
+          setWhatHappened('Ran test inference.');
+          // Deliberately generic: the Completion/Finish reason/Duration/
+          // Provider-model fields below already carry the detail, and
+          // repeating it here would just be a second copy of the same text.
+          setResult('Completed.');
+        } else {
+          setTestInference({ kind: 'outcome_failure', reason: outcome.reason });
+          // The provider's own Healthy-only transition already moved it to
+          // this exact terminal state before this outcome was returned.
+          setState({ kind: outcome.kind, reason: outcome.reason });
+          setWhatHappened('Test inference did not complete.');
+          setResult('Not completed.');
+        }
+      } else {
+        const reason = redactAndTruncate(response.error.message, IPC_ERROR_MESSAGE_MAX);
+        setTestInference({ kind: 'ipc_error', reason });
+        setWhatHappened('Test inference failed.');
+        setResult('Not completed.');
+      }
+    } catch {
+      // `call` forwards the preload bridge's promise unwrapped: a transport
+      // failure (main process gone, channel torn down) rejects rather than
+      // resolving `{ok:false}`. Never render that untyped rejection: it could
+      // contain a response body, path, argv, or credential. Use one bounded,
+      // allowlisted reason and replace any stale completion.
+      if (epoch !== stateOperationEpochRef.current) return;
+      setTestInference({ kind: 'ipc_error', reason: IPC_TRANSPORT_FAILURE_REASON });
+      setWhatHappened('Test inference failed.');
+      setResult('Not completed.');
+    } finally {
+      if (pendingRef.current === operation) {
+        pendingRef.current = null;
+        setPending(null);
       }
     }
   }
 
   async function runStop(): Promise<void> {
-    // Deliberately independent of the primary claim for a start/capabilities/health
-    // claim: Stop must be able to interrupt those, not queue behind them.
-    if (stopPendingRef.current) return;
-    stopPendingRef.current = true;
-    setStopPending(true);
+    if (pendingRef.current !== null) return;
+    const operation: PanelOperation = 'stop';
+    pendingRef.current = operation;
+    setPending(operation);
     const epoch = ++stateOperationEpochRef.current;
     try {
       const response = await call('localInference:stop', {});
@@ -326,10 +468,14 @@ export function LocalInferenceLifecyclePanel({
         setResult(response.error.message);
       }
     } finally {
-      stopPendingRef.current = false;
-      setStopPending(false);
+      if (pendingRef.current === operation) {
+        pendingRef.current = null;
+        setPending(null);
+      }
     }
   }
+
+  const inferenceReason = inferenceUnavailableReason();
 
   return (
     <Card title="Local inference lifecycle">
@@ -353,7 +499,7 @@ export function LocalInferenceLifecyclePanel({
 
         <div className="row">
           <button type="button" className="btn btn--primary" disabled={primary.disabled} onClick={() => void runPrimary()}>
-            {primaryPending === primary.kind ? <Spinner /> : null} {primary.label}
+            {pending === primary.kind ? <Spinner /> : null} {primary.label}
           </button>
           {showStop ? (
             <button
@@ -362,7 +508,7 @@ export function LocalInferenceLifecyclePanel({
               disabled={stopDisabled}
               onClick={() => void runStop()}
             >
-              {stopPending ? <Spinner /> : null} Stop
+              {pending === 'stop' ? <Spinner /> : null} Stop
             </button>
           ) : null}
         </div>
@@ -371,6 +517,57 @@ export function LocalInferenceLifecyclePanel({
           <Notice tone="info">
             Local inference is disabled. Enable it above and save Settings to use these controls.
           </Notice>
+        ) : null}
+
+        <Field label="Test inference prompt" hint="Sent once, exactly as typed. Never saved or logged.">
+          <textarea
+            value={prompt}
+            onChange={(event) => setPrompt(event.target.value)}
+            disabled={!promptEditable}
+            rows={3}
+          />
+        </Field>
+
+        <div className="row">
+          <button
+            type="button"
+            className="btn btn--primary"
+            disabled={inferenceDisabled}
+            onClick={() => void runInference()}
+          >
+            {pending === 'inference' ? <Spinner /> : null} Run test inference
+          </button>
+        </div>
+        {inferenceReason ? <Notice tone="info">{inferenceReason}</Notice> : null}
+
+        {testInference !== null ? (
+          testInference.kind === 'completed' ? (
+            <div className="stack">
+              <div className="row">
+                <strong>Completion</strong>
+                <span>{testInference.response.completion}</span>
+              </div>
+              <div className="row">
+                <strong>Finish reason</strong>
+                <span>{describeFinishReason(testInference.response.finishReason)}</span>
+              </div>
+              <div className="row">
+                <strong>Duration</strong>
+                <span>{testInference.response.durationMs} ms</span>
+              </div>
+              <div className="row">
+                <strong>Provider/model</strong>
+                <span>
+                  {testInference.response.providerId} / {testInference.response.modelId}
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="row">
+              <strong>Failure reason</strong>
+              <span>{testInference.reason}</span>
+            </div>
+          )
         ) : null}
       </div>
     </Card>
