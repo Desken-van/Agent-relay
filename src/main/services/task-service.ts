@@ -176,7 +176,7 @@ export class TaskService {
       : null;
     const refusal = assessmentPublishRefusal(readClaudeAssessment(own ?? inherited));
     if (!refusal.blocked) return null;
-    if (own !== null || refusal.code === 'security') return refusal.code;
+    if (refusal.code === 'security') return refusal.code;
 
     const verification = latestVerification(runs);
     if (verification) {

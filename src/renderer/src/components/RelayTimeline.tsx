@@ -138,12 +138,14 @@ function VerificationTag({ run }: { run: Run }): React.JSX.Element | null {
   if (!result.ok) return null;
 
   const status: ClaudeVerificationStatus = result.assessment.verificationStatus;
-  const tone =
-    status === 'passed' ? 'ok' : status === 'failed' ? 'danger' : 'warn';
+  // Agent-side verification runs inside the provider sandbox and is diagnostic.
+  // Relay's separate snapshot verification is authoritative, so an unavailable
+  // or failed provider check is a warning here rather than a failed run.
+  const tone = status === 'passed' ? 'ok' : 'warn';
 
   return (
     <span className={`tag tag--${tone}`} title={result.assessment.reasonCodes.join(', ')}>
-      verification {status.replace(/_/g, ' ')}
+      provider verification {status.replace(/_/g, ' ')}
     </span>
   );
 }

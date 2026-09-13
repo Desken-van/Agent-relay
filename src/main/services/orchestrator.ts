@@ -676,6 +676,7 @@ export class Orchestrator {
     this.assertImplementationConfigured(task, settings);
 
     const controller = this.beginExclusive(taskId);
+    let completed: Task;
     try {
       const completeContinuationStart = await this.deps.continuationGuard?.prepareFirstAction(
         taskId,
@@ -708,7 +709,7 @@ export class Orchestrator {
         .filter((part): part is string => part !== null)
         .join('\n\n');
 
-      return await this.runImplementation(task, controller, prompt, {
+      completed = await this.runImplementation(task, controller, prompt, {
         runType: 'implementation',
         recoverableFailure: 'implementation_aborted'
       });
@@ -718,6 +719,8 @@ export class Orchestrator {
     } finally {
       this.endExclusive(taskId);
     }
+
+    return await this.runRelayVerificationAfterProvider(completed);
   }
 
   /**
@@ -770,6 +773,7 @@ export class Orchestrator {
     }
 
     const controller = this.beginExclusive(taskId);
+    let completed: Task;
     try {
       const completeContinuationStart = await this.deps.continuationGuard?.prepareFirstAction(
         taskId,
@@ -797,7 +801,7 @@ export class Orchestrator {
             ruleEvidence: this.ruleEvidenceText(task.id)
           });
 
-      return await this.runImplementation(task, controller, `${this.implementationPrompt(task, readSpecification(task))}\n\n${prompt}`, {
+      completed = await this.runImplementation(task, controller, `${this.implementationPrompt(task, readSpecification(task))}\n\n${prompt}`, {
         runType: 'correction',
         recoverableFailure: 'correction_aborted',
         unverifiedFailure: 'correction_unverified'
@@ -808,6 +812,35 @@ export class Orchestrator {
     } finally {
       this.endExclusive(taskId);
     }
+
+    return await this.runRelayVerificationAfterProvider(completed);
+  }
+
+  /**
+   * Provider-side checks are useful diagnostics, but their sandbox is not the
+   * authority for the repository. Once an implementation turn returns
+   * normally, run Relay's verifier from the host process before review.
+   *
+   * Security, telemetry and configuration blocks deliberately do not reach
+   * this path: a green test command must never hide an unsafe or incomplete
+   * provider run.
+   */
+  private async runRelayVerificationAfterProvider(task: Task): Promise<Task> {
+    if (!this.deps.verification) {
+      return task;
+    }
+    if (task.status !== 'READY_FOR_IMPLEMENTATION' && task.status !== 'READY_FOR_REVIEW') {
+      return task;
+    }
+
+    const result = readClaudeAssessment(
+      latestClaudeRoundResult(this.deps.runs.listByTask(task.id))
+    );
+    if (!result.ok || result.assessment.publishBlock !== 'verification') {
+      return task;
+    }
+
+    return await this.runVerification(task.id);
   }
 
   /**
@@ -901,14 +934,16 @@ export class Orchestrator {
       });
       const checked = readClaudeAssessment(JSON.stringify({ assessment: result.assessment }));
       const failed = !checked.ok || checked.assessment.disposition !== 'pass' || checked.assessment.publishBlock !== 'none' || checked.assessment.verificationStatus !== 'passed';
+      const verificationOnly = checked.ok && checked.assessment.publishBlock === 'verification';
+      const runFailed = failed && !(verificationOnly && this.deps.verification);
       const error = failed
         ? 'Changes were saved, but this Codex run did not prove verification passed. Run verification in Agent Relay to check the current files.'
         : null;
       const failureEvent = failed && checked.ok && checked.assessment.publishBlock !== 'security'
         ? (options.unverifiedFailure ?? options.recoverableFailure)
         : options.recoverableFailure;
-      handle.finish({ status: failed ? 'failed' : 'succeeded', finalMessage: result.finalMessage,
-        errorMessage: error ?? undefined, structuredResult: { provider: 'codex', providerRevision: task.providerRevision,
+      handle.finish({ status: runFailed ? 'failed' : 'succeeded', finalMessage: result.finalMessage,
+        errorMessage: runFailed ? error ?? undefined : undefined, structuredResult: { provider: 'codex', providerRevision: task.providerRevision,
           sessionId: result.sessionId, assessment: result.assessment } });
       return this.applyEvent(
         this.requireTask(task.id),
@@ -1005,6 +1040,8 @@ export class Orchestrator {
       });
       const record = toAssessmentRecord(assessment);
       const failed = assessment.disposition === 'fail';
+      const verificationOnly = assessment.publishBlock === 'verification';
+      const runFailed = failed && !(verificationOnly && this.deps.verification);
 
       // Appended before the run is closed, so it belongs to this round and is
       // replayed from the database in the same place after a restart.
@@ -1024,9 +1061,9 @@ export class Orchestrator {
       const failureMessage = failed ? describeFailure(assessment) : null;
 
       handle.finish({
-        status: failed ? 'failed' : 'succeeded',
+        status: runFailed ? 'failed' : 'succeeded',
         finalMessage: result.finalMessage,
-        errorMessage: failureMessage ?? undefined,
+        errorMessage: runFailed ? failureMessage ?? undefined : undefined,
         structuredResult: {
           provider: 'claude', providerRevision: task.providerRevision,
           numTurns: result.numTurns,
