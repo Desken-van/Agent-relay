@@ -150,8 +150,8 @@ and **Add project** to refuse.
    Settings defaults afterwards must not alter it.
 3. **Create task** — you land on the **Run** screen with status *Draft*.
 4. Press **Generate specification** (marked read-only, blue).
-5. **Expect:** a Codex node appears on the left lane of the timeline and streams
-   events live; status becomes *Specifying*, then *Ready for implementation*.
+5. **Expect:** a Codex node appears on the Relay timeline and streams events
+   live; status becomes *Specifying*, then *Ready for implementation*.
 6. **Expect:** a Specification panel with title, summary, acceptance criteria,
    constraints, assumptions, suggested tests, and a collapsible
    implementation prompt.
@@ -265,8 +265,9 @@ Restore the default rules afterwards.
 3. **Expect** *Commits on the task branch* to be empty — Agent Relay does not
    commit the agent's work.
 4. Press **Review with Codex** (read-only, blue).
-5. **Expect** a Codex node in the left lane, then a **Codex review** panel with a
-   verdict badge, a summary, and findings grouped critical → low with file:line.
+5. **Expect** a Codex node on the timeline, then a **Review** panel (in the
+   sidebar) with a verdict badge, a summary, and findings grouped critical →
+   low with file:line.
 
 ✅ Pass if the review returns a structured verdict and the worktree is unchanged
 by the review itself (`git -C <worktree> status` before and after should match).

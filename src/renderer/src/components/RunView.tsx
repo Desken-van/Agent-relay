@@ -461,11 +461,112 @@ export function RunView(): React.JSX.Element {
     }
   };
 
+  // Reasonable per-stage defaults for the sidebar's collapsible sections.
+  // Each `key` includes the condition that drives its default so the panel
+  // remounts — and re-defaults — exactly when that condition flips, while a
+  // manual toggle still wins for as long as the key stays the same.
+  const specificationAwaitingApproval = !task.specificationApprovedAt;
+  const reviewActionable = task.status === 'CHANGES_REQUESTED';
+  const approvalsRelevant = task.status === 'READY_TO_PUBLISH' || task.status === 'PUBLISHING' || task.status === 'COMPLETED';
+  const changesRelevant = task.status === 'READY_FOR_REVIEW' || task.status === 'CHANGES_REQUESTED' || task.status === 'APPROVED';
+  const publishing = task.status === 'READY_TO_PUBLISH' || task.status === 'PUBLISHING';
+
   return (
-    <div className="content--split" style={{ display: 'grid' }}>
-      {/* ------------------------------- left ------------------------------- */}
-      <div className="stack">
-        <Card title="Task">
+    <div className="run-layout">
+      {/* ------------------------------- main ------------------------------- */}
+      <div className="run-layout__main">
+        <Card title="Actions">
+          <RunFlowOverview guidance={guidance} />
+          <ProviderControls key={`providers-${task.id}`} task={task} busy={anyBusy || running}
+            onChanged={acceptTask} />
+          <CompletedHistory runs={detail.runs} />
+
+          <PlanReviewPanel
+            key={`plan-review-${task.id}`}
+            task={task}
+            integrationEnabled={planReviewEnabled}
+            onChanged={() => refreshDetail(task.id)}
+            onGuidanceStateChanged={updatePlanReviewPreparation}
+            renderPrimary={false}
+            onDispatchReady={registerPlanDispatcher}
+          />
+
+          {dirtyPrompt ? (
+            <Notice tone="warn">
+              <div className="stack stack--tight" style={{ width: '100%' }}>
+                <div style={{ whiteSpace: 'pre-wrap' }}>{dirtyPrompt}</div>
+                <div className="row">
+                  <button type="button" className="btn btn--sm" onClick={() => sendToClaude(true)}>
+                    Continue anyway
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn--sm btn--ghost"
+                    onClick={() => setDirtyPrompt(null)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            </Notice>
+          ) : null}
+
+          {guidance.action ? (
+            <div className="actions">
+              <PrimaryActionButton
+                action={guidance.action}
+                pending={primaryPending === guidance.action.key}
+                blocked={otherOperationBusy}
+                onClick={dispatchPrimary}
+              />
+            </div>
+          ) : null}
+
+          {publishing ? (
+            <div className="stack" aria-label="Publish">
+              <div className="section-title">Publish</div>
+              <PublishPanel taskId={task.id} onDone={() => void refreshDetail(task.id)} />
+            </div>
+          ) : null}
+
+          <div className="actions actions--control">
+            <button
+              type="button"
+              className="btn btn--danger btn--wide"
+              disabled={!running && isTerminal(task.status)}
+              onClick={() =>
+                void perform('stop', 'Could not stop the task', async () => {
+                  acceptTask(await expect('workflow:stop', { taskId: task.id }));
+                  notify({ tone: 'info', title: 'Task stopped' });
+                })
+              }
+            >
+              Stop task
+            </button>
+          </div>
+        </Card>
+
+        <Card title="Relay timeline" flush>
+          <div style={{ padding: '8px 16px 0' }}>
+            <RelayTimeline runs={detail.runs} />
+          </div>
+          <div className="legend">
+            <span className="legend__item">
+              <span className="relay__dot relay__dot--codex" style={{ width: 9, height: 9 }} /> Codex
+            </span>
+            <span className="legend__item">
+              <span className="relay__dot relay__dot--claude" style={{ width: 9, height: 9 }} /> Claude Code
+            </span>
+            <span className="legend__item">
+              <span className="relay__dot relay__dot--system" style={{ width: 9, height: 9 }} /> Agent Relay
+            </span>
+          </div>
+        </Card>
+      </div>
+
+      {/* ------------------------------ side -------------------------------- */}
+      <div className="run-layout__side">
+        <Card title="Task" collapsible defaultOpen key={`task-${task.id}`}>
           <div className="stack">
             <div className="row row--wrap">
               <StatusBadge status={task.status} />
@@ -522,26 +623,6 @@ export function RunView(): React.JSX.Element {
 
             {task.lastError ? <Notice tone="error">{task.lastError}</Notice> : null}
 
-            {dirtyPrompt ? (
-              <Notice tone="warn">
-                <div className="stack stack--tight" style={{ width: '100%' }}>
-                  <div style={{ whiteSpace: 'pre-wrap' }}>{dirtyPrompt}</div>
-                  <div className="row">
-                    <button type="button" className="btn btn--sm" onClick={() => sendToClaude(true)}>
-                      Continue anyway
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn--sm btn--ghost"
-                      onClick={() => setDirtyPrompt(null)}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              </Notice>
-            ) : null}
-
             <details>
               <summary className="faint" style={{ cursor: 'pointer', fontSize: 12 }}>
                 Original request
@@ -554,84 +635,38 @@ export function RunView(): React.JSX.Element {
         </Card>
 
         {specification ? (
-          <SpecificationPanel
-            specification={specification}
-            approvedAt={task.specificationApprovedAt}
-          />
+          <Card
+            title="Specification"
+            collapsible
+            defaultOpen={specificationAwaitingApproval}
+            key={`spec-${task.id}-${specificationAwaitingApproval}`}
+            actions={<SpecificationStatusTag approvedAt={task.specificationApprovedAt} />}
+          >
+            <SpecificationPanel specification={specification} />
+          </Card>
         ) : null}
 
-        {lastReview ? <ReviewPanel review={lastReview} /> : null}
-
-        <Card title="Relay timeline" flush>
-          <div style={{ padding: '8px 16px 0' }}>
-            <RelayTimeline runs={detail.runs} />
-          </div>
-          <div className="legend">
-            <span className="legend__item">
-              <span className="relay__dot relay__dot--codex" style={{ width: 9, height: 9 }} /> Codex
-            </span>
-            <span className="legend__item">
-              <span className="relay__dot relay__dot--claude" style={{ width: 9, height: 9 }} /> Claude Code
-            </span>
-            <span className="legend__item">
-              <span className="relay__dot relay__dot--system" style={{ width: 9, height: 9 }} /> Agent Relay
-            </span>
-          </div>
-        </Card>
-      </div>
-
-      {/* ------------------------------ right ------------------------------- */}
-      <div className="stack">
-        <Card title="Actions">
-          <RunFlowOverview guidance={guidance} />
-          <ProviderControls key={`providers-${task.id}`} task={task} busy={anyBusy || running}
-            onChanged={acceptTask} />
-          <CompletedHistory runs={detail.runs} />
-
-          <PlanReviewPanel
-            key={`plan-review-${task.id}`}
-            task={task}
-            integrationEnabled={planReviewEnabled}
-            onChanged={() => refreshDetail(task.id)}
-            onGuidanceStateChanged={updatePlanReviewPreparation}
-            renderPrimary={false}
-            onDispatchReady={registerPlanDispatcher}
-          />
-
-          {guidance.action ? (
-            <div className="actions">
-              <PrimaryActionButton
-                action={guidance.action}
-                pending={primaryPending === guidance.action.key}
-                blocked={otherOperationBusy}
-                onClick={dispatchPrimary}
-              />
-            </div>
-          ) : null}
-
-          <div className="actions actions--control">
-            <button
-              type="button"
-              className="btn btn--danger btn--wide"
-              disabled={!running && isTerminal(task.status)}
-              onClick={() =>
-                void perform('stop', 'Could not stop the task', async () => {
-                  acceptTask(await expect('workflow:stop', { taskId: task.id }));
-                  notify({ tone: 'info', title: 'Task stopped' });
-                })
-              }
-            >
-              Stop task
-            </button>
-          </div>
-        </Card>
-
-        {task.status === 'READY_TO_PUBLISH' || task.status === 'PUBLISHING' ? (
-          <PublishPanel taskId={task.id} onDone={() => void refreshDetail(task.id)} />
+        {lastReview ? (
+          <Card
+            title="Review"
+            flush
+            collapsible
+            defaultOpen={reviewActionable}
+            key={`review-${task.id}-${reviewActionable}`}
+            actions={<ReviewVerdictTag verdict={lastReview.verdict} />}
+          >
+            <ReviewPanel review={lastReview} />
+          </Card>
         ) : null}
 
         {detail.approvals.length > 0 ? (
-          <Card title="Approval trail" flush>
+          <Card
+            title="Approval trail"
+            flush
+            collapsible
+            defaultOpen={approvalsRelevant}
+            key={`approvals-${task.id}-${approvalsRelevant}`}
+          >
             {detail.approvals.map((approval) => (
               <div key={approval.id} className="filerow">
                 <span className={`tag ${approval.status === 'granted' ? 'tag--ok' : approval.status === 'denied' ? 'tag--danger' : 'tag--warn'}`}>
@@ -644,7 +679,20 @@ export function RunView(): React.JSX.Element {
           </Card>
         ) : null}
 
-        <ChangesPanel changes={changes} loading={loadingChanges} onRefresh={() => void loadChanges()} />
+        <Card
+          title="Changes and diff"
+          flush
+          collapsible
+          defaultOpen={changesRelevant}
+          key={`changes-${task.id}-${changesRelevant}`}
+          actions={
+            <button type="button" className="btn btn--sm btn--ghost" onClick={() => void loadChanges()} disabled={loadingChanges}>
+              {loadingChanges ? 'Collecting…' : 'Refresh'}
+            </button>
+          }
+        >
+          <ChangesPanel changes={changes} />
+        </Card>
       </div>
     </div>
   );
@@ -1179,86 +1227,91 @@ function isTerminal(status: string): boolean {
   return status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED';
 }
 
-function SpecificationPanel({
-  specification,
-  approvedAt
-}: {
-  specification: TaskSpecification;
-  approvedAt: string | null;
-}): React.JSX.Element {
+/** The approval tag shown in the Specification section's collapsed header. */
+function SpecificationStatusTag({ approvedAt }: { approvedAt: string | null }): React.JSX.Element {
+  return approvedAt ? (
+    <span className="tag tag--ok">approved {formatDateTime(approvedAt)}</span>
+  ) : (
+    <span className="tag tag--warn">awaiting approval</span>
+  );
+}
+
+function SpecificationPanel({ specification }: { specification: TaskSpecification }): React.JSX.Element {
   return (
-    <Card
-      title="Specification"
-      actions={
-        approvedAt ? (
-          <span className="tag tag--ok">approved {formatDateTime(approvedAt)}</span>
-        ) : (
-          <span className="tag tag--warn">awaiting approval</span>
-        )
-      }
-    >
-      <div className="stack">
-        <div style={{ fontWeight: 600 }}>{specification.title}</div>
-        <div className="selectable" style={{ whiteSpace: 'pre-wrap' }}>
-          {specification.summary}
-        </div>
-
-        <div>
-          <div className="section-title">Acceptance criteria</div>
-          <ol className="bullets selectable">
-            {specification.acceptanceCriteria.map((criterion, index) => (
-              <li key={index}>{criterion}</li>
-            ))}
-          </ol>
-        </div>
-
-        {specification.constraints.length > 0 ? (
-          <div>
-            <div className="section-title">Constraints</div>
-            <ul className="bullets selectable">
-              {specification.constraints.map((item, index) => (
-                <li key={index}>{item}</li>
-              ))}
-            </ul>
-          </div>
-        ) : null}
-
-        {specification.assumptions.length > 0 ? (
-          <div>
-            <div className="section-title">Assumptions</div>
-            <ul className="bullets selectable">
-              {specification.assumptions.map((item, index) => (
-                <li key={index}>{item}</li>
-              ))}
-            </ul>
-          </div>
-        ) : null}
-
-        {specification.suggestedTests.length > 0 ? (
-          <div>
-            <div className="section-title">Suggested tests</div>
-            <ul className="bullets selectable">
-              {specification.suggestedTests.map((item, index) => (
-                <li key={index}>{item}</li>
-              ))}
-            </ul>
-          </div>
-        ) : null}
-
-        <details>
-          <summary className="faint" style={{ cursor: 'pointer', fontSize: 12 }}>
-            Implementation prompt
-          </summary>
-          <pre className="pre selectable" style={{ marginTop: 8 }}>
-            {specification.implementationPrompt}
-          </pre>
-        </details>
+    <div className="stack">
+      <div style={{ fontWeight: 600 }}>{specification.title}</div>
+      <div className="selectable" style={{ whiteSpace: 'pre-wrap' }}>
+        {specification.summary}
       </div>
-    </Card>
+
+      <div>
+        <div className="section-title">Acceptance criteria</div>
+        <ol className="bullets selectable">
+          {specification.acceptanceCriteria.map((criterion, index) => (
+            <li key={index}>{criterion}</li>
+          ))}
+        </ol>
+      </div>
+
+      {specification.constraints.length > 0 ? (
+        <div>
+          <div className="section-title">Constraints</div>
+          <ul className="bullets selectable">
+            {specification.constraints.map((item, index) => (
+              <li key={index}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {specification.assumptions.length > 0 ? (
+        <div>
+          <div className="section-title">Assumptions</div>
+          <ul className="bullets selectable">
+            {specification.assumptions.map((item, index) => (
+              <li key={index}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {specification.suggestedTests.length > 0 ? (
+        <div>
+          <div className="section-title">Suggested tests</div>
+          <ul className="bullets selectable">
+            {specification.suggestedTests.map((item, index) => (
+              <li key={index}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      <details>
+        <summary className="faint" style={{ cursor: 'pointer', fontSize: 12 }}>
+          Implementation prompt
+        </summary>
+        <pre className="pre selectable" style={{ marginTop: 8 }}>
+          {specification.implementationPrompt}
+        </pre>
+      </details>
+    </div>
   );
 }
 
 const SEVERITY_ORDER: readonly FindingSeverity[] = ['critical', 'high', 'medium', 'low'];
+
+/** The verdict tag shown in the Review section's collapsed header. */
+function ReviewVerdictTag({ verdict }: { verdict: CodexReviewResult['verdict'] }): React.JSX.Element {
+  return (
+    <span
+      className={`tag ${
+        verdict === 'approved' ? 'tag--ok' : verdict === 'blocked' ? 'tag--danger' : 'tag--warn'
+      }`}
+    >
+      {verdict.replace(/_/g, ' ')}
+    </span>
+  );
+}
 
 function ReviewPanel({ review }: { review: CodexReviewResult }): React.JSX.Element {
   const counts = SEVERITY_ORDER.map(
@@ -1266,23 +1319,7 @@ function ReviewPanel({ review }: { review: CodexReviewResult }): React.JSX.Eleme
   ).filter(([, count]) => count > 0);
 
   return (
-    <Card
-      title="Codex review"
-      flush
-      actions={
-        <span
-          className={`tag ${
-            review.verdict === 'approved'
-              ? 'tag--ok'
-              : review.verdict === 'blocked'
-                ? 'tag--danger'
-                : 'tag--warn'
-          }`}
-        >
-          {review.verdict.replace(/_/g, ' ')}
-        </span>
-      }
-    >
+    <>
       <div style={{ padding: 16, borderBottom: review.findings.length > 0 ? '1px solid var(--border)' : 'none' }}>
         <div className="selectable" style={{ whiteSpace: 'pre-wrap' }}>
           {review.summary}
@@ -1318,7 +1355,7 @@ function ReviewPanel({ review }: { review: CodexReviewResult }): React.JSX.Eleme
             </div>
           ))
       )}
-    </Card>
+    </>
   );
 }
 
@@ -1366,112 +1403,110 @@ function PublishPanel({ taskId, onDone }: { taskId: string; onDone: () => void }
   }, [fetchPreview]);
 
   return (
-    <Card title="Publish">
-      <div className="stack">
-        <Notice tone="warn">
-          Every action below opens a confirmation dialog owned by the application itself. Nothing is
-          committed, pushed, or created on GitHub until you accept that dialog.
-        </Notice>
+    <div className="stack">
+      <Notice tone="warn">
+        Every action below opens a confirmation dialog owned by the application itself. Nothing is
+        committed, pushed, or created on GitHub until you accept that dialog.
+      </Notice>
 
-        <Field label="Action">
-          <select
-            className="select"
-            value={action}
-            onChange={(e) => setAction(e.target.value as ApprovalAction)}
-          >
-            {PUBLISH_ACTIONS.map((item) => (
-              <option key={item.value} value={item.value}>
-                {item.label}
-              </option>
-            ))}
-          </select>
+      <Field label="Action">
+        <select
+          className="select"
+          value={action}
+          onChange={(e) => setAction(e.target.value as ApprovalAction)}
+        >
+          {PUBLISH_ACTIONS.map((item) => (
+            <option key={item.value} value={item.value}>
+              {item.label}
+            </option>
+          ))}
+        </select>
+      </Field>
+
+      {action === 'commit' ? (
+        <Field label="Commit message" hint="Leave empty to use the generated message.">
+          <textarea
+            className="textarea"
+            rows={3}
+            value={commitMessage}
+            placeholder={detail?.task.title ?? ''}
+            onChange={(e) => setCommitMessage(e.target.value)}
+          />
         </Field>
+      ) : null}
 
-        {action === 'commit' ? (
-          <Field label="Commit message" hint="Leave empty to use the generated message.">
-            <textarea
-              className="textarea"
-              rows={3}
-              value={commitMessage}
-              placeholder={detail?.task.title ?? ''}
-              onChange={(e) => setCommitMessage(e.target.value)}
+      {action === 'create_repository' ? (
+        <div className="grid-2">
+          <Field label="Owner">
+            <input
+              className="input input--mono"
+              value={owner}
+              placeholder={detail?.project.githubOwner ?? ''}
+              onChange={(e) => setOwner(e.target.value)}
             />
           </Field>
-        ) : null}
-
-        {action === 'create_repository' ? (
-          <div className="grid-2">
-            <Field label="Owner">
-              <input
-                className="input input--mono"
-                value={owner}
-                placeholder={detail?.project.githubOwner ?? ''}
-                onChange={(e) => setOwner(e.target.value)}
-              />
-            </Field>
-            <Field label="Repository name">
-              <input
-                className="input input--mono"
-                value={repositoryName}
-                placeholder={detail?.project.githubRepo ?? detail?.project.name ?? ''}
-                onChange={(e) => setRepositoryName(e.target.value)}
-              />
-            </Field>
-          </div>
-        ) : null}
-
-        {action === 'create_pull_request' ? (
-          <Field label="Pull request title" hint="Leave empty to use the task title.">
-            <input className="input" value={prTitle} onChange={(e) => setPrTitle(e.target.value)} />
+          <Field label="Repository name">
+            <input
+              className="input input--mono"
+              value={repositoryName}
+              placeholder={detail?.project.githubRepo ?? detail?.project.name ?? ''}
+              onChange={(e) => setRepositoryName(e.target.value)}
+            />
           </Field>
-        ) : null}
+        </div>
+      ) : null}
 
-        {confirmation ? (
-          <div className="pre selectable" style={{ maxHeight: 220 }}>
-            {[
-              confirmation.headline,
-              '',
-              `Account / owner:  ${confirmation.account}`,
-              `Repository:       ${confirmation.repository}`,
-              `Visibility:       ${confirmation.visibility}`,
-              `Branch:           ${confirmation.branch}`,
-              '',
-              ...confirmation.details
-            ].join('\n')}
-          </div>
-        ) : null}
+      {action === 'create_pull_request' ? (
+        <Field label="Pull request title" hint="Leave empty to use the task title.">
+          <input className="input" value={prTitle} onChange={(e) => setPrTitle(e.target.value)} />
+        </Field>
+      ) : null}
 
-        <button
-          type="button"
-          className="btn btn--danger btn--wide"
-          onClick={() =>
-            void perform('publish', 'The publish step failed', async () => {
-              const outcome = await expect('publish:execute', {
-                taskId,
-                action,
-                ...(commitMessage.trim() ? { commitMessage: commitMessage.trim() } : {}),
-                ...(repositoryName.trim() ? { repositoryName: repositoryName.trim() } : {}),
-                ...(owner.trim() ? { owner: owner.trim() } : {}),
-                ...(prTitle.trim() ? { pullRequestTitle: prTitle.trim() } : {})
-              });
+      {confirmation ? (
+        <div className="pre selectable" style={{ maxHeight: 220 }}>
+          {[
+            confirmation.headline,
+            '',
+            `Account / owner:  ${confirmation.account}`,
+            `Repository:       ${confirmation.repository}`,
+            `Visibility:       ${confirmation.visibility}`,
+            `Branch:           ${confirmation.branch}`,
+            '',
+            ...confirmation.details
+          ].join('\n')}
+        </div>
+      ) : null}
 
-              notify({
-                tone: outcome.performed ? 'success' : 'info',
-                title: outcome.performed ? 'Done' : 'Cancelled',
-                body: outcome.message
-              });
+      <button
+        type="button"
+        className="btn btn--danger btn--wide"
+        onClick={() =>
+          void perform('publish', 'The publish step failed', async () => {
+            const outcome = await expect('publish:execute', {
+              taskId,
+              action,
+              ...(commitMessage.trim() ? { commitMessage: commitMessage.trim() } : {}),
+              ...(repositoryName.trim() ? { repositoryName: repositoryName.trim() } : {}),
+              ...(owner.trim() ? { owner: owner.trim() } : {}),
+              ...(prTitle.trim() ? { pullRequestTitle: prTitle.trim() } : {})
+            });
 
-              if (outcome.url) {
-                await call('shell:openExternal', { url: outcome.url });
-              }
-              onDone();
-            })
-          }
-        >
-          <Scope kind={confirmation?.affectsRemote ? 'remote' : 'local'} />
-          Confirm and run…
-        </button>
-      </div>
-    </Card>
+            notify({
+              tone: outcome.performed ? 'success' : 'info',
+              title: outcome.performed ? 'Done' : 'Cancelled',
+              body: outcome.message
+            });
+
+            if (outcome.url) {
+              await call('shell:openExternal', { url: outcome.url });
+            }
+            onDone();
+          })
+        }
+      >
+        <Scope kind={confirmation?.affectsRemote ? 'remote' : 'local'} />
+        Confirm and run…
+      </button>
+    </div>
   );
 }

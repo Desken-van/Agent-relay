@@ -43,6 +43,35 @@ describe('explicit provider routing', () => {
     expect(h.claude.calls).toHaveLength(0);
     expect(h.runs.listByTask(t.id).find(r => r.runType === 'implementation')?.agent).toBe('codex');
   });
+  it('does not open review when automatic Relay verification confirms a real failure', async () => {
+    h.dispose();
+    h = createHarness({
+      verification: {
+        identity: async () => 'b'.repeat(64),
+        execute: async () => ({
+          command: 'npm run verify', exitCode: 1, stdout: 'one test failed', stderr: '',
+          failed: true, timedOut: false, cancelled: false, durationMs: 10
+        })
+      }
+    });
+    const t = await prepared(); select(t.id, 'codex');
+    h.codex.implementationResult = {
+      sessionId: 'codex-implementation-1',
+      finalMessage: 'Files saved; provider-side verification was unavailable.',
+      assessment: {
+        version: 1, disposition: 'fail', verificationStatus: 'failed', publishBlock: 'verification',
+        reasonCodes: ['CODEX_VERIFICATION'], denials: [],
+        verification: { tool: 'Codex', command: 'npm run verify', matchedRule: 'Bash(npm run verify *)', toolUseSequence: 1 }
+      }
+    };
+
+    const implemented = await h.orchestrator.sendToClaude(t.id);
+
+    expect(implemented).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 1 });
+    expect(h.runs.listByTask(t.id).findLast(run => run.runType === 'implementation')).toMatchObject({ status: 'succeeded' });
+    expect(h.runs.listByTask(t.id).findLast(run => run.runType === 'verification')).toMatchObject({ status: 'failed' });
+    await expect(h.orchestrator.reviewWithCodex(t.id)).rejects.toThrow();
+  });
   it('routes a review to Claude without resuming the implementation session', async () => {
     const t = await prepared(); select(t.id, 'claude', 'claude');
     await h.orchestrator.sendToClaude(t.id); await h.orchestrator.reviewWithCodex(t.id);
@@ -95,7 +124,7 @@ describe('explicit provider routing', () => {
     expect(h.codex.implementationCalls[0]?.prompt).toContain('Add the missing test.');
     expect(h.claude.calls).toHaveLength(1);
   });
-  it('hands a saved but unverified Codex correction to Relay verification without spending another round', async () => {
+  it('automatically verifies a saved but unverified Codex correction without spending another round', async () => {
     const t = await prepared(); select(t.id, 'codex');
     await h.orchestrator.sendToClaude(t.id);
     h.codex.reviewQueue = [makeReview({ verdict: 'changes_requested', followUpPrompt: 'Fix the race.' })];
@@ -118,19 +147,19 @@ describe('explicit provider routing', () => {
 
     const corrected = await h.orchestrator.sendCorrections(t.id);
 
-    expect(corrected).toMatchObject({
-      status: 'READY_FOR_IMPLEMENTATION',
-      currentRound: 2,
-      lastError: expect.stringMatching(/Run verification in Agent Relay/)
-    });
+    expect(corrected).toMatchObject({ status: 'READY_FOR_REVIEW', currentRound: 2, lastError: null });
     expect(h.codex.implementationCalls).toHaveLength(2);
-    expect(runGuidance(corrected, h.runs.listByTask(t.id), true).action).toMatchObject({
-      key: 'run_verification', label: 'Run verification'
-    });
+    expect(h.runs.listByTask(t.id).findLast(run => run.runType === 'correction')).toMatchObject({ status: 'succeeded' });
+    expect(h.runs.listByTask(t.id).findLast(run => run.runType === 'verification')).toMatchObject({ status: 'succeeded' });
 
-    const verified = await h.orchestrator.runVerification(t.id);
-    expect(verified).toMatchObject({ status: 'READY_FOR_REVIEW', currentRound: 2, lastError: null });
-    expect(h.codex.implementationCalls).toHaveLength(2);
+    h.codex.reviewQueue = [makeReview({ verdict: 'approved' })];
+    await h.orchestrator.reviewWithCodex(t.id);
+    h.orchestrator.approveForPublishing(t.id);
+
+    expect(h.taskService.detail(t.id)).toMatchObject({
+      task: { status: 'READY_TO_PUBLISH' },
+      effectivePublishRefusal: null
+    });
   });
   it('keeps an interrupted Codex correction retryable from the same review', async () => {
     const t = await prepared(); select(t.id, 'codex');
@@ -144,7 +173,7 @@ describe('explicit provider routing', () => {
     expect(h.tasks.findById(t.id)).toMatchObject({ status: 'CHANGES_REQUESTED', currentRound: 2 });
     expect(h.codex.implementationCalls).toHaveLength(2);
   });
-  it('also hands a normally completed but unverified Claude correction to Relay verification', async () => {
+  it('also automatically verifies a normally completed but unverified Claude correction', async () => {
     const t = await prepared();
     await h.orchestrator.sendToClaude(t.id);
     h.codex.reviewQueue = [makeReview({ verdict: 'changes_requested', followUpPrompt: 'Fix the race.' })];
@@ -153,8 +182,9 @@ describe('explicit provider routing', () => {
 
     const corrected = await h.orchestrator.sendCorrections(t.id);
 
-    expect(corrected).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 2 });
-    expect(runGuidance(corrected, h.runs.listByTask(t.id), true).action?.key).toBe('run_verification');
+    expect(corrected).toMatchObject({ status: 'READY_FOR_REVIEW', currentRound: 2, lastError: null });
+    expect(h.runs.listByTask(t.id).findLast(run => run.runType === 'correction')).toMatchObject({ status: 'succeeded' });
+    expect(h.runs.listByTask(t.id).findLast(run => run.runType === 'verification')).toMatchObject({ status: 'succeeded' });
     expect(h.claude.calls).toHaveLength(2);
   });
   it('does not let Relay verification hide a Codex security refusal', async () => {

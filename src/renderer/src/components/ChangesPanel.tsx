@@ -1,27 +1,23 @@
 import { useMemo } from 'react';
 import type { GitChangeSet } from '@shared/domain/git';
-import { Card, Empty } from './primitives';
+import { Empty } from './primitives';
 
-export function ChangesPanel({
-  changes,
-  loading,
-  onRefresh
-}: {
-  changes: GitChangeSet | null;
-  loading: boolean;
-  onRefresh: () => void;
-}): React.JSX.Element {
+/**
+ * Changed files, diff and recent commits as one stack of labelled
+ * subsections. The caller wraps this in a single flush, collapsible Card
+ * ("Changes and diff") and owns the Refresh action in that Card's header —
+ * this component only ever renders content, never its own chrome, so a task
+ * with nothing to show collapses to one "No changes collected yet" line
+ * instead of three empty bordered boxes. Each subsection carries its own
+ * horizontal inset (matching `.filerow`'s) since the Card itself is flush.
+ */
+export function ChangesPanel({ changes }: { changes: GitChangeSet | null }): React.JSX.Element {
   return (
-    <>
-      <Card
-        title={changes ? `Changed files (${changes.changedFiles.length})` : 'Changed files'}
-        flush
-        actions={
-          <button type="button" className="btn btn--sm btn--ghost" onClick={onRefresh} disabled={loading}>
-            {loading ? 'Collecting…' : 'Refresh'}
-          </button>
-        }
-      >
+    <div className="stack">
+      <div>
+        <div className="section-title" style={{ padding: '12px 14px 0' }}>
+          {changes ? `Changed files (${changes.changedFiles.length})` : 'Changed files'}
+        </div>
         {!changes ? (
           <Empty title="No changes collected yet" hint="Refresh once Claude has finished a round." />
         ) : changes.changedFiles.length === 0 ? (
@@ -50,28 +46,29 @@ export function ChangesPanel({
             ))}
           </div>
         )}
-      </Card>
+      </div>
 
       {changes && changes.diff.trim().length > 0 ? (
-        <Card
-          title={`Diff${changes.diffTruncated ? ' (truncated)' : ''}`}
-          flush
-          actions={<span className="faint mono">{changes.diffBytes.toLocaleString()} chars</span>}
-        >
+        <div>
+          <div className="row" style={{ justifyContent: 'space-between', padding: '12px 14px 0' }}>
+            <div className="section-title">Diff{changes.diffTruncated ? ' (truncated)' : ''}</div>
+            <span className="faint mono">{changes.diffBytes.toLocaleString()} chars</span>
+          </div>
           <DiffView diff={changes.diff} />
-        </Card>
+        </div>
       ) : null}
 
       {changes && changes.recentCommits.length > 0 ? (
-        <Card title="Commits on the task branch" flush>
+        <div>
+          <div className="section-title" style={{ padding: '12px 14px 0' }}>Commits on the task branch</div>
           {changes.recentCommits.map((commit) => (
             <div key={commit} className="filerow">
               <span className="filerow__path selectable">{commit}</span>
             </div>
           ))}
-        </Card>
+        </div>
       ) : null}
-    </>
+    </div>
   );
 }
 

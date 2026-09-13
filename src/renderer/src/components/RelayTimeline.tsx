@@ -1,10 +1,11 @@
 /**
- * The relay spine.
+ * The relay timeline.
  *
- * Each run is a node on a vertical timeline: Codex work sits in the left lane,
- * Claude's in the right, and system steps (Git, GitHub) straddle the middle. The
- * point is that a glance tells you who has the baton and how many times it has
- * changed hands — which is the one thing a generic log list never shows.
+ * Each run is a full-width card in chronological order. Colour still encodes
+ * who acted — a 3px agent-coloured left border plus the coloured agent tag —
+ * so the "who has the baton" glance read survives without the old two-lane,
+ * half-width layout that clipped headers and squeezed the event log into a
+ * handful of characters per column.
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -80,28 +81,28 @@ function RelayNode({
   onToggle: () => void;
 }): React.JSX.Element {
   const tone = agentTone(run.agent);
-  const side = run.agent === 'claude' ? 'right' : run.agent === 'codex' ? 'left' : 'system';
   const running = run.status === 'running';
 
   return (
-    <div className={`relay__node relay__node--${side === 'system' ? 'left relay__node--system' : side}`}>
-      <div className="relay__marker">
-        <span className={`relay__dot relay__dot--${tone}${running ? ' relay__dot--running' : ''}`} />
-      </div>
+    <div className={`relay__node relay__node--${tone}`}>
+      <button type="button" className="relay__head" onClick={onToggle} aria-expanded={open}>
+        <span
+          className={`relay__dot relay__dot--${tone}${running ? ' relay__dot--running' : ''}`}
+          style={{ width: 9, height: 9 }}
+          aria-hidden="true"
+        />
+        <span className={`relay__chevron${open ? ' relay__chevron--open' : ''}`} aria-hidden="true">
+          ▶
+        </span>
+        <span className={`tag tag--${tone}`}>{AGENT_LABELS[run.agent]}</span>
+        <span className="relay__label">{RUN_LABELS[run.runType]}</span>
+        {run.round > 0 ? <span className="tag">round {run.round}</span> : null}
+        <RunStatusTag run={run} />
+        <VerificationTag run={run} />
+        <span className="relay__time">{formatDuration(run.startedAt, run.finishedAt)}</span>
+      </button>
 
-      <div className="relay__card">
-        <button type="button" className="relay__head" onClick={onToggle} aria-expanded={open}>
-          <span className={`relay__chevron${open ? ' relay__chevron--open' : ''}`}>▶</span>
-          <span className={`tag tag--${tone}`}>{AGENT_LABELS[run.agent]}</span>
-          <span className="relay__label">{RUN_LABELS[run.runType]}</span>
-          {run.round > 0 ? <span className="tag">round {run.round}</span> : null}
-          <RunStatusTag run={run} />
-          <VerificationTag run={run} />
-          <span className="relay__time">{formatDuration(run.startedAt, run.finishedAt)}</span>
-        </button>
-
-        {open ? <RelayNodeBody run={run} /> : null}
-      </div>
+      {open ? <RelayNodeBody run={run} /> : null}
     </div>
   );
 }
@@ -138,12 +139,14 @@ function VerificationTag({ run }: { run: Run }): React.JSX.Element | null {
   if (!result.ok) return null;
 
   const status: ClaudeVerificationStatus = result.assessment.verificationStatus;
-  const tone =
-    status === 'passed' ? 'ok' : status === 'failed' ? 'danger' : 'warn';
+  // Agent-side verification runs inside the provider sandbox and is diagnostic.
+  // Relay's separate snapshot verification is authoritative, so an unavailable
+  // or failed provider check is a warning here rather than a failed run.
+  const tone = status === 'passed' ? 'ok' : 'warn';
 
   return (
     <span className={`tag tag--${tone}`} title={result.assessment.reasonCodes.join(', ')}>
-      verification {status.replace(/_/g, ' ')}
+      provider verification {status.replace(/_/g, ' ')}
     </span>
   );
 }
@@ -214,6 +217,7 @@ function WarningLine({
 function RelayNodeBody({ run }: { run: Run }): React.JSX.Element {
   const { liveEvents } = useStore();
   const [stored, setStored] = useState<RunEvent[] | null>(null);
+  const [logExpanded, setLogExpanded] = useState(false);
   const logRef = useRef<HTMLDivElement | null>(null);
 
   // Stored history is fetched once per run. State is only written after the
@@ -249,39 +253,90 @@ function RelayNodeBody({ run }: { run: Run }): React.JSX.Element {
 
   return (
     <div className="relay__body">
-      {run.runType === 'verification' ? <VerificationSummary run={run} /> : null}
-      {run.finalMessage ? (
-        <div className="relay__final selectable">{run.finalMessage}</div>
+      {run.runType === 'verification' ? (
+        <RelayBodySection title="Verification evidence">
+          <VerificationSummary run={run} />
+        </RelayBodySection>
       ) : null}
 
-      {run.errorMessage ? <div className="relay__error selectable">{run.errorMessage}</div> : null}
+      {run.finalMessage ? (
+        <RelayBodySection title="Outcome">
+          <div className="relay__final selectable">{run.finalMessage}</div>
+        </RelayBodySection>
+      ) : null}
 
-      {loading && events.length === 0 ? (
-        <div style={{ padding: '10px 13px' }} className="faint">
-          Loading events…
-        </div>
-      ) : events.length === 0 ? (
-        <div style={{ padding: '10px 13px' }} className="faint">
-          No events were recorded for this run.
-        </div>
-      ) : (
-        <div className="logs" ref={logRef}>
-          {events.map((event) => {
-            const decoded = decodeEvent(event);
-            return (
-              <div key={event.id} className={`logs__line logs__line--${event.type}`}>
-                <span className="logs__time">{formatTime(event.timestamp)}</span>
-                <span className="logs__type">{event.type.replace(/_/g, ' ')}</span>
-                {event.type === 'warning' ? (
-                  <WarningLine text={decoded.text} data={decoded.data} />
-                ) : (
-                  <span className="logs__text selectable">{decoded.text}</span>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
+      {run.errorMessage ? (
+        <RelayBodySection title="Error">
+          <div className="relay__error selectable">{run.errorMessage}</div>
+        </RelayBodySection>
+      ) : null}
+
+      <RelayBodySection
+        title={`Events${events.length > 0 ? ` (${events.length})` : ''}`}
+        actions={
+          events.length > 0 ? (
+            <button
+              type="button"
+              className="btn btn--sm btn--ghost"
+              aria-expanded={logExpanded}
+              onClick={() => setLogExpanded((current) => !current)}
+            >
+              {logExpanded ? 'Collapse event log' : 'Show full event log'}
+            </button>
+          ) : null
+        }
+      >
+        {loading && events.length === 0 ? (
+          <div className="faint">Loading events…</div>
+        ) : events.length === 0 ? (
+          <div className="faint">No events were recorded for this run.</div>
+        ) : (
+          <div className={`logs${logExpanded ? ' logs--full' : ''}`} ref={logRef}>
+            {events.map((event) => {
+              const decoded = decodeEvent(event);
+              return (
+                <div key={event.id} className={`logs__line logs__line--${event.type}`}>
+                  <span className="logs__meta">
+                    <span className="logs__time">{formatTime(event.timestamp)}</span>
+                    <span className="logs__type">{event.type.replace(/_/g, ' ')}</span>
+                  </span>
+                  {event.type === 'warning' ? (
+                    <WarningLine text={decoded.text} data={decoded.data} />
+                  ) : (
+                    <span className="logs__text selectable">{decoded.text}</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </RelayBodySection>
+    </div>
+  );
+}
+
+/**
+ * One labelled subsection of an expanded run: Verification evidence, Outcome,
+ * Error or Events, each visually distinct rather than blended into one block.
+ * `actions` sits beside the title — used by Events for its "Show full event
+ * log" disclosure.
+ */
+function RelayBodySection({
+  title,
+  actions,
+  children
+}: {
+  title: string;
+  actions?: React.ReactNode;
+  children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <div className="relay__section">
+      <div className="relay__section-head">
+        <div className="section-title">{title}</div>
+        {actions}
+      </div>
+      {children}
     </div>
   );
 }

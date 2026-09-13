@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import type { ToolStatus } from '@shared/domain/diagnostics';
 import type { RunAgent } from '@shared/domain/models';
 import { STATUS_LABELS, type TaskStatus } from '@shared/domain/workflow';
@@ -95,26 +95,52 @@ export function Scope({ kind }: { kind: 'read' | 'local' | 'remote' }): React.JS
   return <span className={`btn__scope btn__scope--${kind}`} />;
 }
 
+/**
+ * `collapsible` turns the title into a disclosure button (aria-expanded,
+ * native Enter/Space handling) and hides the body while closed. The chevron
+ * is decorative — `aria-expanded` on the button is what a screen reader
+ * actually hears, so the glyph itself is `aria-hidden`.
+ */
 export function Card({
   title,
   actions,
   flush,
+  collapsible = false,
+  defaultOpen = true,
   children
 }: {
   title?: string;
   actions?: ReactNode;
   flush?: boolean;
+  collapsible?: boolean;
+  defaultOpen?: boolean;
   children: ReactNode;
 }): React.JSX.Element {
+  const [open, setOpen] = useState(defaultOpen);
+  const showBody = !collapsible || open;
   return (
     <section className="card">
       {title ? (
         <header className="card__head">
-          <span className="card__title">{title}</span>
+          {collapsible ? (
+            <button
+              type="button"
+              className="card__toggle"
+              aria-expanded={open}
+              onClick={() => setOpen((current) => !current)}
+            >
+              <span className={`card__chevron${open ? ' card__chevron--open' : ''}`} aria-hidden="true">
+                ▶
+              </span>
+              <span className="card__title">{title}</span>
+            </button>
+          ) : (
+            <span className="card__title">{title}</span>
+          )}
           {actions ? <div className="card__actions">{actions}</div> : null}
         </header>
       ) : null}
-      <div className={flush ? 'card__body card__body--flush' : 'card__body'}>{children}</div>
+      {showBody ? <div className={flush ? 'card__body card__body--flush' : 'card__body'}>{children}</div> : null}
     </section>
   );
 }
