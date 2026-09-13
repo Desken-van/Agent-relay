@@ -2,9 +2,10 @@
  * Safe linked continuations.
  *
  * A continuation is what "Continue in a new run" creates once a task has
- * closed FAILED because its final successful review requested changes at an
- * exhausted round budget. It is a new Task that reuses the closed task's
- * worktree, branch, base branch, approved specification and provider
+ * closed REVIEW_LIMIT_REACHED (its final successful review requested changes
+ * at an exhausted round budget) or REVIEW_BLOCKED (a successful review found
+ * the approach itself needs rework). It is a new Task that reuses the closed
+ * task's worktree, branch, base branch, approved specification and provider
  * context, with a fresh bounded review budget — never a mutation of the
  * closed task itself.
  *
@@ -14,10 +15,11 @@
  *    database claim, then by the continuation relationship's UNIQUE keys.
  *    The claim is process-wide (all application instances using the database
  *    see it) and survives a renderer timeout or main-process crash.
- *  * **Exactly one non-terminal task per worktree.** The source stays FAILED
- *    (terminal) and keeps its own `worktree_path`; the continuation is the
- *    only *non-terminal* task now pointing at that path, which is exactly
- *    what the partial unique index on `tasks.worktree_path` allows. Nothing
+ *  * **Exactly one non-terminal task per worktree.** The source stays
+ *    REVIEW_LIMIT_REACHED or REVIEW_BLOCKED (terminal) and keeps its own
+ *    `worktree_path`; the continuation is the only *non-terminal* task now
+ *    pointing at that path, which is exactly what the partial unique index
+ *    on `tasks.worktree_path` allows. Nothing
  *  * **Validation-to-dispatch lease.** The durable claim owns the canonical
  *    worktree path from the first eligibility read until the continuation's
  *    first action has revalidated identity and durably entered its busy state.
@@ -100,7 +102,7 @@ export function reconcileContinuationClaims(deps: {
         claim.state === 'awaiting_first_action' &&
         link?.continuationTaskId === claim.continuationTaskId &&
         continuation !== null &&
-        !['COMPLETED', 'FAILED', 'CANCELLED'].includes(continuation.status);
+        !['COMPLETED', 'REVIEW_LIMIT_REACHED', 'REVIEW_BLOCKED', 'FAILED', 'CANCELLED'].includes(continuation.status);
       if (!validBoundClaim) {
         deps.continuations.deleteClaim(claim.sourceTaskId);
         removed += 1;
@@ -269,31 +271,50 @@ export class ContinuationService {
    * continuation past a check that was true only when it was first read.
    */
   private assertEligible(task: Task): void {
-    if (task.status !== 'FAILED') {
+    // REVIEW_LIMIT_REACHED and REVIEW_BLOCKED are the two durable outcomes this
+    // service continues from; FAILED is kept as a legacy fallback so a historical
+    // row a migration has not (or could not) reclassify is still judged on its
+    // actual evidence below rather than rejected on status alone.
+    if (task.status !== 'REVIEW_LIMIT_REACHED' && task.status !== 'REVIEW_BLOCKED' && task.status !== 'FAILED') {
       throw new AgentRelayError(
         'INVALID_TRANSITION',
-        'Only a closed, failed task can be continued.'
+        'Only a task stopped at its review limit or blocked by review can be continued.'
       );
     }
     if (this.deps.isSourceBusy(task.id) || this.deps.runs.listByTask(task.id).some((run) => run.status === 'running')) {
       throw new AgentRelayError('BUSY', 'This task still has an operation in flight.');
     }
-    if (task.currentRound < task.maxRounds) {
-      throw new AgentRelayError(
-        'VALIDATION_FAILED',
-        'This task did not stop because its review round budget was exhausted.'
-      );
-    }
+
     const review = parseJson(task.lastReviewJson, codexReviewResultSchema);
     const reviewRun = this.deps.runs.findLatestByType(task.id, 'review');
     const durableReview = reviewRun?.status === 'succeeded'
       ? parseJson(reviewRun.structuredResult, codexReviewResultSchema)
       : null;
-    if (!review || review.verdict !== 'changes_requested' || durableReview?.verdict !== 'changes_requested') {
-      throw new AgentRelayError(
-        'VALIDATION_FAILED',
-        'This task did not stop on a review that requested changes.'
-      );
+
+    // Which validation applies is decided by the review's own verdict, not by
+    // which terminal status the task happens to carry: a blocked verdict is
+    // terminal at any round, while a changes-requested verdict is only a valid
+    // continuation source once the round budget is exhausted.
+    if (review?.verdict === 'blocked') {
+      if (durableReview?.verdict !== 'blocked') {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'This task did not stop on a review that blocked the approach.'
+        );
+      }
+    } else {
+      if (task.currentRound < task.maxRounds) {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'This task did not stop because its review round budget was exhausted.'
+        );
+      }
+      if (!review || review.verdict !== 'changes_requested' || durableReview?.verdict !== 'changes_requested') {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'This task did not stop on a review that requested changes.'
+        );
+      }
     }
     if (!task.specificationApprovedAt || !parseJson(task.specificationJson, taskSpecificationSchema)) {
       throw new AgentRelayError(
@@ -356,12 +377,15 @@ export class ContinuationService {
     }
 
     // Eligibility above already established that the source's last review
-    // requested changes; with verification still current for the same
-    // worktree, that review still describes it, so corrections apply.
+    // either requested changes or blocked the approach; either way it left a
+    // followUpPrompt meant for the implementing agent (empty only when
+    // approved, per the review schema), and with verification still current
+    // for the same worktree that review still describes it, so corrections
+    // apply.
     const review = parseJson(source.lastReviewJson, codexReviewResultSchema);
     const reviewStillApplies = Boolean(
       review &&
-      review.verdict === 'changes_requested' &&
+      (review.verdict === 'changes_requested' || review.verdict === 'blocked') &&
       reviewRun?.status === 'succeeded' &&
       (!verificationRun?.finishedAt || !reviewRun.finishedAt || reviewRun.finishedAt >= verificationRun.finishedAt)
     );

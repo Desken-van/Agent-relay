@@ -23,4 +23,20 @@ describe('run flow overview', () => {
     expect(screen.getByText('Run review · Codex')).toBeTruthy();
     expect(screen.getByText('Review').closest('li')?.getAttribute('aria-current')).toBe('step');
   });
+
+  it('renders a review-blocked outcome with a warning tone, never an error tone', () => {
+    const { container } = render(<RunFlowOverview guidance={{
+      happened: 'The review completed and found that the approach itself needs rework.',
+      stage: 'Review blocked',
+      result: 'Wrong approach.',
+      next: 'Continue in a new run',
+      action: { key: 'continue_in_new_run', label: 'Continue in a new run', enabled: true, disabledReason: null },
+      activeStep: 3, tone: 'warning'
+    }} />);
+
+    expect(container.querySelector('.run-guide--warning')).toBeTruthy();
+    expect(container.querySelector('.run-guide--error')).toBeFalsy();
+    expect(screen.getByText('Wrong approach.')).toBeTruthy();
+    expect(screen.getByText('Continue in a new run')).toBeTruthy();
+  });
 });

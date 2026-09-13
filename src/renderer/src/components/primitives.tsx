@@ -21,6 +21,8 @@ const STATUS_CLASS: Record<TaskStatus, string> = {
   READY_TO_PUBLISH: 'publish',
   PUBLISHING: 'publish',
   COMPLETED: 'done',
+  REVIEW_LIMIT_REACHED: 'changes',
+  REVIEW_BLOCKED: 'changes',
   FAILED: 'failed',
   CANCELLED: 'cancelled'
 };

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closeDatabase, openDatabase, type Db } from '../../src/main/db/database';
 import { MIGRATIONS, runMigrations } from '../../src/main/db/migrations';
+import { createSqliteDatabase } from '../../src/main/db/sqlite';
 import { SqliteApprovalRepository } from '../../src/main/db/repositories/approval-repository';
 import { SqliteProjectRepository } from '../../src/main/db/repositories/project-repository';
 import { SqliteRunEventRepository } from '../../src/main/db/repositories/run-event-repository';
@@ -83,6 +84,129 @@ describe('migrations', () => {
       version: number;
     }[];
     expect(rows.map((r) => r.version)).toEqual(MIGRATIONS.map((m) => m.version));
+  });
+
+  it('reclassifies only proven review-limit stops and releases their worktree for continuation', () => {
+    const legacy = createSqliteDatabase(':memory:');
+    try {
+      legacy.exec(`CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
+      )`);
+      for (const migration of MIGRATIONS.filter((entry) => entry.version < 12)) {
+        migration.up(legacy);
+        legacy.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
+          .run(migration.version, migration.name, '2026-09-13T00:00:00.000Z');
+      }
+
+      const legacyClock = new FixedClock();
+      const projects = new SqliteProjectRepository(legacy, legacyClock);
+      const tasks = new SqliteTaskRepository(legacy, legacyClock);
+      const runs = new SqliteRunRepository(legacy);
+      const projectId = seedProject(projects);
+      const review = { verdict: 'changes_requested', summary: 'More work', findings: [], followUpPrompt: 'Fix it' };
+      const stopped = tasks.create({
+        id: 'review-limit-source', projectId, title: 'Stopped review', originalRequest: 'Work',
+        status: 'FAILED', currentRound: 3, maxRounds: 3, codexThreadId: null,
+        claudeSessionId: null, worktreePath: 'C:\\worktrees\\shared', branchName: 'agent/review',
+        baseBranch: 'main', specificationJson: null, specificationApprovedAt: null,
+        lastReviewJson: JSON.stringify(review), lastError: 'Review round limit reached (3/3).',
+        codexModel: null, claudeModel: null
+      });
+      runs.create({ id: 'review-run', taskId: stopped.id, agent: 'codex', runType: 'review', status: 'running', round: 3, startedAt: legacyClock.nowIso() });
+      runs.finish('review-run', { status: 'succeeded', finishedAt: legacyClock.nowIso(), structuredResult: JSON.stringify(review) });
+      const genuineFailure = tasks.create({
+        id: 'genuine-failure', projectId, title: 'Failed process', originalRequest: 'Work',
+        status: 'FAILED', currentRound: 1, maxRounds: 3, codexThreadId: null,
+        claudeSessionId: null, worktreePath: 'C:\\worktrees\\failed', branchName: 'agent/failed',
+        baseBranch: 'main', specificationJson: null, specificationApprovedAt: null,
+        lastReviewJson: null, lastError: 'Process exited with code 1.', codexModel: null, claudeModel: null
+      });
+
+      // Migrations 12 (this test's own subject) and 13 (review-blocked-status)
+      // are both still pending from this starting point.
+      expect(runMigrations(legacy)).toBe(2);
+      expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_LIMIT_REACHED');
+      expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');
+      expect(() => tasks.create({
+        id: 'continuation-owner', projectId, title: 'Continuation', originalRequest: 'Work',
+        status: 'CHANGES_REQUESTED', currentRound: 0, maxRounds: 3, codexThreadId: null,
+        claudeSessionId: null, worktreePath: stopped.worktreePath, branchName: stopped.branchName,
+        baseBranch: stopped.baseBranch, specificationJson: null, specificationApprovedAt: null,
+        lastReviewJson: JSON.stringify(review), lastError: null, codexModel: null, claudeModel: null
+      })).not.toThrow();
+    } finally {
+      legacy.close();
+    }
+  });
+
+  it('reclassifies only proven review-blocked stops, leaving stale or unrelated evidence untouched', () => {
+    const legacy = createSqliteDatabase(':memory:');
+    try {
+      legacy.exec(`CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
+      )`);
+      for (const migration of MIGRATIONS.filter((entry) => entry.version < 13)) {
+        migration.up(legacy);
+        legacy.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
+          .run(migration.version, migration.name, '2026-09-13T00:00:00.000Z');
+      }
+
+      const legacyClock = new FixedClock();
+      const projects = new SqliteProjectRepository(legacy, legacyClock);
+      const tasks = new SqliteTaskRepository(legacy, legacyClock);
+      const runs = new SqliteRunRepository(legacy);
+      const projectId = seedProject(projects);
+      const blocked = { verdict: 'blocked', summary: 'Wrong approach.', findings: [], followUpPrompt: 'Rework it.' };
+
+      const stopped = tasks.create({
+        id: 'review-blocked-source', projectId, title: 'Blocked review', originalRequest: 'Work',
+        status: 'FAILED', currentRound: 1, maxRounds: 3, codexThreadId: null,
+        claudeSessionId: null, worktreePath: 'C:\\worktrees\\shared-blocked', branchName: 'agent/blocked',
+        baseBranch: 'main', specificationJson: null, specificationApprovedAt: null,
+        lastReviewJson: JSON.stringify(blocked), lastError: 'Wrong approach.',
+        codexModel: null, claudeModel: null
+      });
+      runs.create({ id: 'blocked-review-run', taskId: stopped.id, agent: 'codex', runType: 'review', status: 'running', round: 1, startedAt: legacyClock.nowIso() });
+      runs.finish('blocked-review-run', { status: 'succeeded', finishedAt: legacyClock.nowIso(), structuredResult: JSON.stringify(blocked) });
+
+      // Task JSON claims 'blocked', but the task's own succeeded review run
+      // disagrees (stale/mismatched evidence) — must stay FAILED.
+      const staleEvidence = tasks.create({
+        id: 'stale-blocked-claim', projectId, title: 'Stale claim', originalRequest: 'Work',
+        status: 'FAILED', currentRound: 1, maxRounds: 3, codexThreadId: null,
+        claudeSessionId: null, worktreePath: 'C:\\worktrees\\stale-blocked', branchName: 'agent/stale-blocked',
+        baseBranch: 'main', specificationJson: null, specificationApprovedAt: null,
+        lastReviewJson: JSON.stringify(blocked), lastError: 'Publish failed unexpectedly.',
+        codexModel: null, claudeModel: null
+      });
+      runs.create({ id: 'stale-review-run', taskId: staleEvidence.id, agent: 'codex', runType: 'review', status: 'succeeded', round: 1, startedAt: legacyClock.nowIso() });
+      runs.finish('stale-review-run', {
+        status: 'succeeded', finishedAt: legacyClock.nowIso(),
+        structuredResult: JSON.stringify({ ...blocked, verdict: 'changes_requested' })
+      });
+
+      const genuineFailure = tasks.create({
+        id: 'genuine-failure-blocked', projectId, title: 'Failed process', originalRequest: 'Work',
+        status: 'FAILED', currentRound: 1, maxRounds: 3, codexThreadId: null,
+        claudeSessionId: null, worktreePath: 'C:\\worktrees\\failed-blocked', branchName: 'agent/failed-blocked',
+        baseBranch: 'main', specificationJson: null, specificationApprovedAt: null,
+        lastReviewJson: null, lastError: 'Process exited with code 1.', codexModel: null, claudeModel: null
+      });
+
+      expect(runMigrations(legacy)).toBe(1);
+      expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_BLOCKED');
+      expect(tasks.findById(staleEvidence.id)?.status).toBe('FAILED');
+      expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');
+      expect(() => tasks.create({
+        id: 'continuation-owner-blocked', projectId, title: 'Continuation', originalRequest: 'Work',
+        status: 'CHANGES_REQUESTED', currentRound: 0, maxRounds: 3, codexThreadId: null,
+        claudeSessionId: null, worktreePath: stopped.worktreePath, branchName: stopped.branchName,
+        baseBranch: stopped.baseBranch, specificationJson: null, specificationApprovedAt: null,
+        lastReviewJson: JSON.stringify(blocked), lastError: null, codexModel: null, claudeModel: null
+      })).not.toThrow();
+    } finally {
+      legacy.close();
+    }
   });
 
   it('enables foreign keys', () => {

@@ -138,7 +138,7 @@ export class SqliteTaskRepository implements TaskRepository {
         `SELECT id, worktree_path
            FROM tasks
           WHERE worktree_path IS NOT NULL
-            AND status NOT IN ('COMPLETED','FAILED','CANCELLED')`
+            AND status NOT IN ('COMPLETED','REVIEW_LIMIT_REACHED','REVIEW_BLOCKED','FAILED','CANCELLED')`
       )
       .all() as { id: string; worktree_path: string }[];
     return rows.map((row) => ({ taskId: row.id, worktreePath: row.worktree_path }));

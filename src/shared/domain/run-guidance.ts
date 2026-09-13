@@ -67,10 +67,10 @@ export interface RunGuidance {
 export interface RunGuidanceExtra {
   /**
    * Verdict of `task.lastReviewJson`, precomputed by the caller so this module
-   * stays free of JSON parsing. Only consulted for a FAILED task.
+   * stays free of JSON parsing. Consulted for review-limit and legacy FAILED tasks.
    */
   readonly lastReviewVerdict?: 'approved' | 'changes_requested' | 'blocked' | null;
-  /** Set once a continuation already exists for this (FAILED) task. */
+  /** Set once a continuation already exists for this closed task. */
   readonly continuationTaskId?: string | null;
   readonly continuationCreationStatus?: 'creating' | 'ready' | null;
   /**
@@ -467,6 +467,72 @@ export function runGuidance(
         activeStep: 5,
         tone: 'success'
       });
+    case 'REVIEW_LIMIT_REACHED': {
+      const happened = 'The bounded review cycle ended with changes still requested.';
+      const stage = 'Review limit reached';
+      const result = stoppedResult(task, runs);
+      const activeStep = 3;
+
+      if (extra.continuationTaskId) {
+        return waiting({
+          happened, stage, result,
+          next: 'This review cycle is closed. Open the linked continuation to keep working.',
+          activeStep, tone: 'warning'
+        });
+      }
+
+      if (extra.continuationCreationStatus === 'creating') {
+        return acting({
+          happened, stage, result,
+          action: action(
+            'continue_in_new_run',
+            'Continue in a new run',
+            false,
+            'Continuation creation is already in progress.'
+          ),
+          activeStep, tone: 'warning'
+        });
+      }
+
+      return acting({
+        happened, stage, result,
+        action: action('continue_in_new_run', 'Continue in a new run'),
+        activeStep, tone: 'warning'
+      });
+    }
+    case 'REVIEW_BLOCKED': {
+      const happened = 'The review completed and found that the approach itself needs rework.';
+      const stage = 'Review blocked';
+      const result = stoppedResult(task, runs);
+      const activeStep = 3;
+
+      if (extra.continuationTaskId) {
+        return waiting({
+          happened, stage, result,
+          next: 'This review is closed. Open the linked continuation to keep working.',
+          activeStep, tone: 'warning'
+        });
+      }
+
+      if (extra.continuationCreationStatus === 'creating') {
+        return acting({
+          happened, stage, result,
+          action: action(
+            'continue_in_new_run',
+            'Continue in a new run',
+            false,
+            'Continuation creation is already in progress.'
+          ),
+          activeStep, tone: 'warning'
+        });
+      }
+
+      return acting({
+        happened, stage, result,
+        action: action('continue_in_new_run', 'Continue in a new run'),
+        activeStep, tone: 'warning'
+      });
+    }
     case 'FAILED': {
       const happened = latestRun(runs)?.runType === 'review'
         ? 'The workflow stopped after the final review did not approve the changes.'

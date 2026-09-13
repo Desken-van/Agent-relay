@@ -101,7 +101,7 @@ describe('workflow state machine', () => {
     });
 
     it('makes terminal states genuinely terminal', () => {
-      for (const status of ['COMPLETED', 'FAILED', 'CANCELLED'] as const) {
+      for (const status of ['COMPLETED', 'REVIEW_LIMIT_REACHED', 'REVIEW_BLOCKED', 'FAILED', 'CANCELLED'] as const) {
         expect(isTerminal(status)).toBe(true);
         expect(allowedEvents(status)).toHaveLength(0);
         for (const event of WORKFLOW_EVENTS) {
@@ -150,6 +150,16 @@ describe('workflow state machine', () => {
       expect(transition('IMPLEMENTING', 'correction_aborted')).toBe('CHANGES_REQUESTED');
       expect(transition('REVIEWING', 'review_aborted')).toBe('READY_FOR_REVIEW');
       expect(transition('PUBLISHING', 'publish_aborted')).toBe('READY_TO_PUBLISH');
+    });
+  });
+
+  describe('a blocked verdict is a successful outcome, never a technical failure', () => {
+    it('sends review_blocked to REVIEW_BLOCKED, not FAILED', () => {
+      expect(transition('REVIEWING', 'review_blocked')).toBe('REVIEW_BLOCKED');
+    });
+
+    it('keeps review_failed — the review process itself throwing — on FAILED', () => {
+      expect(transition('REVIEWING', 'review_failed')).toBe('FAILED');
     });
   });
 
