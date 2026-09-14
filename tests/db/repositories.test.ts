@@ -122,9 +122,9 @@ describe('migrations', () => {
         lastReviewJson: null, lastError: 'Process exited with code 1.', codexModel: null, claudeModel: null
       });
 
-      // Migrations 12 (Ornith), 13 (this test's review-limit subject), and
-      // 14 (review-blocked-status) are still pending from this starting point.
-      expect(runMigrations(legacy)).toBe(3);
+      // Migrations 12 (Ornith), 13 (this test's review-limit subject),
+      // 14 (review-blocked-status), and 15 (compatibility repair) are pending.
+      expect(runMigrations(legacy)).toBe(4);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_LIMIT_REACHED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');
       expect(() => tasks.create({
@@ -193,9 +193,9 @@ describe('migrations', () => {
         lastReviewJson: null, lastError: 'Process exited with code 1.', codexModel: null, claudeModel: null
       });
 
-      // Migrations 13 (review-limit-status) and 14 (this test's
-      // review-blocked subject) are still pending from this starting point.
-      expect(runMigrations(legacy)).toBe(2);
+      // Migrations 13 (review-limit-status), 14 (this test's review-blocked
+      // subject), and 15 (compatibility repair) are still pending.
+      expect(runMigrations(legacy)).toBe(3);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_BLOCKED');
       expect(tasks.findById(staleEvidence.id)?.status).toBe('FAILED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');

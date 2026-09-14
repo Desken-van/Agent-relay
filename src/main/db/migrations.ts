@@ -909,6 +909,79 @@ export const MIGRATIONS: readonly Migration[] = [
             AND status NOT IN ('COMPLETED','REVIEW_LIMIT_REACHED','REVIEW_BLOCKED','FAILED','CANCELLED');
       `);
     }
+  },
+  {
+    version: 15,
+    name: 'ornith-provider-version-collision-repair',
+    up(db) {
+      // A short-lived development branch shipped review-limit-status as v12
+      // and review-blocked-status as v13. Profiles opened by that branch can
+      // therefore already contain versions 12 and 13 while still carrying the
+      // old provider CHECK constraints. The canonical sequence assigns v12 to
+      // Ornith, so version-only migration bookkeeping skips the required
+      // rebuild on exactly those profiles.
+      //
+      // Check the durable schema, not the historical label. Fresh/canonical
+      // databases already support Ornith and take the no-op path. Affected
+      // profiles replay the exact v12 rebuild inside this migration's own
+      // transaction. Review terminal statuses are temporarily represented as
+      // FAILED because the original v12 index predates those statuses; their
+      // exact values are restored only after the final terminal-aware index is
+      // in place.
+      const providerTables = ['tasks', 'runs', 'task_provider_changes'] as const;
+      const schemaSupportsOrnith = providerTables.every((table) => {
+        const row = db
+          .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+          .get(table) as { sql: string | null } | undefined;
+        return row?.sql?.includes("'ornith'") === true;
+      });
+      if (schemaSupportsOrnith) return;
+
+      db.exec(`
+        CREATE TEMP TABLE ornith_repair_terminal_statuses (
+          task_id TEXT PRIMARY KEY,
+          status  TEXT NOT NULL
+        );
+        INSERT INTO ornith_repair_terminal_statuses (task_id, status)
+        SELECT id, status
+        FROM tasks
+        WHERE status IN ('REVIEW_LIMIT_REACHED','REVIEW_BLOCKED');
+        UPDATE tasks
+        SET status = 'FAILED'
+        WHERE id IN (SELECT task_id FROM ornith_repair_terminal_statuses);
+      `);
+
+      const canonicalOrnithMigration = MIGRATIONS.find((migration) => migration.version === 12);
+      if (!canonicalOrnithMigration || canonicalOrnithMigration.name !== 'ornith-provider') {
+        throw new Error('Canonical migration 12 (ornith-provider) is unavailable.');
+      }
+      canonicalOrnithMigration.up(db);
+
+      db.exec(`
+        DROP INDEX IF EXISTS idx_tasks_worktree_active;
+        CREATE UNIQUE INDEX idx_tasks_worktree_active
+          ON tasks(worktree_path)
+          WHERE worktree_path IS NOT NULL
+            AND status NOT IN ('COMPLETED','REVIEW_LIMIT_REACHED','REVIEW_BLOCKED','FAILED','CANCELLED');
+
+        UPDATE tasks
+        SET status = (
+          SELECT saved.status
+          FROM ornith_repair_terminal_statuses AS saved
+          WHERE saved.task_id = tasks.id
+        )
+        WHERE id IN (SELECT task_id FROM ornith_repair_terminal_statuses);
+
+        DROP TABLE ornith_repair_terminal_statuses;
+      `);
+
+      const violations = db.prepare('PRAGMA foreign_key_check').all();
+      if (violations.length > 0) {
+        throw new Error(
+          `Migration 15 (ornith-provider-version-collision-repair) left ${violations.length} dangling foreign key reference(s).`
+        );
+      }
+    }
   }
 ];
 
