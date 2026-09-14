@@ -47,6 +47,9 @@ export const ORNITH_LIMITS = {
   maxPromptBytes: 512 * 1024,
   maxCompletionBytes: 512 * 1024,
   maxToolResultBytes: 64 * 1024,
+  /** Reserve room for the chat template/BOS and keep one action concise. */
+  contextSafetyTokens: 512,
+  maxTurnOutputTokens: 1_024,
 
   /** Cumulative repository I/O for the whole run. */
   maxCumulativeReadBytes: 4 * 1024 * 1024,

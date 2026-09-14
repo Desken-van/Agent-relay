@@ -426,6 +426,12 @@ What Ornith adds, precisely:
   an overall loop deadline of `min(settings.processTimeoutMs, 30 minutes)`.
   None of this is renderer-configurable, and nothing a completion contains
   can widen any of it.
+- The execution lease captures the retained runtime's exact context and output
+  limits. Before a worktree or round is created, Relay reserves template and
+  completion space and proves the immutable prompt fits using a conservative
+  one-UTF-8-byte-per-token ceiling. Large read results are paged to the
+  remaining prompt budget. An undersized context therefore produces a clear
+  Settings remediation without dispatching inference or consuming a round.
 - **No conversation is retained.** Every request is a complete, stateless
   chat-completion request: the full approved specification, any accepted
   plan-review addenda, and the bound rule evidence travel on *every* turn
@@ -453,8 +459,10 @@ has the no-publish acceptance path using a real Ornith/llama.cpp model.
   cache, Context Pack, repository indexing/RAG, patching, retries, fallback
   models, or workflow wiring. A non-completed test inference is never retried
   automatically.
-- Prompt bytes are bounded, but there is no tokenizer-based preflight prompt
-  token count.
+- There is no model-specific tokenizer in the trusted host process. Ornith
+  instead uses a deliberately conservative byte-to-token upper bound, so some
+  prompts that a particular tokenizer could fit may require a larger configured
+  context window.
 - Runtime usage fields are optional and are returned as `null` when absent.
 - One provider manages one process and one inference at a time; the manual
   test action and every Ornith task round share that same

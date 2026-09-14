@@ -49,6 +49,8 @@ function fakeLease(overrides: Partial<OrnithHealthyLease> = {}): OrnithHealthyLe
     runtimeInstanceId: 'runtime-1',
     providerId: 'local-llama-cpp',
     modelId: 'test-model',
+    contextLimitTokens: 32_768,
+    maxOutputTokens: 1_024,
     release: () => undefined,
     onIndependentStop: () => undefined,
     ...overrides
@@ -81,6 +83,28 @@ function passingResult(finalMessage = 'Ornith finished.'): OrnithImplementationR
       denials: []
     },
     ornithAudit: { turns: 1, actions: 1, readBytes: 0, writeBytes: 0, changedFiles: 1, verifications: 0, outcomes: [] }
+  };
+}
+
+function providerFailureResult(): OrnithImplementationResult {
+  return {
+    sessionId: null,
+    finalMessage: 'The local runtime failed (rejected): The runtime rejected the inference request with HTTP 500.',
+    assessment: {
+      version: CLAUDE_ASSESSMENT_VERSION,
+      disposition: 'fail',
+      verificationStatus: 'not_run',
+      publishBlock: 'configuration',
+      reasonCodes: ['runtime_unavailable'],
+      verification: null,
+      denials: []
+    },
+    providerFailure: {
+      kind: 'failed',
+      reason: 'The runtime rejected the inference request with HTTP 500.',
+      dispatchOutcome: 'rejected'
+    },
+    ornithAudit: { turns: 1, actions: 0, readBytes: 0, writeBytes: 0, changedFiles: 0, verifications: 0, outcomes: [] }
   };
 }
 
@@ -238,5 +262,89 @@ describe('Orchestrator: Ornith provider routing', () => {
     expect(after?.status).toBe('READY_FOR_IMPLEMENTATION');
     expect(after?.worktreePath).toBeNull();
     expect(after?.currentRound).toBe(0);
+  });
+
+  it('refuses an undersized retained context before creating a worktree or consuming a round', async () => {
+    const ornith = fakeOrnithService(async () => passingResult());
+    const ornithLease = healthyLeaseService({
+      acquireOrnithLease: async () => fakeLease({
+        contextLimitTokens: 1_024,
+        maxOutputTokens: 1_024
+      })
+    });
+    harness = createHarness({ ornith, ornithLease, processRunner: unusedProcessRunner });
+
+    const project = harness.createProject();
+    const task = harness.createTask(project.id, { implementationProvider: 'ornith' });
+    await harness.orchestrator.generateSpecification(task.id);
+    harness.orchestrator.approveSpecification(task.id);
+
+    await expect(harness.orchestrator.sendToClaude(task.id)).rejects.toMatchObject({
+      code: 'VALIDATION_FAILED'
+    });
+
+    expect(ornith.implement).not.toHaveBeenCalled();
+    expect(harness.git.createdWorktrees).toHaveLength(0);
+    expect(harness.tasks.findById(task.id)).toMatchObject({
+      status: 'READY_FOR_IMPLEMENTATION',
+      currentRound: 0,
+      worktreePath: null
+    });
+  });
+
+  it('does not consume a round or claim files were saved when Ornith fails before mutating', async () => {
+    const ornith = fakeOrnithService(async () => providerFailureResult());
+    harness = createHarness({
+      ornith,
+      ornithLease: healthyLeaseService(),
+      processRunner: unusedProcessRunner
+    });
+
+    const project = harness.createProject();
+    const task = harness.createTask(project.id, { implementationProvider: 'ornith' });
+    await harness.orchestrator.generateSpecification(task.id);
+    harness.orchestrator.approveSpecification(task.id);
+
+    const after = await harness.orchestrator.sendToClaude(task.id);
+
+    expect(after).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 0 });
+    expect(after.lastError).toContain('stopped before changing any files');
+    expect(after.lastError).toContain('HTTP 500');
+    expect(after.lastError).not.toContain('Changes were saved');
+    const run = harness.runs.listByTask(task.id).find((candidate) => candidate.agent === 'ornith');
+    expect(run?.status).toBe('failed');
+    expect(run?.structuredResult).toContain('"dispatchOutcome":"rejected"');
+  });
+
+  it('keeps the prior review-round count when a correction fails before mutating', async () => {
+    let attempt = 0;
+    const ornith = fakeOrnithService(async () => {
+      attempt += 1;
+      return attempt === 1 ? passingResult() : providerFailureResult();
+    });
+    harness = createHarness({
+      ornith,
+      ornithLease: healthyLeaseService(),
+      processRunner: unusedProcessRunner,
+      verification: passingVerification
+    });
+
+    const project = harness.createProject();
+    const task = harness.createTask(project.id, { implementationProvider: 'ornith' });
+    await harness.orchestrator.generateSpecification(task.id);
+    harness.orchestrator.approveSpecification(task.id);
+    await harness.orchestrator.sendToClaude(task.id);
+    await harness.orchestrator.runVerification(task.id);
+    harness.codex.reviewQueue.push(makeReview({
+      verdict: 'changes_requested',
+      summary: 'Needs a correction.'
+    }));
+    const reviewed = await harness.orchestrator.reviewWithCodex(task.id);
+    expect(reviewed.currentRound).toBe(1);
+
+    const after = await harness.orchestrator.sendCorrections(task.id);
+
+    expect(after).toMatchObject({ status: 'CHANGES_REQUESTED', currentRound: 1 });
+    expect(after.lastError).toContain('stopped before changing any files');
   });
 });
