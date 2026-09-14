@@ -839,6 +839,76 @@ export const MIGRATIONS: readonly Migration[] = [
         );
       }
     }
+  },
+  {
+    version: 13,
+    name: 'review-limit-status',
+    up(db) {
+      // The old workflow represented an exhausted, successful review cycle as
+      // FAILED. Preserve genuine failures, while reclassifying only rows whose
+      // durable task and run evidence both prove a final changes-requested
+      // review at the configured limit.
+      db.exec(`
+        DROP INDEX IF EXISTS idx_tasks_worktree_active;
+
+        UPDATE tasks
+        SET status = 'REVIEW_LIMIT_REACHED'
+        WHERE status = 'FAILED'
+          AND current_round >= max_rounds
+          AND json_valid(last_review_json)
+          AND json_extract(last_review_json, '$.verdict') = 'changes_requested'
+          AND EXISTS (
+            SELECT 1
+            FROM runs
+            WHERE runs.task_id = tasks.id
+              AND runs.run_type = 'review'
+              AND runs.status = 'succeeded'
+              AND json_valid(runs.structured_result)
+              AND json_extract(runs.structured_result, '$.verdict') = 'changes_requested'
+          );
+
+        CREATE UNIQUE INDEX idx_tasks_worktree_active
+          ON tasks(worktree_path)
+          WHERE worktree_path IS NOT NULL
+            AND status NOT IN ('COMPLETED','REVIEW_LIMIT_REACHED','FAILED','CANCELLED');
+      `);
+    }
+  },
+  {
+    version: 14,
+    name: 'review-blocked-status',
+    up(db) {
+      // The old workflow also represented a *successful* review that blocked
+      // ("the approach itself is wrong") as FAILED, identical to a genuine
+      // crash. Reclassify only rows whose durable task and run evidence both
+      // prove a succeeded review with verdict 'blocked' for that exact task —
+      // never rows that merely mention 'blocked' incidentally. Unlike the
+      // review-limit reclassification above, this one is not conditioned on
+      // the round budget: a blocked verdict is terminal at any round.
+      db.exec(`
+        DROP INDEX IF EXISTS idx_tasks_worktree_active;
+
+        UPDATE tasks
+        SET status = 'REVIEW_BLOCKED'
+        WHERE status = 'FAILED'
+          AND json_valid(last_review_json)
+          AND json_extract(last_review_json, '$.verdict') = 'blocked'
+          AND EXISTS (
+            SELECT 1
+            FROM runs
+            WHERE runs.task_id = tasks.id
+              AND runs.run_type = 'review'
+              AND runs.status = 'succeeded'
+              AND json_valid(runs.structured_result)
+              AND json_extract(runs.structured_result, '$.verdict') = 'blocked'
+          );
+
+        CREATE UNIQUE INDEX idx_tasks_worktree_active
+          ON tasks(worktree_path)
+          WHERE worktree_path IS NOT NULL
+            AND status NOT IN ('COMPLETED','REVIEW_LIMIT_REACHED','REVIEW_BLOCKED','FAILED','CANCELLED');
+      `);
+    }
   }
 ];
 

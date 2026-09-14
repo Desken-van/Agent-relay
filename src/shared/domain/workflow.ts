@@ -24,6 +24,8 @@ export const TASK_STATUSES = [
   'READY_TO_PUBLISH',
   'PUBLISHING',
   'COMPLETED',
+  'REVIEW_LIMIT_REACHED',
+  'REVIEW_BLOCKED',
   'FAILED',
   'CANCELLED'
 ] as const;
@@ -66,7 +68,13 @@ export const WORKFLOW_EVENTS = [
 export type WorkflowEvent = (typeof WORKFLOW_EVENTS)[number];
 
 /** Statuses from which no further transition is possible. */
-export const TERMINAL_STATUSES: readonly TaskStatus[] = ['COMPLETED', 'FAILED', 'CANCELLED'];
+export const TERMINAL_STATUSES: readonly TaskStatus[] = [
+  'COMPLETED',
+  'REVIEW_LIMIT_REACHED',
+  'REVIEW_BLOCKED',
+  'FAILED',
+  'CANCELLED'
+];
 
 /**
  * Statuses in which an agent process may currently be running. Used to block a
@@ -136,7 +144,12 @@ export const TRANSITIONS: TransitionTable = {
   REVIEWING: {
     review_approved: 'APPROVED',
     review_changes_requested: 'CHANGES_REQUESTED',
-    review_blocked: 'FAILED',
+    // A blocked verdict is a *successful* reviewer response ("the approach
+    // itself is wrong"), never a technical failure — it gets its own terminal
+    // status so it is never rendered or stored as FAILED. review_failed (the
+    // review process itself crashing or throwing) is the only path that
+    // still reaches FAILED from here.
+    review_blocked: 'REVIEW_BLOCKED',
     review_failed: 'FAILED',
     review_aborted: 'READY_FOR_REVIEW',
     cancelled: 'CANCELLED'
@@ -144,7 +157,7 @@ export const TRANSITIONS: TransitionTable = {
   CHANGES_REQUESTED: {
     verification_started: 'VERIFYING',
     corrections_sent: 'IMPLEMENTING',
-    max_rounds_reached: 'FAILED',
+    max_rounds_reached: 'REVIEW_LIMIT_REACHED',
     cancelled: 'CANCELLED'
   },
   APPROVED: {
@@ -185,6 +198,8 @@ export const TRANSITIONS: TransitionTable = {
     cancelled: 'CANCELLED'
   },
   COMPLETED: {},
+  REVIEW_LIMIT_REACHED: {},
+  REVIEW_BLOCKED: {},
   FAILED: {},
   CANCELLED: {}
 };
@@ -293,6 +308,8 @@ export const STATUS_LABELS: Record<TaskStatus, string> = {
   READY_TO_PUBLISH: 'Ready to publish',
   PUBLISHING: 'Publishing',
   COMPLETED: 'Completed',
+  REVIEW_LIMIT_REACHED: 'Review limit reached',
+  REVIEW_BLOCKED: 'Review blocked',
   FAILED: 'Failed',
   CANCELLED: 'Cancelled'
 };

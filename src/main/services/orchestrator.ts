@@ -1452,8 +1452,11 @@ export class Orchestrator {
    * Turn a Codex verdict into a state change, applying the round budget.
    *
    * This is where the loop is guaranteed to end: when the budget is exhausted
-   * the task is moved to FAILED with an explanatory message instead of being
-   * left in a state from which another Claude round could start.
+   * the task is moved to REVIEW_LIMIT_REACHED with an explanatory message,
+   * and a `blocked` verdict moves it to REVIEW_BLOCKED (via `decideReviewOutcome`
+   * and the `review_blocked` transition) — neither is mislabeled as a
+   * technical failure, and neither leaves the task in a state from which
+   * another implementation round could start automatically.
    */
   private applyReviewOutcome(
     taskId: string,
@@ -1464,9 +1467,16 @@ export class Orchestrator {
     const task = this.requireTask(taskId);
     const decision = decideReviewOutcome(review.verdict, task.currentRound, task.maxRounds);
 
+    // `lastError` is the durable explanatory note the UI shows for why a task
+    // stopped, not strictly a technical error — REVIEW_LIMIT_REACHED already
+    // uses it for the round-budget halt reason below. A blocked verdict has no
+    // halt reason (it isn't round-dependent), so it carries the reviewer's own
+    // summary instead of leaving the note empty.
+    const lastError = decision.haltReason ?? (review.verdict === 'blocked' ? review.summary : null);
+
     const updated = this.applyEvent(task, decision.event, {
       lastReviewJson: JSON.stringify(review),
-      lastError: decision.haltReason ?? null
+      lastError
     });
 
     if (decision.haltReason) {

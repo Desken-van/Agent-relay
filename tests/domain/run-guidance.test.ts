@@ -199,6 +199,64 @@ describe('run guidance — review round exhaustion and continuation', () => {
     expectConsistent(value);
   });
 
+  it('presents review-limit exhaustion as a warning outcome rather than a failure', () => {
+    const value = runGuidance(
+      task({
+        status: 'REVIEW_LIMIT_REACHED',
+        currentRound: 3,
+        maxRounds: 3,
+        lastError: 'Review round limit reached (3/3).'
+      }),
+      [run({ runType: 'review', status: 'succeeded' })],
+      true,
+      false,
+      'not_required',
+      { lastReviewVerdict: 'changes_requested' }
+    );
+    expect(value.stage).toBe('Review limit reached');
+    expect(value.tone).toBe('warning');
+    expect(value.action?.key).toBe('continue_in_new_run');
+    expectConsistent(value);
+  });
+
+  it('presents a blocked review as a warning outcome, never as a failure, even at round 1', () => {
+    const value = runGuidance(
+      task({
+        status: 'REVIEW_BLOCKED',
+        currentRound: 1,
+        maxRounds: 3,
+        lastError: 'Wrong approach.',
+        lastReviewJson: JSON.stringify({
+          verdict: 'blocked', summary: 'Wrong approach.', findings: [], followUpPrompt: 'Rework the approach.', suggestedTests: []
+        })
+      }),
+      [run({ runType: 'review', status: 'succeeded' })],
+      true,
+      false,
+      'not_required',
+      { lastReviewVerdict: 'blocked' }
+    );
+    expect(value.stage).toBe('Review blocked');
+    expect(value.tone).toBe('warning');
+    expect(value.action?.key).toBe('continue_in_new_run');
+    expect(value.result).toBe('Wrong approach.');
+    expectConsistent(value);
+  });
+
+  it('points a blocked review with an existing continuation at the linked run instead of offering a new one', () => {
+    const value = runGuidance(
+      task({ status: 'REVIEW_BLOCKED', currentRound: 1, maxRounds: 3, lastError: 'Wrong approach.' }),
+      [run({ runType: 'review', status: 'succeeded' })],
+      true,
+      false,
+      'not_required',
+      { lastReviewVerdict: 'blocked', continuationTaskId: 'continuation-1' }
+    );
+    expect(value.tone).toBe('warning');
+    expect(value.action).toBeNull();
+    expect(value.next).toContain('linked continuation');
+  });
+
   it('does not offer a continuation for a FAILED task that did not exhaust the round budget', () => {
     const value = runGuidance(
       task({ status: 'FAILED', currentRound: 0, maxRounds: 2 }),

@@ -16,7 +16,7 @@ import {
   type RunGuidance,
   type RunPrimaryAction
 } from '@shared/domain/run-guidance';
-import { isBusy } from '@shared/domain/workflow';
+import { isBusy, isTerminal } from '@shared/domain/workflow';
 import type { PlanReviewDetail, PublishConfirmation, TaskDetail } from '@shared/ipc';
 import type { CodexReviewResult, FindingSeverity, TaskSpecification } from '@shared/schemas/codex';
 import { ApiError, call, expect } from '../lib/api';
@@ -667,7 +667,17 @@ export function RunView(): React.JSX.Element {
               </button>
             ) : null}
 
-            {task.lastError ? <Notice tone="error">{task.lastError}</Notice> : null}
+            {task.lastError ? (
+              <Notice
+                tone={
+                  task.status === 'REVIEW_LIMIT_REACHED' || task.status === 'REVIEW_BLOCKED'
+                    ? 'warn'
+                    : 'error'
+                }
+              >
+                {task.lastError}
+              </Notice>
+            ) : null}
 
             <details>
               <summary className="faint" style={{ cursor: 'pointer', fontSize: 12 }}>
@@ -1269,9 +1279,6 @@ export function PlanReviewPanel({
 
 /* -------------------------------------------------------------------------- */
 
-function isTerminal(status: string): boolean {
-  return status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED';
-}
 
 /** The approval tag shown in the Specification section's collapsed header. */
 function SpecificationStatusTag({ approvedAt }: { approvedAt: string | null }): React.JSX.Element {

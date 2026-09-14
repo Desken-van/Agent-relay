@@ -300,8 +300,26 @@ export async function runToFailedRoundExhaustion(
   await harness.orchestrator.runVerification(afterImplementation.id);
   harness.codex.reviewQueue.push(makeReview({ verdict: 'changes_requested', summary: 'Needs one more pass.' }));
   const reviewed = await harness.orchestrator.reviewWithCodex(afterImplementation.id);
-  if (reviewed.status !== 'FAILED') {
-    throw new Error(`Expected the task to fail on round exhaustion, got ${reviewed.status}.`);
+  if (reviewed.status !== 'REVIEW_LIMIT_REACHED') {
+    throw new Error(`Expected the task to stop at its review limit, got ${reviewed.status}.`);
+  }
+  return { project, task: reviewed };
+}
+
+/** Drive a task from DRAFT to REVIEW_BLOCKED using the fake adapters. */
+export async function runToBlockedReview(
+  harness: Harness,
+  options: { maxRounds?: number } = {}
+): Promise<{ project: Project; task: Task }> {
+  const maxRounds = options.maxRounds ?? 3;
+  const { project, task: afterImplementation } = await runToReview(harness);
+  harness.tasks.update(afterImplementation.id, { maxRounds });
+
+  await harness.orchestrator.runVerification(afterImplementation.id);
+  harness.codex.reviewQueue.push(makeReview({ verdict: 'blocked', summary: 'Wrong approach.' }));
+  const reviewed = await harness.orchestrator.reviewWithCodex(afterImplementation.id);
+  if (reviewed.status !== 'REVIEW_BLOCKED') {
+    throw new Error(`Expected the task to be blocked by review, got ${reviewed.status}.`);
   }
   return { project, task: reviewed };
 }

@@ -313,12 +313,35 @@ describe('review stage and the relay loop', () => {
     expect(harness.claude.calls[1]?.prompt).toContain('Handle the null case.');
   });
 
-  it('fails the task when Codex blocks', async () => {
+  it('moves to REVIEW_BLOCKED, not FAILED, when Codex blocks a successful review', async () => {
     const { task } = await runToReview(harness);
     harness.codex.reviewQueue = [makeReview({ verdict: 'blocked', summary: 'Wrong approach.' })];
 
     const reviewed = await harness.orchestrator.reviewWithCodex(task.id);
-    expect(reviewed.status).toBe('FAILED');
+    expect(reviewed.status).toBe('REVIEW_BLOCKED');
+    // The reviewer's own summary is preserved as the durable explanatory note
+    // instead of a generic or empty message.
+    expect(reviewed.lastError).toBe('Wrong approach.');
+    expect(reviewed.lastReviewJson).toContain('"verdict":"blocked"');
+
+    // The loop is genuinely over: REVIEW_BLOCKED has no outgoing transition,
+    // so no further correction round is possible from this task.
+    await expect(harness.orchestrator.sendCorrections(task.id)).rejects.toThrow();
+  });
+
+  it('blocks at round 1 of a multi-round budget, not only once it is exhausted', async () => {
+    const project = harness.createProject();
+    const created = harness.createTask(project.id, { maxRounds: 3 });
+    await harness.orchestrator.generateSpecification(created.id);
+    harness.orchestrator.approveSpecification(created.id);
+    await harness.orchestrator.sendToClaude(created.id);
+
+    harness.codex.reviewQueue = [makeReview({ verdict: 'blocked', summary: 'Wrong approach.' })];
+    const reviewed = await harness.orchestrator.reviewWithCodex(created.id);
+
+    expect(reviewed.status).toBe('REVIEW_BLOCKED');
+    expect(reviewed.currentRound).toBe(1);
+    expect(reviewed.maxRounds).toBe(3);
   });
 
   it('stops the loop at the round limit instead of running forever', async () => {
@@ -345,7 +368,7 @@ describe('review stage and the relay loop', () => {
     expect(task.currentRound).toBe(2);
     task = await harness.orchestrator.reviewWithCodex(created.id);
 
-    expect(task.status).toBe('FAILED');
+    expect(task.status).toBe('REVIEW_LIMIT_REACHED');
     expect(task.lastError).toContain('Review round limit reached (2/2)');
 
     // The loop is genuinely over: no third Claude run is possible.

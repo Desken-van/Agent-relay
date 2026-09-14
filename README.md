@@ -526,7 +526,14 @@ status, findings,
 errors, decisions and its one required transition are shown in this same panel.
 
 When the final review requests changes after the bounded round budget is spent,
-the failed run offers **Continue in a new run**. The new linked run reuses the
+the run stops as **Review limit reached** and offers **Continue in a new run**.
+This is a bounded workflow outcome, not a technical failure. When a review
+instead completes successfully with verdict `blocked` — the reviewer judges the
+approach itself, not just the code, to be wrong — the run stops as **Review
+blocked** and offers the same **Continue in a new run** action, at any round.
+Both outcomes are rendered as warnings, never as a red technical failure: the
+review ran to completion, verification passed, and its findings are preserved
+for a user decision or a reworked approach. The new linked run reuses the
 same branch, worktree, approved specification, provider/session context and
 applicable immutable evidence, but starts with a fresh Settings-bounded review
 budget. Creation starts no model, verification, Git or publishing operation.
@@ -538,13 +545,14 @@ through creation and the first protected action. Identity is sampled again at
 the final creation boundary, and that first action revalidates it once more
 before dispatch; changed files atomically retarget the task and lease to
 **Run verification**. At most one non-terminal task may own a worktree. Terminal
-status releases that active ownership, allowing an exhausted continuation to be
-continued again without rewriting any earlier run's immutable history.
+status releases that active ownership, allowing a closed continuation — whether
+it stopped at its review limit or on a blocked review — to be continued again
+without rewriting any earlier run's immutable history.
 Run details also project publishing guidance from the same effective own-or-
 inherited implementation evidence enforced by the backend, so a review-entry
 continuation does not invent a recovery action after valid publishing approval.
 
-Test suite: **1971 deterministic tests in 82 files, plus two automated Electron
+Test suite: **2026 deterministic tests in 84 files, plus two automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -707,7 +715,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              1971 deterministic tests + 2 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              2026 deterministic tests + 2 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```
