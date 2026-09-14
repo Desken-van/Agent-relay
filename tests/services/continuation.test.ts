@@ -370,18 +370,43 @@ describe('safe linked continuations', () => {
     expect(harness.taskContinuations.findBySource(orphan.id)).toBeNull();
   });
 
-  it('refuses a continuation when the task JSON and the durable review run disagree on the verdict', async () => {
-    const { task: source } = await runToFailedRoundExhaustion(harness);
-    // Only the display-only `last_review_json` is rewritten to falsely claim
-    // 'blocked'; the task's real, succeeded review run still holds
-    // 'changes_requested'. The two evidence sources must both agree before a
-    // continuation is allowed.
-    harness.tasks.update(source.id, {
-      lastReviewJson: JSON.stringify(makeReview({ verdict: 'blocked', summary: 'Tampered claim.' }))
+  it('refuses a continuation when a REVIEW_BLOCKED task and its own durable review run disagree on the verdict', async () => {
+    const { task: legit } = await runToBlockedReview(harness);
+    // The task's own status is REVIEW_BLOCKED and its last_review_json still
+    // claims 'blocked', but its actual succeeded review run's structured
+    // result disagrees — the two evidence sources must both agree before a
+    // continuation is allowed, whatever the task's own JSON claims.
+    const mismatched = harness.createTask(legit.projectId, {
+      status: 'REVIEW_BLOCKED',
+      lastReviewJson: legit.lastReviewJson,
+      worktreePath: 'C:\\worktrees\\mismatched-blocked',
+      branchName: 'agent/mismatched-blocked',
+      baseBranch: 'main'
+    });
+    harness.runs.create({
+      id: 'mismatched-review-run', taskId: mismatched.id, agent: 'codex', runType: 'review',
+      status: 'running', round: 1, startedAt: harness.clock.nowIso()
+    });
+    harness.runs.finish('mismatched-review-run', {
+      status: 'succeeded', finishedAt: harness.clock.nowIso(),
+      structuredResult: JSON.stringify(makeReview({ verdict: 'changes_requested' }))
     });
 
-    await expect(harness.continuationService.create(source.id)).rejects.toThrow(/blocked the approach/);
-    expect(harness.taskContinuations.findBySource(source.id)).toBeNull();
+    await expect(harness.continuationService.create(mismatched.id)).rejects.toThrow(/blocked the approach/);
+    expect(harness.taskContinuations.findBySource(mismatched.id)).toBeNull();
+  });
+
+  it('dispatches a REVIEW_LIMIT_REACHED task on its own status, not a tampered blocked claim in its JSON', async () => {
+    const { task: limitReached } = await runToFailedRoundExhaustion(harness);
+    // Only the display-only `last_review_json` is rewritten to falsely claim
+    // 'blocked'; the task's actual status is still REVIEW_LIMIT_REACHED, so it
+    // is judged (and refused) on the round-exhaustion/changes-requested check,
+    // never treated as blocked evidence.
+    harness.tasks.update(limitReached.id, {
+      lastReviewJson: JSON.stringify(makeReview({ verdict: 'blocked', summary: 'Tampered claim.' }))
+    });
+    await expect(harness.continuationService.create(limitReached.id)).rejects.toThrow(/requested changes/);
+    expect(harness.taskContinuations.findBySource(limitReached.id)).toBeNull();
   });
 
   it('removes a bound claim once its own continuation task has itself become REVIEW_BLOCKED', () => {

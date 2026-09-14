@@ -38,7 +38,7 @@ import type {
   Task,
   TaskContinuation
 } from '../../shared/domain/models';
-import { isBusy } from '../../shared/domain/workflow';
+import { isBusy, isTerminal } from '../../shared/domain/workflow';
 import { latestVerification, readVerification } from '../../shared/domain/verification';
 import { codexReviewResultSchema, taskSpecificationSchema } from '../../shared/schemas/codex';
 import type { TaskStatus } from '../../shared/domain/workflow';
@@ -102,7 +102,7 @@ export function reconcileContinuationClaims(deps: {
         claim.state === 'awaiting_first_action' &&
         link?.continuationTaskId === claim.continuationTaskId &&
         continuation !== null &&
-        !['COMPLETED', 'REVIEW_LIMIT_REACHED', 'REVIEW_BLOCKED', 'FAILED', 'CANCELLED'].includes(continuation.status);
+        !isTerminal(continuation.status);
       if (!validBoundClaim) {
         deps.continuations.deleteClaim(claim.sourceTaskId);
         removed += 1;
@@ -291,12 +291,18 @@ export class ContinuationService {
       ? parseJson(reviewRun.structuredResult, codexReviewResultSchema)
       : null;
 
-    // Which validation applies is decided by the review's own verdict, not by
-    // which terminal status the task happens to carry: a blocked verdict is
-    // terminal at any round, while a changes-requested verdict is only a valid
-    // continuation source once the round budget is exhausted.
-    if (review?.verdict === 'blocked') {
-      if (durableReview?.verdict !== 'blocked') {
+    // The task's own status is authoritative once it already carries one of
+    // the two current terminal review outcomes — REVIEW_BLOCKED always gets
+    // the blocked-evidence check, REVIEW_LIMIT_REACHED always gets the
+    // round-exhaustion check, even if lastReviewJson is missing or corrupt
+    // (that fails the check below with an accurate message instead of the
+    // wrong one). Only a legacy FAILED row, which carries no such signal,
+    // falls back to whatever its own review evidence actually says.
+    const wantsBlockedEvidence = task.status === 'REVIEW_BLOCKED'
+      || (task.status === 'FAILED' && review?.verdict === 'blocked');
+
+    if (wantsBlockedEvidence) {
+      if (!review || review.verdict !== 'blocked' || durableReview?.verdict !== 'blocked') {
         throw new AgentRelayError(
           'VALIDATION_FAILED',
           'This task did not stop on a review that blocked the approach.'
