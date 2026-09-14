@@ -40,6 +40,7 @@ describe('local worktree dependency preparation', () => {
     if (process.platform === 'win32') {
       mkdirSync(join(repositoryPath, 'build', 'Release'), { recursive: true });
       writeFileSync(join(repositoryPath, 'build', 'Release', 'agent-relay-windows-job.exe'), 'fixture-launcher');
+      writeFileSync(join(repositoryPath, 'build', 'Release', 'agent-relay-fs-guard.exe'), 'fixture-fs-guard');
     }
 
     await prepare.prepare({ repositoryPath, worktreePath });
@@ -51,6 +52,8 @@ describe('local worktree dependency preparation', () => {
     if (process.platform === 'win32') {
       expect(readFileSync(join(worktreePath, 'build', 'Release', 'agent-relay-windows-job.exe'), 'utf8'))
         .toBe('fixture-launcher');
+      expect(readFileSync(join(worktreePath, 'build', 'Release', 'agent-relay-fs-guard.exe'), 'utf8'))
+        .toBe('fixture-fs-guard');
     }
     expect(execFileSync('git', ['status', '--short'], { cwd: worktreePath, encoding: 'utf8' })).toBe('');
   });

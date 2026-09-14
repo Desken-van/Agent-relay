@@ -24,7 +24,10 @@ const MANIFESTS = [
   'bun.lockb'
 ] as const;
 
-const WINDOWS_JOB_LAUNCHER = 'agent-relay-windows-job.exe';
+const WINDOWS_NATIVE_HELPERS = [
+  'agent-relay-windows-job.exe',
+  'agent-relay-fs-guard.exe'
+] as const;
 
 async function bytes(path: string): Promise<Buffer | null> {
   try {
@@ -118,7 +121,7 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
         if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
           const [actual, expected] = await Promise.all([realpath(target), realpath(source)]);
           if (isSamePath(actual, expected)) {
-            await this.prepareWindowsLauncher(repositoryPath, worktreePath);
+            await this.prepareWindowsNativeHelpers(repositoryPath, worktreePath);
             return;
           }
         }
@@ -126,24 +129,34 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
       }
     }
 
-    await this.prepareWindowsLauncher(repositoryPath, worktreePath);
+    await this.prepareWindowsNativeHelpers(repositoryPath, worktreePath);
   }
 
   /**
-   * node-gyp places Agent Relay's native Windows containment launcher outside
-   * node_modules. A dependency junction alone therefore cannot run process
-   * contract tests in a worktree. Copy just that ignored, locally built binary
-   * from the registered checkout; never copy the whole build directory, whose
-   * other outputs must remain isolated per worktree.
+   * node-gyp places Agent Relay's native Windows helpers outside node_modules.
+   * A dependency junction alone therefore cannot run the process-contract and
+   * Ornith containment tests in a worktree. Copy only the known ignored,
+   * locally built binaries from the registered checkout; never copy the whole
+   * build directory, whose other outputs must remain isolated per worktree.
    */
-  private async prepareWindowsLauncher(repositoryPath: string, worktreePath: string): Promise<void> {
+  private async prepareWindowsNativeHelpers(repositoryPath: string, worktreePath: string): Promise<void> {
     if (process.platform !== 'win32') return;
 
-    const source = join(repositoryPath, 'build', 'Release', WINDOWS_JOB_LAUNCHER);
+    for (const helper of WINDOWS_NATIVE_HELPERS) {
+      await this.prepareWindowsNativeHelper(repositoryPath, worktreePath, helper);
+    }
+  }
+
+  private async prepareWindowsNativeHelper(
+    repositoryPath: string,
+    worktreePath: string,
+    helper: (typeof WINDOWS_NATIVE_HELPERS)[number]
+  ): Promise<void> {
+    const source = join(repositoryPath, 'build', 'Release', helper);
     const sourceBytes = await bytes(source);
     if (sourceBytes === null) return;
 
-    const relativeTarget = join('build', 'Release', WINDOWS_JOB_LAUNCHER);
+    const relativeTarget = join('build', 'Release', helper);
     const target = join(worktreePath, relativeTarget);
     const targetBytes = await bytes(target);
     if (targetBytes?.equals(sourceBytes)) return;
