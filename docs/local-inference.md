@@ -388,12 +388,67 @@ that is running. Missing usage is represented by `null` token counts. A missing 
 reason is `{kind:"unknown"}`; an unfamiliar bounded reason is an explicit
 `other` value. Absence is never invented as zero or `stop`.
 
+## Ornith: the implementation-provider integration built on this boundary
+
+Ornith is a third, explicitly selected **implementation-only** task provider,
+alongside Claude and Codex. It is not a separate runtime: selecting Ornith
+reuses this exact `LocalInferenceService`/`LocalInferenceProvider` boundary —
+same configuration, same lifecycle, same manual Start/Stop. Nothing about
+choosing Ornith on a task starts, restarts, or health-checks the runtime; an
+Ornith round refuses outright unless the runtime is *already* retained and
+*already* `healthy`, confirmed by one bounded `health()` check immediately
+before the round begins.
+
+What Ornith adds, precisely:
+
+- An application-wide **execution lease** (`OrnithInferenceLeaseService`,
+  internal — never an IPC channel): at most one Ornith round may run at a
+  time, and a second concurrent attempt (including while the Settings "Run
+  test inference" smoke test could otherwise fire) is refused as `BUSY`
+  rather than sharing or queueing behind the retained provider.
+- A strict, versioned **action protocol** (`src/shared/domain/ornith.ts`):
+  Ornith's only output is one JSON object naming one of a fixed set of
+  repository operations (list/read/search files, create/replace/delete a
+  file, `git status`/`git diff`, request verification, `finish`, or
+  `blocked`). Nothing resembling a shell command, an argv, or a URL is ever
+  an accepted field, and prose, Markdown fences, or trailing content make the
+  whole completion a terminal failure — never something Agent Relay tries to
+  repair or re-ask for.
+- A bounded, Agent Relay-owned **tool executor**
+  (`src/main/services/ornith-worktree-tools.ts`) that resolves every path
+  against the real filesystem, refuses symlinks/reparse points/hard-linked
+  write targets, hash-guards every edit and delete, and never executes
+  anything the model wrote as a command — `git` is invoked only with a fixed,
+  read-only or narrowly-scoped argv.
+- A hard, non-negotiable limit set (`ORNITH_LIMITS`): turns, actions,
+  rolling-context bytes, prompt/completion bytes, cumulative read/write
+  bytes, changed-file count, verification calls, per-operation timeouts, and
+  an overall loop deadline of `min(settings.processTimeoutMs, 30 minutes)`.
+  None of this is renderer-configurable, and nothing a completion contains
+  can widen any of it.
+- **No conversation is retained.** Every request is a complete, stateless
+  chat-completion request: the full approved specification, any accepted
+  plan-review addenda, and the bound rule evidence travel on *every* turn
+  (Ornith keeps no server-side memory of earlier turns), and only the rolling
+  log of prior tool results is pruned as the turn budget is spent. If the
+  authoritative content alone cannot fit the prompt budget, the round refuses
+  before any inference call is made rather than silently truncating it.
+- Ornith never fabricates or persists a durable session/thread identifier —
+  `Task.implementationThreadId` stays `null` for every Ornith run, by
+  contract.
+
+See `docs/architecture.md` for how this fits the relay loop and
+`docs/security.md` for the full boundary/limit list. `docs/manual-test.md`
+has the no-publish acceptance path using a real Ornith/llama.cpp model.
+
 ## Known limitations
 
-- The only inference surface is the one manual, single-shot smoke-test button
-  described above. There is no task workflow integration, no automatic
-  startup or automatic inference, and mounting the renderer, opening Settings,
-  or checking state never dispatches one on its own.
+- Outside the Ornith implementation-provider integration described above, the
+  only other inference surface is the one manual, single-shot smoke-test
+  button described earlier in this document. Neither surface starts,
+  restarts, or health-checks the runtime automatically, and mounting the
+  renderer, opening Settings, or checking state never dispatches an inference
+  request on its own.
 - There is no streaming, tool calling, embeddings, multimodal input, completion
   cache, Context Pack, repository indexing/RAG, patching, retries, fallback
   models, or workflow wiring. A non-completed test inference is never retried
@@ -402,7 +457,10 @@ reason is `{kind:"unknown"}`; an unfamiliar bounded reason is an explicit
   token count.
 - Runtime usage fields are optional and are returned as `null` when absent.
 - One provider manages one process and one inference at a time; the manual
-  test action shares that same single-inference-at-a-time constraint.
+  test action and every Ornith task round share that same
+  single-inference-at-a-time constraint, enforced by the Ornith execution
+  lease described above — a second concurrent request is refused as `BUSY`,
+  never queued.
 - Lifecycle and inference evidence, including the manual test prompt and its
   result, are process-local and non-durable; only configuration persists.
 - The Windows launcher is an Agent Relay-owned native executable built during

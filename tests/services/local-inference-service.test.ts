@@ -56,6 +56,7 @@ class StubProvider implements LocalInferenceProvider {
   stopResult: LocalInferenceState = { kind: 'stopped' };
   startGate: Promise<void> | null = null;
   stopGate: Promise<void> | null = null;
+  inferGate: Promise<void> | null = null;
   /** Every request `infer` actually received, in order. */
   readonly inferCalls: LocalInferenceRequest[] = [];
   /** Overrides the outcome the next `infer` call returns. */
@@ -105,6 +106,7 @@ class StubProvider implements LocalInferenceProvider {
   async infer(request: LocalInferenceRequest): Promise<LocalInferenceOutcome> {
     if (this.current.kind !== 'healthy') throw new Error('infer is not legal now');
     this.inferCalls.push(request);
+    if (this.inferGate !== null) await this.inferGate;
     if (this.inferOutcome !== null) return this.inferOutcome;
     return {
       kind: 'completed',
@@ -450,6 +452,62 @@ describe('LocalInferenceService ownership and lifecycle delegation', () => {
 });
 
 describe('LocalInferenceService.runTestInference', () => {
+  it('returns BUSY without dispatching while an Ornith lease owns the retained runtime', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = new LocalInferenceService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    const lease = await service.acquireOrnithLease();
+
+    const outcome = await service.runTestInference('must not dispatch');
+
+    expect(outcome).toMatchObject({ kind: 'failed', dispatchOutcome: 'not_dispatched' });
+    expect(provider.inferCalls).toHaveLength(0);
+    lease.release();
+  });
+
+  it('rejects a released stale lease and changed saved configuration before inference', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = new LocalInferenceService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    const stale = await service.acquireOrnithLease();
+    stale.release();
+    const request: LocalInferenceRequest = {
+      version: LOCAL_INFERENCE_CONTRACT_VERSION,
+      requestId: 'stale-request',
+      messages: [{ role: 'user', content: 'no dispatch' }]
+    };
+    expect(await service.inferForOrnith(stale, request)).toMatchObject({ kind: 'failed', dispatchOutcome: 'not_dispatched' });
+    settings.update({ localInference: { ...settings.get().localInference, port: 19091 } });
+    await expect(service.acquireOrnithLease()).rejects.toThrow('does not match');
+    expect(provider.inferCalls).toHaveLength(0);
+  });
+
+  it('discards a completion when settings drift while inference is in flight', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = new LocalInferenceService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    const lease = await service.acquireOrnithLease();
+    let release!: () => void;
+    provider.inferGate = new Promise<void>((resolve) => { release = resolve; });
+    const request: LocalInferenceRequest = {
+      version: LOCAL_INFERENCE_CONTRACT_VERSION,
+      requestId: 'drift-request',
+      messages: [{ role: 'user', content: 'must be discarded' }]
+    };
+
+    const pending = service.inferForOrnith(lease, request);
+    await Promise.resolve();
+    settings.update({ localInference: { ...settings.get().localInference, port: 19091 } });
+    release();
+
+    expect(await pending).toMatchObject({ kind: 'failed', dispatchOutcome: 'unknown' });
+    expect(provider.inferCalls).toHaveLength(1);
+    lease.release();
+  });
+
   it('constructs no provider and returns a bounded structured failure when disabled and unbound', async () => {
     const settings = new MutableSettings();
     settings.update({ localInference: { ...settings.get().localInference, enabled: false } });

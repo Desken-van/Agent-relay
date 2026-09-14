@@ -13,6 +13,7 @@ const SECTIONS: ReadonlyArray<{ id: Section; label: string; glyph: string }> = [
 const TOOL_LABELS: Record<ToolId, string> = {
   codex: 'Codex',
   claude: 'Claude Code',
+  ornith: 'Ornith',
   git: 'Git',
   github: 'GitHub CLI'
 };
@@ -21,7 +22,7 @@ export function AppRail(): React.JSX.Element {
   const { section, setSection, selectedProjectId, selectedTaskId, tasks, diagnostics } = useStore();
 
   const tools: ToolDiagnostic[] = diagnostics
-    ? [diagnostics.codex, diagnostics.claude, diagnostics.git, diagnostics.github]
+    ? [diagnostics.codex, diagnostics.claude, diagnostics.git, diagnostics.github, diagnostics.ornith]
     : [];
 
   return (

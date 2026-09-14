@@ -13,7 +13,7 @@
  */
 
 import { z } from 'zod';
-import { executionProviderSchema } from './domain/execution-providers';
+import { implementationProviderSchema, reviewProviderSchema } from './domain/execution-providers';
 import type { CodexModelCatalogResult } from './domain/codex-catalog';
 import type { DiagnosticsReport } from './domain/diagnostics';
 import type { SerializedError } from './domain/errors';
@@ -319,8 +319,8 @@ export const ipcInputSchemas = {
        */
       codexModel: modelIdSchema.optional(),
       claudeModel: modelIdSchema.optional(),
-      implementationProvider: executionProviderSchema.optional(),
-      reviewProvider: executionProviderSchema.optional()
+      implementationProvider: implementationProviderSchema.optional(),
+      reviewProvider: reviewProviderSchema.optional()
     })
     .strict(),
 
@@ -331,7 +331,7 @@ export const ipcInputSchemas = {
 
   'workflow:generateSpecification': byTask,
   'workflow:configureProviders': z.object({ taskId: z.string().min(1), expectedRevision: z.number().int().min(0),
-    implementationProvider: executionProviderSchema, reviewProvider: executionProviderSchema }).strict(),
+    implementationProvider: implementationProviderSchema, reviewProvider: reviewProviderSchema }).strict(),
   'workflow:implement': z.object({ taskId: z.string().min(1), acceptDirtyWorkingTree: z.boolean().optional() }).strict(),
   'workflow:review': byTask,
   'workflow:verify': byTask,

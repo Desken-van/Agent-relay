@@ -28,6 +28,9 @@ import { ProjectService } from '../../src/main/services/project-service';
 import { PublishService } from '../../src/main/services/publish-service';
 import { TaskService } from '../../src/main/services/task-service';
 import { defaultSettings } from '../../src/main/container';
+import type { OrnithInferenceLeaseService } from '../../src/main/ports';
+import type { OrnithImplementationService } from '../../src/main/services/ornith-implementation';
+import type { ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import type { Project, Settings, Task } from '../../src/shared/domain/models';
 import {
   FakeClaudeAdapter,
@@ -74,6 +77,10 @@ export function createHarness(
     settings?: Partial<Settings>;
     verification?: VerificationExecutor;
     worktreeDependencies?: WorktreeDependencyPreparer;
+    /** Present only in tests that exercise Ornith routing; absent everywhere else, matching production's optional wiring. */
+    ornith?: OrnithImplementationService;
+    ornithLease?: OrnithInferenceLeaseService;
+    processRunner?: ProcessRunner;
   } = {}
 ): Harness {
   const tempRoot = mkdtempSync(join(tmpdir(), 'agent-relay-test-'));
@@ -150,7 +157,10 @@ export function createHarness(
       retargetFirstActionToVerification: (...args) =>
         continuationService.retargetFirstActionToVerification(...args),
       assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId)
-    }
+    },
+    ornith: options.ornith,
+    ornithLease: options.ornithLease,
+    processRunner: options.processRunner
   });
 
   const publishService = new PublishService({

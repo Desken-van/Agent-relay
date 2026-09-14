@@ -63,6 +63,8 @@ import type {
   EventPublisher,
   GitAdapter,
   IdGenerator,
+  OrnithHealthyLease,
+  OrnithInferenceLeaseService,
   ProjectRepository,
   PlanReviewGateRepository,
   RunEventRepository,
@@ -72,6 +74,8 @@ import type {
   TaskRepository,
   TaskRuleEvidenceRepository
 } from '../ports';
+import type { ProcessRunner } from '../adapters/process/process-runner';
+import type { OrnithImplementationService } from './ornith-implementation';
 import { assertSafeWorktreePath, isSamePath } from './path-safety';
 import { assessClaudeRound } from './claude-round-policy';
 import {
@@ -87,7 +91,13 @@ import {
 } from './plan-review-gate';
 import { renderRuleEvidence } from './rule-evidence';
 import { join } from 'node:path';
-import { canChangeProviders, executionProviderSchema, type ExecutionProvider } from '../../shared/domain/execution-providers';
+import {
+  canChangeProviders,
+  implementationProviderSchema,
+  reviewProviderSchema,
+  type ImplementationProvider,
+  type ReviewProvider
+} from '../../shared/domain/execution-providers';
 import {
   latestVerification,
   readVerification,
@@ -96,7 +106,8 @@ import {
 import type { VerificationExecutor } from './worktree-verification';
 import type { WorktreeDependencyPreparer } from './worktree-dependencies';
 import type { ProtectedContinuationAction } from './continuation-service';
-import { redactSecrets } from '../../shared/util/redact';
+import { redactAndTruncate, redactSecrets } from '../../shared/util/redact';
+import { ORNITH_LIMITS, ornithRelativePathSchema, redactAbsoluteMachinePaths } from '../../shared/domain/ornith';
 
 const MAX_VERIFICATION_REPAIR_OUTPUT_CHARS = 64_000;
 
@@ -138,6 +149,11 @@ export interface OrchestratorDeps {
   readonly planReviews: PlanReviewGateRepository;
   readonly continuationGuard?: ContinuationActionGuard;
   readonly continuations?: TaskContinuationRepository;
+  /** Present only when Ornith is wired; absent build configurations simply cannot select it. */
+  readonly ornith?: OrnithImplementationService;
+  readonly ornithLease?: OrnithInferenceLeaseService;
+  /** Used only to invoke fixed, read-only Git argv for the Ornith worktree tools. */
+  readonly processRunner?: ProcessRunner;
 }
 
 export class Orchestrator {
@@ -247,6 +263,16 @@ export class Orchestrator {
       : `…[earlier verification output omitted]\n${safe.slice(-MAX_VERIFICATION_REPAIR_OUTPUT_CHARS)}`;
 
     return buildVerificationFailurePrompt({ command, reason, output });
+  }
+
+  /** Relay-authored status only; stored verification logs may contain absolute machine paths. */
+  private ornithVerificationFailureEvidence(taskId: string): string | null {
+    const run = latestVerification(this.deps.runs.listByTask(taskId));
+    if (!verificationNeedsImplementationRepair(run)) return null;
+    const record = readVerification(run);
+    return record.success
+      ? `Relay verification status: failed; exitCode=${record.data.exitCode ?? 'unknown'}; durationMs=${record.data.durationMs}.`
+      : 'Relay verification status: failed; stored verification evidence was unavailable.';
   }
 
   private applyEvent(task: Task, event: WorkflowEvent, patch: Partial<Task> = {}): Task {
@@ -363,13 +389,13 @@ export class Orchestrator {
     return record.data;
   }
 
-  configureProviders(input: { taskId: string; expectedRevision: number; implementationProvider: ExecutionProvider; reviewProvider: ExecutionProvider }): Task {
+  configureProviders(input: { taskId: string; expectedRevision: number; implementationProvider: ImplementationProvider; reviewProvider: ReviewProvider }): Task {
     const task = this.requireTask(input.taskId);
     if (this.isRunning(task.id) || !canChangeProviders(task.status) || this.deps.runs.listByTask(task.id).some((r) => r.status === 'running')) {
       throw new AgentRelayError('INVALID_TRANSITION', 'Providers can only change while the task is idle and not approved for publication.');
     }
-    const implementation = executionProviderSchema.parse(input.implementationProvider);
-    const review = executionProviderSchema.parse(input.reviewProvider);
+    const implementation = implementationProviderSchema.parse(input.implementationProvider);
+    const review = reviewProviderSchema.parse(input.reviewProvider);
     const updated = this.deps.tasks.changeProviders(task.id, input.expectedRevision, implementation, review);
     this.deps.events.publishTask(updated);
     return updated;
@@ -677,7 +703,13 @@ export class Orchestrator {
 
     const controller = this.beginExclusive(taskId);
     let completed: Task;
+    let ornithLease: OrnithHealthyLease | null = null;
     try {
+      // Before worktree creation, the IMPLEMENTING transition, or round
+      // consumption: an Ornith round that cannot even start must leave
+      // nothing durable behind.
+      ornithLease = await this.acquireOrnithLeaseIfNeeded(task, controller);
+
       const completeContinuationStart = await this.deps.continuationGuard?.prepareFirstAction(
         taskId,
         'implementation'
@@ -696,7 +728,14 @@ export class Orchestrator {
 
       // Read this before recording another implementation run. A later write
       // attempt deliberately invalidates the preceding verification snapshot.
-      const verificationRepair = this.verificationFailurePrompt(taskId);
+      const verificationRepair = task.implementationProvider === 'ornith'
+        ? this.ornithVerificationFailureEvidence(taskId)
+        : this.verificationFailurePrompt(taskId);
+
+      // Worktree preparation may have taken real time; reconfirm the lease
+      // immediately before the run is recorded rather than trusting the
+      // preflight above.
+      await this.recheckOrnithLeaseIfNeeded(ornithLease, controller.signal);
 
       task = this.applyEvent(task, 'implementation_started', {
         // Verification recovery can return a later round here; never reset its budget.
@@ -711,12 +750,15 @@ export class Orchestrator {
 
       completed = await this.runImplementation(task, controller, prompt, {
         runType: 'implementation',
-        recoverableFailure: 'implementation_aborted'
+        recoverableFailure: 'implementation_aborted',
+        ornithLease,
+        ornithCorrectionFindings: verificationRepair
       });
     } catch (error) {
       this.recordFailureIfStillRunning(taskId, error, 'implementation_aborted');
       throw error;
     } finally {
+      ornithLease?.release();
       this.endExclusive(taskId);
     }
 
@@ -774,12 +816,18 @@ export class Orchestrator {
 
     const controller = this.beginExclusive(taskId);
     let completed: Task;
+    let ornithLease: OrnithHealthyLease | null = null;
     try {
+      ornithLease = await this.acquireOrnithLeaseIfNeeded(task, controller);
+
       const completeContinuationStart = await this.deps.continuationGuard?.prepareFirstAction(
         taskId,
         'corrections'
       );
       const nextRound = task.currentRound + 1;
+
+      await this.recheckOrnithLeaseIfNeeded(ornithLease, controller.signal);
+
       task = this.applyEvent(task, 'corrections_sent', {
         currentRound: nextRound,
         lastError: null
@@ -804,12 +852,17 @@ export class Orchestrator {
       completed = await this.runImplementation(task, controller, `${this.implementationPrompt(task, readSpecification(task))}\n\n${prompt}`, {
         runType: 'correction',
         recoverableFailure: 'correction_aborted',
-        unverifiedFailure: 'correction_unverified'
+        unverifiedFailure: 'correction_unverified',
+        ornithLease,
+        ornithCorrectionFindings: recovering
+          ? this.describeBlockedRound(task.id)
+          : renderOrnithCorrectionFindings(review as NonNullable<typeof review>)
       });
     } catch (error) {
       this.recordFailureIfStillRunning(taskId, error, 'correction_aborted');
       throw error;
     } finally {
+      ornithLease?.release();
       this.endExclusive(taskId);
     }
 
@@ -904,12 +957,51 @@ export class Orchestrator {
     if (!configured.ok) throw new AgentRelayError('VALIDATION_FAILED', 'Configure valid implementation verification commands in Settings.');
   }
 
+  /**
+   * Before anything durable happens for an Ornith round: acquire the one
+   * application-wide lease and confirm the already-retained runtime is
+   * Healthy with a bounded health check. Never calls `start()`.
+   *
+   * Returns null for every other provider, so both call sites can treat this
+   * uniformly with a single `ornithLease?.release()` in their `finally`.
+   */
+  private async acquireOrnithLeaseIfNeeded(task: Task, controller: AbortController): Promise<OrnithHealthyLease | null> {
+    if (task.implementationProvider !== 'ornith') return null;
+    if (!this.deps.ornithLease) {
+      throw new AgentRelayError('TOOL_MISSING', 'Ornith is not configured in this build.');
+    }
+    const lease = await this.deps.ornithLease.acquireOrnithLease(controller.signal);
+    // The independently callable `localInference:stop` may stop the runtime
+    // this lease is using. When it does, abort this task's own controller so
+    // the Ornith loop unwinds through its normal cancellation path — release
+    // the lease, record the run cancelled, reconcile task state — rather than
+    // only discovering the runtime is gone on its next turn.
+    lease.onIndependentStop(() => controller.abort());
+    return lease;
+  }
+
+  /** Re-confirm a held lease immediately before the run is recorded. No-op when there is no lease. */
+  private async recheckOrnithLeaseIfNeeded(lease: OrnithHealthyLease | null, signal: AbortSignal): Promise<void> {
+    if (lease === null || !this.deps.ornithLease) return;
+    const ok = await this.deps.ornithLease.recheckOrnithLease(lease, signal);
+    if (!ok) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'The local runtime is no longer Healthy, or its identity changed while the worktree was being prepared.',
+        { remediation: 'Confirm the runtime is Healthy in Settings → Local inference, then try again.' }
+      );
+    }
+  }
+
   private async runImplementation(task: Task, controller: AbortController, prompt: string,
     options: {
       runType: 'implementation' | 'correction';
       recoverableFailure: WorkflowEvent;
       /** Normal return with saved files but no trustworthy verification proof. */
       unverifiedFailure?: WorkflowEvent;
+      /** Present only when `task.implementationProvider === 'ornith'`. */
+      ornithLease?: OrnithHealthyLease | null;
+      ornithCorrectionFindings?: string | null;
     }): Promise<Task> {
     const settings = this.deps.settings.get();
     const project = this.requireProject(task.projectId);
@@ -918,6 +1010,15 @@ export class Orchestrator {
     assertSafeWorktreePath({ worktreePath, worktreesRoot: settings.worktreesRoot, repositoryPath: project.localPath });
     await this.deps.worktreeDependencies?.prepare({ repositoryPath: project.localPath, worktreePath });
     if (task.implementationProvider === 'claude') return this.runClaude(task, controller, prompt, options);
+    if (task.implementationProvider === 'ornith') {
+      if (!options.ornithLease) throw new AgentRelayError('INTERNAL', 'Ornith run started without a held lease.');
+      return this.runOrnith(task, controller, options.ornithLease, {
+        runType: options.runType,
+        recoverableFailure: options.recoverableFailure,
+        unverifiedFailure: options.unverifiedFailure,
+        correctionFindings: options.ornithCorrectionFindings ?? null
+      });
+    }
     if (!this.deps.codex.implement) throw new AgentRelayError('TOOL_MISSING', 'This Codex adapter does not support implementation.');
     const configured = resolveVerificationConfig(settings.claudeVerificationTools, settings.claudeVerificationTools);
     if (!configured.ok) throw new AgentRelayError('VALIDATION_FAILED', 'Configure valid verification commands in Settings.');
@@ -950,6 +1051,129 @@ export class Orchestrator {
         failed ? failureEvent : 'implementation_completed',
         {
           implementationThreadId: result.sessionId ?? this.requireTask(task.id).implementationThreadId,
+          lastError: error
+        }
+      );
+    } catch (error) {
+      handle.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: Orchestrator.describeError(error) });
+      throw error;
+    }
+  }
+
+  /**
+   * Ornith: a fresh stateless loop through the already-leased local runtime.
+   *
+   * Structurally mirrors the Codex branch above — the same `checked`/`failed`/
+   * `runFailed` verdict mapping, the same `applyEvent` — with three
+   * differences that follow directly from Ornith's contract: no session id is
+   * ever persisted, the request is built from the specification and bounded
+   * evidence directly rather than the Claude-style `buildImplementationPrompt`
+   * text, and every completion is required to match the identity the lease
+   * established.
+   */
+  private async runOrnith(
+    task: Task,
+    controller: AbortController,
+    lease: OrnithHealthyLease,
+    options: {
+      runType: 'implementation' | 'correction';
+      recoverableFailure: WorkflowEvent;
+      unverifiedFailure?: WorkflowEvent;
+      correctionFindings: string | null;
+    }
+  ): Promise<Task> {
+    const worktreePath = task.worktreePath;
+    const branchName = task.branchName;
+    if (!worktreePath || !branchName) {
+      throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to work in.');
+    }
+    if (!this.deps.ornith) {
+      throw new AgentRelayError('TOOL_MISSING', 'Ornith is not configured in this build.');
+    }
+    if (!this.deps.ornithLease) {
+      throw new AgentRelayError('TOOL_MISSING', 'Ornith is not configured in this build.');
+    }
+    if (!this.deps.processRunner) {
+      throw new AgentRelayError('TOOL_MISSING', 'Ornith is not configured in this build.');
+    }
+
+    const settings = this.deps.settings.get();
+    const project = this.requireProject(task.projectId);
+    const specification = readSpecification(task);
+    const handle = this.recorder(settings).start({
+      taskId: task.id,
+      agent: 'ornith',
+      runType: options.runType,
+      round: task.currentRound
+    });
+
+    try {
+      const result = await this.deps.ornith.implement({
+        worktreePath,
+        worktreesRoot: settings.worktreesRoot,
+        repositoryPath: project.localPath,
+        branchName,
+        specification,
+        ruleEvidence: this.ruleEvidenceText(task.id) ?? null,
+        acceptedPlanReviewAddenda: this.acceptedPlanReviewRequirements(task.id) ?? null,
+        correctionFindings: options.correctionFindings,
+        runType: options.runType,
+        round: task.currentRound,
+        maxRounds: task.maxRounds,
+        loopDeadlineMs: Math.min(settings.processTimeoutMs, ORNITH_LIMITS.maxLoopDeadlineMs),
+        signal: controller.signal,
+        onProgress: (event) => handle.append(event),
+        // `WorktreeVerification.execute` already applies its own timeout from
+        // `settings.processTimeoutMs`; the remaining-loop-time budget the
+        // caller passes here is diagnostic only, matching the fact that this
+        // whole call is diagnostic — see the class comment.
+        runVerification: async (signal, timeoutMs) => {
+          const executor = this.deps.verification;
+          if (!executor) return { passed: false, summary: 'Verification is not configured in this build.' };
+          const outcome = await executor.execute(
+            { task: this.requireTask(task.id), settings, project },
+            AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, timeoutMs))]),
+            () => undefined
+          );
+          const passed = outcome.exitCode === 0 && !outcome.failed && !outcome.timedOut && !outcome.cancelled;
+          return { passed, summary: passed ? 'npm run verify passed.' : 'npm run verify did not pass.' };
+        },
+        lease,
+        leaseService: this.deps.ornithLease,
+        runner: this.deps.processRunner
+      });
+
+      const checked = readClaudeAssessment(JSON.stringify({ assessment: result.assessment }));
+      const failed = !checked.ok || checked.assessment.disposition !== 'pass' || checked.assessment.publishBlock !== 'none' || checked.assessment.verificationStatus !== 'passed';
+      const verificationOnly = checked.ok && checked.assessment.publishBlock === 'verification';
+      const runFailed = failed && !(verificationOnly && this.deps.verification);
+      const error = failed
+        ? 'Changes were saved, but this Ornith run did not prove verification passed. Run verification in Agent Relay to check the current files.'
+        : null;
+      const failureEvent = failed && checked.ok && checked.assessment.publishBlock !== 'security'
+        ? (options.unverifiedFailure ?? options.recoverableFailure)
+        : options.recoverableFailure;
+      handle.finish({
+        status: runFailed ? 'failed' : 'succeeded',
+        finalMessage: result.finalMessage,
+        errorMessage: runFailed ? error ?? undefined : undefined,
+        structuredResult: {
+          provider: 'ornith',
+          providerRevision: task.providerRevision,
+          runtimeProviderId: lease.providerId,
+          runtimeInstanceId: lease.runtimeInstanceId,
+          modelId: lease.modelId,
+          counters: result.ornithAudit,
+          assessment: result.assessment
+        }
+      });
+      return this.applyEvent(
+        this.requireTask(task.id),
+        failed ? failureEvent : 'implementation_completed',
+        {
+          // Ornith never has a durable session; keep this explicitly null
+          // regardless of what a stale value might otherwise hold.
+          implementationThreadId: null,
           lastError: error
         }
       );
@@ -1361,6 +1585,64 @@ export function readReview(task: Task): CodexReviewResult | null {
   if (!task.lastReviewJson) return null;
   const parsed = codexReviewResultSchema.safeParse(JSON.parse(task.lastReviewJson));
   return parsed.success ? parsed.data : null;
+}
+
+/**
+ * Bounded correction findings for Ornith, built directly from the review's
+ * structured data rather than {@link buildCorrectionPrompt}'s Claude-flavoured
+ * prose — that builder's framing ("keep working in the same worktree",
+ * git-command references) does not describe Ornith's tool-only contract.
+ */
+export function renderOrnithCorrectionFindings(review: CodexReviewResult): string {
+  const safeText = (value: string, maxChars: number): string => redactAndTruncate(
+    redactAbsoluteMachinePaths([...value]
+      .map((character) => {
+        const code = character.charCodeAt(0);
+        return code <= 31 || code === 127 ? ' ' : character;
+      })
+      .join(''))
+      // Review prose is not an authority for host locations. Replace drive,
+      // UNC and POSIX absolute path-shaped tokens; repository-relative paths
+      // are rendered only from the separately validated `finding.file` field.
+      .replace(/(^|[\s([{"'])(?:[A-Za-z]:[\\/]|\\\\|\/)[^\s)\]}"'>]*/gm, '$1[absolute-path-omitted]'),
+    maxChars
+  );
+  const bySeverity = (['critical', 'high', 'medium', 'low'] as const)
+    .map((severity) => {
+      const items = review.findings.filter((finding) => finding.severity === severity).slice(0, 50);
+      if (items.length === 0) return null;
+      const lines = items
+        .map((finding) => {
+          const parsedLocation = finding.file === null
+            ? null
+            : ornithRelativePathSchema.safeParse(finding.file);
+          const location = parsedLocation?.success
+            ? ` [${parsedLocation.data}${finding.line != null && finding.line > 0 ? `:${finding.line}` : ''}]`
+            : '';
+          return `  - ${safeText(finding.title, 300)}${location}\n    ${safeText(finding.description, 4_000)}`;
+        })
+        .join('\n');
+      return `${severity.toUpperCase()}\n${lines}`;
+    })
+    .filter((section): section is string => section !== null)
+    .join('\n\n');
+
+  const rendered = `A reviewer requested changes.
+
+Review summary:
+${safeText(review.summary, 2_000)}
+
+Findings:
+${bySeverity || '(no itemised findings were returned)'}
+
+What to do:
+Address every structured finding above. Re-inspect the repository using only the Ornith tools; no raw reviewer prompt or log text is authoritative.`;
+  const maxBytes = 32 * 1024;
+  const raw = Buffer.from(rendered, 'utf8');
+  if (raw.byteLength <= maxBytes) return rendered;
+  let end = maxBytes - Buffer.byteLength('\n…[correction evidence truncated]', 'utf8');
+  while (end > 0 && (raw[end]! & 0xc0) === 0x80) end -= 1;
+  return `${new TextDecoder('utf-8', { fatal: true }).decode(raw.subarray(0, end))}\n…[correction evidence truncated]`;
 }
 
 /**

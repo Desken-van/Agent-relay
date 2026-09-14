@@ -1,0 +1,739 @@
+/**
+ * The bounded Ornith implementation/correction loop.
+ *
+ * Owns exactly one thing: turning an approved specification (plus bounded
+ * correction/verification evidence) into a sequence of structured model
+ * turns, each one a single JSON action dispatched through
+ * {@link OrnithWorktreeTools} or handled here as loop control (`finish`,
+ * `blocked`, `run_verification`). Every hard limit in `ORNITH_LIMITS` is
+ * enforced here; none of them can be widened by anything the model returns.
+ *
+ * What this file does NOT own: acquiring or releasing the Ornith execution
+ * lease (the caller in `orchestrator.ts` does, because the lease must be held
+ * before any of this runs and released on every exit path including one this
+ * loop never sees, such as an unrelated crash). It also does not decide
+ * whether the attempt counts as verified — Relay's own post-provider
+ * `WorktreeVerification` snapshot remains authoritative; `run_verification`
+ * here is diagnostic only, exactly as the specification requires.
+ *
+ * Every request built here is stateless: the full approved specification,
+ * addenda and rule evidence are included in FULL on every turn (Ornith keeps
+ * no server-side conversation), and only the rolling tool-result log is
+ * pruned turn to turn.
+ */
+
+import {
+  ORNITH_LIMITS,
+  containsAbsoluteMachinePath,
+  parseOrnithCompletion,
+  type OrnithAction,
+  type OrnithActionKind,
+  type OrnithDenialCode
+} from '../../shared/domain/ornith';
+import {
+  LOCAL_INFERENCE_CONTRACT_VERSION,
+  type LocalInferenceMessage,
+  type LocalInferenceRequest
+} from '../../shared/domain/local-inference';
+import type { ClaudeRoundAssessmentRecord } from '../../shared/domain/claude-assessment';
+import { CLAUDE_ASSESSMENT_VERSION } from '../../shared/domain/claude-assessment';
+import { AgentRelayError } from '../../shared/domain/errors';
+import { containsSecretShape } from '../../shared/util/redact';
+import type { TaskSpecification } from '../../shared/schemas/codex';
+import type { AgentProgressEvent, ImplementationResult, OrnithHealthyLease, OrnithInferenceLeaseService } from '../ports';
+import type { ProcessRunner } from '../adapters/process/process-runner';
+import { OrnithWorktreeTools, type OrnithOperationBudget, type OrnithToolResult } from './ornith-worktree-tools';
+
+/* -------------------------------------------------------------------------- */
+/* Request / result                                                           */
+/* -------------------------------------------------------------------------- */
+
+export interface OrnithImplementationRequest {
+  readonly worktreePath: string;
+  readonly worktreesRoot: string;
+  readonly repositoryPath: string;
+  readonly branchName: string;
+  readonly specification: TaskSpecification;
+  /** Complete, never truncated. */
+  readonly ruleEvidence: string | null;
+  /** Complete, never truncated. */
+  readonly acceptedPlanReviewAddenda: string | null;
+  /** Bounded correction findings or Relay verification-failure evidence, already rendered. */
+  readonly correctionFindings: string | null;
+  readonly runType: 'implementation' | 'correction';
+  readonly round: number;
+  readonly maxRounds: number;
+  /** `min(settings.processTimeoutMs, ORNITH_LIMITS.maxLoopDeadlineMs)`. */
+  readonly loopDeadlineMs: number;
+  readonly signal: AbortSignal;
+  readonly onProgress: (event: AgentProgressEvent) => void;
+  /**
+   * Dispatch to the existing WorktreeVerification executor. Diagnostic only —
+   * its result never decides the attempt's outcome; only Relay's own
+   * post-provider snapshot verification does.
+   */
+  readonly runVerification: (signal: AbortSignal, timeoutMs: number) => Promise<{ readonly passed: boolean; readonly summary: string }>;
+  /** Already acquired and health-confirmed by the caller. */
+  readonly lease: OrnithHealthyLease;
+  readonly leaseService: OrnithInferenceLeaseService;
+  readonly gitExecutablePath?: string | null;
+  /** Used only to invoke fixed, read-only Git argv for the worktree tools. */
+  readonly runner: ProcessRunner;
+}
+
+export interface OrnithImplementationAudit {
+  readonly turns: number;
+  readonly actions: number;
+  readonly readBytes: number;
+  readonly writeBytes: number;
+  readonly changedFiles: number;
+  readonly verifications: number;
+  readonly outcomes: readonly { sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }[];
+}
+
+export interface OrnithImplementationResult extends ImplementationResult {
+  readonly ornithAudit: OrnithImplementationAudit;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Prompt construction                                                        */
+/* -------------------------------------------------------------------------- */
+
+interface RollingResult {
+  readonly turn: number;
+  readonly action: OrnithActionKind;
+  /** Bounded JSON text: either the tool's `forModel`, or a denial description. */
+  readonly resultText: string;
+}
+
+function renderSpecification(specification: TaskSpecification): string {
+  return `=== THE APPROVED SPECIFICATION ===
+Title: ${specification.title}
+
+Summary:
+${specification.summary}
+
+Acceptance criteria — all of these must be true when you are done:
+${specification.acceptanceCriteria.map((c, i) => `  ${i + 1}. ${c}`).join('\n')}
+
+Constraints:
+${specification.constraints.length > 0 ? specification.constraints.map((c) => `  - ${c}`).join('\n') : '  (none stated)'}
+
+Assumptions the specification made:
+${specification.assumptions.length > 0 ? specification.assumptions.map((a) => `  - ${a}`).join('\n') : '  (none stated)'}
+
+Tests to add or run:
+${specification.suggestedTests.length > 0 ? specification.suggestedTests.map((t) => `  - ${t}`).join('\n') : '  (none suggested)'}
+
+=== DETAILED INSTRUCTION ===
+${specification.implementationPrompt}`;
+}
+
+const ORNITH_PROTOCOL_INSTRUCTIONS = `You are Ornith, an implementation agent working through Agent Relay in a bounded
+tool loop. You do not have a shell, a terminal, or any way to run an arbitrary command.
+Every reply you send MUST be exactly one JSON object and NOTHING else — no prose before
+or after it, no Markdown code fence. Reply with only ONE of the following action shapes,
+matching this exact JSON structure (all fields required unless marked optional):
+
+{"version":1,"action":"list_files","prefix":"<relative directory prefix; empty string means root>","limit":<=200,"cursor":<optional>}
+{"version":1,"action":"read_file","path":"<relative file>","offset":0,"limit":<=65536}
+{"version":1,"action":"search_text","query":"<literal text>","caseSensitive":false,"limit":<=100,"files":[<optional relative paths>]}
+{"version":1,"action":"create_file","path":"<relative file>","content":"<UTF-8 text>"}
+{"version":1,"action":"replace_text","path":"<relative file>","sha256":"<current file sha256>","replacements":[{"oldText":"<exact text>","newText":"<replacement>"}]}
+{"version":1,"action":"delete_file","path":"<relative file>","sha256":"<current file sha256>"}
+{"version":1,"action":"git_status"}
+{"version":1,"action":"git_diff","paths":[<optional relative paths>]}
+{"version":1,"action":"run_verification"}
+{"version":1,"action":"finish","summary":"<what you changed, at most 4000 characters>"}
+{"version":1,"action":"blocked","reason":"<why you cannot proceed, at most 2000 characters>"}
+
+Rules:
+- All paths are repository-relative, use forward slashes, and must stay inside the worktree.
+- "replace_text" requires the file's CURRENT sha256 (given in the last read_file/create_file/
+  replace_text result for that file) and fails with no write if oldText does not occur
+  exactly once.
+- You have no git commit, push, merge, checkout, reset, or remote access of any kind —
+  do not ask for one, it does not exist.
+- Call "run_verification" only when you believe the work is complete; Agent Relay itself
+  re-verifies afterward regardless.
+- Call "finish" only when the acceptance criteria are met. Call "blocked" only when you
+  cannot proceed and must stop.
+- Every reply is judged on its own: nothing you say outside the JSON is read.`;
+
+/**
+ * Build one complete, stateless request body.
+ *
+ * @returns `null` when the complete authoritative content (specification,
+ * addenda, rule evidence, protocol instructions) alone exceeds the prompt
+ * budget — the caller must refuse before inference rather than silently
+ * dropping any of it.
+ */
+function buildOrnithPromptText(
+  request: OrnithImplementationRequest,
+  rolling: readonly RollingResult[],
+  remaining: { turns: number; actions: number; verifications: number; readBytes: number; writeBytes: number; changedFiles: number }
+): string | null {
+  const authoritative = [
+    renderSpecification(request.specification),
+    request.acceptedPlanReviewAddenda
+      ? `=== USER-ACCEPTED EXTERNAL PLAN-REVIEW ADDENDA ===\n${request.acceptedPlanReviewAddenda}`
+      : null,
+    request.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${request.ruleEvidence}` : null,
+    request.correctionFindings ? `=== EVIDENCE FROM THE PREVIOUS ATTEMPT ===\n${request.correctionFindings}` : null,
+    ORNITH_PROTOCOL_INSTRUCTIONS
+  ]
+    .filter((part): part is string => part !== null)
+    .join('\n\n');
+
+  if (Buffer.byteLength(authoritative, 'utf8') > ORNITH_LIMITS.maxPromptBytes) {
+    return null;
+  }
+
+  const budget = `=== REMAINING BUDGET ===
+Model turns remaining: ${remaining.turns}
+Non-terminal actions remaining: ${remaining.actions}
+Verification calls remaining: ${remaining.verifications}
+Repository read bytes remaining: ${remaining.readBytes}
+Repository write bytes remaining: ${remaining.writeBytes}
+Changed files remaining: ${remaining.changedFiles}
+Round ${request.round} of at most ${request.maxRounds}.`;
+
+  const fixedTail = `${budget}\n\nReply with exactly one JSON action now.`;
+  const fixedBytes = Buffer.byteLength(`${authoritative}\n\n${fixedTail}`, 'utf8');
+  if (fixedBytes > ORNITH_LIMITS.maxPromptBytes) return null;
+  const rollingByteBudget = Math.min(
+    ORNITH_LIMITS.maxRollingContextBytes,
+    ORNITH_LIMITS.maxPromptBytes - fixedBytes
+  );
+
+  let history = '';
+  let omitted = 0;
+  const kept: RollingResult[] = [];
+  let contextBytes = 0;
+  for (let i = rolling.length - 1; i >= 0; i -= 1) {
+    const entry = rolling[i];
+    if (entry === undefined) continue;
+    const entryText = `turn ${entry.turn} [${entry.action}]: ${entry.resultText}`;
+    const bytes = Buffer.byteLength(entryText, 'utf8');
+    if (kept.length >= ORNITH_LIMITS.maxRetainedResults || contextBytes + bytes > rollingByteBudget) {
+      omitted += 1;
+      continue;
+    }
+    kept.unshift(entry);
+    contextBytes += bytes;
+  }
+  if (kept.length > 0) {
+    history = `=== PRIOR TOOL RESULTS (most recent last${omitted > 0 ? `; ${omitted} older result(s) omitted` : ''}) ===\n${kept
+      .map((entry) => `turn ${entry.turn} [${entry.action}]: ${entry.resultText}`)
+      .join('\n')}`;
+  }
+
+  const full = [authoritative, history, budget, 'Reply with exactly one JSON action now.']
+    .filter((part) => part.length > 0)
+    .join('\n\n');
+
+  return Buffer.byteLength(full, 'utf8') > ORNITH_LIMITS.maxPromptBytes
+    ? // The rolling section alone pushed it over; drop history entirely and
+      // retry with just the authoritative content and budget, which was
+      // already proven to fit above.
+      [authoritative, budget, 'Reply with exactly one JSON action now.'].join('\n\n')
+    : full;
+}
+
+function toMessages(promptText: string): LocalInferenceMessage[] {
+  const CHUNK = 190_000;
+  const messages: LocalInferenceMessage[] = [];
+  for (let offset = 0; offset < promptText.length; offset += CHUNK) {
+    messages.push({ role: 'user', content: promptText.slice(offset, offset + CHUNK) });
+  }
+  return messages.length > 0 ? messages : [{ role: 'user', content: promptText }];
+}
+
+/* -------------------------------------------------------------------------- */
+/* Assessment mapping                                                         */
+/* -------------------------------------------------------------------------- */
+
+function assessmentFor(input: {
+  disposition: 'pass' | 'fail';
+  publishBlock: ClaudeRoundAssessmentRecord['publishBlock'];
+  reasonCodes: readonly string[];
+}): ClaudeRoundAssessmentRecord {
+  return {
+    version: CLAUDE_ASSESSMENT_VERSION,
+    disposition: input.disposition,
+    // Relay's own post-provider snapshot verification is what decides
+    // publish eligibility; Ornith's tool-loop `run_verification` is
+    // diagnostic and never sets this to "passed" on its own account.
+    verificationStatus: 'not_run',
+    publishBlock: input.publishBlock,
+    reasonCodes: [...input.reasonCodes].slice(0, 40),
+    verification: null,
+    denials: []
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* The loop                                                                    */
+/* -------------------------------------------------------------------------- */
+
+export class OrnithImplementationService {
+  async implement(request: OrnithImplementationRequest): Promise<OrnithImplementationResult> {
+    const tools = new OrnithWorktreeTools({
+      worktreePath: request.worktreePath,
+      worktreesRoot: request.worktreesRoot,
+      repositoryPath: request.repositoryPath,
+      branchName: request.branchName,
+      runner: request.runner,
+      gitExecutablePath: request.gitExecutablePath ?? null
+    });
+
+    const deadline = Date.now() + request.loopDeadlineMs;
+    const rolling: RollingResult[] = [];
+    let turnsUsed = 0;
+    let nonterminalActionsUsed = 0;
+    let verificationsUsed = 0;
+    let cumulativeReadBytes = 0;
+    let cumulativeWriteBytes = 0;
+    const outcomes: Array<{ sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }> = [];
+    const finish = (
+      disposition: 'pass' | 'fail', message: string,
+      publishBlock: ClaudeRoundAssessmentRecord['publishBlock'], reasonCodes: readonly string[]
+    ): OrnithImplementationResult => ({
+      ...finishedResult(disposition, message, publishBlock, reasonCodes),
+      ornithAudit: {
+        turns: turnsUsed,
+        actions: nonterminalActionsUsed,
+        readBytes: cumulativeReadBytes,
+        writeBytes: cumulativeWriteBytes,
+        changedFiles: tools.changedFileCount(),
+        verifications: verificationsUsed,
+        outcomes: outcomes.slice(-20)
+      }
+    });
+
+    // These sources are authoritative and must be included byte-for-byte.
+    // Unsafe host paths or credentials therefore cause refusal before the
+    // first inference instead of being silently rewritten.
+    const promptSources = [
+      renderSpecification(request.specification),
+      request.acceptedPlanReviewAddenda,
+      request.ruleEvidence,
+      request.correctionFindings
+    ].filter((value): value is string => value !== null);
+    if (promptSources.some((value) => containsSecretShape(value) || containsAbsoluteMachinePath(value))) {
+      return finish(
+        'fail',
+        'The approved Ornith inputs contain credential-shaped text or an absolute machine path.',
+        'security',
+        ['disallowed_action']
+      );
+    }
+
+    for (;;) {
+      if (request.signal.aborted) {
+        throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+      }
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        return finish(
+          'fail',
+          'The Ornith implementation loop exceeded its overall time budget.',
+          'configuration',
+          ['limit_deadline_exceeded']
+        );
+      }
+      if (turnsUsed >= ORNITH_LIMITS.maxModelTurns) {
+        return finish(
+          'fail',
+          'The Ornith implementation loop used its full turn budget without finishing.',
+          'configuration',
+          ['limit_turns_exceeded']
+        );
+      }
+
+      const checkoutSignal = deadlineSignal(request.signal, remainingMs);
+      let checkoutOk: boolean;
+      try {
+        checkoutOk = await tools.assertCheckoutIdentity(checkoutSignal.signal);
+      } catch (error) {
+        if (request.signal.aborted) throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+        if (checkoutSignal.timedOut()) {
+          return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+        }
+        throw error;
+      } finally {
+        checkoutSignal.dispose();
+      }
+      if (checkoutSignal.timedOut() || Date.now() >= deadline) {
+        return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+      }
+      if (!checkoutOk) {
+        return finish(
+          'fail',
+          'The task worktree no longer matches its expected checkout identity.',
+          'security',
+          ['checkout_identity_changed']
+        );
+      }
+
+      const promptText = buildOrnithPromptText(request, rolling, {
+        turns: Math.max(0, ORNITH_LIMITS.maxModelTurns - turnsUsed),
+        actions: Math.max(0, ORNITH_LIMITS.maxNonterminalActions - nonterminalActionsUsed),
+        verifications: Math.max(0, ORNITH_LIMITS.maxVerificationCalls - verificationsUsed),
+        readBytes: Math.max(0, ORNITH_LIMITS.maxCumulativeReadBytes - cumulativeReadBytes),
+        writeBytes: Math.max(0, ORNITH_LIMITS.maxCumulativeWriteBytes - cumulativeWriteBytes),
+        changedFiles: Math.max(0, ORNITH_LIMITS.maxChangedFiles - tools.changedFileCount())
+      });
+      if (promptText === null) {
+        return finish(
+          'fail',
+          'The approved specification, addenda and rule evidence do not fit the Ornith prompt budget.',
+          'configuration',
+          ['limit_prompt_exceeded']
+        );
+      }
+
+      const requestId = `ornith-${Date.now().toString(36)}-${turnsUsed}`;
+      const inferRequest: LocalInferenceRequest = {
+        version: LOCAL_INFERENCE_CONTRACT_VERSION,
+        requestId,
+        messages: toMessages(promptText)
+      };
+
+      turnsUsed += 1;
+      request.onProgress({ type: 'progress', text: `Ornith turn ${turnsUsed}` });
+
+      const inferenceRemainingMs = deadline - Date.now();
+      if (inferenceRemainingMs <= 0) {
+        return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+      }
+      const inferenceSignal = deadlineSignal(request.signal, inferenceRemainingMs);
+      let outcome;
+      try {
+        outcome = await request.leaseService.inferForOrnith(request.lease, inferRequest, inferenceSignal.signal);
+      } finally {
+        inferenceSignal.dispose();
+      }
+
+      if (request.signal.aborted) {
+        throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+      }
+      if (inferenceSignal.timedOut() || Date.now() >= deadline) {
+        return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+      }
+      if (outcome.kind !== 'completed') {
+        if (outcome.kind === 'cancelled') {
+          throw new AgentRelayError('CANCELLED', 'The local runtime cancelled the Ornith inference.');
+        }
+        return finish(
+          'fail',
+          'The local runtime did not return a usable completion.',
+          'configuration',
+          ['runtime_unavailable']
+        );
+      }
+
+      const response = outcome.response;
+      if (
+        response.providerId !== request.lease.providerId ||
+        response.modelId !== request.lease.modelId ||
+        response.runtimeInstanceId !== request.lease.runtimeInstanceId
+      ) {
+        return finish(
+          'fail',
+          'The local runtime identity changed during this run.',
+          'configuration',
+          ['runtime_identity_changed']
+        );
+      }
+
+      const parsed = parseOrnithCompletion(response.completion);
+      if (!parsed.ok) {
+        return finish('fail', 'Ornith returned output that could not be accepted.', 'configuration', [parsed.code]);
+      }
+      const action = parsed.action;
+
+      // The identity/health check inside `inferForOrnith` covers the instant
+      // the completion arrived; it proves nothing about the moment between
+      // then and now. Re-confirm the exact lease owner, retained provider
+      // instance, runtime instance, provider/model/settings fingerprint, and
+      // Healthy state immediately before accepting ANY parsed action —
+      // `finish`, `blocked`, or a nonterminal tool dispatch alike — so an
+      // unexpected exit in that window discards the completion outright
+      // rather than letting one more action run on its strength.
+      const leaseRemainingMs = deadline - Date.now();
+      if (leaseRemainingMs <= 0) {
+        return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+      }
+      const leaseSignal = deadlineSignal(request.signal, leaseRemainingMs);
+      let leaseStillHealthy: boolean;
+      try {
+        leaseStillHealthy = await request.leaseService.recheckOrnithLease(request.lease, leaseSignal.signal);
+      } catch (error) {
+        if (request.signal.aborted) throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+        if (leaseSignal.timedOut()) {
+          return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+        }
+        throw error;
+      } finally {
+        leaseSignal.dispose();
+      }
+      if (request.signal.aborted) {
+        throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+      }
+      if (leaseSignal.timedOut() || Date.now() >= deadline) {
+        return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+      }
+      if (!leaseStillHealthy) {
+        return finish(
+          'fail',
+          'The local runtime identity or health changed before this action could be accepted.',
+          'security',
+          ['runtime_unhealthy']
+        );
+      }
+
+      if (action.action === 'finish') {
+        if (containsAbsoluteMachinePath(action.summary)) {
+          return finish(
+            'fail',
+            'Ornith finished with a summary that referenced an absolute machine path, which was refused.',
+            'security',
+            ['disallowed_action']
+          );
+        }
+        request.onProgress({ type: 'assistant_message', text: 'Ornith finished.' });
+        return finish('pass', action.summary, 'verification', []);
+      }
+      if (action.action === 'blocked') {
+        request.onProgress({
+          type: 'tool_use',
+          text: 'Ornith ended the run as blocked.',
+          data: {
+            sequence: nonterminalActionsUsed + 1,
+            action: 'blocked',
+            ok: false,
+            code: 'blocked',
+            providerId: request.lease.providerId,
+            modelId: request.lease.modelId,
+            runtimeInstanceId: request.lease.runtimeInstanceId
+          }
+        });
+        return finish('fail', 'Ornith reported that it could not continue.', 'configuration', ['blocked']);
+      }
+
+      if (nonterminalActionsUsed >= ORNITH_LIMITS.maxNonterminalActions) {
+        return finish(
+          'fail',
+          'The Ornith implementation loop used its full action budget without finishing.',
+          'configuration',
+          ['limit_actions_exceeded']
+        );
+      }
+      nonterminalActionsUsed += 1;
+
+      const changedPath = 'path' in action && (action.action === 'create_file' || action.action === 'replace_text' || action.action === 'delete_file')
+        ? action.path : null;
+      if (changedPath !== null && tools.wouldExceedChangedFileLimit(changedPath)) {
+        return finish(
+          'fail',
+          'The Ornith implementation loop exceeded the changed-file limit.',
+          'configuration',
+          ['limit_changed_files_exceeded']
+        );
+      }
+
+      let toolResult: OrnithToolResult;
+      const operationStarted = Date.now();
+      if (action.action === 'run_verification') {
+        if (verificationsUsed >= ORNITH_LIMITS.maxVerificationCalls) {
+          return finish('fail', 'The verification-call budget for this run is exhausted.', 'configuration', ['limit_verification_calls_exceeded']);
+        } else {
+          verificationsUsed += 1;
+          // The caller's closure additionally clamps this to its own process
+          // timeout — see the `runVerification` field doc and the Orchestrator
+          // wiring, which is where `settings.processTimeoutMs` is known.
+          const remainingLoopMs = Math.max(1, deadline - Date.now());
+          const verificationSignal = deadlineSignal(request.signal, remainingLoopMs);
+          try {
+            const result = await request.runVerification(verificationSignal.signal, remainingLoopMs);
+            if (verificationSignal.timedOut() || Date.now() >= deadline) {
+              return finish(
+                'fail',
+                'The Ornith implementation loop exceeded its overall time budget.',
+                'configuration',
+                ['limit_deadline_exceeded']
+              );
+            }
+            toolResult = {
+              ok: true,
+              forModel: { passed: result.passed, summary: result.summary.slice(0, ORNITH_LIMITS.maxToolResultBytes) },
+              readBytes: 0,
+              writeBytes: 0,
+              auditSummary: `run_verification -> ${result.passed ? 'passed' : 'failed'}`
+            };
+          } catch (error) {
+            if (request.signal.aborted) {
+              throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+            }
+            if (verificationSignal.timedOut()) {
+              return finish(
+                'fail',
+                'The Ornith implementation loop exceeded its overall time budget.',
+                'configuration',
+                ['limit_deadline_exceeded']
+              );
+            }
+            toolResult = { ok: false, code: 'timeout', reason: boundedVerificationError(error) };
+          } finally {
+            verificationSignal.dispose();
+          }
+        }
+      } else {
+        const operationRemainingMs = deadline - Date.now();
+        if (operationRemainingMs <= 0) {
+          return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+        }
+        const operationSignal = deadlineSignal(request.signal, operationRemainingMs);
+        try {
+          if (!(await tools.assertCheckoutIdentity(operationSignal.signal))) {
+            return finish('fail', 'The task worktree checkout identity changed.', 'security', ['checkout_identity_changed']);
+          }
+          toolResult = await this.dispatchToolAction(tools, action, operationSignal.signal, {
+            readBytes: ORNITH_LIMITS.maxCumulativeReadBytes - cumulativeReadBytes,
+            writeBytes: ORNITH_LIMITS.maxCumulativeWriteBytes - cumulativeWriteBytes
+          });
+        } catch (error) {
+          if (request.signal.aborted) throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+          if (operationSignal.timedOut()) {
+            return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+          }
+          throw error;
+        } finally {
+          operationSignal.dispose();
+        }
+        if (operationSignal.timedOut() || Date.now() >= deadline) {
+          return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+        }
+      }
+
+      const durationMs = Date.now() - operationStarted;
+      if (!toolResult.ok) {
+        outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code });
+        request.onProgress({
+          type: 'tool_use',
+          text: `Ornith action ${action.action} denied (${toolResult.code}).`,
+          data: { sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code, durationMs }
+        });
+        return finish('fail', 'Agent Relay refused an unsafe or over-limit Ornith action.', 'security', [toolResult.code]);
+      }
+
+      if (cumulativeReadBytes + toolResult.readBytes > ORNITH_LIMITS.maxCumulativeReadBytes) {
+        return finish('fail', 'The Ornith repository read budget was exceeded.', 'configuration', ['limit_read_bytes_exceeded']);
+      }
+      if (cumulativeWriteBytes + toolResult.writeBytes > ORNITH_LIMITS.maxCumulativeWriteBytes) {
+        return finish('fail', 'The Ornith repository write budget was exceeded.', 'configuration', ['limit_write_bytes_exceeded']);
+      }
+      cumulativeReadBytes += toolResult.readBytes;
+      cumulativeWriteBytes += toolResult.writeBytes;
+      outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: true });
+
+      request.onProgress({
+        type: 'tool_use',
+        text: toolResult.auditSummary,
+        data: {
+          sequence: nonterminalActionsUsed, turn: turnsUsed, action: action.action, ok: true,
+          durationMs, readBytes: toolResult.readBytes, writeBytes: toolResult.writeBytes,
+          changedPath: toolResult.changedPath ?? null, cumulativeReadBytes, cumulativeWriteBytes,
+          changedFiles: tools.changedFileCount(), verifications: verificationsUsed,
+          providerId: request.lease.providerId, modelId: request.lease.modelId,
+          runtimeInstanceId: request.lease.runtimeInstanceId
+        }
+      });
+
+      const resultText = boundedJson(toolResult.forModel);
+      rolling.push({ turn: turnsUsed, action: action.action, resultText });
+    }
+  }
+
+  private async dispatchToolAction(
+    tools: OrnithWorktreeTools,
+    action: Exclude<OrnithAction, { action: 'finish' } | { action: 'blocked' } | { action: 'run_verification' }>,
+    signal: AbortSignal,
+    budget: OrnithOperationBudget
+  ): Promise<OrnithToolResult> {
+    switch (action.action) {
+      case 'list_files':
+        return tools.listFiles(action, signal);
+      case 'read_file':
+        return tools.readFile(action, signal, budget);
+      case 'search_text':
+        return tools.searchText(action, signal, budget);
+      case 'create_file':
+        return tools.createFile(action, signal, budget);
+      case 'replace_text':
+        return tools.replaceText(action, signal, budget);
+      case 'delete_file':
+        return tools.deleteFile(action, signal, budget);
+      case 'git_status':
+        return tools.gitStatus(signal);
+      case 'git_diff':
+        return tools.gitDiff(action, signal, budget);
+      default: {
+        const exhaustive: never = action;
+        return { ok: false, code: 'unknown_action', reason: `Unhandled action ${String((exhaustive as { action?: string }).action)}.` };
+      }
+    }
+  }
+}
+
+function finishedResult(
+  disposition: 'pass' | 'fail',
+  message: string,
+  publishBlock: ClaudeRoundAssessmentRecord['publishBlock'],
+  reasonCodes: readonly string[]
+): ImplementationResult {
+  return {
+    sessionId: null,
+    finalMessage: message,
+    assessment: assessmentFor({ disposition, publishBlock, reasonCodes })
+  };
+}
+
+function boundedJson(value: unknown): string {
+  try {
+    const text = JSON.stringify(value);
+    const bytes = Buffer.byteLength(text, 'utf8');
+    return bytes > ORNITH_LIMITS.maxToolResultBytes
+      ? JSON.stringify({ truncated: true, originalBytes: bytes, reason: 'Tool result exceeded the serialized byte limit.' })
+      : text;
+  } catch {
+    return '(unserializable result)';
+  }
+}
+
+function boundedVerificationError(error: unknown): string {
+  const message = error instanceof Error ? error.constructor.name : 'unknown error';
+  return `Verification could not be run (${message}).`.slice(0, ORNITH_LIMITS.maxErrorChars);
+}
+
+function deadlineSignal(parent: AbortSignal, timeoutMs: number): { signal: AbortSignal; timedOut: () => boolean; dispose: () => void } {
+  const controller = new AbortController();
+  let expired = false;
+  const timer = setTimeout(() => {
+    expired = true;
+    controller.abort();
+  }, Math.max(1, timeoutMs));
+  timer.unref?.();
+  const abort = (): void => controller.abort();
+  if (parent.aborted) controller.abort();
+  else parent.addEventListener('abort', abort, { once: true });
+  return {
+    signal: controller.signal,
+    timedOut: () => expired,
+    dispose: () => {
+      clearTimeout(timer);
+      parent.removeEventListener('abort', abort);
+    }
+  };
+}

@@ -1,5 +1,6 @@
 import { providerLabel } from './execution-providers';
 import type { ContinuationEntryAction, Run, Task } from './models';
+import type { LocalInferenceStateKind } from './local-inference';
 import { latestVerification, verificationNeedsImplementationRepair } from './verification';
 
 /**
@@ -83,6 +84,37 @@ export interface RunGuidanceExtra {
   readonly continuationEntryAction?: ContinuationEntryAction | null;
   /** True for every linked continuation, including after its entry lease is consumed. */
   readonly isContinuation?: boolean;
+  /**
+   * The renderer's last passively-read `localInference:getState` kind.
+   *
+   * Consulted only when `task.implementationProvider === 'ornith'`, and only to
+   * disable the implementation/correction action with remediation — this
+   * module never starts, stops or health-checks anything, and the backend
+   * re-checks health itself before every Ornith run regardless of what this
+   * says. `null`/`undefined` means "not read yet", and is treated as not ready.
+   */
+  readonly ornithLocalInferenceState?: LocalInferenceStateKind | null;
+}
+
+const ORNITH_NOT_READY_REASON =
+  'Start the local runtime and confirm it is Healthy in Settings → Local inference before running Ornith.';
+
+/**
+ * Disable an implementation/correction action when it would dispatch Ornith
+ * against a runtime this renderer has not last observed as Healthy.
+ *
+ * Purely a UI convenience: the backend performs its own bounded health check
+ * immediately before every Ornith run and refuses independently. This exists
+ * only so the button does not invite a click that is certain to be refused.
+ */
+function guardOrnithReadiness(
+  candidate: RunPrimaryAction,
+  task: Task,
+  extra: RunGuidanceExtra
+): RunPrimaryAction {
+  if (task.implementationProvider !== 'ornith' || !candidate.enabled) return candidate;
+  if (extra.ornithLocalInferenceState === 'healthy') return candidate;
+  return { ...candidate, enabled: false, disabledReason: ORNITH_NOT_READY_REASON };
 }
 
 function latestRun(runs: readonly Run[], types?: readonly Run['runType'][]): Run | null {
@@ -312,7 +344,7 @@ export function runGuidance(
           happened: 'Agent Relay ran verification and the current files did not pass.',
           stage: 'Step 2 of 5 · Fix verification failures',
           result: task.lastError ?? verification.errorMessage ?? 'The verification output is saved for the implementation provider.',
-          action: action('run_implementation', repairLabel),
+          action: guardOrnithReadiness(action('run_implementation', repairLabel), task, extra),
           activeStep: 1,
           tone: 'warning'
         });
@@ -341,7 +373,7 @@ export function runGuidance(
         happened: 'The specification was approved.',
         stage: 'Step 2 of 5 · Implementation',
         result: 'The selected implementation provider is ready to write the code.',
-        action: action('run_implementation', implementationLabel),
+        action: guardOrnithReadiness(action('run_implementation', implementationLabel), task, extra),
         activeStep: 1,
         tone: 'active'
       });
@@ -398,7 +430,7 @@ export function runGuidance(
         happened: 'The reviewer requested code changes.',
         stage: 'Step 4 of 5 · Review found issues',
         result: `Another implementation round is available (${task.currentRound}/${task.maxRounds} used).`,
-        action: action('send_corrections', 'Send corrections'),
+        action: guardOrnithReadiness(action('send_corrections', 'Send corrections'), task, extra),
         activeStep: 3,
         tone: 'warning'
       });
@@ -431,11 +463,15 @@ export function runGuidance(
           result: spent
             ? `All ${task.maxRounds} implementation rounds have been used.`
             : 'Publishing remains locked until a new implementation round is verified and reviewed.',
-          action: action(
-            'send_corrections',
-            'Send corrections',
-            !spent,
-            spent ? 'The review round budget for this task is exhausted.' : null
+          action: guardOrnithReadiness(
+            action(
+              'send_corrections',
+              'Send corrections',
+              !spent,
+              spent ? 'The review round budget for this task is exhausted.' : null
+            ),
+            task,
+            extra
           ),
           activeStep: 3,
           tone: 'warning'

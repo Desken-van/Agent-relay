@@ -3,9 +3,12 @@ import type { ToolStatus } from '@shared/domain/diagnostics';
 import type { RunAgent } from '@shared/domain/models';
 import { STATUS_LABELS, type TaskStatus } from '@shared/domain/workflow';
 
-/** Which of the three visual lanes an actor belongs to. */
-export function agentTone(agent: RunAgent): 'codex' | 'claude' | 'system' {
-  return agent === 'codex' ? 'codex' : agent === 'claude' ? 'claude' : 'system';
+/** Which of the four visual lanes an actor belongs to. */
+export function agentTone(agent: RunAgent): 'codex' | 'claude' | 'ornith' | 'system' {
+  if (agent === 'codex') return 'codex';
+  if (agent === 'claude') return 'claude';
+  if (agent === 'ornith') return 'ornith';
+  return 'system';
 }
 
 const STATUS_CLASS: Record<TaskStatus, string> = {

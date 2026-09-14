@@ -330,7 +330,10 @@ describe('local inference process contract: startup', () => {
   it('keeps polling a loading runtime rather than calling it healthy', async () => {
     const built = await harness(
       { health: 'loading' },
-      { startupTimeoutMs: 2_500, healthTimeoutMs: 500 }
+      // Real process launch and the version probe contend with the rest of the
+      // integration suite. Keep enough overall budget for the assertion to
+      // observe the provider's second health poll under parallel CI load.
+      { startupTimeoutMs: 5_000, healthTimeoutMs: 500 }
     );
     expect((await built.provider.start()).kind).toBe('timed_out');
     // It really did keep asking rather than giving up on the first answer.

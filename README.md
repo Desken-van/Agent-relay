@@ -1,19 +1,22 @@
 # Agent Relay
 
-A local Windows desktop application that relays one software task between two
+A local Windows desktop application that relays one software task between
 coding agents:
 
 > **Codex** writes the specification → you approve it → your selected
-> **Claude or Codex** implements it in an isolated Git worktree → your selected
-> **Codex or Claude** reviews the result in a fresh read-only session →
-> corrections return to the executor until approval, stop, or the round limit.
+> **Claude, Codex, or Ornith** implements it in an isolated Git worktree →
+> your selected **Codex or Claude** reviews the result in a fresh read-only
+> session → corrections return to the executor until approval, stop, or the
+> round limit.
 
 ### Choosing the implementation and review providers
 
-New tasks have independent **Implementation provider** and **Review provider**
-selectors. Defaults remain Claude / Codex for compatibility. To work without a
-Claude quota, select Codex for both. Each review is a fresh session, separate from
-specification and implementation; using the same vendor is not a multi-vendor review.
+New tasks have independent **Implementation provider** (Claude, Codex, or
+Ornith) and **Review provider** (Codex or Claude) selectors. Defaults remain
+Claude / Codex for compatibility. To work without a Claude quota, select Codex
+for both. Each review is a fresh session, separate from specification and
+implementation; using the same vendor is not a multi-vendor review. Ornith is
+implementation-only and is never offered as a review provider.
 
 For an existing idle task, use the selectors in **Run → Actions**, then **Apply
 providers**. This does not start a model. Changing the executor keeps the worktree,
@@ -29,8 +32,17 @@ the saved assessment uses SDK command completion events, not the model's claim.
 Unsupported/compound command shapes or edits after verification block publication.
 Claude review exposes only Read/Grep/Glob, without implementation-session reuse or
 MCP tools. Coai remains a separate, explicitly configured external review gate;
-these selectors neither configure it nor invoke it automatically. Ornith is not an
-executor option in this change.
+these selectors neither configure it nor invoke it automatically.
+
+**Ornith** reuses the local runtime configured under **Settings → Local
+inference** — there is no second executable, endpoint, or model to set up.
+Selecting Ornith never starts that runtime: it must already be started and
+**Healthy**, which Agent Relay confirms itself with a bounded health check
+immediately before every round. Ornith works through a strict, bounded set of
+structured file/Git operations (never a shell or an arbitrary command), keeps
+no durable session between rounds, and is refused with a clear remediation
+message whenever the runtime is not ready. See `docs/local-inference.md` and
+`docs/security.md` for the full contract and limits.
 
 Nothing is committed, pushed, or published without an explicit confirmation
 dialog owned by the main process.
@@ -78,6 +90,7 @@ Every action button carries a **blast-radius marker**:
 | **Git** | everything | Plus `user.name` / `user.email` before any commit |
 | **Codex** | specification + review | Ships with the app's dependencies; you only need to log in |
 | **Claude Code CLI** | implementation | `winget install --id Anthropic.ClaudeCode -e` |
+| **`llama-server` (local runtime)** | Ornith implementation only | Optional — configure under Settings → Local inference; see `docs/local-inference.md` |
 | **GitHub CLI (`gh`)** | publishing only | Optional — everything else works without it |
 | **Python + Visual Studio C++ Build Tools** | building from source on Windows | `npm install` uses `node-gyp` to build Agent Relay's Job Object launcher |
 

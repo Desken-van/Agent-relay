@@ -20,6 +20,28 @@
           }
         ]
       ]
+    },
+    {
+      "target_name": "agent-relay-fs-guard",
+      "type": "executable",
+      "conditions": [
+        [
+          "OS=='win'",
+          {
+            "sources": ["native/windows-fs-guard.cpp"],
+            "defines": ["UNICODE", "_UNICODE", "WIN32_LEAN_AND_MEAN", "NOMINMAX"],
+            "libraries": ["ntdll.lib", "bcrypt.lib"],
+            "msvs_settings": {
+              "VCCLCompilerTool": {
+                "AdditionalOptions": ["/utf-8", "/EHsc"]
+              }
+            }
+          },
+          {
+            "type": "none"
+          }
+        ]
+      ]
     }
   ]
 }

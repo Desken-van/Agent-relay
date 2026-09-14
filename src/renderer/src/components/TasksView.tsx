@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { CLAUDE_MODEL_ALIASES } from '@shared/domain/models';
-import type { ExecutionProvider } from '@shared/domain/execution-providers';
+import type { ImplementationProvider, ReviewProvider } from '@shared/domain/execution-providers';
 import {
   choiceFromModel,
   choiceToModel,
@@ -30,8 +30,8 @@ export function TasksView(): React.JSX.Element {
 
   const [title, setTitle] = useState('');
   const [request, setRequest] = useState('');
-  const [implementationProvider, setImplementationProvider] = useState<ExecutionProvider>('claude');
-  const [reviewProvider, setReviewProvider] = useState<ExecutionProvider>('codex');
+  const [implementationProvider, setImplementationProvider] = useState<ImplementationProvider>('claude');
+  const [reviewProvider, setReviewProvider] = useState<ReviewProvider>('codex');
 
   // The round budget is derived, not synchronised: the settings ceiling is the
   // default, and an explicit choice is clamped to it. Lowering the ceiling in
@@ -162,12 +162,19 @@ export function TasksView(): React.JSX.Element {
             </Field>
 
             <Field label="Implementation provider">
-              <select className="input" aria-label="Implementation provider" value={implementationProvider} onChange={(e) => setImplementationProvider(e.target.value as ExecutionProvider)}>
-                <option value="claude">Claude</option><option value="codex">Codex</option>
+              <select className="input" aria-label="Implementation provider" value={implementationProvider} onChange={(e) => setImplementationProvider(e.target.value as ImplementationProvider)}>
+                <option value="claude">Claude</option><option value="codex">Codex</option><option value="ornith">Ornith</option>
               </select>
             </Field>
+            {implementationProvider === 'ornith' ? (
+              <Notice tone="info">
+                Ornith implements using the local runtime configured under Settings → Local
+                inference. Start it and confirm it is Healthy before running implementation —
+                Agent Relay never starts or restarts it automatically.
+              </Notice>
+            ) : null}
             <Field label="Review provider">
-              <select className="input" aria-label="Review provider" value={reviewProvider} onChange={(e) => setReviewProvider(e.target.value as ExecutionProvider)}>
+              <select className="input" aria-label="Review provider" value={reviewProvider} onChange={(e) => setReviewProvider(e.target.value as ReviewProvider)}>
                 <option value="codex">Codex</option><option value="claude">Claude</option>
               </select>
             </Field>

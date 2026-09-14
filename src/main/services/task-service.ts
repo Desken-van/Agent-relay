@@ -4,7 +4,7 @@ import {
   latestImplementationRoundResult,
   readClaudeAssessment
 } from '../../shared/domain/claude-assessment';
-import type { ExecutionProvider } from '../../shared/domain/execution-providers';
+import type { ImplementationProvider, ReviewProvider } from '../../shared/domain/execution-providers';
 import type { ContinuationEntryAction, Task } from '../../shared/domain/models';
 import { isBusy, type TaskStatus } from '../../shared/domain/workflow';
 import { latestVerification, readVerification } from '../../shared/domain/verification';
@@ -42,8 +42,8 @@ export interface CreateTaskInput {
    */
   readonly codexModel?: string | null;
   readonly claudeModel?: string | null;
-  readonly implementationProvider?: ExecutionProvider;
-  readonly reviewProvider?: ExecutionProvider;
+  readonly implementationProvider?: ImplementationProvider;
+  readonly reviewProvider?: ReviewProvider;
 }
 
 export interface TaskServiceDeps {

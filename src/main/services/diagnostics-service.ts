@@ -8,6 +8,7 @@
  */
 
 import type { DiagnosticsReport, ToolDiagnostic, ToolId } from '../../shared/domain/diagnostics';
+import type { LocalInferenceState } from '../../shared/domain/local-inference';
 import { redactSecrets } from '../../shared/util/redact';
 import type {
   ClaudeAdapter,
@@ -15,7 +16,8 @@ import type {
   DiagnosticsService,
   EventPublisher,
   GitAdapter,
-  GitHubAdapter
+  GitHubAdapter,
+  LocalInferenceLifecycleService
 } from '../ports';
 
 export interface DiagnosticsDeps {
@@ -23,6 +25,8 @@ export interface DiagnosticsDeps {
   readonly claude: ClaudeAdapter;
   readonly git: GitAdapter;
   readonly github: GitHubAdapter;
+  /** Read passively (`.state()` only) to build the Ornith diagnostic. */
+  readonly localInference: LocalInferenceLifecycleService;
   readonly events: EventPublisher;
 }
 
@@ -67,8 +71,101 @@ export class ToolDiagnosticsService implements DiagnosticsService {
       safeProbe('git', () => this.deps.git.diagnose()),
       safeProbe('github', () => this.deps.github.diagnose())
     ]);
+    const ornith = ornithDiagnostic(this.deps.localInference.state());
 
-    return { codex, claude, git, github, checkedAt: new Date().toISOString() };
+    return { codex, claude, git, github, ornith, checkedAt: new Date().toISOString() };
+  }
+}
+
+/**
+ * Build the Ornith diagnostic from the local-inference lifecycle's own
+ * already-retained state, and nothing else.
+ *
+ * Deliberately synchronous and side-effect-free: this must never call
+ * `capabilities`, `health`, `start` or `infer`. A diagnostic that triggered
+ * one of those every time Settings opened would defeat the "start and stop
+ * stay manual" guarantee the rest of Ornith depends on.
+ */
+export function ornithDiagnostic(state: LocalInferenceState): ToolDiagnostic {
+  const checkedAt = new Date().toISOString();
+  const base = {
+    tool: 'ornith' as const,
+    executablePath: null,
+    version: null,
+    checkedAt
+  };
+
+  switch (state.kind) {
+    case 'unavailable':
+      return {
+        ...base,
+        status: 'missing',
+        detail: `Local inference is not available: ${state.reason}`,
+        remediation: 'Enable and configure Local inference in Settings, then Start it.'
+      };
+    case 'stopped':
+      return {
+        ...base,
+        status: 'unauthenticated',
+        detail: 'The local runtime is stopped.',
+        remediation: 'Start the local runtime in Settings → Local inference, then confirm it is Healthy.'
+      };
+    case 'starting':
+      return {
+        ...base,
+        status: 'unauthenticated',
+        detail: `The local runtime is starting (${state.runtimeInstanceId}).`,
+        remediation: 'Wait for it to become Healthy before running Ornith.'
+      };
+    case 'healthy':
+      return {
+        ...base,
+        status: 'ok',
+        detail: `The local runtime is Healthy (${state.runtimeInstanceId}). Ornith implementation is usable.`,
+        remediation: null
+      };
+    case 'inferring':
+      return {
+        ...base,
+        status: 'ok',
+        detail: `The local runtime is busy running an inference (${state.runtimeInstanceId}).`,
+        remediation: null
+      };
+    case 'stopping':
+      return {
+        ...base,
+        status: 'unauthenticated',
+        detail: 'The local runtime is stopping.',
+        remediation: 'Wait for it to stop, then Start it again before running Ornith.'
+      };
+    case 'failed':
+      return {
+        ...base,
+        status: 'error',
+        detail: `The local runtime failed: ${state.reason}`,
+        remediation: 'Stop the runtime to clear the failure, then Start it again.'
+      };
+    case 'cancelled':
+      return {
+        ...base,
+        status: 'error',
+        detail: `The local runtime was cancelled: ${state.reason}`,
+        remediation: 'Stop the runtime to clear the failure, then Start it again.'
+      };
+    case 'timed_out':
+      return {
+        ...base,
+        status: 'error',
+        detail: `The local runtime timed out: ${state.reason}`,
+        remediation: 'Stop the runtime to clear the failure, then Start it again.'
+      };
+    default:
+      return {
+        ...base,
+        status: 'unknown',
+        detail: 'The local runtime state is not yet known.',
+        remediation: null
+      };
   }
 }
 

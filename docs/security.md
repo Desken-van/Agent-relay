@@ -535,6 +535,96 @@ failed, which nothing has any evidence for.
 
 ---
 
+## 5c. Ornith: a bounded, structured-only implementation provider
+
+Ornith is a third, explicitly selected implementation-only task provider,
+backed exclusively by the existing local-inference boundary (`docs/local-
+inference.md`). It is never a specification, plan-review, or code-review
+provider, and it is rejected outright anywhere one of those roles is
+accepted — the typed schemas (`implementationProviderSchema` vs
+`reviewProviderSchema`) make this a compile-time fact, not a runtime
+convention.
+
+**No shell, ever.** Ornith's entire output contract is one JSON object per
+completion, matching a strict Zod discriminated union
+(`src/shared/domain/ornith.ts`). The union has no member shaped like a shell
+command, an executable, an argv array, an environment variable, a URL, or a
+Git ref/revision/option. Parsing is intolerant by design: the whole trimmed
+completion is handed to `JSON.parse` once, with no Markdown-fence stripping,
+no substring recovery, and no retry-on-malformed-output. Prose, trailing
+content, an unknown action, an extra property, or an over-limit value is a
+terminal failure for that attempt.
+
+**Every repository operation is Agent Relay-owned,** in
+`src/main/services/ornith-worktree-tools.ts`:
+
+- All paths are required to be normalized, repository-relative POSIX paths;
+  absolute, drive-relative/rooted, UNC, `.`/`..`, control-character, and
+  `.git`-touching paths are refused before anything is resolved on disk.
+- Every existing ancestor is resolved with `fs.realpath` and checked for
+  containment inside the task worktree before the final component is
+  touched; a symlink or reparse point anywhere in the resolved chain, or as
+  the final component itself, is refused rather than followed.
+  Hard-linked write/delete targets (`nlink > 1`) are refused.
+  Non-regular files (directories, devices) are refused.
+- Reads and searches operate only on a bounded manifest built from
+  `git ls-files --cached` plus `git ls-files --others --exclude-standard`
+  (capped at 20,000 entries) or a file this exact run created — never on an
+  arbitrary path the model names.
+- `create_file`/`replace_text`/`delete_file` are hash-guarded: an edit or
+  delete requires the file's current SHA-256, and a mismatch — or a
+  replacement whose `oldText` does not occur exactly once at the moment it
+  is applied — performs no write at all. Writes are staged to a sibling
+  temporary file in the same directory and renamed into place, so a writer
+  never observes a partially-written file.
+- `git status`/`git diff` use a fixed, narrow, read-only argv shape only —
+  `git diff` accepts model-selected *paths* after a literal `--`, never a
+  ref, revision, or option — through the same `ProcessRunner` (no shell,
+  scrubbed environment) every other Git invocation in this application uses.
+  Neither ever stages, commits, branches, merges, resets, or touches a
+  remote; there is no code path from an Ornith completion to any of those
+  operations.
+- Every checkout is re-confirmed (branch, common Git directory, not
+  detached) before each turn and again before verification; a worktree
+  re-pointed at a different repository underneath a running loop is refused
+  the moment it is next observed, not merely at the round's start.
+
+**Hard, non-negotiable limits** (`ORNITH_LIMITS` in the same domain module)
+bound every dimension a runaway or adversarial completion could otherwise
+exploit: model turns, non-terminal actions, rolling-context bytes,
+prompt/completion bytes, per-tool-result bytes, cumulative repository
+read/write bytes, changed-file count, verification-call count, per-operation
+timeouts (filesystem, search, Git), and an overall loop deadline of
+`min(settings.processTimeoutMs, 30 minutes)`. None of these is
+renderer-configurable, and nothing an Ornith completion contains can widen
+any of them — there is no `limit` field anywhere in the action schema for a
+completion to supply one.
+
+**Least-privilege runtime access.** Selecting Ornith never starts, restarts,
+or health-checks the local runtime; a round refuses outright unless the
+runtime is already retained and already `healthy`, reconfirmed by one bounded
+health check immediately before the round begins and again immediately
+before the run is recorded if worktree preparation took real time. An
+application-wide execution lease (never an IPC channel) makes a second
+concurrent Ornith attempt — including a Settings "Run test inference"
+request — fail closed as `BUSY` rather than sharing or queueing behind the
+retained provider. If the retained runtime's identity changes, is stopped
+independently (`localInference:stop`), or the process exits, the run
+terminates without ever calling `start()` or falling back to Claude or Codex.
+
+**Bounded, redacted audit evidence only.** Run events record the action kind,
+sequence number, normalized relative paths, byte/count/hash/truncation
+metadata, duration, and verification status — never a search query, file
+content, edit fragment, prompt, raw action JSON, or completion text. The
+final structured result carries the same class of bounded, safe identifiers
+(provider, provider revision, runtime/model/instance ids, counters, the
+existing assessment record, and a bounded redacted summary) and nothing else.
+A normally finished Ornith round still goes through Agent Relay's own
+post-provider `WorktreeVerification` snapshot before review — Ornith's own
+`run_verification` tool call is diagnostic only and never substitutes for it.
+
+---
+
 ## 6. The publishing gate
 
 No commit, push, repository creation, or pull request can happen without a

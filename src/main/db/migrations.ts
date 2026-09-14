@@ -706,6 +706,142 @@ export const MIGRATIONS: readonly Migration[] = [
   },
   {
     version: 12,
+    name: 'ornith-provider',
+    up(db) {
+      // Additive in effect, not in mechanism: SQLite cannot ALTER a CHECK
+      // constraint, so `tasks`, `runs` and `task_provider_changes` are rebuilt
+      // under their own name with a widened constraint and every existing row
+      // copied across unchanged. `tasks.review_provider` keeps its existing
+      // `claude`/`codex` constraint — Ornith is implementation-only and must
+      // never validate as a review provider.
+      //
+      // Both `tasks` and `runs` have many dependent tables (run_events,
+      // approvals, task_rule_evidence, plan_review_gates, code_review_*,
+      // task_continuations, task_continuation_claims, task_provider_changes).
+      // `openDatabase` defers `PRAGMA foreign_keys = ON` until after
+      // migrations finish specifically so the DROP TABLE below cannot trigger
+      // SQLite's implicit cascading delete through any of them; nothing here
+      // deletes a dependent row, and `foreign_key_check` at the end proves it.
+      db.exec(`
+        CREATE TABLE tasks_v12 (
+          id                        TEXT PRIMARY KEY,
+          project_id                TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          title                     TEXT NOT NULL,
+          original_request          TEXT NOT NULL,
+          status                    TEXT NOT NULL,
+          current_round             INTEGER NOT NULL DEFAULT 0,
+          max_rounds                INTEGER NOT NULL DEFAULT 3,
+          codex_thread_id           TEXT,
+          claude_session_id         TEXT,
+          worktree_path             TEXT,
+          branch_name               TEXT,
+          base_branch               TEXT,
+          specification_json        TEXT,
+          specification_approved_at TEXT,
+          last_review_json          TEXT,
+          last_error                TEXT,
+          codex_model               TEXT,
+          claude_model              TEXT,
+          implementation_provider   TEXT NOT NULL DEFAULT 'claude'
+                                     CHECK (implementation_provider IN ('claude','codex','ornith')),
+          review_provider           TEXT NOT NULL DEFAULT 'codex'
+                                     CHECK (review_provider IN ('claude','codex')),
+          provider_revision         INTEGER NOT NULL DEFAULT 0 CHECK (provider_revision >= 0),
+          implementation_thread_id  TEXT,
+          created_at                TEXT NOT NULL,
+          updated_at                TEXT NOT NULL
+        );
+
+        INSERT INTO tasks_v12 (
+          id, project_id, title, original_request, status, current_round, max_rounds,
+          codex_thread_id, claude_session_id, worktree_path, branch_name, base_branch,
+          specification_json, specification_approved_at, last_review_json, last_error,
+          codex_model, claude_model, implementation_provider, review_provider,
+          provider_revision, implementation_thread_id, created_at, updated_at)
+        SELECT
+          id, project_id, title, original_request, status, current_round, max_rounds,
+          codex_thread_id, claude_session_id, worktree_path, branch_name, base_branch,
+          specification_json, specification_approved_at, last_review_json, last_error,
+          codex_model, claude_model, implementation_provider, review_provider,
+          provider_revision, implementation_thread_id, created_at, updated_at
+        FROM tasks;
+
+        DROP TABLE tasks;
+        ALTER TABLE tasks_v12 RENAME TO tasks;
+
+        CREATE INDEX idx_tasks_project ON tasks(project_id, created_at DESC);
+        CREATE UNIQUE INDEX idx_tasks_worktree_active
+          ON tasks(worktree_path)
+          WHERE worktree_path IS NOT NULL AND status NOT IN ('COMPLETED','FAILED','CANCELLED');
+      `);
+
+      db.exec(`
+        CREATE TABLE runs_v12 (
+          id                TEXT PRIMARY KEY,
+          task_id           TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          agent             TEXT NOT NULL CHECK (agent IN ('codex','claude','ornith','system')),
+          run_type          TEXT NOT NULL,
+          status            TEXT NOT NULL CHECK (status IN ('running','succeeded','failed','cancelled')),
+          round             INTEGER NOT NULL DEFAULT 0,
+          started_at        TEXT NOT NULL,
+          finished_at       TEXT,
+          final_message     TEXT,
+          structured_result TEXT,
+          error_message     TEXT,
+          -- Ornith is implementation-only: it may never appear as the agent on
+          -- a specification, review, verification, git or github run.
+          CHECK (agent <> 'ornith' OR run_type IN ('implementation','correction'))
+        );
+
+        INSERT INTO runs_v12 (
+          id, task_id, agent, run_type, status, round, started_at,
+          finished_at, final_message, structured_result, error_message)
+        SELECT
+          id, task_id, agent, run_type, status, round, started_at,
+          finished_at, final_message, structured_result, error_message
+        FROM runs;
+
+        DROP TABLE runs;
+        ALTER TABLE runs_v12 RENAME TO runs;
+
+        CREATE INDEX idx_runs_task ON runs(task_id, started_at);
+      `);
+
+      db.exec(`
+        CREATE TABLE task_provider_changes_v12 (
+          task_id                 TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          revision                INTEGER NOT NULL,
+          previous_implementation TEXT NOT NULL CHECK (previous_implementation IN ('claude','codex','ornith')),
+          implementation          TEXT NOT NULL CHECK (implementation IN ('claude','codex','ornith')),
+          previous_review         TEXT NOT NULL CHECK (previous_review IN ('claude','codex')),
+          review                  TEXT NOT NULL CHECK (review IN ('claude','codex')),
+          changed_at               TEXT NOT NULL,
+          PRIMARY KEY(task_id, revision)
+        );
+
+        INSERT INTO task_provider_changes_v12
+          (task_id, revision, previous_implementation, implementation, previous_review, review, changed_at)
+        SELECT
+          task_id, revision, previous_implementation, implementation, previous_review, review, changed_at
+        FROM task_provider_changes;
+
+        DROP TABLE task_provider_changes;
+        ALTER TABLE task_provider_changes_v12 RENAME TO task_provider_changes;
+      `);
+
+      // Proves the rebuild above preserved every dependent row's referential
+      // integrity. A non-empty result rolls the whole migration back — see
+      // the transaction wrapper in `runMigrations` below.
+      const violations = db.prepare('PRAGMA foreign_key_check').all();
+      if (violations.length > 0) {
+        throw new Error(
+          `Migration 12 (ornith-provider) left ${violations.length} dangling foreign key reference(s).`
+        );
+      }
+    }
+  },
+  {
+    version: 13,
     name: 'review-limit-status',
     up(db) {
       // The old workflow represented an exhausted, successful review cycle as
@@ -739,7 +875,7 @@ export const MIGRATIONS: readonly Migration[] = [
     }
   },
   {
-    version: 13,
+    version: 14,
     name: 'review-blocked-status',
     up(db) {
       // The old workflow also represented a *successful* review that blocked
@@ -777,36 +913,48 @@ export const MIGRATIONS: readonly Migration[] = [
 ];
 
 export function runMigrations(db: SqliteDatabase): number {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      version    INTEGER PRIMARY KEY,
-      name       TEXT NOT NULL,
-      applied_at TEXT NOT NULL
+  // SQLite cannot disable foreign-key enforcement from inside a transaction.
+  // Do it before the per-migration transaction so parent-table rebuilds do not
+  // cascade-delete dependent audit history. Re-enable the caller's original
+  // setting on both success and failure. Rebuild migrations remain responsible
+  // for running `foreign_key_check` before their transaction can commit.
+  const foreignKeysWereEnabled = db.pragma('foreign_keys', { simple: true }) === 1;
+  if (foreignKeysWereEnabled) db.pragma('foreign_keys = OFF');
+
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version    INTEGER PRIMARY KEY,
+        name       TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+
+    const applied = new Set(
+      db
+        .prepare('SELECT version FROM schema_migrations')
+        .all()
+        .map((row) => (row as { version: number }).version)
     );
-  `);
 
-  const applied = new Set(
-    db
-      .prepare('SELECT version FROM schema_migrations')
-      .all()
-      .map((row) => (row as { version: number }).version)
-  );
+    const record = db.prepare(
+      'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)'
+    );
 
-  const record = db.prepare(
-    'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)'
-  );
+    let count = 0;
+    for (const migration of MIGRATIONS) {
+      if (applied.has(migration.version)) continue;
 
-  let count = 0;
-  for (const migration of MIGRATIONS) {
-    if (applied.has(migration.version)) continue;
+      const apply = db.transaction(() => {
+        migration.up(db);
+        record.run(migration.version, migration.name, new Date().toISOString());
+      });
+      apply();
+      count += 1;
+    }
 
-    const apply = db.transaction(() => {
-      migration.up(db);
-      record.run(migration.version, migration.name, new Date().toISOString());
-    });
-    apply();
-    count += 1;
+    return count;
+  } finally {
+    if (foreignKeysWereEnabled) db.pragma('foreign_keys = ON');
   }
-
-  return count;
 }

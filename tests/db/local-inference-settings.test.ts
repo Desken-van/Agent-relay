@@ -23,7 +23,7 @@ function tempDatabase(): { root: string; file: string } {
 
 const defaults = () => defaultSettings({ dataDir: 'C:\\data', documentsDir: 'C:\\docs' });
 
-describe('migrations 9, 11, 12 and 13', () => {
+describe('migrations 9 and 11 through 14', () => {
   it('are appended after unchanged migrations and preserve the local-inference row', () => {
     expect(MIGRATIONS.map(({ version, name }) => ({ version, name }))).toEqual([
       { version: 1, name: 'initial-schema' },
@@ -37,8 +37,9 @@ describe('migrations 9, 11, 12 and 13', () => {
       { version: 9, name: 'local-inference-settings' },
       { version: 10, name: 'task-continuations' },
       { version: 11, name: 'local-inference-request-defaults' },
-      { version: 12, name: 'review-limit-status' },
-      { version: 13, name: 'review-blocked-status' }
+      { version: 12, name: 'ornith-provider' },
+      { version: 13, name: 'review-limit-status' },
+      { version: 14, name: 'review-blocked-status' }
     ]);
 
     const db = createSqliteDatabase(':memory:');
@@ -62,7 +63,7 @@ describe('migrations 9, 11, 12 and 13', () => {
       'localInference',
       JSON.stringify(existing)
     );
-    expect(runMigrations(db)).toBe(5);
+    expect(runMigrations(db)).toBe(6);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };
@@ -112,7 +113,7 @@ describe('migrations 9, 11, 12 and 13', () => {
       JSON.stringify('kept-across-migration')
     );
 
-    expect(runMigrations(db)).toBe(3);
+    expect(runMigrations(db)).toBe(4);
 
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
@@ -149,7 +150,7 @@ describe('migrations 9, 11, 12 and 13', () => {
     }
     db.prepare('UPDATE settings SET value = ? WHERE key = ?').run('{not valid json', 'localInference');
 
-    expect(runMigrations(db)).toBe(3);
+    expect(runMigrations(db)).toBe(4);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };
