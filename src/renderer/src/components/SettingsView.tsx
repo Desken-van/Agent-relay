@@ -39,7 +39,8 @@ const TOOL_TITLES: Record<string, string> = {
   codex: 'Codex',
   claude: 'Claude Code',
   git: 'Git',
-  github: 'GitHub CLI'
+  github: 'GitHub CLI',
+  ornith: 'Ornith'
 };
 
 export function SettingsView(): React.JSX.Element {
@@ -68,7 +69,7 @@ export function SettingsView(): React.JSX.Element {
   >(null);
 
   const tools: ToolDiagnostic[] = diagnostics
-    ? [diagnostics.codex, diagnostics.claude, diagnostics.git, diagnostics.github]
+    ? [diagnostics.codex, diagnostics.claude, diagnostics.git, diagnostics.github, diagnostics.ornith]
     : [];
 
   const set = <K extends keyof Settings>(key: K, value: Settings[K]): void => {
@@ -346,6 +347,13 @@ export function SettingsView(): React.JSX.Element {
 
             <Card title="Local inference">
               <div className="stack">
+                <Notice tone="info">
+                  Selecting Ornith as a task&apos;s implementation provider reuses this exact
+                  configured runtime — there is no second executable, endpoint or model to set
+                  up. Choosing Ornith never starts it: the runtime must already be started and
+                  Healthy below. Every Ornith implementation rechecks health itself immediately
+                  before it runs, and Stop here remains independent of any running task.
+                </Notice>
                 <label className="row" style={{ alignItems: 'flex-start' }}>
                   <input
                     type="checkbox"

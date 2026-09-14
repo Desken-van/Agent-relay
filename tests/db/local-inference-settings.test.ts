@@ -36,7 +36,8 @@ describe('migrations 9 and 11', () => {
       { version: 8, name: 'task-provider-routing' },
       { version: 9, name: 'local-inference-settings' },
       { version: 10, name: 'task-continuations' },
-      { version: 11, name: 'local-inference-request-defaults' }
+      { version: 11, name: 'local-inference-request-defaults' },
+      { version: 12, name: 'ornith-provider' }
     ]);
 
     const db = createSqliteDatabase(':memory:');
@@ -60,7 +61,7 @@ describe('migrations 9 and 11', () => {
       'localInference',
       JSON.stringify(existing)
     );
-    expect(runMigrations(db)).toBe(3);
+    expect(runMigrations(db)).toBe(4);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };
@@ -110,7 +111,7 @@ describe('migrations 9 and 11', () => {
       JSON.stringify('kept-across-migration')
     );
 
-    expect(runMigrations(db)).toBe(1);
+    expect(runMigrations(db)).toBe(2);
 
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
@@ -147,7 +148,7 @@ describe('migrations 9 and 11', () => {
     }
     db.prepare('UPDATE settings SET value = ? WHERE key = ?').run('{not valid json', 'localInference');
 
-    expect(runMigrations(db)).toBe(1);
+    expect(runMigrations(db)).toBe(2);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };

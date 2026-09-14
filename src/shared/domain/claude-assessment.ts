@@ -256,7 +256,7 @@ export function latestClaudeRoundResult(runs: readonly ClaudeRoundRun[]): string
 export function latestImplementationRoundResult(runs: readonly ClaudeRoundRun[]): string | null {
   for (let index = runs.length - 1; index >= 0; index--) {
     const run = runs[index];
-    if (run && (run.agent === 'claude' || run.agent === 'codex') &&
+    if (run && (run.agent === 'claude' || run.agent === 'codex' || run.agent === 'ornith') &&
       (run.runType === 'implementation' || run.runType === 'correction')) return run.structuredResult;
   }
   return null;

@@ -93,6 +93,7 @@ import {
   LocalInferenceService,
   type LocalInferenceProviderFactory
 } from './services/local-inference-service';
+import { OrnithImplementationService } from './services/ornith-implementation';
 
 export interface ApplicationPaths {
   /** Directory holding the SQLite database and worktrees. */
@@ -411,7 +412,13 @@ export function buildApplication(options: BuildApplicationOptions): Application 
       retargetFirstActionToVerification: (...args) =>
         continuationService.retargetFirstActionToVerification(...args),
       assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId)
-    }
+    },
+    // Ornith reuses the same LocalInferenceService instance the Local
+    // inference lifecycle IPC handlers use; the Ornith surface it exposes
+    // here is a separate, non-IPC interface — see `OrnithInferenceLeaseService`.
+    ornith: new OrnithImplementationService(),
+    ornithLease: localInference,
+    processRunner: runner
   });
 
   runtime.orchestrator = orchestrator;
@@ -464,6 +471,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     claude: adapters.claude,
     git: adapters.git,
     github: adapters.github,
+    localInference,
     events: options.events
   });
 

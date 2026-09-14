@@ -27,6 +27,8 @@
   --claude-dim: #a86e46;
   --system: #56d4c0;
   --system-dim: #3a8d81;
+  --ornith: #5b9dfa;
+  --ornith-dim: #3d6bb0;
 
   --ok: #4ade80;
   --warn: #fbbf24;
@@ -546,6 +548,11 @@ pre,
   border-color: var(--system-dim);
   background: rgba(86, 212, 192, 0.1);
 }
+.tag--ornith {
+  color: var(--ornith);
+  border-color: var(--ornith-dim);
+  background: rgba(91, 157, 250, 0.1);
+}
 .tag--ok {
   color: var(--ok);
   border-color: #2c6b45;
@@ -966,6 +973,9 @@ pre,
 .relay__node--system {
   border-left-color: var(--system-dim);
 }
+.relay__node--ornith {
+  border-left-color: var(--ornith-dim);
+}
 
 .relay__dot {
   width: 13px;
@@ -985,6 +995,9 @@ pre,
 }
 .relay__dot--system {
   background: var(--system);
+}
+.relay__dot--ornith {
+  background: var(--ornith);
 }
 
 .relay__dot--running {

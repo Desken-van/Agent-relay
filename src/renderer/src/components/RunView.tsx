@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { canChangeProviders, providerLabel, type ExecutionProvider } from '@shared/domain/execution-providers';
+import {
+  canChangeProviders,
+  providerLabel,
+  type ImplementationProvider,
+  type ReviewProvider
+} from '@shared/domain/execution-providers';
+import type { LocalInferenceStateKind } from '@shared/domain/local-inference';
 import type { GitChangeSet } from '@shared/domain/git';
 import type { ApprovalAction, Run, Task } from '@shared/domain/models';
 import type { PlanReviewDecision } from '@shared/domain/plan-review';
@@ -115,8 +121,8 @@ export function PrimaryActionButton({
 }
 
 export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: boolean; onChanged: (task: Task) => void | Promise<void> }): React.JSX.Element {
-  const [implementation, setImplementation] = useState<ExecutionProvider | null>(null);
-  const [review, setReview] = useState<ExecutionProvider | null>(null);
+  const [implementation, setImplementation] = useState<ImplementationProvider | null>(null);
+  const [review, setReview] = useState<ReviewProvider | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const claim = useRef(false);
@@ -133,12 +139,18 @@ export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: 
     </summary>
     <div className="stack provider-controls__body">
       <Field label="Implementation provider">
-        <select className="input" aria-label="Implementation provider" value={implementationValue} disabled={disabled} onChange={(e) => setImplementation(e.target.value as ExecutionProvider)}>
-          <option value="claude">Claude</option><option value="codex">Codex</option>
+        <select className="input" aria-label="Implementation provider" value={implementationValue} disabled={disabled} onChange={(e) => setImplementation(e.target.value as ImplementationProvider)}>
+          <option value="claude">Claude</option><option value="codex">Codex</option><option value="ornith">Ornith</option>
         </select>
       </Field>
+      {implementationValue === 'ornith' ? (
+        <p className="hint">
+          Ornith uses the local runtime configured under Settings → Local inference. It must
+          already be started and Healthy — Agent Relay never starts or restarts it.
+        </p>
+      ) : null}
       <Field label="Review provider">
-        <select className="input" aria-label="Review provider" value={reviewValue} disabled={disabled} onChange={(e) => setReview(e.target.value as ExecutionProvider)}>
+        <select className="input" aria-label="Review provider" value={reviewValue} disabled={disabled} onChange={(e) => setReview(e.target.value as ReviewProvider)}>
           <option value="codex">Codex</option><option value="claude">Claude</option>
         </select>
       </Field>
@@ -284,6 +296,39 @@ export function RunView(): React.JSX.Element {
     });
   }, [openTaskDetail, perform]);
 
+  // Passive only: periodically refresh the retained lifecycle snapshot, never
+  // start or health-check it. Runtime exit/start can happen while this view is
+  // mounted, so a one-time read would leave the action incorrectly enabled or
+  // disabled until navigation. The backend still performs the authoritative
+  // health check immediately before every Ornith run.
+  const [ornithReadiness, setOrnithReadiness] = useState<{
+    taskId: string;
+    kind: LocalInferenceStateKind | null;
+  } | null>(null);
+  const implementationProviderForReadiness = detail?.task.implementationProvider ?? null;
+  useEffect(() => {
+    if (implementationProviderForReadiness !== 'ornith' || selectedTaskId === null) return undefined;
+    let cancelled = false;
+    let pending = false;
+    const refresh = (): void => {
+      if (pending || cancelled) return;
+      pending = true;
+      void call('localInference:getState', {}).then((response) => {
+        if (!cancelled) {
+          setOrnithReadiness({ taskId: selectedTaskId, kind: response.ok ? response.data.kind : null });
+        }
+      }).finally(() => {
+        pending = false;
+      });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [implementationProviderForReadiness, selectedTaskId]);
+
   if (!selectedTaskId || !detail) {
     return (
       <Card>
@@ -321,7 +366,8 @@ export function RunView(): React.JSX.Element {
       continuationTaskId: detail.continuedAs?.taskId ?? null,
       continuationCreationStatus: detail.continuationCreationStatus,
       continuationEntryAction: detail.continuationEntryAction,
-      isContinuation: detail.continuationOf !== null
+      isContinuation: detail.continuationOf !== null,
+      ornithLocalInferenceState: ornithReadiness?.taskId === task.id ? ornithReadiness.kind : null
     }
   );
   const running = isBusy(task.status);

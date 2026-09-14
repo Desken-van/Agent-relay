@@ -6,7 +6,7 @@
  * to do — never throw an unhandled error at startup.
  */
 
-export const TOOL_IDS = ['codex', 'claude', 'git', 'github'] as const;
+export const TOOL_IDS = ['codex', 'claude', 'git', 'github', 'ornith'] as const;
 export type ToolId = (typeof TOOL_IDS)[number];
 
 export type ToolStatus =
@@ -43,6 +43,13 @@ export interface DiagnosticsReport {
   readonly claude: ToolDiagnostic;
   readonly git: ToolDiagnostic;
   readonly github: ToolDiagnostic;
+  /**
+   * Passive only. Unlike the other four entries, this is never produced by
+   * probing a process — it is a pure projection of the local-inference
+   * lifecycle's already-retained state, so `diagnostics:run` never starts,
+   * stops, health-checks or infers anything on Ornith's account.
+   */
+  readonly ornith: ToolDiagnostic;
   readonly checkedAt: string;
 }
 

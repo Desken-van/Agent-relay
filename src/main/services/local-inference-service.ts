@@ -17,10 +17,13 @@ import {
   type LocalInferenceSettings,
   type LocalInferenceState
 } from '../../shared/domain/local-inference';
+import { AgentRelayError } from '../../shared/domain/errors';
 import type {
   IdGenerator,
   LocalInferenceLifecycleService,
   LocalInferenceProvider,
+  OrnithHealthyLease,
+  OrnithInferenceLeaseService,
   SettingsRepository
 } from '../ports';
 
@@ -77,9 +80,23 @@ export interface LocalInferenceServiceOptions {
   readonly ids: IdGenerator;
 }
 
-export class LocalInferenceService implements LocalInferenceLifecycleService {
+export class LocalInferenceService implements LocalInferenceLifecycleService, OrnithInferenceLeaseService {
   private provider: LocalInferenceProvider | null = null;
   private boundSettings: string | null = null;
+  /**
+   * The one outstanding Ornith execution lease, if any.
+   *
+   * A private token rather than a boolean: `release()` clears the lease only
+   * when it still identifies the holder that created it, so a stale/duplicate
+   * release call (e.g. from a `finally` block firing after a already-released
+   * lease) cannot clear a DIFFERENT run's later lease.
+   */
+  private ornithLeaseToken: symbol | null = null;
+  private ornithLeaseOwner: OrnithHealthyLease | null = null;
+  private ornithLeaseProvider: LocalInferenceProvider | null = null;
+  private ornithLeaseSettings: string | null = null;
+  /** Fired by `stop()` when it stops a runtime an Ornith lease is holding. */
+  private readonly ornithStopHandlers = new Set<() => void>();
 
   constructor(private readonly options: LocalInferenceServiceOptions) {}
 
@@ -112,6 +129,24 @@ export class LocalInferenceService implements LocalInferenceLifecycleService {
 
   stop(): Promise<LocalInferenceState> {
     const provider = this.provider;
+
+    // Independently callable, so this may stop a runtime an Ornith run's
+    // lease is currently using. Notify before anything else: the run's own
+    // AbortSignal is what unwinds its loop, releases the lease and reconciles
+    // task state, and it must start unwinding immediately rather than only
+    // discovering the runtime is gone on its next `inferForOrnith` call.
+    if (this.ornithLeaseToken !== null) {
+      const handlers = [...this.ornithStopHandlers];
+      this.ornithStopHandlers.clear();
+      for (const handler of handlers) {
+        try {
+          handler();
+        } catch {
+          // A misbehaving handler must never prevent Stop from proceeding.
+        }
+      }
+    }
+
     if (provider === null) return Promise.resolve({ kind: 'stopped' });
 
     // Delegate immediately. LOCAL-A owns cancellation, concurrent/idempotent
@@ -144,6 +179,15 @@ export class LocalInferenceService implements LocalInferenceLifecycleService {
    * and returns a structured failure for every other state.
    */
   runTestInference(prompt: string): Promise<LocalInferenceOutcome> {
+    if (this.ornithLeaseToken !== null) {
+      return Promise.resolve({
+        kind: 'failed',
+        version: LOCAL_INFERENCE_CONTRACT_VERSION,
+        requestId: this.options.ids.next(),
+        reason: 'The local runtime is busy with an Ornith implementation run.',
+        dispatchOutcome: 'not_dispatched'
+      });
+    }
     if (this.isDisabledAndUnbound()) {
       return Promise.resolve({
         kind: 'failed',
@@ -160,6 +204,174 @@ export class LocalInferenceService implements LocalInferenceLifecycleService {
       messages: [{ role: 'user', content: prompt }]
     };
     return this.bindProvider().infer(request);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Ornith: internal, non-IPC lease surface                             */
+  /* ------------------------------------------------------------------ */
+
+  async acquireOrnithLease(signal?: AbortSignal): Promise<OrnithHealthyLease> {
+    if (this.ornithLeaseToken !== null) {
+      throw new AgentRelayError(
+        'BUSY',
+        'Another Ornith run is already using the local runtime.',
+        { remediation: 'Wait for the other run to finish, or stop it, then try again.' }
+      );
+    }
+    const token = Symbol('ornith-lease');
+    this.ornithLeaseToken = token;
+    const release = (): void => {
+      if (this.ornithLeaseToken === token) {
+        this.ornithLeaseToken = null;
+        this.ornithLeaseOwner = null;
+        this.ornithLeaseProvider = null;
+        this.ornithLeaseSettings = null;
+        this.ornithStopHandlers.clear();
+      }
+    };
+
+    try {
+      // Deliberately reads `this.provider` directly rather than calling
+      // `bindProvider()`: binding would construct a fresh provider instance
+      // when none is retained, which is exactly the "quietly start something"
+      // behaviour Ornith must never trigger. No retained provider means no
+      // run, full stop.
+      const provider = this.provider;
+      if (provider === null || provider.state().kind !== 'healthy') {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'The local runtime is not Healthy.',
+          {
+            remediation:
+              'Start the local runtime in Settings → Local inference and confirm it is Healthy.'
+          }
+        );
+      }
+
+      const checked = await provider.health(signal);
+      if (checked.kind !== 'healthy' || this.provider !== provider) {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'The local runtime health check did not confirm it is Healthy.',
+          { remediation: 'Check the runtime state in Settings → Local inference.' }
+        );
+      }
+
+      const currentSettings = JSON.stringify(this.options.settings.get().localInference);
+      if (this.boundSettings !== currentSettings) {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'The retained local runtime does not match the saved local-inference configuration.',
+          { remediation: 'Stop the runtime, review Settings, then start it manually again.' }
+        );
+      }
+      const config = this.assembledConfig();
+      const lease: OrnithHealthyLease = {
+        runtimeInstanceId: checked.runtimeInstanceId,
+        providerId: config.providerId,
+        modelId: config.model.id,
+        release,
+        onIndependentStop: (handler) => {
+          // A lease already released must not accumulate handlers nobody
+          // will ever clear.
+          if (this.ornithLeaseToken === token) this.ornithStopHandlers.add(handler);
+        }
+      };
+      this.ornithLeaseOwner = lease;
+      this.ornithLeaseProvider = provider;
+      this.ornithLeaseSettings = currentSettings;
+      return lease;
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
+  async recheckOrnithLease(lease: OrnithHealthyLease, signal?: AbortSignal): Promise<boolean> {
+    if (this.ornithLeaseToken === null || this.ornithLeaseOwner !== lease) return false;
+    const provider = this.provider;
+    if (provider === null || provider !== this.ornithLeaseProvider) return false;
+    const state = provider.state();
+    if (state.kind !== 'healthy' || state.runtimeInstanceId !== lease.runtimeInstanceId) return false;
+    const settingsFingerprint = JSON.stringify(this.options.settings.get().localInference);
+    if (settingsFingerprint !== this.ornithLeaseSettings || settingsFingerprint !== this.boundSettings) return false;
+    const config = this.assembledConfig();
+    if (config.providerId !== lease.providerId || config.model.id !== lease.modelId) return false;
+
+    const checked = await provider.health(signal);
+    return (
+      checked.kind === 'healthy' &&
+      checked.runtimeInstanceId === lease.runtimeInstanceId &&
+      this.provider === provider
+    );
+  }
+
+  async inferForOrnith(
+    lease: OrnithHealthyLease,
+    request: LocalInferenceRequest,
+    signal?: AbortSignal
+  ): Promise<LocalInferenceOutcome> {
+    const failed = (
+      reason: string,
+      dispatchOutcome: 'not_dispatched' | 'unknown' = 'not_dispatched'
+    ): LocalInferenceOutcome => ({
+      kind: 'failed',
+      version: LOCAL_INFERENCE_CONTRACT_VERSION,
+      requestId: request.requestId,
+      reason,
+      dispatchOutcome
+    });
+
+    if (this.ornithLeaseToken === null || this.ornithLeaseOwner !== lease) {
+      return failed('No Ornith lease is currently held.');
+    }
+    const provider = this.provider;
+    if (provider === null || provider !== this.ornithLeaseProvider) {
+      return failed('The local runtime is no longer retained.');
+    }
+    const settingsFingerprint = JSON.stringify(this.options.settings.get().localInference);
+    if (settingsFingerprint !== this.ornithLeaseSettings || settingsFingerprint !== this.boundSettings) {
+      return failed('The saved local-inference configuration changed during this run.');
+    }
+    const config = this.assembledConfig();
+    if (config.providerId !== lease.providerId || config.model.id !== lease.modelId) {
+      return failed('The configured local-inference provider or model changed during this run.');
+    }
+    const state = provider.state();
+    if (state.kind !== 'healthy' || state.runtimeInstanceId !== lease.runtimeInstanceId) {
+      return failed('The local runtime is not Healthy.');
+    }
+
+    // The one and only dispatch for this turn. Never retried by this method
+    // regardless of outcome — a caller that wants another turn builds another
+    // request and calls this again, subject to the same lease and identity
+    // checks every time.
+    const outcome = await provider.infer(request, signal);
+    const afterSettings = JSON.stringify(this.options.settings.get().localInference);
+    const afterConfig = this.assembledConfig();
+    const afterState = provider.state();
+    if (
+      this.ornithLeaseOwner !== lease ||
+      this.provider !== provider ||
+      this.ornithLeaseProvider !== provider ||
+      afterSettings !== this.ornithLeaseSettings ||
+      afterSettings !== this.boundSettings ||
+      afterConfig.providerId !== lease.providerId ||
+      afterConfig.model.id !== lease.modelId ||
+      afterState.kind !== 'healthy' ||
+      afterState.runtimeInstanceId !== lease.runtimeInstanceId
+    ) {
+      // Dispatch already occurred. `unknown` is deliberately conservative:
+      // the completion is discarded, and the caller must not issue another
+      // inference or execute the returned action.
+      return failed('The retained runtime or saved configuration changed during inference.', 'unknown');
+    }
+    return outcome;
+  }
+
+  /** The complete configuration this connection would currently bind, read fresh every time. */
+  private assembledConfig(): LocalInferenceConfig {
+    return assembleLocalInferenceConfig(this.options.settings.get().localInference);
   }
 
   /** No provider is retained, and Settings currently forbid constructing one. */

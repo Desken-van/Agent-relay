@@ -1292,6 +1292,80 @@ export interface LocalInferenceLifecycleService {
   runTestInference(prompt: string): Promise<LocalInferenceOutcome>;
 }
 
+/**
+ * The application-wide right to run one Ornith turn sequence against the
+ * retained local-inference provider.
+ *
+ * Not an IPC type: it never crosses the renderer boundary. Held for the
+ * lifetime of one Ornith implementation/correction attempt and released on
+ * every exit (success, failure, cancellation). `runtimeInstanceId`,
+ * `providerId` and `modelId` are captured once, at acquisition, and every
+ * later completion must be checked against them — see
+ * {@link OrnithInferenceLeaseService.inferForOrnith}.
+ */
+export interface OrnithHealthyLease {
+  readonly runtimeInstanceId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+  /** Idempotent. Safe to call more than once, and from a `finally` block. */
+  release(): void;
+  /**
+   * Register a callback fired if the independently-callable
+   * `localInference:stop` operation stops the retained runtime while this
+   * lease is still held.
+   *
+   * This is how `localInference:stop` closes an active Ornith run rather
+   * than leaving it to discover the runtime is gone only on its next turn:
+   * the handler is expected to abort the owning task's own AbortSignal, which
+   * unwinds the Ornith loop through its normal cancellation path (release the
+   * lease, reconcile task state, record the run as cancelled). Not fired by
+   * this lease's own `release()`.
+   */
+  onIndependentStop(handler: () => void): void;
+}
+
+/**
+ * Internal-only surface LOCAL-A exposes to the Ornith implementation service.
+ *
+ * Deliberately separate from {@link LocalInferenceLifecycleService}: that
+ * interface is what IPC handlers use on the renderer's behalf, and none of
+ * this belongs there — there is no IPC channel for any of it. `start()` is
+ * conspicuously absent from every method here: acquiring or using a lease
+ * must never construct, launch or restart a runtime, only use one that is
+ * already retained and already healthy.
+ */
+export interface OrnithInferenceLeaseService {
+  /**
+   * Acquire the one application-wide Ornith execution lease and perform one
+   * bounded `health(signal)` check against the already-retained provider.
+   *
+   * @throws {AgentRelayError} with code `BUSY` when another Ornith run
+   * already holds the lease, or `VALIDATION_FAILED` when no provider is
+   * retained, the retained provider is not `healthy`, or the health check
+   * does not confirm it. Never calls `start()`.
+   */
+  acquireOrnithLease(signal?: AbortSignal): Promise<OrnithHealthyLease>;
+  /**
+   * Re-confirm the lease is still valid: the same provider/model identity is
+   * still configured and the retained provider is still healthy right now.
+   * Used immediately before a worktree-preparing caller records the run.
+   */
+  recheckOrnithLease(lease: OrnithHealthyLease, signal?: AbortSignal): Promise<boolean>;
+  /**
+   * Exactly one `infer` call through the retained provider.
+   *
+   * Refuses (a `failed` outcome, `dispatchOutcome: 'not_dispatched'`) rather
+   * than dispatching when the lease is no longer held, the provider is no
+   * longer retained, or the configured provider/model identity no longer
+   * matches the lease. Never retries and never calls `start()`.
+   */
+  inferForOrnith(
+    lease: OrnithHealthyLease,
+    request: LocalInferenceRequest,
+    signal?: AbortSignal
+  ): Promise<LocalInferenceOutcome>;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Rule evidence                                                              */
 /* -------------------------------------------------------------------------- */
