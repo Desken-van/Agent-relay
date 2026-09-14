@@ -129,6 +129,28 @@ function hasImplementationAttempt(runs: readonly Run[]): boolean {
   return latestRun(runs, ['implementation', 'correction']) !== null;
 }
 
+/**
+ * Ornith's application-authored audit record can prove that a failed attempt
+ * stopped before any mutation. Only that exact, fail-closed signal permits a
+ * retry: missing/malformed evidence still routes to verification so possible
+ * preserved edits are never overwritten.
+ */
+function failedOrnithAttemptProvedNoChanges(run: Run | null): run is Run {
+  if (run?.agent !== 'ornith' || run.status !== 'failed' || run.structuredResult === null) {
+    return false;
+  }
+  try {
+    const parsed: unknown = JSON.parse(run.structuredResult);
+    if (typeof parsed !== 'object' || parsed === null) return false;
+    const counters = (parsed as { readonly counters?: unknown }).counters;
+    return typeof counters === 'object'
+      && counters !== null
+      && (counters as { readonly changedFiles?: unknown }).changedFiles === 0;
+  } catch {
+    return false;
+  }
+}
+
 function stoppedResult(task: Task, runs: readonly Run[]): string {
   if (task.lastError) return task.lastError;
   const run = latestRun(runs);
@@ -345,6 +367,17 @@ export function runGuidance(
           stage: 'Step 2 of 5 · Fix verification failures',
           result: task.lastError ?? verification.errorMessage ?? 'The verification output is saved for the implementation provider.',
           action: guardOrnithReadiness(action('run_implementation', repairLabel), task, extra),
+          activeStep: 1,
+          tone: 'warning'
+        });
+      }
+      const implementationAttempt = latestRun(runs, ['implementation', 'correction']);
+      if (failedOrnithAttemptProvedNoChanges(implementationAttempt)) {
+        return acting({
+          happened: 'Ornith stopped before changing any files.',
+          stage: 'Step 2 of 5 · Implementation',
+          result: task.lastError ?? implementationAttempt.errorMessage ?? 'No worktree changes were made.',
+          action: guardOrnithReadiness(action('run_implementation', implementationLabel), task, extra),
           activeStep: 1,
           tone: 'warning'
         });
