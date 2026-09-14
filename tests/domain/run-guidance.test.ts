@@ -73,6 +73,42 @@ describe('run guidance — exactly one action per state', () => {
     expectConsistent(value);
   });
 
+  it('offers Ornith implementation again when its failed audit proves zero changed files', () => {
+    const value = runGuidance(task({
+      status: 'READY_FOR_IMPLEMENTATION', currentRound: 1,
+      specificationApprovedAt: '2026-09-11T00:00:00.000Z',
+      implementationProvider: 'ornith',
+      lastError: 'Ornith stopped before changing any files.'
+    }), [run({
+      agent: 'ornith',
+      structuredResult: JSON.stringify({
+        provider: 'ornith',
+        counters: { changedFiles: 0 }
+      })
+    })], true, false, 'not_required', { ornithLocalInferenceState: 'healthy' });
+
+    expect(value.action).toMatchObject({
+      key: 'run_implementation', label: 'Run implementation · Ornith', enabled: true
+    });
+    expect(value.stage).toBe('Step 2 of 5 · Implementation');
+    expect(value.result).toBe('Ornith stopped before changing any files.');
+    expectConsistent(value);
+  });
+
+  it('keeps verification fail-closed when a failed Ornith audit does not prove zero changes', () => {
+    const value = runGuidance(task({
+      status: 'READY_FOR_IMPLEMENTATION', currentRound: 1,
+      specificationApprovedAt: '2026-09-11T00:00:00.000Z',
+      implementationProvider: 'ornith'
+    }), [run({
+      agent: 'ornith',
+      structuredResult: JSON.stringify({ provider: 'ornith', counters: { changedFiles: 1 } })
+    })], true, false, 'not_required', { ornithLocalInferenceState: 'healthy' });
+
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification' });
+    expectConsistent(value);
+  });
+
   it('offers an implementation repair after Relay verification failed', () => {
     const value = runGuidance(task({
       status: 'READY_FOR_IMPLEMENTATION', currentRound: 2,
