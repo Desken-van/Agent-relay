@@ -78,6 +78,8 @@ export interface FakeRuntimeScenario {
     | 'huge_completion';
   readonly completionDelayMs?: number;
   readonly completionText?: string;
+  /** Answers successive completion requests in order (the last entry repeats once exhausted); overrides `completionText` when present. */
+  readonly completionTextSequence?: readonly string[];
   readonly responseId?: string;
   readonly finishReason?: string;
   readonly omitFinishReason?: boolean;

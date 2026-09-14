@@ -33,6 +33,7 @@ const RUN_LABELS: Record<Run['runType'], string> = {
 const AGENT_LABELS: Record<Run['agent'], string> = {
   codex: 'Codex',
   claude: 'Claude Code',
+  ornith: 'Ornith',
   system: 'Agent Relay'
 };
 

@@ -18,6 +18,7 @@ const ACTIONS: readonly [RunActionKey, string][] = [
   ['approve_specification', 'Approve specification'],
   ['run_implementation', 'Run implementation · Claude'],
   ['run_implementation', 'Run implementation · Codex'],
+  ['run_implementation', 'Run implementation · Ornith'],
   ['run_verification', 'Run verification'],
   ['run_review', 'Run review · Codex'],
   ['run_review', 'Run review · Claude'],

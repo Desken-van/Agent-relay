@@ -33,11 +33,23 @@ export function openDatabase({ file }: OpenDatabaseOptions): Db {
     db.pragma('journal_mode = WAL');
   }
   db.pragma('synchronous = NORMAL');
-  db.pragma('foreign_keys = ON');
   // Fail fast rather than hanging the UI if another connection holds a lock.
   db.pragma('busy_timeout = 5000');
 
+  // `runMigrations` temporarily suspends foreign-key enforcement before each
+  // migration transaction, then restores the connection's original setting.
+  // SQLite fires an implicit cascading DELETE — visiting every ON DELETE
+  // CASCADE/SET NULL child row — when a table with incoming foreign keys is
+  // dropped while `foreign_keys` is on (see sqlite.org/foreignkeys.html,
+  // "Schema Related Transactions"). A migration that rebuilds `tasks` or
+  // `runs` (both have many dependents) would otherwise silently erase that
+  // dependent history the moment it dropped the old table. Migrations that
+  // rebuild such a table must call `PRAGMA foreign_key_check` themselves
+  // before returning, so a mistake still fails the migration instead of
+  // leaving a dangling reference undetected. Keep enforcement explicit for all
+  // normal repository work after migration.
   runMigrations(db);
+  db.pragma('foreign_keys = ON');
 
   return db;
 }

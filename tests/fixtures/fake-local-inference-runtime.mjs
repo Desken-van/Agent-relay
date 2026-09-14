@@ -169,8 +169,17 @@ function readBody(request) {
   });
 }
 
-function completionBody(current) {
-  const text = current.completionText ?? 'Fake completion.';
+function completionBody(current, completionIndex) {
+  // `completionTextSequence`, when present, lets one scenario answer several
+  // completion requests differently in order (e.g. Ornith's multi-turn tool
+  // loop) — the fixture is already re-read per request, this just indexes
+  // into it instead of requiring the test to rewrite the file mid-loop, which
+  // it has no way to synchronize with a loop it does not step one turn at a
+  // time. The last entry repeats once the sequence is exhausted.
+  const sequence = Array.isArray(current.completionTextSequence) ? current.completionTextSequence : null;
+  const text = sequence
+    ? (sequence[Math.min(completionIndex, sequence.length - 1)] ?? 'Fake completion.')
+    : (current.completionText ?? 'Fake completion.');
   const payload = {
     id: current.responseId ?? 'chatcmpl-fake-1',
     object: 'chat.completion',
@@ -217,7 +226,7 @@ async function handleHealth(current, response) {
   }
 }
 
-async function handleCompletion(current, response) {
+async function handleCompletion(current, response, completionIndex) {
   if (typeof current.completionDelayMs === 'number') await delay(current.completionDelayMs);
 
   switch (current.completion) {
@@ -265,7 +274,7 @@ async function handleCompletion(current, response) {
         })
       );
     default:
-      return send(response, 200, completionBody(current));
+      return send(response, 200, completionBody(current, completionIndex));
   }
 }
 
@@ -282,7 +291,10 @@ const server = createServer((request, response) => {
     recordEvidence();
 
     if (request.url === '/health') return handleHealth(current, response);
-    if (request.url === '/v1/chat/completions') return handleCompletion(current, response);
+    if (request.url === '/v1/chat/completions') {
+      const completionIndex = evidence.requests.filter((entry) => entry.path === '/v1/chat/completions').length - 1;
+      return handleCompletion(current, response, completionIndex);
+    }
     return send(response, 404, JSON.stringify({ error: 'not found' }));
   })();
 });

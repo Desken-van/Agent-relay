@@ -1,10 +1,13 @@
 # Architecture
 
 Agent Relay is an Electron desktop application that relays one software task
-between selectable agents: **Codex** specifies; **Claude Code** or **Codex**
-implements, and either provider can perform the primary read-only review.
-All the work happens inside a dedicated Git worktree, and nothing leaves the
-machine without an explicit confirmation.
+between selectable agents: **Codex** specifies; **Claude Code**, **Codex**, or
+**Ornith** (a locally-run model, reusing the local-inference boundary in
+`docs/local-inference.md`) implements, and **Claude Code** or **Codex** can
+perform the primary read-only review — Ornith is implementation-only and is
+never a specification, plan-review, or code-review provider. All the work
+happens inside a dedicated Git worktree, and nothing leaves the machine
+without an explicit confirmation.
 
 ---
 
@@ -1226,6 +1229,70 @@ check runs against the argv array, so there is no string to obfuscate through.
 
 No token ever passes through Agent Relay. `gh auth status` is parsed for account
 names only; `--show-token` is never used.
+
+---
+
+## 6b. Ornith — the local-inference implementation provider
+
+Ornith is routed exactly like the Claude/Codex branches in
+`Orchestrator.runImplementation`, with an exhaustive switch on
+`task.implementationProvider` — there is no default branch, so an unhandled
+provider fails to compile rather than silently falling back to Claude. It
+reuses the existing relay-loop invariants unchanged: isolated worktree,
+round budget, one-run-per-task exclusion, startup reconciliation, and the
+post-provider `WorktreeVerification` snapshot gate before `READY_FOR_REVIEW`.
+
+**Preflight, before anything durable.** `Orchestrator.acquireOrnithLeaseIfNeeded`
+runs before the task moves to `IMPLEMENTING`, before a round is consumed, and
+before a run row exists — it acquires the application-wide
+`OrnithInferenceLeaseService` lease (implemented by the same
+`LocalInferenceService` instance the Local inference lifecycle IPC handlers
+use) and performs one bounded `health()` check against the already-retained
+provider. `recheckOrnithLeaseIfNeeded` re-confirms it immediately before the
+run is recorded, covering the time worktree creation may have taken. Neither
+call, nor anything downstream, ever calls `start()`.
+
+**The loop** (`src/main/services/ornith-implementation.ts`) builds one
+complete, stateless chat-completion request per turn — the full approved
+specification, any accepted plan-review addenda, the bound rule evidence,
+fixed protocol instructions, a rolling window of prior bounded tool results,
+and remaining-budget counters — dispatches it through
+`OrnithInferenceLeaseService.inferForOrnith`, and parses the single JSON
+action in the reply with `parseOrnithCompletion`
+(`src/shared/domain/ornith.ts`). Every completion's `providerId`/`modelId`/
+`runtimeInstanceId` must match the identity the lease established; a
+mismatch — from a Settings change, a runtime replacement, or a race with
+`localInference:stop` — ends the round rather than continuing against a
+different runtime. Non-terminal actions are executed by
+`OrnithWorktreeTools` (`src/main/services/ornith-worktree-tools.ts`, detailed
+in `docs/security.md` §5c); `finish` and `blocked` end the loop;
+`run_verification` dispatches to the same `WorktreeVerification` executor
+used elsewhere, but only as diagnostic evidence folded into the loop's own
+assessment — the authoritative gate remains Agent Relay's own post-provider
+snapshot verification, run exactly as it is for Claude and Codex.
+
+**Stop.** `workflow:stop` aborts the task's `AbortController`, which
+`inferForOrnith` and every bounded tool/verification operation observe. The
+independently callable `localInference:stop` additionally calls
+`onIndependentStop` on the held lease, which aborts that same controller —
+so stopping the runtime directly still closes the owning Ornith run
+(cancelled status, released lease, reconciled task state) instead of leaving
+it to discover the runtime is gone only on its next turn. Neither Stop path
+starts or restarts anything.
+
+**Persistence.** Migration 12 (`ornith-provider`) widens the `CHECK`
+constraint on `tasks.implementation_provider` and `runs.agent` to accept
+`ornith`, adds a `CHECK` that an `ornith` run's `run_type` is
+`implementation` or `correction`, and widens `task_provider_changes`'
+implementation-side columns the same way — all three tables are rebuilt
+under their existing name (SQLite has no `ALTER TABLE ... ALTER CONSTRAINT`)
+with every row copied across unchanged. `tasks.review_provider` keeps its
+existing `claude`/`codex`-only constraint. Because `tasks` and `runs` have
+many dependent tables, `openDatabase` defers `PRAGMA foreign_keys = ON`
+until after migrations finish, so the `DROP TABLE` the rebuild requires
+cannot trigger SQLite's implicit cascading delete through any of them; the
+migration proves this with `PRAGMA foreign_key_check` before it returns, and
+throws — rolling the whole migration back — if that check is not empty.
 
 ---
 

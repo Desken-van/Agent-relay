@@ -701,6 +701,77 @@ lifecycle result above is the one piece of it that has actually run.
 
 ---
 
+## 15. Ornith as a task implementation provider — real acceptance path
+
+**Status: not yet run against a real runtime and model.** This checklist was
+written and reviewed as part of adding Ornith as a task-level implementation
+provider, but a real end-to-end pass — a real `llama-server`/Ornith build, a
+real model, a real task worked from specification through review — has not
+been executed and is not claimed here. Do not report this as passed without
+actually running it and recording the result below. This section builds on
+§14 above: complete that section's lifecycle setup first.
+
+**No publishing happens in this checklist.** Stop before §9 territory — do
+not approve for publishing, commit, push, or create a pull request from the
+task this section creates.
+
+1. With a real runtime and model already **Started** and **Healthy** (§14),
+   register or select a project with a real Git repository (§3).
+2. Create a task (§4). Set **Implementation provider** to **Ornith** and
+   **Review provider** to **Claude** or **Codex** — Ornith must never appear
+   as a review-provider option; confirm the selector genuinely omits it.
+3. **Expect** a visible notice that Ornith reuses the local runtime and must
+   already be Healthy. Generate and approve the specification as usual (Codex
+   still writes it — Ornith never does).
+4. Stop the local runtime (**Settings → Local inference → Stop**) and attempt
+   **Run implementation**. **Expect** the primary action to be disabled with
+   remediation pointing at Settings, or — if dispatched anyway through a
+   stale UI state — a clean refusal with no run row created and no worktree
+   mutation. Confirm with an OS network tool that **no completion request
+   reached the runtime's port** while it was stopped.
+5. Start the runtime again, confirm **Healthy**, and press **Run
+   implementation**. **Expect**:
+   - The task moves to `IMPLEMENTING`, then to `READY_FOR_REVIEW` (via
+     Relay's own automatic verification) or `CHANGES_REQUESTED`/failed,
+     never silently to Claude or Codex.
+   - Files change only inside this task's own worktree directory — confirm
+     with an OS tool that no other path on disk was touched.
+   - The Relay timeline shows an **Ornith**-labelled node (distinct color
+     from the Claude/Codex/Agent Relay lanes) with bounded operation
+     evidence — action kinds, paths, counts — and no raw prompt, completion,
+     or full model-authored text rendered anywhere in it.
+   - `task.implementationThreadId` remains `null` throughout (inspect via the
+     Run screen or the SQLite file directly, read-only, app closed).
+6. Confirm **Relay's own verification actually ran** after the Ornith round
+   (visible as a `verification` timeline node), independent of anything
+   Ornith itself reported via its own `run_verification` tool calls.
+7. Send corrections at least once if the reviewer requests changes, and
+   confirm the correction round is also attributed to Ornith with a fresh
+   bounded loop (no durable session reused).
+8. With the runtime **Healthy** and an Ornith round in progress (a long
+   prompt or a deliberately slow model helps here), press **Stop** on the
+   *task* (not the runtime). **Expect** the round to end as cancelled, the
+   lease released (a fresh Ornith round on this or another task becomes
+   possible immediately), and the task in a stable, non-busy state.
+9. Separately, start another Ornith round and instead press **Stop** on the
+   *local runtime* itself (`localInference:stop`), independent of the task
+   UI. **Expect** the owning Ornith round to also end (cancelled), not hang
+   or leave the task stuck in `IMPLEMENTING`.
+10. Inspect the application's SQLite file and log output (read-only, app
+    closed) for the sentinels that must never appear: the raw prompt text
+    sent to Ornith, the raw action JSON it returned, the raw completion body,
+    and the full runtime response payload. Only bounded, redacted metadata
+    (paths, counts, hashes, durations, status codes) should be present.
+11. Confirm no commit, push, remote, or publishing action occurred at any
+    point in this checklist — `git log`/`git status` in the real repository
+    (not the worktree) should show nothing from this task.
+
+Record the result of a completed real run — model, runtime version, task
+outcome per step, and pass/fail — in a dated subsection here once this
+checklist is actually executed.
+
+---
+
 ## Cleanup
 
 ```powershell

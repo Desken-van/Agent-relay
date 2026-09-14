@@ -11,7 +11,7 @@
 
 import { z } from 'zod';
 import { TASK_STATUSES } from './workflow';
-import { executionProviderSchema } from './execution-providers';
+import { implementationProviderSchema, reviewProviderSchema } from './execution-providers';
 import { localInferenceSettingsSchema } from './local-inference';
 
 /** ISO-8601 instant, e.g. `2026-08-10T09:41:12.004Z`. */
@@ -102,8 +102,8 @@ export const taskSchema = z.object({
   maxRounds: z.number().int().min(1).max(20),
   codexThreadId: z.string().nullable(),
   claudeSessionId: z.string().nullable(),
-  implementationProvider: executionProviderSchema.default('claude'),
-  reviewProvider: executionProviderSchema.default('codex'),
+  implementationProvider: implementationProviderSchema.default('claude'),
+  reviewProvider: reviewProviderSchema.default('codex'),
   providerRevision: z.number().int().min(0).default(0),
   implementationThreadId: z.string().nullable().default(null),
   worktreePath: z.string().nullable(),
@@ -137,7 +137,7 @@ export type Task = z.infer<typeof taskSchema>;
 /* Run                                                                         */
 /* -------------------------------------------------------------------------- */
 
-export const RUN_AGENTS = ['codex', 'claude', 'system'] as const;
+export const RUN_AGENTS = ['codex', 'claude', 'ornith', 'system'] as const;
 export const RUN_TYPES = [
   'verification',
   'specification',
@@ -148,6 +148,16 @@ export const RUN_TYPES = [
   'github'
 ] as const;
 export const RUN_STATUSES = ['running', 'succeeded', 'failed', 'cancelled'] as const;
+
+/**
+ * Ornith is implementation-only: it may never appear on a specification,
+ * review, verification, git or github run. Mirrors the database CHECK
+ * constraint added by migration 12, so an in-process construction attempt
+ * fails the same way a stored row would.
+ */
+export function isRunAgentAllowedForType(agent: RunAgent, runType: RunType): boolean {
+  return agent !== 'ornith' || runType === 'implementation' || runType === 'correction';
+}
 
 export const runSchema = z.object({
   id: idSchema,
@@ -163,6 +173,14 @@ export const runSchema = z.object({
   /** JSON-serialised structured payload (specification / review result / git summary). */
   structuredResult: z.string().nullable(),
   errorMessage: z.string().nullable()
+}).superRefine((run, context) => {
+  if (!isRunAgentAllowedForType(run.agent, run.runType)) {
+    context.addIssue({
+      code: 'custom',
+      path: ['agent'],
+      message: 'Ornith is valid only for implementation and correction runs.'
+    });
+  }
 });
 
 export type Run = z.infer<typeof runSchema>;
