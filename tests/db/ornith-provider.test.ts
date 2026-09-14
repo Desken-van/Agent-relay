@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createSqliteDatabase, type SqliteDatabase } from '../../src/main/db/sqlite';
-import { MIGRATIONS } from '../../src/main/db/migrations';
+import { MIGRATIONS, runMigrations } from '../../src/main/db/migrations';
 
 let db: SqliteDatabase;
 
@@ -188,6 +188,84 @@ describe('migration 12 (ornith-provider)', () => {
         )
         .run()
     ).not.toThrow();
+  });
+
+  it('repairs profiles where historical review migrations occupied Ornith version 12', () => {
+    applyMigrationsUpTo(db, 11);
+    seedV11Fixture(db);
+
+    const reviewLimit = MIGRATIONS.find((migration) => migration.version === 13);
+    const reviewBlocked = MIGRATIONS.find((migration) => migration.version === 14);
+    if (!reviewLimit || !reviewBlocked) throw new Error('Review migrations are unavailable.');
+    const record = db.prepare(
+      'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)'
+    );
+    const applyHistorical = (migration: typeof reviewLimit, version: number, name: string): void => {
+      const apply = db.transaction(() => {
+        migration.up(db);
+        record.run(version, name, '2026-09-14T00:00:00.000Z');
+      });
+      apply();
+    };
+
+    // Exact version/name lineage independently observed in the affected live
+    // profile: the old branch used 12/13, then canonical v14 ran once after
+    // merge while canonical v12 remained skipped by version bookkeeping.
+    applyHistorical(reviewLimit, 12, 'review-limit-status');
+    applyHistorical(reviewBlocked, 13, 'review-blocked-status');
+    applyHistorical(reviewBlocked, 14, 'review-blocked-status');
+
+    // Both terminal tasks may legitimately retain the same worktree path.
+    // Migration 15 must preserve that history while rebuilding the old schema.
+    db.prepare("UPDATE tasks SET status = 'REVIEW_BLOCKED' WHERE id = 'task-1'").run();
+    db.prepare(
+      "UPDATE tasks SET status = 'REVIEW_LIMIT_REACHED', worktree_path = 'C:\\worktrees\\task-1' WHERE id = 'task-2'"
+    ).run();
+
+    const before = {
+      tasks: (db.prepare('SELECT COUNT(*) AS n FROM tasks').get() as { n: number }).n,
+      runs: (db.prepare('SELECT COUNT(*) AS n FROM runs').get() as { n: number }).n,
+      events: (db.prepare('SELECT COUNT(*) AS n FROM run_events').get() as { n: number }).n,
+      approvals: (db.prepare('SELECT COUNT(*) AS n FROM approvals').get() as { n: number }).n,
+      continuations: (db.prepare('SELECT COUNT(*) AS n FROM task_continuations').get() as { n: number }).n
+    };
+
+    expect(runMigrations(db)).toBe(1);
+    db.pragma('foreign_keys = ON');
+
+    expect((db.prepare('SELECT COUNT(*) AS n FROM tasks').get() as { n: number }).n).toBe(before.tasks);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM runs').get() as { n: number }).n).toBe(before.runs);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM run_events').get() as { n: number }).n).toBe(before.events);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM approvals').get() as { n: number }).n).toBe(before.approvals);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM task_continuations').get() as { n: number }).n).toBe(before.continuations);
+    expect(db.prepare('SELECT id, status, worktree_path FROM tasks ORDER BY id').all()).toEqual([
+      { id: 'task-1', status: 'REVIEW_BLOCKED', worktree_path: 'C:\\worktrees\\task-1' },
+      { id: 'task-2', status: 'REVIEW_LIMIT_REACHED', worktree_path: 'C:\\worktrees\\task-1' }
+    ]);
+
+    expect(() =>
+      db.prepare("UPDATE tasks SET implementation_provider = 'ornith' WHERE id = 'task-2'").run()
+    ).not.toThrow();
+    expect(() =>
+      db.prepare(
+        `INSERT INTO runs (id, task_id, agent, run_type, status, round, started_at)
+         VALUES ('run-repaired-ornith', 'task-2', 'ornith', 'implementation', 'succeeded', 1, '2026-09-14T00:00:00.000Z')`
+      ).run()
+    ).not.toThrow();
+    expect(() =>
+      db.prepare(
+        `INSERT INTO task_provider_changes (task_id, revision, previous_implementation, implementation, previous_review, review, changed_at)
+         VALUES ('task-2', 2, 'codex', 'ornith', 'codex', 'codex', '2026-09-14T00:00:00.000Z')`
+      ).run()
+    ).not.toThrow();
+
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    expect(db.prepare('SELECT version, name FROM schema_migrations WHERE version >= 12 ORDER BY version').all()).toEqual([
+      { version: 12, name: 'review-limit-status' },
+      { version: 13, name: 'review-blocked-status' },
+      { version: 14, name: 'review-blocked-status' },
+      { version: 15, name: 'ornith-provider-version-collision-repair' }
+    ]);
   });
 
   it('rolls back entirely, leaving the original v11 database usable, when the rebuild would violate a new constraint', () => {
