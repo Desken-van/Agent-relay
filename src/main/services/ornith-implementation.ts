@@ -93,6 +93,12 @@ export interface OrnithImplementationAudit {
 
 export interface OrnithImplementationResult extends ImplementationResult {
   readonly ornithAudit: OrnithImplementationAudit;
+  /** Present when the retained runtime itself did not produce a completion. */
+  readonly providerFailure?: {
+    readonly kind: 'failed' | 'timed_out';
+    readonly reason: string;
+    readonly dispatchOutcome: 'not_dispatched' | 'rejected' | 'unknown';
+  } | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -168,12 +174,61 @@ Rules:
  * budget — the caller must refuse before inference rather than silently
  * dropping any of it.
  */
-function buildOrnithPromptText(
-  request: OrnithImplementationRequest,
-  rolling: readonly RollingResult[],
-  remaining: { turns: number; actions: number; verifications: number; readBytes: number; writeBytes: number; changedFiles: number }
-): string | null {
-  const authoritative = [
+export interface OrnithPromptPreflightInput {
+  readonly specification: TaskSpecification;
+  readonly ruleEvidence: string | null;
+  readonly acceptedPlanReviewAddenda: string | null;
+  readonly correctionFindings: string | null;
+  readonly round: number;
+  readonly maxRounds: number;
+  readonly lease: Pick<OrnithHealthyLease, 'contextLimitTokens' | 'maxOutputTokens'>;
+}
+
+interface OrnithPromptBudget {
+  readonly maxPromptBytes: number;
+  readonly maxOutputTokens: number;
+  readonly maxToolResultBytes: number;
+}
+
+export type OrnithPromptPreflight =
+  | { readonly ok: true; readonly budget: OrnithPromptBudget }
+  | {
+      readonly ok: false;
+      readonly reason: string;
+      readonly requiredContextTokens: number;
+    };
+
+function promptBudgetFor(lease: OrnithPromptPreflightInput['lease']): OrnithPromptBudget {
+  const contextLimitTokens = Math.max(0, Math.floor(lease.contextLimitTokens));
+  const configuredOutputTokens = Math.max(1, Math.floor(lease.maxOutputTokens));
+  const maxOutputTokens = Math.max(
+    1,
+    Math.min(
+      configuredOutputTokens,
+      ORNITH_LIMITS.maxTurnOutputTokens,
+      Math.floor(Math.max(1, contextLimitTokens - ORNITH_LIMITS.contextSafetyTokens) / 4)
+    )
+  );
+  // A byte-level tokenizer cannot produce more content tokens than there are
+  // UTF-8 bytes. Using one byte per token is intentionally conservative and,
+  // together with the template reserve, makes this a fail-closed bound without
+  // requiring a model-specific tokenizer in the trusted host process.
+  const maxPromptBytes = Math.min(
+    ORNITH_LIMITS.maxPromptBytes,
+    Math.max(0, contextLimitTokens - maxOutputTokens - ORNITH_LIMITS.contextSafetyTokens)
+  );
+  return {
+    maxPromptBytes,
+    maxOutputTokens,
+    maxToolResultBytes: Math.min(
+      ORNITH_LIMITS.maxToolResultBytes,
+      Math.max(0, Math.floor(maxPromptBytes / 2))
+    )
+  };
+}
+
+function authoritativePromptText(request: OrnithPromptPreflightInput): string {
+  return [
     renderSpecification(request.specification),
     request.acceptedPlanReviewAddenda
       ? `=== USER-ACCEPTED EXTERNAL PLAN-REVIEW ADDENDA ===\n${request.acceptedPlanReviewAddenda}`
@@ -184,8 +239,49 @@ function buildOrnithPromptText(
   ]
     .filter((part): part is string => part !== null)
     .join('\n\n');
+}
 
-  if (Buffer.byteLength(authoritative, 'utf8') > ORNITH_LIMITS.maxPromptBytes) {
+/**
+ * Prove the immutable part of every stateless Ornith request fits the exact
+ * retained runtime window. Callers use this before creating a worktree or
+ * consuming a round; the loop repeats the same check before inference.
+ */
+export function preflightOrnithPrompt(input: OrnithPromptPreflightInput): OrnithPromptPreflight {
+  const budget = promptBudgetFor(input.lease);
+  const authoritativeBytes = Buffer.byteLength(authoritativePromptText(input), 'utf8');
+  const fixedBudgetBytes = Buffer.byteLength(`=== REMAINING BUDGET ===
+Model turns remaining: ${ORNITH_LIMITS.maxModelTurns}
+Non-terminal actions remaining: ${ORNITH_LIMITS.maxNonterminalActions}
+Verification calls remaining: ${ORNITH_LIMITS.maxVerificationCalls}
+Repository read bytes remaining: ${ORNITH_LIMITS.maxCumulativeReadBytes}
+Repository write bytes remaining: ${ORNITH_LIMITS.maxCumulativeWriteBytes}
+Changed files remaining: ${ORNITH_LIMITS.maxChangedFiles}
+Maximum retained tool-result bytes: ${budget.maxToolResultBytes}
+Round ${input.round} of at most ${input.maxRounds}.
+
+Reply with exactly one JSON action now.`, 'utf8');
+  const requiredPromptBytes = authoritativeBytes + 2 + fixedBudgetBytes;
+  if (requiredPromptBytes <= budget.maxPromptBytes) return { ok: true, budget };
+  return {
+    ok: false,
+    reason:
+      `The immutable Ornith prompt needs ${requiredPromptBytes} bytes, but the retained ` +
+      `${input.lease.contextLimitTokens}-token runtime allows at most ${budget.maxPromptBytes} prompt bytes ` +
+      `after output and template reserves.`,
+    requiredContextTokens:
+      requiredPromptBytes + budget.maxOutputTokens + ORNITH_LIMITS.contextSafetyTokens
+  };
+}
+
+function buildOrnithPromptText(
+  request: OrnithPromptPreflightInput,
+  rolling: readonly RollingResult[],
+  remaining: { turns: number; actions: number; verifications: number; readBytes: number; writeBytes: number; changedFiles: number },
+  promptBudget: OrnithPromptBudget
+): string | null {
+  const authoritative = authoritativePromptText(request);
+
+  if (Buffer.byteLength(authoritative, 'utf8') > promptBudget.maxPromptBytes) {
     return null;
   }
 
@@ -196,14 +292,15 @@ Verification calls remaining: ${remaining.verifications}
 Repository read bytes remaining: ${remaining.readBytes}
 Repository write bytes remaining: ${remaining.writeBytes}
 Changed files remaining: ${remaining.changedFiles}
+Maximum retained tool-result bytes: ${promptBudget.maxToolResultBytes}
 Round ${request.round} of at most ${request.maxRounds}.`;
 
   const fixedTail = `${budget}\n\nReply with exactly one JSON action now.`;
   const fixedBytes = Buffer.byteLength(`${authoritative}\n\n${fixedTail}`, 'utf8');
-  if (fixedBytes > ORNITH_LIMITS.maxPromptBytes) return null;
+  if (fixedBytes > promptBudget.maxPromptBytes) return null;
   const rollingByteBudget = Math.min(
     ORNITH_LIMITS.maxRollingContextBytes,
-    ORNITH_LIMITS.maxPromptBytes - fixedBytes
+    promptBudget.maxPromptBytes - fixedBytes
   );
 
   let history = '';
@@ -232,7 +329,7 @@ Round ${request.round} of at most ${request.maxRounds}.`;
     .filter((part) => part.length > 0)
     .join('\n\n');
 
-  return Buffer.byteLength(full, 'utf8') > ORNITH_LIMITS.maxPromptBytes
+  return Buffer.byteLength(full, 'utf8') > promptBudget.maxPromptBytes
     ? // The rolling section alone pushed it over; drop history entirely and
       // retry with just the authoritative content and budget, which was
       // already proven to fit above.
@@ -297,9 +394,11 @@ export class OrnithImplementationService {
     const outcomes: Array<{ sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }> = [];
     const finish = (
       disposition: 'pass' | 'fail', message: string,
-      publishBlock: ClaudeRoundAssessmentRecord['publishBlock'], reasonCodes: readonly string[]
+      publishBlock: ClaudeRoundAssessmentRecord['publishBlock'], reasonCodes: readonly string[],
+      providerFailure: OrnithImplementationResult['providerFailure'] = null
     ): OrnithImplementationResult => ({
       ...finishedResult(disposition, message, publishBlock, reasonCodes),
+      providerFailure,
       ornithAudit: {
         turns: turnsUsed,
         actions: nonterminalActionsUsed,
@@ -328,6 +427,18 @@ export class OrnithImplementationService {
         ['disallowed_action']
       );
     }
+
+    const promptPreflight = preflightOrnithPrompt(request);
+    if (!promptPreflight.ok) {
+      return finish(
+        'fail',
+        `${promptPreflight.reason} Increase the Local inference context limit to at least ` +
+          `${promptPreflight.requiredContextTokens} tokens and restart the runtime.`,
+        'configuration',
+        ['limit_context_exceeded']
+      );
+    }
+    const promptBudget = promptPreflight.budget;
 
     for (;;) {
       if (request.signal.aborted) {
@@ -383,7 +494,7 @@ export class OrnithImplementationService {
         readBytes: Math.max(0, ORNITH_LIMITS.maxCumulativeReadBytes - cumulativeReadBytes),
         writeBytes: Math.max(0, ORNITH_LIMITS.maxCumulativeWriteBytes - cumulativeWriteBytes),
         changedFiles: Math.max(0, ORNITH_LIMITS.maxChangedFiles - tools.changedFileCount())
-      });
+      }, promptBudget);
       if (promptText === null) {
         return finish(
           'fail',
@@ -397,7 +508,8 @@ export class OrnithImplementationService {
       const inferRequest: LocalInferenceRequest = {
         version: LOCAL_INFERENCE_CONTRACT_VERSION,
         requestId,
-        messages: toMessages(promptText)
+        messages: toMessages(promptText),
+        maxOutputTokens: promptBudget.maxOutputTokens
       };
 
       turnsUsed += 1;
@@ -425,11 +537,18 @@ export class OrnithImplementationService {
         if (outcome.kind === 'cancelled') {
           throw new AgentRelayError('CANCELLED', 'The local runtime cancelled the Ornith inference.');
         }
+        const safeReason = safeProviderFailureReason(outcome.reason);
         return finish(
           'fail',
-          'The local runtime did not return a usable completion.',
+          `The local runtime ${outcome.kind === 'timed_out' ? 'timed out' : 'failed'} ` +
+            `(${outcome.dispatchOutcome}): ${safeReason}`,
           'configuration',
-          ['runtime_unavailable']
+          [outcome.kind === 'timed_out' ? 'timeout' : 'runtime_unavailable'],
+          {
+            kind: outcome.kind,
+            reason: safeReason,
+            dispatchOutcome: outcome.dispatchOutcome
+          }
         );
       }
 
@@ -602,7 +721,7 @@ export class OrnithImplementationService {
           toolResult = await this.dispatchToolAction(tools, action, operationSignal.signal, {
             readBytes: ORNITH_LIMITS.maxCumulativeReadBytes - cumulativeReadBytes,
             writeBytes: ORNITH_LIMITS.maxCumulativeWriteBytes - cumulativeWriteBytes
-          });
+          }, promptBudget.maxToolResultBytes);
         } catch (error) {
           if (request.signal.aborted) throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
           if (operationSignal.timedOut()) {
@@ -651,7 +770,7 @@ export class OrnithImplementationService {
         }
       });
 
-      const resultText = boundedJson(toolResult.forModel);
+      const resultText = boundedJson(toolResult.forModel, promptBudget.maxToolResultBytes);
       rolling.push({ turn: turnsUsed, action: action.action, resultText });
     }
   }
@@ -660,13 +779,18 @@ export class OrnithImplementationService {
     tools: OrnithWorktreeTools,
     action: Exclude<OrnithAction, { action: 'finish' } | { action: 'blocked' } | { action: 'run_verification' }>,
     signal: AbortSignal,
-    budget: OrnithOperationBudget
+    budget: OrnithOperationBudget,
+    maxToolResultBytes: number
   ): Promise<OrnithToolResult> {
     switch (action.action) {
       case 'list_files':
         return tools.listFiles(action, signal);
       case 'read_file':
-        return tools.readFile(action, signal, budget);
+        return tools.readFile(
+          { ...action, limit: Math.min(action.limit, Math.max(1, maxToolResultBytes - 512)) },
+          signal,
+          budget
+        );
       case 'search_text':
         return tools.searchText(action, signal, budget);
       case 'create_file':
@@ -700,16 +824,33 @@ function finishedResult(
   };
 }
 
-function boundedJson(value: unknown): string {
+function boundedJson(value: unknown, maxBytes: number): string {
   try {
     const text = JSON.stringify(value);
     const bytes = Buffer.byteLength(text, 'utf8');
-    return bytes > ORNITH_LIMITS.maxToolResultBytes
-      ? JSON.stringify({ truncated: true, originalBytes: bytes, reason: 'Tool result exceeded the serialized byte limit.' })
+    return bytes > maxBytes
+      ? JSON.stringify({
+          truncated: true,
+          originalBytes: bytes,
+          retainedLimitBytes: maxBytes,
+          reason: 'Tool result exceeded this runtime context budget; request a smaller page or read chunk.'
+        })
       : text;
   } catch {
     return '(unserializable result)';
   }
+}
+
+function safeProviderFailureReason(reason: string): string {
+  const bounded = reason.trim().slice(0, ORNITH_LIMITS.maxErrorChars);
+  if (
+    bounded.length === 0 ||
+    containsSecretShape(bounded) ||
+    containsAbsoluteMachinePath(bounded)
+  ) {
+    return 'The runtime returned an unsafe or empty failure description.';
+  }
+  return bounded;
 }
 
 function boundedVerificationError(error: unknown): string {

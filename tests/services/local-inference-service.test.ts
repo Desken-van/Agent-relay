@@ -458,6 +458,8 @@ describe('LocalInferenceService.runTestInference', () => {
     const service = new LocalInferenceService({ settings, createProvider: () => provider, ids: testIds() });
     await service.start();
     const lease = await service.acquireOrnithLease();
+    expect(lease.contextLimitTokens).toBe(settings.get().localInference.contextLimitTokens);
+    expect(lease.maxOutputTokens).toBe(settings.get().localInference.requestDefaults.maxOutputTokens);
 
     const outcome = await service.runTestInference('must not dispatch');
 

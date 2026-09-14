@@ -1307,6 +1307,13 @@ export interface OrnithHealthyLease {
   readonly runtimeInstanceId: string;
   readonly providerId: string;
   readonly modelId: string;
+  /**
+   * The exact context/output limits of the retained runtime configuration.
+   * Captured with the provider identity so the Ornith loop can prove every
+   * stateless request fits the model window before it is dispatched.
+   */
+  readonly contextLimitTokens: number;
+  readonly maxOutputTokens: number;
   /** Idempotent. Safe to call more than once, and from a `finally` block. */
   release(): void;
   /**

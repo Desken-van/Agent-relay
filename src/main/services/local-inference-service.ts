@@ -270,6 +270,8 @@ export class LocalInferenceService implements LocalInferenceLifecycleService, Or
         runtimeInstanceId: checked.runtimeInstanceId,
         providerId: config.providerId,
         modelId: config.model.id,
+        contextLimitTokens: config.contextLimitTokens,
+        maxOutputTokens: config.maxOutputTokens,
         release,
         onIndependentStop: (handler) => {
           // A lease already released must not accumulate handlers nobody
@@ -296,7 +298,12 @@ export class LocalInferenceService implements LocalInferenceLifecycleService, Or
     const settingsFingerprint = JSON.stringify(this.options.settings.get().localInference);
     if (settingsFingerprint !== this.ornithLeaseSettings || settingsFingerprint !== this.boundSettings) return false;
     const config = this.assembledConfig();
-    if (config.providerId !== lease.providerId || config.model.id !== lease.modelId) return false;
+    if (
+      config.providerId !== lease.providerId ||
+      config.model.id !== lease.modelId ||
+      config.contextLimitTokens !== lease.contextLimitTokens ||
+      config.maxOutputTokens !== lease.maxOutputTokens
+    ) return false;
 
     const checked = await provider.health(signal);
     return (
@@ -334,7 +341,12 @@ export class LocalInferenceService implements LocalInferenceLifecycleService, Or
       return failed('The saved local-inference configuration changed during this run.');
     }
     const config = this.assembledConfig();
-    if (config.providerId !== lease.providerId || config.model.id !== lease.modelId) {
+    if (
+      config.providerId !== lease.providerId ||
+      config.model.id !== lease.modelId ||
+      config.contextLimitTokens !== lease.contextLimitTokens ||
+      config.maxOutputTokens !== lease.maxOutputTokens
+    ) {
       return failed('The configured local-inference provider or model changed during this run.');
     }
     const state = provider.state();
@@ -358,6 +370,8 @@ export class LocalInferenceService implements LocalInferenceLifecycleService, Or
       afterSettings !== this.boundSettings ||
       afterConfig.providerId !== lease.providerId ||
       afterConfig.model.id !== lease.modelId ||
+      afterConfig.contextLimitTokens !== lease.contextLimitTokens ||
+      afterConfig.maxOutputTokens !== lease.maxOutputTokens ||
       afterState.kind !== 'healthy' ||
       afterState.runtimeInstanceId !== lease.runtimeInstanceId
     ) {

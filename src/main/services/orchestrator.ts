@@ -75,7 +75,10 @@ import type {
   TaskRuleEvidenceRepository
 } from '../ports';
 import type { ProcessRunner } from '../adapters/process/process-runner';
-import type { OrnithImplementationService } from './ornith-implementation';
+import {
+  preflightOrnithPrompt,
+  type OrnithImplementationService
+} from './ornith-implementation';
 import { assertSafeWorktreePath, isSamePath } from './path-safety';
 import { assessClaudeRound } from './claude-round-policy';
 import {
@@ -710,6 +713,23 @@ export class Orchestrator {
       // nothing durable behind.
       ornithLease = await this.acquireOrnithLeaseIfNeeded(task, controller);
 
+      // Read this before creating a worktree or consuming a round. In
+      // particular, the immutable specification itself may already be larger
+      // than the retained model's context window; that is a settings preflight
+      // failure, not a failed implementation attempt.
+      const verificationRepair = task.implementationProvider === 'ornith'
+        ? this.ornithVerificationFailureEvidence(taskId)
+        : this.verificationFailurePrompt(taskId);
+      if (ornithLease !== null) {
+        this.assertOrnithPromptFits({
+          task,
+          lease: ornithLease,
+          specification,
+          correctionFindings: verificationRepair,
+          round: Math.max(1, task.currentRound)
+        });
+      }
+
       const completeContinuationStart = await this.deps.continuationGuard?.prepareFirstAction(
         taskId,
         'implementation'
@@ -726,17 +746,12 @@ export class Orchestrator {
         throw new AgentRelayError('INTERNAL', 'The task has no worktree after creation.');
       }
 
-      // Read this before recording another implementation run. A later write
-      // attempt deliberately invalidates the preceding verification snapshot.
-      const verificationRepair = task.implementationProvider === 'ornith'
-        ? this.ornithVerificationFailureEvidence(taskId)
-        : this.verificationFailurePrompt(taskId);
-
       // Worktree preparation may have taken real time; reconfirm the lease
       // immediately before the run is recorded rather than trusting the
       // preflight above.
       await this.recheckOrnithLeaseIfNeeded(ornithLease, controller.signal);
 
+      const roundBeforeAttempt = task.currentRound;
       task = this.applyEvent(task, 'implementation_started', {
         // Verification recovery can return a later round here; never reset its budget.
         currentRound: Math.max(1, task.currentRound),
@@ -752,7 +767,8 @@ export class Orchestrator {
         runType: 'implementation',
         recoverableFailure: 'implementation_aborted',
         ornithLease,
-        ornithCorrectionFindings: verificationRepair
+        ornithCorrectionFindings: verificationRepair,
+        roundBeforeAttempt
       });
     } catch (error) {
       this.recordFailureIfStillRunning(taskId, error, 'implementation_aborted');
@@ -820,11 +836,26 @@ export class Orchestrator {
     try {
       ornithLease = await this.acquireOrnithLeaseIfNeeded(task, controller);
 
+      const nextRound = task.currentRound + 1;
+      const roundBeforeAttempt = task.currentRound;
+
+      const correctionFindings = recovering
+        ? this.describeBlockedRound(task.id)
+        : renderOrnithCorrectionFindings(review as NonNullable<typeof review>);
+      if (ornithLease !== null) {
+        this.assertOrnithPromptFits({
+          task,
+          lease: ornithLease,
+          specification: readSpecification(task),
+          correctionFindings,
+          round: nextRound
+        });
+      }
+
       const completeContinuationStart = await this.deps.continuationGuard?.prepareFirstAction(
         taskId,
         'corrections'
       );
-      const nextRound = task.currentRound + 1;
 
       await this.recheckOrnithLeaseIfNeeded(ornithLease, controller.signal);
 
@@ -854,9 +885,8 @@ export class Orchestrator {
         recoverableFailure: 'correction_aborted',
         unverifiedFailure: 'correction_unverified',
         ornithLease,
-        ornithCorrectionFindings: recovering
-          ? this.describeBlockedRound(task.id)
-          : renderOrnithCorrectionFindings(review as NonNullable<typeof review>)
+        ornithCorrectionFindings: correctionFindings,
+        roundBeforeAttempt
       });
     } catch (error) {
       this.recordFailureIfStillRunning(taskId, error, 'correction_aborted');
@@ -980,6 +1010,30 @@ export class Orchestrator {
     return lease;
   }
 
+  private assertOrnithPromptFits(input: {
+    task: Task;
+    lease: OrnithHealthyLease;
+    specification: TaskSpecification;
+    correctionFindings: string | null;
+    round: number;
+  }): void {
+    const checked = preflightOrnithPrompt({
+      specification: input.specification,
+      ruleEvidence: this.ruleEvidenceText(input.task.id) ?? null,
+      acceptedPlanReviewAddenda: this.acceptedPlanReviewRequirements(input.task.id) ?? null,
+      correctionFindings: input.correctionFindings,
+      round: input.round,
+      maxRounds: input.task.maxRounds,
+      lease: input.lease
+    });
+    if (checked.ok) return;
+    throw new AgentRelayError('VALIDATION_FAILED', checked.reason, {
+      remediation:
+        `Increase Settings → Local inference → Context limit to at least ` +
+        `${checked.requiredContextTokens} tokens, restart the runtime, and retry. No round was consumed.`
+    });
+  }
+
   /** Re-confirm a held lease immediately before the run is recorded. No-op when there is no lease. */
   private async recheckOrnithLeaseIfNeeded(lease: OrnithHealthyLease | null, signal: AbortSignal): Promise<void> {
     if (lease === null || !this.deps.ornithLease) return;
@@ -1002,6 +1056,8 @@ export class Orchestrator {
       /** Present only when `task.implementationProvider === 'ornith'`. */
       ornithLease?: OrnithHealthyLease | null;
       ornithCorrectionFindings?: string | null;
+      /** Round value before this provider attempt began. */
+      roundBeforeAttempt: number;
     }): Promise<Task> {
     const settings = this.deps.settings.get();
     const project = this.requireProject(task.projectId);
@@ -1016,7 +1072,8 @@ export class Orchestrator {
         runType: options.runType,
         recoverableFailure: options.recoverableFailure,
         unverifiedFailure: options.unverifiedFailure,
-        correctionFindings: options.ornithCorrectionFindings ?? null
+        correctionFindings: options.ornithCorrectionFindings ?? null,
+        roundBeforeAttempt: options.roundBeforeAttempt
       });
     }
     if (!this.deps.codex.implement) throw new AgentRelayError('TOOL_MISSING', 'This Codex adapter does not support implementation.');
@@ -1080,6 +1137,7 @@ export class Orchestrator {
       recoverableFailure: WorkflowEvent;
       unverifiedFailure?: WorkflowEvent;
       correctionFindings: string | null;
+      roundBeforeAttempt: number;
     }
   ): Promise<Task> {
     const worktreePath = task.worktreePath;
@@ -1147,10 +1205,13 @@ export class Orchestrator {
       const failed = !checked.ok || checked.assessment.disposition !== 'pass' || checked.assessment.publishBlock !== 'none' || checked.assessment.verificationStatus !== 'passed';
       const verificationOnly = checked.ok && checked.assessment.publishBlock === 'verification';
       const runFailed = failed && !(verificationOnly && this.deps.verification);
+      const changedFiles = result.ornithAudit.changedFiles;
       const error = failed
-        ? 'Changes were saved, but this Ornith run did not prove verification passed. Run verification in Agent Relay to check the current files.'
+        ? changedFiles === 0
+          ? `Ornith stopped before changing any files. ${result.finalMessage}`
+          : 'Ornith changed files, but this run did not prove verification passed. Run verification in Agent Relay to check the current files.'
         : null;
-      const failureEvent = failed && checked.ok && checked.assessment.publishBlock !== 'security'
+      const failureEvent = failed && changedFiles > 0 && checked.ok && checked.assessment.publishBlock !== 'security'
         ? (options.unverifiedFailure ?? options.recoverableFailure)
         : options.recoverableFailure;
       handle.finish({
@@ -1164,6 +1225,7 @@ export class Orchestrator {
           runtimeInstanceId: lease.runtimeInstanceId,
           modelId: lease.modelId,
           counters: result.ornithAudit,
+          providerFailure: result.providerFailure ?? null,
           assessment: result.assessment
         }
       });
@@ -1174,6 +1236,11 @@ export class Orchestrator {
           // Ornith never has a durable session; keep this explicitly null
           // regardless of what a stale value might otherwise hold.
           implementationThreadId: null,
+          // Provider/configuration failures before the first mutation are
+          // attempts, not review rounds. A retry must not silently lose budget.
+          currentRound: failed && changedFiles === 0
+            ? options.roundBeforeAttempt
+            : task.currentRound,
           lastError: error
         }
       );

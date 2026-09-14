@@ -51,13 +51,16 @@ async function git(cwd: string, args: readonly string[]): Promise<void> {
   if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout);
 }
 
-function lease(): OrnithHealthyLease {
+function lease(overrides: Partial<OrnithHealthyLease> = {}): OrnithHealthyLease {
   return {
     providerId: 'llama.cpp',
     modelId: 'ornith-fixture',
     runtimeInstanceId: 'runtime-fixture',
+    contextLimitTokens: 32_768,
+    maxOutputTokens: 1_024,
     release: () => undefined,
-    onIndependentStop: () => undefined
+    onIndependentStop: () => undefined,
+    ...overrides
   };
 }
 
@@ -128,6 +131,94 @@ afterEach(() => {
 });
 
 describe('OrnithImplementationService limits and cancellation', () => {
+  it('refuses a prompt that cannot fit the retained runtime context before inference', async () => {
+    let calls = 0;
+    const constrainedLease = lease({ contextLimitTokens: 4_096, maxOutputTokens: 4_096 });
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => constrainedLease,
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        calls += 1;
+        return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'not reached' }));
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal),
+      lease: constrainedLease
+    });
+
+    expect(calls).toBe(0);
+    expect(result.assessment.reasonCodes).toContain('limit_context_exceeded');
+    expect(result.finalMessage).toContain('4096-token runtime');
+    expect(result.finalMessage).toContain('restart the runtime');
+    expect(result.providerFailure).toBeNull();
+  });
+
+  it('bounds a large read result to the retained context and lowers per-turn output tokens', async () => {
+    writeFileSync(join(worktree, 'large-context.txt'), 'x'.repeat(24_000), 'utf8');
+    const sha256 = createHash('sha256').update(readFileSync(join(worktree, 'large-context.txt'))).digest('hex');
+    const actions = [
+      { version: 1, action: 'read_file', path: 'large-context.txt', offset: 0, limit: 65_536 },
+      { version: 1, action: 'finish', summary: `Read a bounded chunk with hash ${sha256.slice(0, 8)}.` }
+    ];
+    const boundedLease = lease({ contextLimitTokens: 16_384, maxOutputTokens: 8_192 });
+    const requests: LocalInferenceRequest[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => boundedLease,
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(request, JSON.stringify(actions[requests.length - 1]!));
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal),
+      lease: boundedLease
+    });
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expect(request.maxOutputTokens).toBe(1_024);
+      const bytes = request.messages.reduce(
+        (sum, message) => sum + Buffer.byteLength(message.content, 'utf8'),
+        0
+      );
+      expect(bytes).toBeLessThanOrEqual(16_384 - 1_024 - ORNITH_LIMITS.contextSafetyTokens);
+    }
+    const secondPrompt = requests[1]!.messages.map((message) => message.content).join('');
+    expect(secondPrompt).toContain('"path":"large-context.txt"');
+    expect(secondPrompt).not.toContain('x'.repeat(10_000));
+  }, 60_000);
+
+  it('preserves a bounded provider failure reason and dispatch outcome', async () => {
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => ({
+        kind: 'failed',
+        version: LOCAL_INFERENCE_CONTRACT_VERSION,
+        requestId: request.requestId,
+        reason: 'The runtime rejected the inference request with HTTP 500.',
+        dispatchOutcome: 'rejected'
+      })
+    };
+
+    const result = await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal)
+    );
+
+    expect(result.finalMessage).toContain('HTTP 500');
+    expect(result.finalMessage).toContain('(rejected)');
+    expect(result.providerFailure).toEqual({
+      kind: 'failed',
+      reason: 'The runtime rejected the inference request with HTTP 500.',
+      dispatchOutcome: 'rejected'
+    });
+  });
+
   it('completes a healthy bounded read, edit, diff, verification and finish flow', async () => {
     const sha256 = createHash('sha256').update(readFileSync(join(worktree, 'fixture.txt'))).digest('hex');
     const actions = [

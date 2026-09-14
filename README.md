@@ -41,7 +41,9 @@ Selecting Ornith never starts that runtime: it must already be started and
 immediately before every round. Ornith works through a strict, bounded set of
 structured file/Git operations (never a shell or an arbitrary command), keeps
 no durable session between rounds, and is refused with a clear remediation
-message whenever the runtime is not ready. See `docs/local-inference.md` and
+message whenever the runtime is not ready or its configured context window
+cannot hold the immutable task prompt. That preflight runs before worktree
+creation and does not consume a review round. See `docs/local-inference.md` and
 `docs/security.md` for the full contract and limits.
 
 Nothing is committed, pushed, or published without an explicit confirmation
@@ -552,7 +554,7 @@ Run details also project publishing guidance from the same effective own-or-
 inherited implementation evidence enforced by the backend, so a review-entry
 continuation does not invent a recovery action after valid publishing approval.
 
-Test suite: **2026 deterministic tests in 84 files, plus two automated Electron
+Test suite: **2147 deterministic tests in 92 files, plus three automated Electron
 acceptance journey, all passing.** Those tests contact no model or remote service.
 The separate `npm run test:e2e:live-plan-review` command is deliberately opt-in
 because it contacts the configured provider and consumes quota.
@@ -715,7 +717,7 @@ agent-relay/
 │  ├─ preload/         the entire renderer-facing surface (2 functions)
 │  ├─ renderer/        React UI
 │  └─ shared/          domain models, workflow FSM, Zod schemas, IPC contract
-├─ tests/              2026 deterministic tests + 2 routine Electron E2E; live provider E2E is opt-in
+├─ tests/              2147 deterministic tests + 3 routine Electron E2E; live provider E2E is opt-in
 ├─ docs/               architecture · security · manual-test
 └─ scripts/launch.mjs  dev/start launcher (strips ELECTRON_RUN_AS_NODE)
 ```

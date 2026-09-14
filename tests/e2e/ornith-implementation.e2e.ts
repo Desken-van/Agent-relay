@@ -107,6 +107,11 @@ async function startLocalInference(page: Page, runtimePath: string, port: number
   await settingsCard.getByRole('combobox', { name: /^Model source/ }).selectOption('runtime_id');
   await settingsCard.getByLabel('Runtime model identifier').fill('fake-model');
   await settingsCard.getByLabel(/^Port/).fill(String(port));
+  // The production Ornith path now reserves context for both the chat
+  // template and one bounded JSON action. Keep this fixture explicit rather
+  // than relying on the generic 4096/4096 manual-inference defaults.
+  await settingsCard.getByLabel('Context size (tokens)').fill('8192');
+  await settingsCard.getByLabel('Default max output tokens').fill('1024');
   await saveButton.click();
   await page.getByText('Settings saved').waitFor();
 
