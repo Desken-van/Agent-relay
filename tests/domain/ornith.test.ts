@@ -7,6 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  containsAbsoluteMachinePath,
   isOrnithTerminalAction,
   ORNITH_ACTION_KINDS,
   ORNITH_LIMITS,
@@ -16,7 +17,8 @@ import {
   ornithRelativePathSchema,
   ornithRelativePrefixSchema,
   ornithSha256Schema,
-  parseOrnithCompletion
+  parseOrnithCompletion,
+  redactAbsoluteMachinePaths
 } from '../../src/shared/domain/ornith';
 import {
   implementationProviderSchema,
@@ -26,6 +28,23 @@ import {
 import { isRunAgentAllowedForType, runSchema, RUN_AGENTS } from '../../src/shared/domain/models';
 
 const HASH = 'a'.repeat(64);
+
+describe('absolute machine-path prose detection', () => {
+  it('does not mistake arithmetic division or embedded technical slashes for a POSIX path', () => {
+    const prose = 'Derive progress as floor(sum / count); keep the Zod domain/IPC schemas.';
+    expect(containsAbsoluteMachinePath(prose)).toBe(false);
+    expect(redactAbsoluteMachinePaths(prose)).toBe(prose);
+  });
+
+  it.each([
+    'path=C:/Users/operator/repo',
+    'source:/home/operator/repo',
+    '[\\\\server\\share\\repo]'
+  ])('continues to detect and redact %s', (value) => {
+    expect(containsAbsoluteMachinePath(value)).toBe(true);
+    expect(redactAbsoluteMachinePaths(value)).not.toBe(value);
+  });
+});
 
 function envelope(action: Record<string, unknown>): Record<string, unknown> {
   return { version: ORNITH_PROTOCOL_VERSION, ...action };

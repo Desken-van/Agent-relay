@@ -5,7 +5,11 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ExecaProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
-import { OrnithImplementationService } from '../../src/main/services/ornith-implementation';
+import {
+  normalizeOrnithPromptInput,
+  OrnithImplementationService,
+  preflightOrnithPrompt
+} from '../../src/main/services/ornith-implementation';
 import type { OrnithHealthyLease, OrnithInferenceLeaseService } from '../../src/main/ports';
 import { AgentRelayError } from '../../src/shared/domain/errors';
 import {
@@ -13,7 +17,7 @@ import {
   type LocalInferenceOutcome,
   type LocalInferenceRequest
 } from '../../src/shared/domain/local-inference';
-import { ORNITH_LIMITS } from '../../src/shared/domain/ornith';
+import { containsAbsoluteMachinePath, ORNITH_LIMITS } from '../../src/shared/domain/ornith';
 import type { TaskSpecification } from '../../src/shared/schemas/codex';
 
 const runner = new ExecaProcessRunner();
@@ -131,6 +135,80 @@ afterEach(() => {
 });
 
 describe('OrnithImplementationService limits and cancellation', () => {
+  it('leaves degenerate drive and UNC host roots untouched so unknown paths still fail closed', () => {
+    const promptInput = {
+      specification: {
+        ...specification,
+        summary: 'Inspect H:/unrelated/secret.txt and \\\\server\\other\\secret.txt.'
+      },
+      ruleEvidence: null,
+      acceptedPlanReviewAddenda: null,
+      correctionFindings: null,
+      round: 1,
+      maxRounds: 3,
+      lease: lease()
+    };
+
+    const normalized = normalizeOrnithPromptInput(promptInput, ['H:/', '\\\\server\\']);
+
+    expect(normalized.specification.summary).toBe(promptInput.specification.summary);
+    expect(containsAbsoluteMachinePath(normalized.specification.summary)).toBe(true);
+  });
+
+  it('normalizes bound-root descendants without consuming sibling or unrelated absolute paths', () => {
+    const promptInput = {
+      specification: {
+        ...specification,
+        summary:
+          'Read h:/AGENT-RELAY\\src/a.ts, but never H:/Agent-relay-secret/file.txt or C:/outside/file.txt.'
+      },
+      ruleEvidence: null,
+      acceptedPlanReviewAddenda: null,
+      correctionFindings: null,
+      round: 1,
+      maxRounds: 3,
+      lease: lease()
+    };
+
+    const normalized = normalizeOrnithPromptInput(promptInput, ['H:\\Agent-relay']);
+
+    expect(normalized.specification.summary).toContain('[bound task worktree]\\src/a.ts');
+    expect(normalized.specification.summary).toContain('H:/Agent-relay-secret/file.txt');
+    expect(normalized.specification.summary).toContain('C:/outside/file.txt');
+    expect(containsAbsoluteMachinePath(normalized.specification.summary)).toBe(true);
+  });
+
+  it('uses the normalized bound-root text for prompt preflight sizing', () => {
+    const repeatedRoot = `${repository.replaceAll('\\', '/')}/a/very/long/relative/path`;
+    const promptInput = {
+      specification: {
+        ...specification,
+        implementationPrompt: Array.from({ length: 20 }, () => repeatedRoot).join(' ')
+      },
+      ruleEvidence: null,
+      acceptedPlanReviewAddenda: null,
+      correctionFindings: null,
+      round: 1,
+      maxRounds: 3,
+      lease: lease({ contextLimitTokens: 32_768, maxOutputTokens: 1_024 })
+    };
+
+    const normalizedInput = normalizeOrnithPromptInput(promptInput, [repository]);
+    let distinguishingLimit: number | null = null;
+    for (let contextLimitTokens = 4_096; contextLimitTokens <= 32_768; contextLimitTokens += 64) {
+      const candidateLease = lease({ contextLimitTokens, maxOutputTokens: 1_024 });
+      const raw = preflightOrnithPrompt({ ...promptInput, lease: candidateLease });
+      const normalized = preflightOrnithPrompt({ ...normalizedInput, lease: candidateLease });
+      if (!raw.ok && normalized.ok) {
+        distinguishingLimit = contextLimitTokens;
+        break;
+      }
+    }
+
+    expect(distinguishingLimit).not.toBeNull();
+    expect(normalizedInput.specification.implementationPrompt).not.toContain(repository);
+  });
+
   it('refuses a prompt that cannot fit the retained runtime context before inference', async () => {
     let calls = 0;
     const constrainedLease = lease({ contextLimitTokens: 4_096, maxOutputTokens: 4_096 });
@@ -278,6 +356,43 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(result.assessment.reasonCodes).toContain('disallowed_action');
     }
     expect(calls).toBe(0);
+  });
+
+  it('replaces only the already-bound project and worktree roots while preserving ordinary slash prose', async () => {
+    const requests: LocalInferenceRequest[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(
+          request,
+          JSON.stringify({ version: 1, action: 'finish', summary: 'The bounded task is complete.' })
+        );
+      }
+    };
+    const repositoryForward = repository.replaceAll('\\', '/');
+    const worktreeForward = worktree.replaceAll('\\', '/');
+
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal),
+      specification: {
+        ...specification,
+        constraints: [`Work only in ${repositoryForward}.`],
+        implementationPrompt:
+          `Use ${worktreeForward}/src as the task checkout and derive progress as floor(sum / count).`
+      }
+    });
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(requests).toHaveLength(1);
+    const prompt = requests[0]!.messages.map((message) => message.content).join('\n');
+    expect(prompt).toContain('[bound task worktree]');
+    expect(prompt).toContain('floor(sum / count)');
+    expect(prompt).not.toContain(repository);
+    expect(prompt).not.toContain(repositoryForward);
+    expect(prompt).not.toContain(worktree);
+    expect(prompt).not.toContain(worktreeForward);
   });
 
   it('does not retry malformed output or execute a following action', async () => {

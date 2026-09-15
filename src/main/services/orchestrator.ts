@@ -76,6 +76,7 @@ import type {
 } from '../ports';
 import type { ProcessRunner } from '../adapters/process/process-runner';
 import {
+  normalizeOrnithPromptInput,
   preflightOrnithPrompt,
   type OrnithImplementationService
 } from './ornith-implementation';
@@ -1020,7 +1021,8 @@ export class Orchestrator {
     correctionFindings: string | null;
     round: number;
   }): void {
-    const checked = preflightOrnithPrompt({
+    const project = this.requireProject(input.task.projectId);
+    const rawPromptInput = {
       specification: input.specification,
       ruleEvidence: this.ruleEvidenceText(input.task.id) ?? null,
       acceptedPlanReviewAddenda: this.acceptedPlanReviewRequirements(input.task.id) ?? null,
@@ -1028,7 +1030,12 @@ export class Orchestrator {
       round: input.round,
       maxRounds: input.task.maxRounds,
       lease: input.lease
-    });
+    };
+    const checked = preflightOrnithPrompt(normalizeOrnithPromptInput(
+      rawPromptInput,
+      [input.task.worktreePath, project.localPath]
+        .filter((path): path is string => path !== null)
+    ));
     if (checked.ok) return;
     throw new AgentRelayError('VALIDATION_FAILED', checked.reason, {
       remediation:
@@ -1674,7 +1681,10 @@ export function renderOrnithCorrectionFindings(review: CodexReviewResult): strin
       // Review prose is not an authority for host locations. Replace drive,
       // UNC and POSIX absolute path-shaped tokens; repository-relative paths
       // are rendered only from the separately validated `finding.file` field.
-      .replace(/(^|[\s([{"'])(?:[A-Za-z]:[\\/]|\\\\|\/)[^\s)\]}"'>]*/gm, '$1[absolute-path-omitted]'),
+      .replace(
+        /(^|[\s([{"'])(?:(?:[A-Za-z]:[\\/]|\\\\)[^\s)\]}"'>]*|\/[^\s)\]}"'>]+)/gm,
+        '$1[absolute-path-omitted]'
+      ),
     maxChars
   );
   const bySeverity = (['critical', 'high', 'medium', 'low'] as const)
