@@ -601,21 +601,21 @@ intentionally not purchased merely to prove the harness corrections.
 
 ## 14. Local inference — real llama.cpp/Ornith acceptance
 
-**Status recorded 2026-09-12.** An operator reported that a real Ornith
-**lifecycle** acceptance run succeeded while bound and contacted on loopback.
-No run date, model, or version details beyond that report were supplied, and
-none are independently verified in this document. **Real inference
-acceptance — pressing "Run test inference" against a real runtime and model —
-was not run and remains pending until this change merges.** Every automated
-local-inference test in this repository — domain, database, service, adapter,
-renderer, startup, wiring, IPC-contract and Electron E2E suites, including the
-one manual smoke-test inference the renderer now exposes — uses only
-`tests/fixtures/fake-local-inference-runtime.mjs`. None of them load a model,
-run a real llama.cpp/Ornith build, download anything, or spend provider quota.
-This section exists so both claims — the reported lifecycle success and the
-still-pending real inference run — stay checkable, and so a future acceptance
-run against a *real* runtime and model has a checklist rather than starting
-from nothing.
+**Real-runtime acceptance recorded 2026-09-14.** On 2026-09-14, on real
+Windows llama.cpp/Ornith, a real lifecycle and one real test inference
+completed successfully using runtime `llama.cpp 0.4.0-dev`, build `10850`,
+commit `f114f91f9`, with model `Ornith-1.5-9B-Q6_K`. Capabilities were
+available and the runtime reached `Healthy`.
+
+This dated record is limited to the supplied runtime, model, capability,
+health, and inference facts. It does not assert results for the other checklist
+details below. Every automated local-inference test in this repository —
+domain, database, service, adapter, renderer, startup, wiring, IPC-contract and
+Electron E2E suites, including the one manual smoke-test inference the renderer
+now exposes — uses only `tests/fixtures/fake-local-inference-runtime.mjs`.
+None of them load a model, run a real llama.cpp/Ornith build, download anything,
+or spend provider quota. The checklist remains available for repeatable,
+more detailed manual acceptance runs.
 
 **Prerequisites**, all supplied by the operator, none downloaded or installed
 by this checklist:
@@ -692,24 +692,24 @@ values. Then clear the configured map back to `{}`, save, and confirm a
 further test inference's request omits `chat_template_kwargs` entirely rather
 than sending it as `{}`.
 
-Record the result of a completed real-inference run — model, runtime version
-banner, start duration, test-inference prompt/finish-reason/duration, and
-pass/fail per step — in a dated subsection below once this checklist is
-actually executed against a real runtime. Until then, this checklist is
-exploratory only with respect to real inference: the operator-reported
-lifecycle result above is the one piece of it that has actually run.
+For any later execution of this full checklist, record only the details actually
+observed — for example, model, runtime version banner, start duration,
+test-inference prompt/finish-reason/duration, and pass/fail per step — in a new
+dated subsection. The 2026-09-14 record above does not imply that these
+unsupplied details or the remaining checklist steps were verified.
 
 ---
 
 ## 15. Ornith as a task implementation provider — real acceptance path
 
-**Status: not yet run against a real runtime and model.** This checklist was
-written and reviewed as part of adding Ornith as a task-level implementation
-provider, but a real end-to-end pass — a real `llama-server`/Ornith build, a
-real model, a real task worked from specification through review — has not
-been executed and is not claimed here. Do not report this as passed without
-actually running it and recording the result below. This section builds on
-§14 above: complete that section's lifecycle setup first.
+**Status as of 2026-09-15: pending until the current Agent Relay run,
+`15a01938-record-real-ornith-inference-acceptance`, completes.** This is the
+separate full Ornith implementation-provider end-to-end acceptance: a real
+`llama-server`/Ornith build, a real model, and a real task worked from
+specification through review. It is not claimed as passed here. After the run
+completes, the Agent Relay operator must update this status with the outcome and
+durable completion evidence. This section builds on §14 above: complete that
+section's lifecycle setup first.
 
 **No publishing happens in this checklist.** Stop before §9 territory — do
 not approve for publishing, commit, push, or create a pull request from the
