@@ -44,12 +44,16 @@ export const ORNITH_LIMITS = {
   /** Rolling stateless-request context. */
   maxRetainedResults: 20,
   maxRollingContextBytes: 256 * 1024,
+  /** A stateless tool loop is invalid unless at least one compact result can return. */
+  minRollingFeedbackBytes: 1_024,
   maxPromptBytes: 512 * 1024,
   maxCompletionBytes: 512 * 1024,
   maxToolResultBytes: 64 * 1024,
   /** Reserve room for the chat template/BOS and keep one action concise. */
   contextSafetyTokens: 512,
   maxTurnOutputTokens: 1_024,
+  /** First action executes, second identical read-only action gets feedback, third stops. */
+  maxConsecutiveIdenticalReadOnlyActions: 3,
 
   /** Cumulative repository I/O for the whole run. */
   maxCumulativeReadBytes: 4 * 1024 * 1024,

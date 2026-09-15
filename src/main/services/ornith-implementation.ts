@@ -113,6 +113,7 @@ interface RollingResult {
 }
 
 const BOUND_TASK_WORKTREE_MARKER = '[bound task worktree]';
+const ROLLING_HISTORY_OVERHEAD_BYTES = 256;
 
 function isBoundPathStartBoundary(value: string, index: number): boolean {
   if (index === 0) return true;
@@ -244,6 +245,10 @@ Rules:
   do not ask for one, it does not exist.
 - Call "run_verification" only when you believe the work is complete; Agent Relay itself
   re-verifies afterward regardless.
+- Use a narrow prefix or a small page when listing files. If a tool result says it was
+  truncated, retry with a smaller limit or a more specific prefix.
+- Never repeat an identical list_files, git_status, or git_diff action after it succeeds.
+  Use the returned files, cursor, or status to choose a different next action.
 - Call "finish" only when the acceptance criteria are met. Call "blocked" only when you
   cannot proceed and must stop.
 - Every reply is judged on its own: nothing you say outside the JSON is read.`;
@@ -329,29 +334,43 @@ function authoritativePromptText(request: OrnithPromptPreflightInput): string {
  * consuming a round; the loop repeats the same check before inference.
  */
 export function preflightOrnithPrompt(input: OrnithPromptPreflightInput): OrnithPromptPreflight {
-  const budget = promptBudgetFor(input.lease);
+  const initialBudget = promptBudgetFor(input.lease);
   const authoritativeBytes = Buffer.byteLength(authoritativePromptText(input), 'utf8');
-  const fixedBudgetBytes = Buffer.byteLength(`=== REMAINING BUDGET ===
+  const fixedBudgetBytesFor = (maxToolResultBytes: number): number => Buffer.byteLength(`=== REMAINING BUDGET ===
 Model turns remaining: ${ORNITH_LIMITS.maxModelTurns}
 Non-terminal actions remaining: ${ORNITH_LIMITS.maxNonterminalActions}
 Verification calls remaining: ${ORNITH_LIMITS.maxVerificationCalls}
 Repository read bytes remaining: ${ORNITH_LIMITS.maxCumulativeReadBytes}
 Repository write bytes remaining: ${ORNITH_LIMITS.maxCumulativeWriteBytes}
 Changed files remaining: ${ORNITH_LIMITS.maxChangedFiles}
-Maximum retained tool-result bytes: ${budget.maxToolResultBytes}
+Maximum retained tool-result bytes: ${maxToolResultBytes}
 Round ${input.round} of at most ${input.maxRounds}.
 
 Reply with exactly one JSON action now.`, 'utf8');
-  const requiredPromptBytes = authoritativeBytes + 2 + fixedBudgetBytes;
-  if (requiredPromptBytes <= budget.maxPromptBytes) return { ok: true, budget };
+  let maxToolResultBytes = initialBudget.maxToolResultBytes;
+  // Reserve room for two recent results. Without this, a large authoritative
+  // specification can fit while every tool result is silently omitted from
+  // the next stateless turn, causing the model to repeat the same action.
+  for (let pass = 0; pass < 2; pass += 1) {
+    const fixedBytes = authoritativeBytes + 2 + fixedBudgetBytesFor(maxToolResultBytes);
+    const rollingBytes = Math.max(0, initialBudget.maxPromptBytes - fixedBytes);
+    maxToolResultBytes = Math.min(
+      initialBudget.maxToolResultBytes,
+      Math.max(256, Math.floor(Math.max(0, rollingBytes - ROLLING_HISTORY_OVERHEAD_BYTES) / 2))
+    );
+  }
+  const budget = { ...initialBudget, maxToolResultBytes };
+  const requiredPromptBytes = authoritativeBytes + 2 + fixedBudgetBytesFor(maxToolResultBytes);
+  const requiredWithFeedback = requiredPromptBytes + ORNITH_LIMITS.minRollingFeedbackBytes;
+  if (requiredWithFeedback <= budget.maxPromptBytes) return { ok: true, budget };
   return {
     ok: false,
     reason:
-      `The immutable Ornith prompt needs ${requiredPromptBytes} bytes, but the retained ` +
+      `The immutable Ornith prompt and minimum tool feedback need ${requiredWithFeedback} bytes, but the retained ` +
       `${input.lease.contextLimitTokens}-token runtime allows at most ${budget.maxPromptBytes} prompt bytes ` +
       `after output and template reserves.`,
     requiredContextTokens:
-      requiredPromptBytes + budget.maxOutputTokens + ORNITH_LIMITS.contextSafetyTokens
+      requiredWithFeedback + budget.maxOutputTokens + ORNITH_LIMITS.contextSafetyTokens
   };
 }
 
@@ -382,12 +401,12 @@ Round ${request.round} of at most ${request.maxRounds}.`;
   if (fixedBytes > promptBudget.maxPromptBytes) return null;
   const rollingByteBudget = Math.min(
     ORNITH_LIMITS.maxRollingContextBytes,
-    promptBudget.maxPromptBytes - fixedBytes
+    Math.max(0, promptBudget.maxPromptBytes - fixedBytes - ROLLING_HISTORY_OVERHEAD_BYTES)
   );
 
   let history = '';
   let omitted = 0;
-  const kept: RollingResult[] = [];
+  const kept: string[] = [];
   let contextBytes = 0;
   for (let i = rolling.length - 1; i >= 0; i -= 1) {
     const entry = rolling[i];
@@ -395,15 +414,26 @@ Round ${request.round} of at most ${request.maxRounds}.`;
     const entryText = `turn ${entry.turn} [${entry.action}]: ${entry.resultText}`;
     const bytes = Buffer.byteLength(entryText, 'utf8');
     if (kept.length >= ORNITH_LIMITS.maxRetainedResults || contextBytes + bytes > rollingByteBudget) {
+      if (kept.length === 0 && rollingByteBudget >= 256) {
+        const compact = `turn ${entry.turn} [${entry.action}]: ${JSON.stringify({
+          truncated: true,
+          originalBytes: Buffer.byteLength(entry.resultText, 'utf8'),
+          reason: 'The prior tool result did not fit. Retry with a smaller page, read chunk, or narrower query; do not repeat the identical request.'
+        })}`;
+        if (Buffer.byteLength(compact, 'utf8') <= rollingByteBudget) {
+          kept.unshift(compact);
+          contextBytes += Buffer.byteLength(compact, 'utf8');
+          continue;
+        }
+      }
       omitted += 1;
       continue;
     }
-    kept.unshift(entry);
+    kept.unshift(entryText);
     contextBytes += bytes;
   }
   if (kept.length > 0) {
     history = `=== PRIOR TOOL RESULTS (most recent last${omitted > 0 ? `; ${omitted} older result(s) omitted` : ''}) ===\n${kept
-      .map((entry) => `turn ${entry.turn} [${entry.action}]: ${entry.resultText}`)
       .join('\n')}`;
   }
 
@@ -477,6 +507,8 @@ export class OrnithImplementationService {
     let verificationsUsed = 0;
     let cumulativeReadBytes = 0;
     let cumulativeWriteBytes = 0;
+    let previousReadOnlyFingerprint: string | null = null;
+    let consecutiveIdenticalReadOnlyActions = 0;
     const outcomes: Array<{ sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }> = [];
     const finish = (
       disposition: 'pass' | 'fail', message: string,
@@ -738,6 +770,51 @@ export class OrnithImplementationService {
       }
       nonterminalActionsUsed += 1;
 
+      const readOnlyFingerprint = isNoProgressGuardAction(action)
+        ? JSON.stringify(action)
+        : null;
+      if (readOnlyFingerprint !== null && readOnlyFingerprint === previousReadOnlyFingerprint) {
+        consecutiveIdenticalReadOnlyActions += 1;
+      } else {
+        previousReadOnlyFingerprint = readOnlyFingerprint;
+        consecutiveIdenticalReadOnlyActions = readOnlyFingerprint === null ? 0 : 1;
+      }
+      if (consecutiveIdenticalReadOnlyActions >= ORNITH_LIMITS.maxConsecutiveIdenticalReadOnlyActions) {
+        outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: false });
+        request.onProgress({
+          type: 'tool_use',
+          text: `Ornith repeated ${action.action} without progress; the loop stopped.`,
+          data: { sequence: nonterminalActionsUsed, turn: turnsUsed, action: action.action, ok: false, code: 'no_progress_loop' }
+        });
+        return finish(
+          'fail',
+          `Ornith repeated the same ${action.action} request without using its result.`,
+          'configuration',
+          ['no_progress_loop']
+        );
+      }
+      if (consecutiveIdenticalReadOnlyActions === 2) {
+        outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: false });
+        const duplicateFeedback = {
+          ok: false,
+          code: 'duplicate_no_progress',
+          reason:
+            `The identical ${action.action} request already succeeded and was not executed again. ` +
+            'Use its prior result and choose a different action; narrow the query or page only if the result was truncated.'
+        };
+        rolling.push({
+          turn: turnsUsed,
+          action: action.action,
+          resultText: JSON.stringify(duplicateFeedback)
+        });
+        request.onProgress({
+          type: 'tool_use',
+          text: `Skipped duplicate Ornith ${action.action} request with no progress.`,
+          data: { sequence: nonterminalActionsUsed, turn: turnsUsed, action: action.action, ok: false, code: 'duplicate_no_progress' }
+        });
+        continue;
+      }
+
       const changedPath = 'path' in action && (action.action === 'create_file' || action.action === 'replace_text' || action.action === 'delete_file')
         ? action.path : null;
       if (changedPath !== null && tools.wouldExceedChangedFileLimit(changedPath)) {
@@ -896,6 +973,12 @@ export class OrnithImplementationService {
       }
     }
   }
+}
+
+function isNoProgressGuardAction(action: OrnithAction): boolean {
+  return action.action === 'list_files' ||
+    action.action === 'git_status' ||
+    action.action === 'git_diff';
 }
 
 function finishedResult(

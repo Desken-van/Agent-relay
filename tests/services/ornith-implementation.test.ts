@@ -10,7 +10,7 @@ import {
   OrnithImplementationService,
   preflightOrnithPrompt
 } from '../../src/main/services/ornith-implementation';
-import type { OrnithHealthyLease, OrnithInferenceLeaseService } from '../../src/main/ports';
+import type { AgentProgressEvent, OrnithHealthyLease, OrnithInferenceLeaseService } from '../../src/main/ports';
 import { AgentRelayError } from '../../src/shared/domain/errors';
 import {
   LOCAL_INFERENCE_CONTRACT_VERSION,
@@ -209,6 +209,26 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(normalizedInput.specification.implementationPrompt).not.toContain(repository);
   });
 
+  it('reserves rolling feedback space when authoritative prompt content is large', () => {
+    const checked = preflightOrnithPrompt({
+      specification: {
+        ...specification,
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(20_000)}`
+      },
+      ruleEvidence: null,
+      acceptedPlanReviewAddenda: null,
+      correctionFindings: null,
+      round: 1,
+      maxRounds: 3,
+      lease: lease()
+    });
+
+    expect(checked.ok).toBe(true);
+    if (!checked.ok) return;
+    expect(checked.budget.maxToolResultBytes).toBeGreaterThanOrEqual(256);
+    expect(checked.budget.maxToolResultBytes).toBeLessThan(10_000);
+  });
+
   it('refuses a prompt that cannot fit the retained runtime context before inference', async () => {
     let calls = 0;
     const constrainedLease = lease({ contextLimitTokens: 4_096, maxOutputTokens: 4_096 });
@@ -393,6 +413,70 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(prompt).not.toContain(repositoryForward);
     expect(prompt).not.toContain(worktree);
     expect(prompt).not.toContain(worktreeForward);
+  });
+
+  it('returns compact feedback instead of dropping a large tool result from the next stateless turn', async () => {
+    for (let index = 0; index < 200; index += 1) {
+      writeFileSync(
+        join(worktree, `roadmap-long-file-name-${String(index).padStart(3, '0')}.tsx`),
+        'export {};\n',
+        'utf8'
+      );
+    }
+    const requests: LocalInferenceRequest[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(
+          request,
+          requests.length === 1
+            ? JSON.stringify({ version: 1, action: 'list_files', prefix: '', limit: 200 })
+            : JSON.stringify({ version: 1, action: 'finish', summary: 'Used the retained feedback.' })
+        );
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal),
+      specification: {
+        ...specification,
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(22_000)}`
+      }
+    });
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(requests).toHaveLength(2);
+    const secondPrompt = requests[1]!.messages.map((message) => message.content).join('\n');
+    expect(secondPrompt).toContain('PRIOR TOOL RESULTS');
+    expect(secondPrompt).toContain('request a smaller page or read chunk');
+  });
+
+  it('warns once and then stops an identical read-only action loop without dispatching duplicates', async () => {
+    let calls = 0;
+    const events: AgentProgressEvent[] = [];
+    const repeated = JSON.stringify({ version: 1, action: 'list_files', prefix: '', limit: 20 });
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        calls += 1;
+        return completed(request, repeated);
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal),
+      onProgress: (event) => events.push(event)
+    });
+
+    expect(calls).toBe(3);
+    expect(result.assessment.reasonCodes).toContain('no_progress_loop');
+    expect(result.ornithAudit.actions).toBe(3);
+    expect(result.ornithAudit.outcomes).toHaveLength(3);
+    expect(events.some((event) => event.text.includes('Skipped duplicate'))).toBe(true);
+    expect(events.some((event) => event.text.includes('loop stopped'))).toBe(true);
   });
 
   it('does not retry malformed output or execute a following action', async () => {
