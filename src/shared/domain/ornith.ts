@@ -49,6 +49,19 @@ export const ORNITH_LIMITS = {
   maxPromptBytes: 512 * 1024,
   maxCompletionBytes: 512 * 1024,
   maxToolResultBytes: 64 * 1024,
+  /**
+   * Below this, a fitting prompt still leaves too little room per tool result to page
+   * a directory listing or a file read usefully (a handful of entries per round at
+   * most) — exploring even a few hundred files would alone consume a large share of
+   * the run's action budget. Preflight refuses before inference in that case rather
+   * than starting a run doomed to spend its budget on enumeration. Set equal to
+   * `minRollingFeedbackBytes` (same "at least one compact result must return" bar,
+   * applied per-result instead of to the rolling section as a whole) rather than a
+   * separate, larger figure, to keep the refusal narrow to the case actually observed
+   * to fail (a few hundred bytes) without over-rejecting tasks that need little
+   * exploration.
+   */
+  minUsefulToolResultBytes: 1_024,
   /** Reserve room for the chat template/BOS and keep one action concise. */
   contextSafetyTokens: 512,
   maxTurnOutputTokens: 4_096,

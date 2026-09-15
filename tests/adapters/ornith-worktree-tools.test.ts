@@ -543,4 +543,76 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       }
     }
   });
+
+  describe('listFiles byte-budget packing', () => {
+    beforeEach(() => {
+      // Untracked files in the worktree are part of the Ornith manifest too
+      // (`ensureManifest` runs `git ls-files --others --exclude-standard`
+      // against the worktree), so no commit is needed to exercise pagination.
+      for (let index = 0; index < 40; index += 1) {
+        writeFileSync(join(worktree, `roadmap-long-file-name-${String(index).padStart(3, '0')}.tsx`), 'export {};\n');
+      }
+    });
+
+    it('packs fewer entries than requested when the byte budget is tight, and reports a correct nextCursor', async () => {
+      const boundary = tools();
+      const full = await boundary.listFiles({ version: 1, action: 'list_files', prefix: '', limit: 200 });
+      expect(full).toMatchObject({ ok: true });
+      if (!full.ok) throw new Error('unreachable');
+      const fullForModel = full.forModel as { files: string[]; nextCursor: number | null; total: number };
+      expect(fullForModel.total).toBe(41); // 40 fixtures + fixture.txt
+      expect(fullForModel.files.length).toBe(41);
+      expect(fullForModel.nextCursor).toBeNull();
+
+      const tight = await boundary.listFiles(
+        { version: 1, action: 'list_files', prefix: '', limit: 200 },
+        undefined,
+        300
+      );
+      expect(tight).toMatchObject({ ok: true });
+      if (!tight.ok) throw new Error('unreachable');
+      const serializedBytes = Buffer.byteLength(JSON.stringify(tight.forModel), 'utf8');
+      expect(serializedBytes).toBeLessThanOrEqual(300);
+      const tightForModel = tight.forModel as { files: string[]; nextCursor: number | null; total: number };
+      expect(tightForModel.files.length).toBeGreaterThan(0);
+      expect(tightForModel.files.length).toBeLessThan(fullForModel.files.length);
+      expect(tightForModel.total).toBe(41);
+      expect(tightForModel.nextCursor).toBe(tightForModel.files.length);
+
+      // Resuming with the reported cursor must reach the end without gaps or repeats.
+      const resumed = await boundary.listFiles(
+        { version: 1, action: 'list_files', prefix: '', limit: 200, cursor: tightForModel.nextCursor! },
+        undefined,
+        300
+      );
+      expect(resumed).toMatchObject({ ok: true });
+      if (!resumed.ok) throw new Error('unreachable');
+      const resumedForModel = resumed.forModel as { files: string[] };
+      const seen = new Set([...tightForModel.files, ...resumedForModel.files]);
+      expect(seen.size).toBe(tightForModel.files.length + resumedForModel.files.length);
+    });
+
+    it('returns a small metadata-preserving stub, not the generic truncation stub, when even one entry does not fit', async () => {
+      const boundary = tools();
+      const result = await boundary.listFiles(
+        { version: 1, action: 'list_files', prefix: '', limit: 200 },
+        undefined,
+        // Smaller than even the shortest single entry plus its JSON wrapper.
+        16
+      );
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('unreachable');
+      // Fixed-shape stub (two integers, a boolean, and a constant-length message) —
+      // small by construction regardless of how tiny the requested budget was.
+      expect(Buffer.byteLength(JSON.stringify(result.forModel), 'utf8')).toBeLessThanOrEqual(400);
+      expect(result.forModel).toMatchObject({
+        files: [],
+        nextCursor: 0,
+        total: 41,
+        truncated: true
+      });
+      const forModel = result.forModel as { reason: string };
+      expect(forModel.reason).toContain('byte budget');
+    });
+  });
 });

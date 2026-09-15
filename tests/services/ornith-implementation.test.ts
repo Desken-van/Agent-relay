@@ -425,7 +425,14 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(prompt).not.toContain(worktreeForward);
   });
 
-  it('returns compact feedback instead of dropping a large tool result from the next stateless turn', async () => {
+  it('lets a model page a large directory listing to completion via nextCursor under a tight tool-result budget', async () => {
+    // Regression test for the reported failure: a monolithic specification leaves so
+    // little room per tool result that a 200+ entry list_files result used to collapse
+    // entirely to a generic "request a smaller page or read chunk" stub with no files
+    // and no nextCursor — leaving a model with nothing to act on but repeating the
+    // identical request, which the no-progress guard then (correctly) stopped. With
+    // list_files now packing its own response to fit the budget, the model receives a
+    // real, usable page and a real nextCursor on every turn instead.
     for (let index = 0; index < 200; index += 1) {
       writeFileSync(
         join(worktree, `roadmap-long-file-name-${String(index).padStart(3, '0')}.tsx`),
@@ -439,12 +446,22 @@ describe('OrnithImplementationService limits and cancellation', () => {
       recheckOrnithLease: async () => true,
       inferForOrnith: async (_lease, request) => {
         requests.push(request);
-        return completed(
-          request,
-          requests.length === 1
-            ? JSON.stringify({ version: 1, action: 'list_files', prefix: '', limit: 200 })
-            : JSON.stringify({ version: 1, action: 'finish', summary: 'Used the retained feedback.' })
-        );
+        if (requests.length === 1) {
+          return completed(request, JSON.stringify({ version: 1, action: 'list_files', prefix: '', limit: 200 }));
+        }
+        // Simulate a model that actually reads nextCursor from its own prior prompt
+        // (as the sharpened protocol instructions now spell out) rather than one that
+        // repeats the same request or has to guess.
+        const promptText = request.messages.map((message) => message.content).join('\n');
+        const cursorMatches = [...promptText.matchAll(/"nextCursor":\s*(\d+|null)/g)];
+        const lastCursor = cursorMatches.at(-1)?.[1] ?? null;
+        if (lastCursor !== null && lastCursor !== 'null') {
+          return completed(
+            request,
+            JSON.stringify({ version: 1, action: 'list_files', prefix: '', limit: 200, cursor: Number(lastCursor) })
+          );
+        }
+        return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Paged through the listing.' }));
       }
     };
 
@@ -457,10 +474,71 @@ describe('OrnithImplementationService limits and cancellation', () => {
     });
 
     expect(result.assessment.disposition).toBe('pass');
-    expect(requests).toHaveLength(2);
+    // The tight budget (a few KB per tool result against a 200+ entry listing) means a
+    // single page cannot hold everything, so completing requires more than one round —
+    // proof the model kept receiving real, actionable pages rather than an immediate
+    // generic stub.
+    expect(requests.length).toBeGreaterThan(2);
     const secondPrompt = requests[1]!.messages.map((message) => message.content).join('\n');
     expect(secondPrompt).toContain('PRIOR TOOL RESULTS');
-    expect(secondPrompt).toContain('request a smaller page or read chunk');
+    expect(secondPrompt).toContain('roadmap-long-file-name-000.tsx');
+    expect(secondPrompt).not.toContain('request a smaller page or read chunk');
+  });
+
+  it('preflight refuses before any inference call when the prompt fits but leaves too little room to page tool results usefully', async () => {
+    // Reproduces the reported real-run condition mechanically: a large, monolithic
+    // specification (comparable to the "durable hierarchical project roadmaps" task)
+    // against a context limit generous enough that the prompt itself fits, but leaves
+    // only a few hundred bytes per tool result — nowhere near enough to page a
+    // directory listing usefully. This must be refused before the first inference call,
+    // with guidance toward decomposing the specification, not toward the single "raise
+    // the context limit" remediation that would only defer the same failure to a
+    // larger specification.
+    const largeSpecification: TaskSpecification = {
+      title: 'Implement durable hierarchical project roadmaps',
+      summary: 'x'.repeat(2_000),
+      acceptanceCriteria: Array.from({ length: 20 }, (_, i) => `Criterion ${i}: ${'y'.repeat(150)}`),
+      constraints: Array.from({ length: 10 }, (_, i) => `Constraint ${i}: ${'z'.repeat(150)}`),
+      assumptions: Array.from({ length: 5 }, (_, i) => `Assumption ${i}`),
+      suggestedTests: Array.from({ length: 10 }, (_, i) => `Test ${i}: ${'w'.repeat(100)}`),
+      implementationPrompt: 'q'.repeat(15_000)
+    };
+    const tightLease = lease({ contextLimitTokens: 32_768, maxOutputTokens: 4_096 });
+
+    const preflight = preflightOrnithPrompt({
+      specification: largeSpecification,
+      ruleEvidence: null,
+      acceptedPlanReviewAddenda: null,
+      correctionFindings: null,
+      round: 1,
+      maxRounds: 3,
+      lease: tightLease
+    });
+    expect(preflight.ok).toBe(false);
+    if (preflight.ok) return;
+    expect(preflight.kind).toBe('tool_result_budget_too_small');
+    expect(preflight.reason).toMatch(/split the specification|smaller.*sub-task/i);
+
+    let calls = 0;
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => tightLease,
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        calls += 1;
+        return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'not reached' }));
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal),
+      specification: largeSpecification,
+      lease: tightLease
+    });
+
+    expect(calls).toBe(0);
+    expect(result.assessment.reasonCodes).toContain('limit_context_exceeded');
+    expect(result.assessment.disposition).toBe('fail');
+    expect(result.finalMessage).toMatch(/split the specification|smaller.*sub-task/i);
   });
 
   it('warns once and then stops an identical read-only action loop without dispatching duplicates', async () => {

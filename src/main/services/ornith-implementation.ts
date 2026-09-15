@@ -249,6 +249,12 @@ Rules:
   truncated, retry with a smaller limit or a more specific prefix.
 - Never repeat an identical list_files, read_file, search_text, git_status, or git_diff action after it succeeds.
   Use the returned files, cursor, or status to choose a different next action.
+- A "list_files" result's "nextCursor" tells you whether there is more: if it is a number,
+  your NEXT "list_files" call for that SAME "prefix" must set "cursor" to exactly that
+  number to continue; if it is null, that prefix is fully listed and must not be repeated.
+  If a "list_files" result instead comes back with "truncated": true and no files (the
+  entry at that cursor was too large to return), retry with a narrower "prefix" or a
+  smaller "limit" rather than repeating the identical request.
 - Call "finish" only when the acceptance criteria are met. Call "blocked" only when you
   cannot proceed and must stop.
 - Every reply is judged on its own: nothing you say outside the JSON is read.`;
@@ -281,8 +287,24 @@ export type OrnithPromptPreflight =
   | { readonly ok: true; readonly budget: OrnithPromptBudget }
   | {
       readonly ok: false;
+      /** The prompt does not fit the runtime window at all, at any tool-result budget. */
+      readonly kind: 'prompt_too_large';
       readonly reason: string;
       readonly requiredContextTokens: number;
+    }
+  | {
+      readonly ok: false;
+      /**
+       * The prompt fits, but the per-tool-result budget it leaves is too small to page a
+       * directory listing or file read usefully. Raising the context limit is a genuine
+       * fix here (see `maxToolResultBytes` grow with it), but it is not the ONLY fix, and
+       * blindly raising it without shrinking the specification just moves the same failure
+       * to a larger spec — so this is reported as a distinct kind with its own remediation
+       * rather than folded into `prompt_too_large`'s "raise the context limit" advice.
+       */
+      readonly kind: 'tool_result_budget_too_small';
+      readonly reason: string;
+      readonly maxToolResultBytes: number;
     };
 
 function promptBudgetFor(lease: OrnithPromptPreflightInput['lease']): OrnithPromptBudget {
@@ -362,9 +384,27 @@ Reply with exactly one JSON action now.`, 'utf8');
   const budget = { ...initialBudget, maxToolResultBytes };
   const requiredPromptBytes = authoritativeBytes + 2 + fixedBudgetBytesFor(maxToolResultBytes);
   const requiredWithFeedback = requiredPromptBytes + ORNITH_LIMITS.minRollingFeedbackBytes;
-  if (requiredWithFeedback <= budget.maxPromptBytes) return { ok: true, budget };
+  if (requiredWithFeedback <= budget.maxPromptBytes) {
+    if (budget.maxToolResultBytes < ORNITH_LIMITS.minUsefulToolResultBytes) {
+      return {
+        ok: false,
+        kind: 'tool_result_budget_too_small',
+        reason:
+          `The Ornith prompt fits, but only ${budget.maxToolResultBytes} bytes remain for each tool result after ` +
+          'reserving space for the specification and model output — too little to page a directory listing or ' +
+          'file read usefully (a handful of entries per round at most). Split the specification into smaller, ' +
+          'narrower sub-tasks so each leaves the model enough room to explore, or shorten its text; raising the ' +
+          'context limit can also genuinely help here (it grows this budget directly), but on its own it only ' +
+          'defers the same problem to a larger specification, so pair it with a smaller specification rather than ' +
+          'relying on it alone.',
+        maxToolResultBytes: budget.maxToolResultBytes
+      };
+    }
+    return { ok: true, budget };
+  }
   return {
     ok: false,
+    kind: 'prompt_too_large',
     reason:
       `The immutable Ornith prompt and minimum tool feedback need ${requiredWithFeedback} bytes, but the retained ` +
       `${input.lease.contextLimitTokens}-token runtime allows at most ${budget.maxPromptBytes} prompt bytes ` +
@@ -551,8 +591,10 @@ export class OrnithImplementationService {
     if (!promptPreflight.ok) {
       return finish(
         'fail',
-        `${promptPreflight.reason} Increase the Local inference context limit to at least ` +
-          `${promptPreflight.requiredContextTokens} tokens and restart the runtime.`,
+        promptPreflight.kind === 'prompt_too_large'
+          ? `${promptPreflight.reason} Increase the Local inference context limit to at least ` +
+            `${promptPreflight.requiredContextTokens} tokens and restart the runtime.`
+          : promptPreflight.reason,
         'configuration',
         ['limit_context_exceeded']
       );
@@ -958,7 +1000,7 @@ export class OrnithImplementationService {
   ): Promise<OrnithToolResult> {
     switch (action.action) {
       case 'list_files':
-        return tools.listFiles(action, signal);
+        return tools.listFiles(action, signal, maxToolResultBytes);
       case 'read_file':
         return tools.readFile(
           { ...action, limit: Math.min(action.limit, Math.max(1, maxToolResultBytes - 512)) },

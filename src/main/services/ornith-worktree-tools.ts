@@ -526,7 +526,21 @@ export class OrnithWorktreeTools {
   /* Actions                                                              */
   /* ------------------------------------------------------------------ */
 
-  async listFiles(action: Extract<OrnithAction, { action: 'list_files' }>, signal?: AbortSignal): Promise<OrnithToolResult> {
+  /**
+   * `maxResultBytes` bounds the serialized `{files, nextCursor, total}` payload so it
+   * always fits the caller's per-turn prompt budget, instead of building a full
+   * `action.limit`-sized page and leaving truncation to a later, generic byte-budget
+   * check that would otherwise discard `nextCursor`/`total` along with the files —
+   * the defect that let a weak model repeat an identical `list_files` request with
+   * no way to know pagination was even possible. Entries are packed in cursor order
+   * against the EXACT serialized size (not an estimate), so the result is correct by
+   * construction rather than approximated.
+   */
+  async listFiles(
+    action: Extract<OrnithAction, { action: 'list_files' }>,
+    signal?: AbortSignal,
+    maxResultBytes = Number.POSITIVE_INFINITY
+  ): Promise<OrnithToolResult> {
     const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.filesystemTimeoutMs, signal);
     try {
       const manifest = await this.ensureManifest(bounded);
@@ -535,8 +549,41 @@ export class OrnithWorktreeTools {
         ? manifest
         : manifest.filter((name) => name === prefix || name.startsWith(`${prefix}/`));
       const cursor = action.cursor ?? 0;
-      const page = matching.slice(cursor, cursor + action.limit);
-      const nextCursor = cursor + page.length < matching.length ? cursor + page.length : null;
+
+      const page: string[] = [];
+      let index = cursor;
+      while (page.length < action.limit && index < matching.length) {
+        const candidateNextCursor = index + 1 < matching.length ? index + 1 : null;
+        const candidateBytes = Buffer.byteLength(
+          JSON.stringify({ files: [...page, matching[index]], nextCursor: candidateNextCursor, total: matching.length }),
+          'utf8'
+        );
+        if (candidateBytes > maxResultBytes) break;
+        page.push(matching[index]!);
+        index += 1;
+      }
+
+      if (page.length === 0 && index < matching.length) {
+        // Not even the single next entry fits the remaining byte budget. Return a
+        // fixed-shape, always-small stub that still carries `nextCursor` (left at
+        // `cursor`, since nothing was skipped) and `total` rather than falling
+        // through to the fully generic truncation stub that drops them.
+        return {
+          ok: true,
+          forModel: {
+            files: [],
+            nextCursor: cursor,
+            total: matching.length,
+            truncated: true,
+            reason: 'The next entry did not fit the remaining tool-result byte budget. Retry this same list_files request (same prefix and cursor) once more budget is available.'
+          },
+          readBytes: 0,
+          writeBytes: 0,
+          auditSummary: `list_files prefix="${prefix}" -> 0 of ${matching.length} (next entry exceeded byte budget)`
+        };
+      }
+
+      const nextCursor = index < matching.length ? index : null;
       return {
         ok: true,
         forModel: { files: page, nextCursor, total: matching.length },
