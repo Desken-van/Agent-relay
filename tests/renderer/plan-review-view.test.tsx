@@ -155,6 +155,39 @@ describe('the external plan-review panel', () => {
     expect(button.className).toContain('btn--recommended');
   });
 
+  it('turns a dirty checkout into an explicit choice and retries only after acceptance', async () => {
+    bridge.set('planReview:get', () => ok<'planReview:get'>(evidenceDetail));
+    bridge.set('planReview:prepare', () => ({
+      ok: false,
+      error: {
+        code: 'GIT_DIRTY',
+        message: 'The project has uncommitted changes.',
+        details: 'M src/service.ts\n?? notes.txt'
+      }
+    }));
+    render(
+      <PlanReviewPanel
+        task={task('READY_FOR_IMPLEMENTATION')}
+        integrationEnabled
+        onChanged={async () => undefined}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /Prepare isolated review branch/i }));
+    expect(await screen.findByText(/Uncommitted files remain outside this task/i)).toBeTruthy();
+    expect(screen.getByText(/M src\/service\.ts/)).toBeTruthy();
+
+    bridge.set('planReview:prepare', () => ok<'planReview:prepare'>(gateWith('prepared')));
+    fireEvent.click(screen.getByRole('button', { name: /Continue with current HEAD/i }));
+
+    await waitFor(() => expect(bridge.callsTo('planReview:prepare')).toHaveLength(2));
+    expect(bridge.callsTo('planReview:prepare')[0]?.input).toEqual({ taskId: 'task-1' });
+    expect(bridge.callsTo('planReview:prepare')[1]?.input).toEqual({
+      taskId: 'task-1',
+      acceptDirtyWorkingTree: true
+    });
+  });
+
   it('requires a reason before it submits a rejected finding', async () => {
     const awaiting: PlanReviewDetail = {
       ...evidenceDetail,
@@ -258,6 +291,47 @@ describe('the external plan-review panel', () => {
       updatedAt: '2026-09-06T00:00:00.000Z',
       ...extra
     } as PlanReviewDetail['gate']
+  });
+
+  it('fills every undecided finding with the safe accept recommendation without overwriting a rejection', async () => {
+    const awaiting: PlanReviewDetail = {
+      ...gateWith('awaiting_resolve', {
+        verdict: 'revise',
+        reviewers: 'codex:architecture, codex:reliability',
+        gatingCount: 2,
+        threshold: 1
+      }),
+      findings: [
+        {
+          severity: 'major', category: 'reliability', file: 'src/service.ts', line: 42,
+          title: 'Persist the intent', why: 'A lost response may repeat work.',
+          fix: 'Persist before dispatch.', providers: ['codex'], role: 'SecurityReliability'
+        },
+        {
+          severity: 'minor', category: 'ux', file: 'src/view.tsx', line: 12,
+          title: 'Explain the state', why: 'The next action is unclear.',
+          fix: 'Add precise copy.', providers: ['codex'], role: 'UX'
+        }
+      ]
+    };
+    bridge.set('planReview:get', () => ok<'planReview:get'>(awaiting));
+    render(
+      <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+    );
+
+    const decisions = await screen.findAllByLabelText('Decision');
+    fireEvent.change(decisions[0]!, { target: { value: 'reject' } });
+    fireEvent.change(screen.getAllByLabelText(/^Reason/)[0]!, {
+      target: { value: 'The existing invariant already covers it.' }
+    });
+    fireEvent.click(screen.getByRole('button', { name: /Accept all undecided findings/i }));
+
+    expect((decisions[0] as HTMLSelectElement).value).toBe('reject');
+    expect((decisions[1] as HTMLSelectElement).value).toBe('accept');
+    expect(screen.getByRole('button', { name: /Resolve external plan review/i })).toHaveProperty(
+      'disabled',
+      false
+    );
   });
 
   it('offers a read-only reconciliation for an unknown outcome, and never a repeat', async () => {

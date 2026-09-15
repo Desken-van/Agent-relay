@@ -572,6 +572,68 @@ export class Orchestrator {
       return task;
     }
 
+    // Everything above the actual worktree mutation is a read-only preflight.
+    // A dirty checkout is an expected decision point, not a failed Git
+    // operation, so do not create a timeline run until the preflight passes.
+    const info = await this.deps.git.inspect(project.localPath);
+    if (!info.isRepository) {
+      throw new AgentRelayError(
+        'GIT_FAILED',
+        `${project.localPath} is not a Git repository.`,
+        { remediation: 'Initialise Git for this project first, or register a different folder.' }
+      );
+    }
+
+    const baseBranch = project.defaultBranch;
+    if (!(await this.deps.git.branchExists(project.localPath, baseBranch))) {
+      throw new AgentRelayError(
+        'GIT_FAILED',
+        `The project's base branch "${baseBranch}" does not exist in ${project.localPath}.`,
+        {
+          details: `Available branches: ${info.branches.join(', ') || '(none)'}`,
+          remediation: 'Update the project settings to point at a branch that exists.'
+        }
+      );
+    }
+
+    if (!info.isClean && !options.acceptDirtyWorkingTree) {
+      throw new AgentRelayError(
+        'GIT_DIRTY',
+        `${project.localPath} has uncommitted changes.`,
+        {
+          details: info.dirtyFiles.slice(0, 20).join('\n'),
+          remediation:
+            'Commit or stash them, or explicitly continue from the current HEAD. Agent Relay uses a separate worktree, so your uncommitted files stay untouched and are not copied into the task branch.'
+        }
+      );
+    }
+
+    const branchName = buildBranchName(task.id, task.title);
+    if (!isValidBranchName(branchName)) {
+      throw new AgentRelayError('VALIDATION_FAILED', `Computed an invalid branch name: ${branchName}`);
+    }
+
+    const worktreePath = join(settings.worktreesRoot, buildWorktreeDirName(task.id, task.title));
+
+    // Hard path checks before anything is created on disk.
+    assertSafeWorktreePath({
+      worktreePath,
+      worktreesRoot: settings.worktreesRoot,
+      repositoryPath: info.root ?? project.localPath
+    });
+
+    // No two live tasks may share a worktree.
+    const conflict = this.deps.tasks
+      .listActiveWorktreePaths()
+      .find((entry) => entry.taskId !== task.id && isSamePath(entry.worktreePath, worktreePath));
+    if (conflict) {
+      throw new AgentRelayError(
+        'WORKTREE_CONFLICT',
+        `Task ${conflict.taskId} is already using that worktree directory.`,
+        { details: worktreePath }
+      );
+    }
+
     const handle = this.recorder(settings).start({
       taskId: task.id,
       agent: 'system',
@@ -580,66 +642,7 @@ export class Orchestrator {
     });
 
     try {
-      handle.append({ type: 'started', text: `Inspecting ${project.localPath}` });
-
-      const info = await this.deps.git.inspect(project.localPath);
-      if (!info.isRepository) {
-        throw new AgentRelayError(
-          'GIT_FAILED',
-          `${project.localPath} is not a Git repository.`,
-          { remediation: 'Initialise Git for this project first, or register a different folder.' }
-        );
-      }
-
-      const baseBranch = project.defaultBranch;
-      if (!(await this.deps.git.branchExists(project.localPath, baseBranch))) {
-        throw new AgentRelayError(
-          'GIT_FAILED',
-          `The project's base branch "${baseBranch}" does not exist in ${project.localPath}.`,
-          {
-            details: `Available branches: ${info.branches.join(', ') || '(none)'}`,
-            remediation: 'Update the project settings to point at a branch that exists.'
-          }
-        );
-      }
-
-      if (!info.isClean && !options.acceptDirtyWorkingTree) {
-        throw new AgentRelayError(
-          'GIT_DIRTY',
-          `${project.localPath} has uncommitted changes.`,
-          {
-            details: info.dirtyFiles.slice(0, 20).join('\n'),
-            remediation:
-              'Commit or stash them, or re-run and explicitly accept the dirty working tree. Agent Relay works in a separate worktree, so your changes are not touched — but the branch you are cutting from will not include them.'
-          }
-        );
-      }
-
-      const branchName = buildBranchName(task.id, task.title);
-      if (!isValidBranchName(branchName)) {
-        throw new AgentRelayError('VALIDATION_FAILED', `Computed an invalid branch name: ${branchName}`);
-      }
-
-      const worktreePath = join(settings.worktreesRoot, buildWorktreeDirName(task.id, task.title));
-
-      // Hard path checks before anything is created on disk.
-      assertSafeWorktreePath({
-        worktreePath,
-        worktreesRoot: settings.worktreesRoot,
-        repositoryPath: info.root ?? project.localPath
-      });
-
-      // No two live tasks may share a worktree.
-      const conflict = this.deps.tasks
-        .listActiveWorktreePaths()
-        .find((entry) => entry.taskId !== task.id && isSamePath(entry.worktreePath, worktreePath));
-      if (conflict) {
-        throw new AgentRelayError(
-          'WORKTREE_CONFLICT',
-          `Task ${conflict.taskId} is already using that worktree directory.`,
-          { details: worktreePath }
-        );
-      }
+      handle.append({ type: 'started', text: `Creating ${branchName} from ${baseBranch}` });
 
       handle.append({
         type: 'log',
