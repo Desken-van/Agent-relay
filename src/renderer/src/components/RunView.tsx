@@ -7,7 +7,7 @@ import {
 } from '@shared/domain/execution-providers';
 import type { LocalInferenceStateKind } from '@shared/domain/local-inference';
 import type { GitChangeSet } from '@shared/domain/git';
-import type { ApprovalAction, Run, Task } from '@shared/domain/models';
+import { APPROVAL_ACTIONS, type ApprovalAction, type Run, type Task } from '@shared/domain/models';
 import type { PlanReviewDecision } from '@shared/domain/plan-review';
 import {
   runGuidance,
@@ -17,9 +17,9 @@ import {
   type RunPrimaryAction
 } from '@shared/domain/run-guidance';
 import { isBusy, isTerminal } from '@shared/domain/workflow';
-import type { PlanReviewDetail, PublishConfirmation, TaskDetail } from '@shared/ipc';
+import type { PlanReviewDetail, PublishConfirmation, PublishOutcome, TaskDetail } from '@shared/ipc';
 import type { CodexReviewResult, FindingSeverity, TaskSpecification } from '@shared/schemas/codex';
-import { ApiError, call, expect } from '../lib/api';
+import { ApiError, call, describeError, expect } from '../lib/api';
 import { formatDateTime, pluralize } from '../lib/format';
 import { useStore } from '../state/store';
 import { ChangesPanel } from './ChangesPanel';
@@ -477,6 +477,10 @@ export function RunView(): React.JSX.Element {
         void perform('approve-publish', 'Could not approve for publishing', async () => {
           try {
             acceptTask(await expect('workflow:approveForPublishing', { taskId: task.id }));
+            // The workflow response contains only Task. Re-read the full detail
+            // so backend-computed fields such as effectivePublishRefusal cannot
+            // leave the renderer offering an obsolete verification action.
+            await refreshDetail(task.id);
             notify({ tone: 'success', title: 'Approved for publishing' });
           } finally {
             setPrimaryPending(null);
@@ -568,10 +572,18 @@ export function RunView(): React.JSX.Element {
             </div>
           ) : null}
 
-          {publishing ? (
+          {publishing || detail.runs.some(isPublishRun) ? (
             <div className="stack" aria-label="Publish">
               <div className="section-title">Publish</div>
-              <PublishPanel taskId={task.id} onDone={() => void refreshDetail(task.id)} />
+              <PublishActivity runs={detail.runs} />
+              {publishing ? (
+                <PublishPanel
+                  key={`publish-${task.id}`}
+                  taskId={task.id}
+                  runs={detail.runs}
+                  onDone={() => refreshDetail(task.id)}
+                />
+              ) : null}
             </div>
           ) : null}
 
@@ -1414,21 +1426,161 @@ function ReviewPanel({ review }: { review: CodexReviewResult }): React.JSX.Eleme
 
 /* -------------------------------------------------------------------------- */
 
-const PUBLISH_ACTIONS: ReadonlyArray<{ value: ApprovalAction; label: string }> = [
-  { value: 'commit', label: 'Commit changes (local)' },
-  { value: 'create_repository', label: 'Create GitHub repository' },
-  { value: 'push', label: 'Push branch to origin' },
-  { value: 'create_pull_request', label: 'Open pull request' }
+interface PublishActionOption {
+  readonly value: ApprovalAction;
+  readonly label: string;
+  readonly buttonLabel: string;
+  readonly pendingLabel: string;
+}
+
+const PUBLISH_ACTIONS: readonly PublishActionOption[] = [
+  {
+    value: 'commit',
+    label: 'Commit changes (local)',
+    buttonLabel: 'Create local commit',
+    pendingLabel: 'Creating local commit…'
+  },
+  {
+    value: 'create_repository',
+    label: 'Create GitHub repository',
+    buttonLabel: 'Create GitHub repository',
+    pendingLabel: 'Creating GitHub repository…'
+  },
+  {
+    value: 'push',
+    label: 'Push branch to origin',
+    buttonLabel: 'Push branch to origin',
+    pendingLabel: 'Pushing branch to origin…'
+  },
+  {
+    value: 'create_pull_request',
+    label: 'Open pull request',
+    buttonLabel: 'Open pull request',
+    pendingLabel: 'Opening pull request…'
+  }
 ];
 
-function PublishPanel({ taskId, onDone }: { taskId: string; onDone: () => void }): React.JSX.Element {
-  const { perform, notify, detail } = useStore();
-  const [action, setAction] = useState<ApprovalAction>('commit');
+function isPublishRun(run: Run): boolean {
+  return (
+    run.agent === 'system' &&
+    (run.runType === 'git' || run.runType === 'github') &&
+    readPublishAction(run) !== null
+  );
+}
+
+function readPublishAction(run: Run): { action: ApprovalAction; url: string | null } | null {
+  if (!run.structuredResult) return null;
+  try {
+    const value = JSON.parse(run.structuredResult) as { action?: unknown; url?: unknown };
+    if (!APPROVAL_ACTIONS.includes(value.action as ApprovalAction)) return null;
+    return {
+      action: value.action as ApprovalAction,
+      url: typeof value.url === 'string' ? value.url : null
+    };
+  } catch {
+    return null;
+  }
+}
+
+function publishOption(action: ApprovalAction): PublishActionOption {
+  const option = PUBLISH_ACTIONS.find((candidate) => candidate.value === action);
+  if (!option) throw new Error(`Unknown publish action: ${action}`);
+  return option;
+}
+
+function recommendedPublishAction(runs: readonly Run[]): ApprovalAction {
+  const completed = new Set(
+    runs
+      .filter((run) => isPublishRun(run) && run.status === 'succeeded')
+      .map(readPublishAction)
+      .filter((value): value is { action: ApprovalAction; url: string | null } => value !== null)
+      .map((value) => value.action)
+  );
+  if (!completed.has('commit')) return 'commit';
+  if (!completed.has('push')) return 'push';
+  if (!completed.has('create_pull_request')) return 'create_pull_request';
+  return 'commit';
+}
+
+function nextPublishAction(action: ApprovalAction): ApprovalAction {
+  if (action === 'commit' || action === 'create_repository') return 'push';
+  if (action === 'push') return 'create_pull_request';
+  return 'commit';
+}
+
+function PublishActivity({ runs }: { runs: readonly Run[] }): React.JSX.Element | null {
+  const published = runs.filter(isPublishRun).slice(-4).reverse();
+  if (published.length === 0) return null;
+
+  return (
+    <section className="publish-activity" aria-label="Publishing activity">
+      <div className="publish-activity__title">Publishing activity</div>
+      {published.map((run) => {
+        const stored = readPublishAction(run);
+        const option = stored ? publishOption(stored.action) : null;
+        const state = run.status === 'succeeded' ? 'success' : run.status === 'running' ? 'running' : 'error';
+        const message = run.finalMessage ?? run.errorMessage ?? (run.status === 'running' ? 'Operation in progress…' : 'No result was recorded.');
+        return (
+          <div key={run.id} className={`publish-activity__item publish-activity__item--${state}`}>
+            <span className="publish-activity__mark" aria-hidden="true">
+              {run.status === 'succeeded' ? '✓' : run.status === 'running' ? <Spinner /> : '!'}
+            </span>
+            <div className="publish-activity__result">
+              <strong>{option?.buttonLabel ?? (run.runType === 'git' ? 'Git operation' : 'GitHub operation')}</strong>
+              <span className="selectable">{message}</span>
+            </div>
+            <span className="publish-activity__time">{formatDateTime(run.finishedAt ?? run.startedAt)}</span>
+            {stored?.url ? (
+              <button
+                type="button"
+                className="btn btn--sm btn--ghost publish-activity__link"
+                onClick={() => void call('shell:openExternal', { url: stored.url as string })}
+              >
+                Open
+              </button>
+            ) : null}
+          </div>
+        );
+      })}
+    </section>
+  );
+}
+
+interface PublishFeedback {
+  readonly tone: 'info' | 'success' | 'error';
+  readonly title: string;
+  readonly body: string;
+}
+
+function feedbackForOutcome(outcome: PublishOutcome): PublishFeedback {
+  return {
+    tone: outcome.performed ? 'success' : 'info',
+    title: outcome.performed ? `${publishOption(outcome.action).buttonLabel} succeeded` : 'Action cancelled',
+    body: outcome.message
+  };
+}
+
+function PublishPanel({
+  taskId,
+  runs,
+  onDone
+}: {
+  taskId: string;
+  runs: readonly Run[];
+  onDone: () => Promise<void>;
+}): React.JSX.Element {
+  const { perform, notify, detail, busy } = useStore();
+  const [action, setAction] = useState<ApprovalAction>(() => recommendedPublishAction(runs));
   const [commitMessage, setCommitMessage] = useState('');
   const [repositoryName, setRepositoryName] = useState('');
   const [owner, setOwner] = useState('');
   const [prTitle, setPrTitle] = useState('');
   const [confirmation, setConfirmation] = useState<PublishConfirmation | null>(null);
+  const [pendingAction, setPendingAction] = useState<ApprovalAction | null>(null);
+  const [feedback, setFeedback] = useState<PublishFeedback | null>(null);
+  const claim = useRef(false);
+  const blocked = pendingAction !== null || busy['publish'] === true;
+  const selectedOption = publishOption(action);
 
   // `publish:prepare` is side-effect free by contract, so previewing on every
   // edit is safe. It shows the user exactly what the confirmation dialog will
@@ -1466,7 +1618,11 @@ function PublishPanel({ taskId, onDone }: { taskId: string; onDone: () => void }
         <select
           className="select"
           value={action}
-          onChange={(e) => setAction(e.target.value as ApprovalAction)}
+          disabled={blocked}
+          onChange={(e) => {
+            setAction(e.target.value as ApprovalAction);
+            setFeedback(null);
+          }}
         >
           {PUBLISH_ACTIONS.map((item) => (
             <option key={item.value} value={item.value}>
@@ -1482,6 +1638,7 @@ function PublishPanel({ taskId, onDone }: { taskId: string; onDone: () => void }
             className="textarea"
             rows={3}
             value={commitMessage}
+            disabled={blocked}
             placeholder={detail?.task.title ?? ''}
             onChange={(e) => setCommitMessage(e.target.value)}
           />
@@ -1494,6 +1651,7 @@ function PublishPanel({ taskId, onDone }: { taskId: string; onDone: () => void }
             <input
               className="input input--mono"
               value={owner}
+              disabled={blocked}
               placeholder={detail?.project.githubOwner ?? ''}
               onChange={(e) => setOwner(e.target.value)}
             />
@@ -1502,6 +1660,7 @@ function PublishPanel({ taskId, onDone }: { taskId: string; onDone: () => void }
             <input
               className="input input--mono"
               value={repositoryName}
+              disabled={blocked}
               placeholder={detail?.project.githubRepo ?? detail?.project.name ?? ''}
               onChange={(e) => setRepositoryName(e.target.value)}
             />
@@ -1511,7 +1670,7 @@ function PublishPanel({ taskId, onDone }: { taskId: string; onDone: () => void }
 
       {action === 'create_pull_request' ? (
         <Field label="Pull request title" hint="Leave empty to use the task title.">
-          <input className="input" value={prTitle} onChange={(e) => setPrTitle(e.target.value)} />
+          <input className="input" value={prTitle} disabled={blocked} onChange={(e) => setPrTitle(e.target.value)} />
         </Field>
       ) : null}
 
@@ -1530,35 +1689,74 @@ function PublishPanel({ taskId, onDone }: { taskId: string; onDone: () => void }
         </div>
       ) : null}
 
+      {feedback ? (
+        <Notice tone={feedback.tone}>
+          <div className="publish-feedback" role="status" aria-live="polite">
+            <strong>{feedback.title}</strong>
+            <span className="selectable">{feedback.body}</span>
+          </div>
+        </Notice>
+      ) : null}
+
       <button
         type="button"
-        className="btn btn--danger btn--wide"
-        onClick={() =>
+        className="btn btn--primary btn--wide"
+        disabled={blocked || confirmation === null}
+        onClick={() => {
+          if (claim.current) return;
+          claim.current = true;
+          const requestedAction = action;
+          const requestedOption = publishOption(requestedAction);
+          setPendingAction(requestedAction);
+          setFeedback({
+            tone: 'info',
+            title: requestedOption.pendingLabel,
+            body: 'Waiting for the operation to finish. Keep this task open.'
+          });
           void perform('publish', 'The publish step failed', async () => {
-            const outcome = await expect('publish:execute', {
-              taskId,
-              action,
-              ...(commitMessage.trim() ? { commitMessage: commitMessage.trim() } : {}),
-              ...(repositoryName.trim() ? { repositoryName: repositoryName.trim() } : {}),
-              ...(owner.trim() ? { owner: owner.trim() } : {}),
-              ...(prTitle.trim() ? { pullRequestTitle: prTitle.trim() } : {})
-            });
+            try {
+              const outcome = await expect('publish:execute', {
+                taskId,
+                action: requestedAction,
+                ...(commitMessage.trim() ? { commitMessage: commitMessage.trim() } : {}),
+                ...(repositoryName.trim() ? { repositoryName: repositoryName.trim() } : {}),
+                ...(owner.trim() ? { owner: owner.trim() } : {}),
+                ...(prTitle.trim() ? { pullRequestTitle: prTitle.trim() } : {})
+              });
 
-            notify({
-              tone: outcome.performed ? 'success' : 'info',
-              title: outcome.performed ? 'Done' : 'Cancelled',
-              body: outcome.message
-            });
+              const nextFeedback = feedbackForOutcome(outcome);
+              setFeedback(nextFeedback);
+              notify({
+                tone: outcome.performed ? 'success' : 'info',
+                title: nextFeedback.title,
+                body: outcome.message
+              });
 
-            if (outcome.url) {
-              await call('shell:openExternal', { url: outcome.url });
+              if (outcome.performed) setAction(nextPublishAction(requestedAction));
+              if (outcome.url) await call('shell:openExternal', { url: outcome.url });
+            } catch (error) {
+              const described = describeError(error);
+              setFeedback({
+                tone: 'error',
+                title: `${requestedOption.buttonLabel} failed`,
+                body: described.remediation
+                  ? `${described.message} ${described.remediation}`
+                  : described.message
+              });
+              throw error;
+            } finally {
+              try {
+                await onDone();
+              } finally {
+                setPendingAction(null);
+                claim.current = false;
+              }
             }
-            onDone();
-          })
-        }
+          });
+        }}
       >
-        <Scope kind={confirmation?.affectsRemote ? 'remote' : 'local'} />
-        Confirm and run…
+        {pendingAction !== null ? <Spinner /> : <Scope kind={confirmation?.affectsRemote ? 'remote' : 'local'} />}
+        {pendingAction !== null ? publishOption(pendingAction).pendingLabel : selectedOption.buttonLabel}
       </button>
     </div>
   );

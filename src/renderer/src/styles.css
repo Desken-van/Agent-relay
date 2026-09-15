@@ -787,6 +787,12 @@ pre,
   color: #a8c8f5;
 }
 
+.notice--success {
+  border-color: #2f6b48;
+  background: rgba(74, 222, 128, 0.07);
+  color: #a7e8bd;
+}
+
 /* ------------------------------------------------------------------ */
 /* Task list                                                           */
 /* ------------------------------------------------------------------ */
@@ -1415,6 +1421,96 @@ pre,
   text-transform: uppercase;
   color: var(--text-faint);
   margin: 6px 0 1px;
+}
+
+.publish-activity {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #0e131d;
+}
+
+.publish-activity__title {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 640;
+}
+
+.publish-activity__item {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  min-height: 54px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.publish-activity__item:last-child {
+  border-bottom: 0;
+}
+
+.publish-activity__mark {
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.publish-activity__item--success .publish-activity__mark {
+  color: var(--ok);
+}
+
+.publish-activity__item--running .publish-activity__mark {
+  color: var(--info);
+}
+
+.publish-activity__item--error .publish-activity__mark {
+  color: var(--danger);
+}
+
+.publish-activity__result {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.publish-activity__result span {
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.publish-activity__time {
+  color: var(--text-faint);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.publish-feedback {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+@media (max-width: 720px) {
+  .publish-activity__item {
+    grid-template-columns: 24px minmax(0, 1fr);
+  }
+
+  .publish-activity__time,
+  .publish-activity__link {
+    grid-column: 2;
+    justify-self: start;
+  }
 }
 
 /* The workflow guide makes the action rail read as a process, not a button tray. */
