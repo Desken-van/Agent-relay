@@ -852,7 +852,7 @@ export function PlanReviewPanel({
   const [busy, setBusy] = useState<string | null>(null);
   const inFlightRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  const [dirtyPrompt, setDirtyPrompt] = useState(false);
+  const [dirtyPrompt, setDirtyPrompt] = useState<string | null>(null);
   const [draftState, setDraftState] = useState<DecisionDrafts>({ roundKey: null, drafts: {} });
   const roundKey = detail?.gate ? `${detail.gate.id}:${detail.gate.revision}` : null;
   const decisions = draftState.roundKey === roundKey ? draftState.drafts : NO_DRAFTS;
@@ -914,11 +914,11 @@ export function PlanReviewPanel({
     try {
       const next = await operation();
       setDetail(next);
-      setDirtyPrompt(false);
+      setDirtyPrompt(null);
       await onChanged();
     } catch (caught) {
       if (caught instanceof ApiError && caught.code === 'GIT_DIRTY' && key === 'prepare') {
-        setDirtyPrompt(true);
+        setDirtyPrompt(caught.message + (caught.details ? `\n\n${caught.details}` : ''));
       } else {
         setError(caught instanceof Error ? caught.message : String(caught));
         // A failed `review` or `resolve` is the one case where the screen is now
@@ -1143,19 +1143,34 @@ export function PlanReviewPanel({
 
       {dirtyPrompt ? (
         <Notice tone="warn">
-          The project checkout is dirty. The isolated task branch can still be based on its
-          current HEAD, but uncommitted project changes are not copied.
-          {renderPrimary ? (
-            <button
-              type="button"
-              className="btn btn--sm"
-              style={{ marginTop: 8 }}
-              disabled={busy !== null}
-              onClick={() => dispatchPlanPrimary('prepare_plan_review')}
-            >
-              Continue with current HEAD
-            </button>
-          ) : ' Click “Prepare isolated review branch” again to continue from the current HEAD.'}
+          <div className="stack stack--tight" style={{ width: '100%' }}>
+            <strong>Uncommitted files remain outside this task</strong>
+            <div style={{ whiteSpace: 'pre-wrap' }}>{dirtyPrompt}</div>
+            <span>
+              The isolated task branch can use the checkout&apos;s current HEAD. Your uncommitted
+              files stay untouched and are not copied into it.
+            </span>
+            {renderPrimary ? (
+              <div className="row">
+                <button
+                  type="button"
+                  className="btn btn--sm"
+                  disabled={busy !== null}
+                  onClick={() => dispatchPlanPrimary('prepare_plan_review')}
+                >
+                  Continue with current HEAD
+                </button>
+                <button
+                  type="button"
+                  className="btn btn--sm btn--ghost"
+                  disabled={busy !== null}
+                  onClick={() => setDirtyPrompt(null)}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : ' Click “Prepare isolated review branch” again to continue from the current HEAD.'}
+          </div>
         </Notice>
       ) : null}
 
@@ -1213,10 +1228,39 @@ export function PlanReviewPanel({
             The verdict does not approve the plan. Decide every finding, then resolve the
             external round. Rejecting a finding requires a written reason.
           </Notice>
+          <Notice tone="info">
+            <strong>Safe default:</strong> accept reviewer findings as implementation requirements.
+            Agent Relay never rejects a finding automatically because that would require contrary
+            evidence and an audit reason.
+          </Notice>
           <div className="kv">
             <span className="kv__k">Verdict</span><span className="kv__v">{gate.verdict}</span>
             <span className="kv__k">Gating</span><span className="kv__v">{gate.gatingCount} / threshold {gate.threshold}</span>
             <span className="kv__k">Reviewers</span><span className="kv__v selectable">{gate.reviewers}</span>
+          </div>
+          <div className="row">
+            <button
+              type="button"
+              className="btn btn--sm"
+              disabled={busy !== null || allDecided}
+              onClick={() => setDecisions((current) => {
+                const next = { ...current };
+                findings.forEach((_, index) => {
+                  if (!next[index]?.action) next[index] = { action: 'accept', reason: '' };
+                });
+                return next;
+              })}
+            >
+              Accept all undecided findings
+            </button>
+            <button
+              type="button"
+              className="btn btn--sm btn--ghost"
+              disabled={busy !== null || Object.keys(decisions).length === 0}
+              onClick={() => setDecisions(() => ({}))}
+            >
+              Clear decisions
+            </button>
           </div>
           {findings.map((finding, index) => {
             const decision = decisions[index] ?? { action: '', reason: '' };

@@ -206,6 +206,8 @@ describe('implementation stage', () => {
       code: 'GIT_DIRTY'
     });
     expect(harness.git.createdWorktrees).toHaveLength(0);
+    // A dirty checkout is a preflight choice, not a failed Git operation.
+    expect(harness.runs.listByTask(task.id).filter((run) => run.runType === 'git')).toEqual([]);
     // Still retryable.
     expect(harness.tasks.findById(task.id)?.status).toBe('READY_FOR_IMPLEMENTATION');
 
@@ -213,6 +215,7 @@ describe('implementation stage', () => {
       acceptDirtyWorkingTree: true
     });
     expect(accepted.status).toBe('READY_FOR_REVIEW');
+    expect(harness.runs.listByTask(task.id).filter((run) => run.runType === 'git')).toHaveLength(1);
   });
 
   it('refuses when the base branch does not exist', async () => {
