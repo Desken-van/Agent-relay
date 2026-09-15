@@ -83,10 +83,20 @@ describe('Coai plan reviewer adapter', () => {
   it('normalises the documented plan verdict and finding enums', async () => {
     const client = new FakeMcpClient();
     client.responses.push(result('review_plan', {
-      verdict: 'REVISE', gatingCount: 1, threshold: 0, reviewers: 'all 2 reviewers answered',
+      verdict: 'REVISE', gatingCount: 5, threshold: 0, reviewers: 'all 2 reviewers answered',
       instruction: 'resolve first',
-      findings: [{ severity: 'Major', category: 'Architecture', file: null, line: null,
-        title: 'Missing rollback', why: 'The plan omits it.', fix: 'Add it.', providers: ['codex'] }]
+      findings: [
+        { severity: 'Major', category: 'Architecture', file: null, line: null,
+          title: 'Missing boundary', why: 'The plan omits it.', fix: 'Add it.', providers: ['codex'] },
+        { severity: 'Major', category: 'Clarity', file: null, line: null,
+          title: 'Unclear ownership', why: 'The plan leaves it ambiguous.', fix: 'Name the owner.', providers: ['codex'] },
+        { severity: 'Major', category: 'Completeness', file: null, line: null,
+          title: 'Missing rollback', why: 'The plan omits it.', fix: 'Add it.', providers: ['codex'] },
+        { severity: 'Major', category: 'Consistency', file: null, line: null,
+          title: 'Conflicting rules', why: 'Two requirements disagree.', fix: 'Choose one rule.', providers: ['codex'] },
+        { severity: 'Major', category: 'Feasibility', file: null, line: null,
+          title: 'Unavailable primitive', why: 'The platform cannot provide it.', fix: 'Use the supported primitive.', providers: ['codex'] }
+      ]
     }));
     const reviewer = new CoaiPlanReviewer(client, config);
 
@@ -95,7 +105,14 @@ describe('Coai plan reviewer adapter', () => {
       'exact plan'
     );
     expect(answer.verdict).toBe('revise');
-    expect(answer.findings[0]).toMatchObject({ severity: 'major', category: 'architecture', file: '', line: 0 });
+    expect(answer.findings.map((finding) => finding.category)).toEqual([
+      'architecture',
+      'clarity',
+      'completeness',
+      'consistency',
+      'feasibility'
+    ]);
+    expect(answer.findings[0]).toMatchObject({ severity: 'major', file: '', line: 0 });
     expect(client.calls[0]).toEqual({
       tool: 'review_plan',
       args: { repoPath: 'C:\\repo', branch: 'agent/task', planText: 'exact plan' }

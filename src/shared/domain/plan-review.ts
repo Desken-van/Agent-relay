@@ -40,7 +40,11 @@ export const PLAN_FINDING_CATEGORIES = [
   'reliability',
   'performance',
   'ux',
-  'convention'
+  'convention',
+  'clarity',
+  'completeness',
+  'consistency',
+  'feasibility'
 ] as const;
 
 export const planReviewFindingSchema = z
