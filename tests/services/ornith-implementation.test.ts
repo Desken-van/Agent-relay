@@ -14,6 +14,7 @@ import type { AgentProgressEvent, OrnithHealthyLease, OrnithInferenceLeaseServic
 import { AgentRelayError } from '../../src/shared/domain/errors';
 import {
   LOCAL_INFERENCE_CONTRACT_VERSION,
+  type LocalInferenceFinishReason,
   type LocalInferenceOutcome,
   type LocalInferenceRequest
 } from '../../src/shared/domain/local-inference';
@@ -68,7 +69,11 @@ function lease(overrides: Partial<OrnithHealthyLease> = {}): OrnithHealthyLease 
   };
 }
 
-function completed(request: LocalInferenceRequest, completion: string): LocalInferenceOutcome {
+function completed(
+  request: LocalInferenceRequest,
+  completion: string,
+  finishReason: LocalInferenceFinishReason = { kind: 'stop' }
+): LocalInferenceOutcome {
   return {
     kind: 'completed',
     version: LOCAL_INFERENCE_CONTRACT_VERSION,
@@ -84,7 +89,7 @@ function completed(request: LocalInferenceRequest, completion: string): LocalInf
       promptTokens: null,
       completionTokens: null,
       runtimeResponseId: null,
-      finishReason: { kind: 'stop' }
+      finishReason
     }
   };
 }
@@ -278,13 +283,17 @@ describe('OrnithImplementationService limits and cancellation', () => {
 
     expect(result.assessment.disposition).toBe('pass');
     expect(requests).toHaveLength(2);
+    const expectedOutputTokens = Math.min(
+      ORNITH_LIMITS.maxTurnOutputTokens,
+      Math.floor((16_384 - ORNITH_LIMITS.contextSafetyTokens) / 4)
+    );
     for (const request of requests) {
-      expect(request.maxOutputTokens).toBe(1_024);
+      expect(request.maxOutputTokens).toBe(expectedOutputTokens);
       const bytes = request.messages.reduce(
         (sum, message) => sum + Buffer.byteLength(message.content, 'utf8'),
         0
       );
-      expect(bytes).toBeLessThanOrEqual(16_384 - 1_024 - ORNITH_LIMITS.contextSafetyTokens);
+      expect(bytes).toBeLessThanOrEqual(16_384 - expectedOutputTokens - ORNITH_LIMITS.contextSafetyTokens);
     }
     const secondPrompt = requests[1]!.messages.map((message) => message.content).join('');
     expect(secondPrompt).toContain('"path":"large-context.txt"');
@@ -495,6 +504,32 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(result.assessment.reasonCodes).toContain('malformed_output');
     expect(calls).toBe(1);
     expect(() => readFileSync(join(worktree, 'bad.txt'), 'utf8')).toThrow();
+  });
+
+  it('reports an output-token truncation distinctly from arbitrary malformed output', async () => {
+    let calls = 0;
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        calls += 1;
+        return completed(
+          request,
+          '{"version":1,"action":"create_file","path":"large.ts","content":"unfinished',
+          { kind: 'length' }
+        );
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal)
+    );
+
+    expect(calls).toBe(1);
+    expect(result.assessment.reasonCodes).toContain('limit_output_exceeded');
+    expect(result.finalMessage).toContain('1024-token output limit');
+    expect(result.finalMessage).toContain('Default max output tokens');
+    expect(() => readFileSync(join(worktree, 'large.ts'), 'utf8')).toThrow();
   });
 
   it('terminates immediately when the cumulative read budget is exhausted', async () => {

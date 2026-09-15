@@ -687,6 +687,15 @@ export class OrnithImplementationService {
 
       const parsed = parseOrnithCompletion(response.completion);
       if (!parsed.ok) {
+        if (response.finishReason.kind === 'length') {
+          return finish(
+            'fail',
+            `Ornith reached the ${inferRequest.maxOutputTokens}-token output limit before returning a complete JSON action. ` +
+              'Increase Local inference → Default max output tokens and restart the runtime.',
+            'configuration',
+            ['limit_output_exceeded']
+          );
+        }
         return finish('fail', 'Ornith returned output that could not be accepted.', 'configuration', [parsed.code]);
       }
       const action = parsed.action;

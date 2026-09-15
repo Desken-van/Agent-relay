@@ -51,7 +51,7 @@ export const ORNITH_LIMITS = {
   maxToolResultBytes: 64 * 1024,
   /** Reserve room for the chat template/BOS and keep one action concise. */
   contextSafetyTokens: 512,
-  maxTurnOutputTokens: 1_024,
+  maxTurnOutputTokens: 4_096,
   /** First action executes, second identical read-only action gets feedback, third stops. */
   maxConsecutiveIdenticalReadOnlyActions: 3,
 
