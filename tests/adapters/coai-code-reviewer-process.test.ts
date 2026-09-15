@@ -37,7 +37,7 @@ const subject: ExternalCodeReviewSubject = {
 
 /**
  * @param mode
- * Which tool list the fake advertises. `ten` is the audited profile; the others
+ * Which tool list the fake advertises. `twelve` is the audited profile; the others
  * are the shapes that must fail closed.
  */
 function config(mode: string, overrides: Partial<ExternalMcpServerConfig> = {}): ExternalMcpServerConfig {
@@ -59,20 +59,20 @@ function config(mode: string, overrides: Partial<ExternalMcpServerConfig> = {}):
 beforeAll(() => {
   directory = mkdtempSync(join(tmpdir(), 'agent-relay-coai-'));
   serverScript = join(directory, 'fake-coai-mcp.mjs');
-  const ten = JSON.stringify([...COAI_ADDRESSABLE_PROFILE]);
-  const seven = JSON.stringify([...COAI_PLAN_PROFILE]);
+  const twelve = JSON.stringify([...COAI_ADDRESSABLE_PROFILE]);
+  const nine = JSON.stringify([...COAI_PLAN_PROFILE]);
   writeFileSync(
     serverScript,
     [
-      'const mode = process.argv[2] ?? "ten";',
-      `const TEN = ${ten};`,
-      `const SEVEN = ${seven};`,
+      'const mode = process.argv[2] ?? "twelve";',
+      `const TWELVE = ${twelve};`,
+      `const NINE = ${nine};`,
       'const names = () => {',
-      '  if (mode === "legacy") return SEVEN;',
-      '  if (mode === "extra") return [...TEN, "something_new"];',
-      '  if (mode === "missing") return TEN.filter((n) => n !== "round_status");',
-      '  if (mode === "duplicate") return [...TEN.slice(0, 9), "run_round"];',
-      '  return TEN;',
+      '  if (mode === "plan-only") return NINE;',
+      '  if (mode === "extra") return [...TWELVE, "something_new"];',
+      '  if (mode === "missing") return TWELVE.filter((n) => n !== "round_status");',
+      '  if (mode === "duplicate") return [...TWELVE.slice(0, 11), "run_round"];',
+      '  return TWELVE;',
       '};',
       'const send = (v) => process.stdout.write(JSON.stringify(v) + "\\n");',
       'const ok = (id, value) => send({ jsonrpc: "2.0", id, result: value });',
@@ -138,14 +138,14 @@ afterAll(() => {
 });
 
 describe('the Coai code reviewer over a real MCP process', () => {
-  it('accepts a server that advertises exactly the audited ten-tool profile', async () => {
-    const reviewer = new CoaiCodeReviewer(client, config('ten'));
+  it('accepts a server that advertises exactly the audited twelve-tool profile', async () => {
+    const reviewer = new CoaiCodeReviewer(client, config('twelve'));
 
     await expect(reviewer.availability()).resolves.toEqual({ available: true, reason: null });
   });
 
-  it('refuses the legacy seven-tool server, naming the tools it lacks', async () => {
-    const answer = await new CoaiCodeReviewer(client, config('legacy')).availability();
+  it('refuses the plan-only nine-tool server, naming the tools it lacks', async () => {
+    const answer = await new CoaiCodeReviewer(client, config('plan-only')).availability();
 
     expect(answer.available).toBe(false);
     expect(answer.reason).toMatch(/addressable code review is not supported/i);
@@ -172,7 +172,7 @@ describe('the Coai code reviewer over a real MCP process', () => {
   });
 
   it('reserves, runs and reads back over the real transport', async () => {
-    const reviewer = new CoaiCodeReviewer(client, config('ten'));
+    const reviewer = new CoaiCodeReviewer(client, config('twelve'));
 
     const locator = await reviewer.beginRound(subject, 'local-round-7');
     expect(locator).toEqual({ providerId: COAI_PROVIDER_ID, sessionId: 's-1', roundId: 'r-1' });

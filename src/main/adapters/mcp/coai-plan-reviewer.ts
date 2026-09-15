@@ -144,9 +144,9 @@ function isNoSessionRefusal(result: ExternalMcpCallResult): boolean {
  * Either audited profile, and nothing between them.
  *
  * The plan tools are identical in both, so a server presenting the exact
- * ten-tool profile serves this gate as well as the seven-tool one does — and a
+ * twelve-tool profile serves this gate as well as the nine-tool one does — and a
  * deployment that has the newer server should not have to run two of them to
- * keep plan review working. What is NOT accepted is a superset: "the seven I
+ * keep plan review working. What is NOT accepted is a superset: "the nine I
  * need are present" would admit any server that grew tools nobody here has
  * read, and its other tools may have changed too.
  */
@@ -157,7 +157,7 @@ function assertCoaiAllowlist(config: ExternalMcpServerConfig): void {
   ) {
     throw new AgentRelayError(
       'VALIDATION_FAILED',
-      'The Coai plan adapter requires one of its exact audited profiles: the seven plan tools, or those ten.'
+      'The Coai plan adapter requires one of its exact audited profiles: the nine plan tools, or those twelve.'
     );
   }
 }

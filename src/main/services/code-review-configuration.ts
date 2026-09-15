@@ -37,7 +37,7 @@ export function externalCodeReviewConfig(settings: Settings): ExternalMcpServerC
   // argv, one transport capacity, and the exact audited profile chosen by what
   // is enabled — so neither gate can be configured into refusing the server the
   // other is talking to. The transport compares that profile exactly, which is
-  // why a legacy seven-tool server cannot be talked to at all. That is the
+  // why a plan-only nine-tool server cannot be talked to at all. That is the
   // honest outcome rather than a degraded one.
   return coaiServerConfig(settings, 'coai-code-review', settings.coaiMcpExecutablePath);
 }

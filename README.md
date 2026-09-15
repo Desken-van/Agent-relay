@@ -451,11 +451,11 @@ Git refuses and you are told, rather than losing it.
 ### External code review (INT-D-B)
 
 The provider adapter exists and is **off by default**. It requires an MCP server
-that advertises an exact ten-tool profile — the seven Coai plan tools plus
+that advertises an exact twelve-tool profile — the nine Coai 0.22 plan tools plus
 `reserve_round`, `run_round` and `round_status` — because a code round must be
 named before it runs for its answer to be findable afterwards.
 
-**The Coai build shipped today advertises seven.** Plan review works against it
+**The installed Coai 0.22 build advertises nine.** Plan review works against it
 exactly as before; code review reports *"addressable code review is not
 supported"* and writes nothing. That answer comes from discovery, so a refusal
 costs no round and leaves nothing to reconcile. A server with a missing tool, an
@@ -470,8 +470,8 @@ that does not exist yet; this build creates no hidden commits and never touches
 the index to work around it.
 
 No sibling repository and no unpublished local build is required or referenced —
-the profile is a wire contract. **Live provider acceptance has not been
-performed:** every test runs against an Agent Relay-owned fake MCP process.
+the profile is a wire contract. **Live review acceptance is not part of the
+automated suite:** its MCP process tests use an Agent Relay-owned fake server.
 
 | `npm run verify` | lint → typecheck → deterministic tests → build → Electron acceptance |
 

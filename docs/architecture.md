@@ -467,10 +467,11 @@ server identity, verdict, structured findings, decisions and durable status.
 No absolute repository path is stored in either table.
 
 `CoaiPlanReviewer` is provider-specific policy over the generic INT-A transport.
-It requires the exact audited seven-tool discovery set and itself calls only the
-fixed `open`, `review_plan` and `resolve` names with typed arguments. JSON inside
-the single MCP text block is parsed again; MCP `isError`, `{error: ...}` refusal,
-malformed output and workflow verdict remain different outcomes.
+It requires the exact audited nine-tool Coai 0.22 discovery set and itself calls
+only the fixed `open`, `review_plan` and `resolve` names with typed arguments.
+JSON inside the single MCP text block is parsed again; MCP `isError`,
+`{error: ...}` refusal, malformed output and workflow verdict remain different
+outcomes.
 
 `PlanReviewGateService` writes `reviewing` before the non-idempotent plan round
 and writes `resolving` plus all decisions before the non-idempotent resolve.
@@ -713,8 +714,8 @@ list, not a minimum.
 
 | Profile | Tools | What it serves |
 |---|---|---|
-| plan | `providers`, `open`, `review_plan`, `review_code`, `resolve`, `status`, `ask_human` | plan review only |
-| addressable | those seven plus `reserve_round`, `run_round`, `round_status` | plan review **and** code review |
+| plan | `providers`, `open`, `review_plan`, `review_code`, `review_document`, `consult`, `resolve`, `status`, `ask_human` | plan review only |
+| addressable | those nine plus `reserve_round`, `run_round`, `round_status` | plan review **and** code review |
 
 A server whose list is missing a tool, carries an unknown extra, or repeats a
 name is refused — the same refusal in all three cases, because from this side
@@ -726,9 +727,9 @@ second one to keep the plan gate working.
 
 **One server, one profile, chosen by what is enabled.** Both gates talk to the
 same executable, so the profile is decided by configuration rather than by which
-gate is asking: with code review off the plan gate is configured for the seven
-tools, and with it on BOTH gates are configured for the ten. Pinning the plan
-gate to seven for ever would have refused the addressable server outright — so
+gate is asking: with code review off the plan gate is configured for the nine
+tools, and with it on BOTH gates are configured for the twelve. Pinning the plan
+gate to nine for ever would have refused the addressable server outright — so
 enabling code review would have silently broken plan review against the very
 server that supports both. The choice is still between two audited lists; it is
 never a subset, a minimum or a superset.
