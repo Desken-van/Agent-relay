@@ -604,7 +604,7 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       if (!result.ok) throw new Error('unreachable');
       // Fixed-shape stub (two integers, a boolean, and a constant-length message) —
       // small by construction regardless of how tiny the requested budget was.
-      expect(Buffer.byteLength(JSON.stringify(result.forModel), 'utf8')).toBeLessThanOrEqual(400);
+      expect(Buffer.byteLength(JSON.stringify(result.forModel), 'utf8')).toBeLessThanOrEqual(600);
       // nextCursor must advance past the unlistable entry (index 0), not stay at it —
       // otherwise a model that faithfully resubmits `cursor: nextCursor` would send
       // the identical request forever instead of making progress.

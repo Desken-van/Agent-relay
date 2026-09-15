@@ -245,15 +245,18 @@ Rules:
   do not ask for one, it does not exist.
 - Call "run_verification" only when you believe the work is complete; Agent Relay itself
   re-verifies afterward regardless.
-- Use a narrow prefix or a small page when listing files. If a tool result says it was
-  truncated, retry with a smaller limit or a more specific prefix.
+- Use a narrow prefix or a small page when listing files. If a "read_file" or "search_text"
+  result says it was truncated, retry with a smaller limit, offset, or a more specific query
+  — do not repeat the identical request. ("list_files" truncation works differently: see the
+  "nextCursor" rule below, not this one.)
 - Never repeat an identical list_files, read_file, search_text, git_status, or git_diff action after it succeeds.
   Use the returned files, cursor, or status to choose a different next action.
-- A "list_files" result's "nextCursor" tells you whether there is more: if it is a number,
-  your NEXT "list_files" call for that SAME "prefix" must set "cursor" to exactly that
-  number to continue (this applies even when "truncated" is true and "files" is empty —
-  one entry was too large to list and was skipped, but "nextCursor" still moved past it);
-  if "nextCursor" is null, that prefix is fully listed and must not be repeated.
+- A "list_files" result's "nextCursor" is the ONLY thing that tells you whether there is
+  more, including when "truncated" is true: if "nextCursor" is a number, your NEXT
+  "list_files" call for that SAME "prefix" must set "cursor" to exactly that number to
+  continue (this applies even when "files" is empty — one entry was too large to list and
+  was skipped, but "nextCursor" still moved past it, so the listing is incomplete at that
+  position); if "nextCursor" is null, that prefix is fully listed and must not be repeated.
 - Call "finish" only when the acceptance criteria are met. Call "blocked" only when you
   cannot proceed and must stop.
 - Every reply is judged on its own: nothing you say outside the JSON is read.`;
@@ -286,24 +289,8 @@ export type OrnithPromptPreflight =
   | { readonly ok: true; readonly budget: OrnithPromptBudget }
   | {
       readonly ok: false;
-      /** The prompt does not fit the runtime window at all, at any tool-result budget. */
-      readonly kind: 'prompt_too_large';
       readonly reason: string;
       readonly requiredContextTokens: number;
-    }
-  | {
-      readonly ok: false;
-      /**
-       * The prompt fits, but the per-tool-result budget it leaves is too small to page a
-       * directory listing or file read usefully. Raising the context limit is a genuine
-       * fix here (see `maxToolResultBytes` grow with it), but it is not the ONLY fix, and
-       * blindly raising it without shrinking the specification just moves the same failure
-       * to a larger spec — so this is reported as a distinct kind with its own remediation
-       * rather than folded into `prompt_too_large`'s "raise the context limit" advice.
-       */
-      readonly kind: 'tool_result_budget_too_small';
-      readonly reason: string;
-      readonly maxToolResultBytes: number;
     };
 
 function promptBudgetFor(lease: OrnithPromptPreflightInput['lease']): OrnithPromptBudget {
@@ -383,27 +370,9 @@ Reply with exactly one JSON action now.`, 'utf8');
   const budget = { ...initialBudget, maxToolResultBytes };
   const requiredPromptBytes = authoritativeBytes + 2 + fixedBudgetBytesFor(maxToolResultBytes);
   const requiredWithFeedback = requiredPromptBytes + ORNITH_LIMITS.minRollingFeedbackBytes;
-  if (requiredWithFeedback <= budget.maxPromptBytes) {
-    if (budget.maxToolResultBytes < ORNITH_LIMITS.minUsefulToolResultBytes) {
-      return {
-        ok: false,
-        kind: 'tool_result_budget_too_small',
-        reason:
-          `The Ornith prompt fits, but only ${budget.maxToolResultBytes} bytes remain for each tool result after ` +
-          'reserving space for the specification and model output — too little to page a directory listing or ' +
-          'file read usefully (a handful of entries per round at most). Split the specification into smaller, ' +
-          'narrower sub-tasks so each leaves the model enough room to explore, or shorten its text; raising the ' +
-          'context limit can also genuinely help here (it grows this budget directly), but on its own it only ' +
-          'defers the same problem to a larger specification, so pair it with a smaller specification rather than ' +
-          'relying on it alone.',
-        maxToolResultBytes: budget.maxToolResultBytes
-      };
-    }
-    return { ok: true, budget };
-  }
+  if (requiredWithFeedback <= budget.maxPromptBytes) return { ok: true, budget };
   return {
     ok: false,
-    kind: 'prompt_too_large',
     reason:
       `The immutable Ornith prompt and minimum tool feedback need ${requiredWithFeedback} bytes, but the retained ` +
       `${input.lease.contextLimitTokens}-token runtime allows at most ${budget.maxPromptBytes} prompt bytes ` +
@@ -590,10 +559,8 @@ export class OrnithImplementationService {
     if (!promptPreflight.ok) {
       return finish(
         'fail',
-        promptPreflight.kind === 'prompt_too_large'
-          ? `${promptPreflight.reason} Increase the Local inference context limit to at least ` +
-            `${promptPreflight.requiredContextTokens} tokens and restart the runtime.`
-          : promptPreflight.reason,
+        `${promptPreflight.reason} Increase the Local inference context limit to at least ` +
+          `${promptPreflight.requiredContextTokens} tokens and restart the runtime.`,
         'configuration',
         ['limit_context_exceeded']
       );

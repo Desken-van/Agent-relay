@@ -49,25 +49,6 @@ export const ORNITH_LIMITS = {
   maxPromptBytes: 512 * 1024,
   maxCompletionBytes: 512 * 1024,
   maxToolResultBytes: 64 * 1024,
-  /**
-   * Below this, nothing useful can come back from ANY tool call, not just
-   * `list_files` — it is the same 512-byte reserve `dispatchToolAction` already
-   * subtracts from `maxToolResultBytes` before clamping a `read_file` request's
-   * own `limit` (see ornith-implementation.ts), so below it even a single-byte read
-   * chunk becomes degenerate. `list_files` itself degrades far more gracefully than
-   * that (it packs however many whole entries fit, however few, and always reports a
-   * correct `nextCursor`), so this floor is intentionally NOT set high enough to
-   * preemptively refuse every task with a merely tight per-result budget — an early
-   * design that used a much higher, spec-size-derived figure was shown in review to
-   * refuse legitimate small, single-file tasks (e.g. a modest context window
-   * combined with a larger configured output-token reserve) that never needed
-   * `list_files` at all and would have completed fine via smaller, more numerous
-   * reads. This floor exists only to fail closed before the genuinely degenerate
-   * case — reserved budget that cannot productively return anything at all — rather
-   * than to detect "this task will need a lot of exploration", which preflight has
-   * no reliable way to know from specification text alone.
-   */
-  minUsefulToolResultBytes: 512,
   /** Reserve room for the chat template/BOS and keep one action concise. */
   contextSafetyTokens: 512,
   maxTurnOutputTokens: 4_096,

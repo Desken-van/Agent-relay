@@ -1037,19 +1037,10 @@ export class Orchestrator {
         .filter((path): path is string => path !== null)
     ));
     if (checked.ok) return;
-    if (checked.kind === 'prompt_too_large') {
-      throw new AgentRelayError('VALIDATION_FAILED', checked.reason, {
-        remediation:
-          `Increase Settings → Local inference → Context limit to at least ` +
-          `${checked.requiredContextTokens} tokens, restart the runtime, and retry. No round was consumed.`
-      });
-    }
     throw new AgentRelayError('VALIDATION_FAILED', checked.reason, {
       remediation:
-        'Split this task into a smaller, narrower sub-task (fewer acceptance criteria, less implementation ' +
-        'detail) so it leaves Ornith room to page through files and tool results. If Settings → Local inference → ' +
-        'Context limit can be raised further, that also helps, but only alongside a smaller specification — raising ' +
-        'it alone does not fix this. No round was consumed.'
+        `Increase Settings → Local inference → Context limit to at least ` +
+        `${checked.requiredContextTokens} tokens, restart the runtime, and retry. No round was consumed.`
     });
   }
 

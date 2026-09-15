@@ -485,58 +485,6 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(secondPrompt).not.toContain('request a smaller page or read chunk');
   });
 
-  it('preflight refuses before any inference call when the prompt fits but leaves too little room for any tool result at all', async () => {
-    // This is deliberately a narrow, extreme case, not "any task with a tight
-    // budget": review of an earlier, higher threshold showed it refused legitimate
-    // small single-file tasks (e.g. a modest context window with a larger
-    // configured output-token reserve) that never needed list_files at all — a
-    // 15KB-implementation-prompt spec at a 32768-token context landed at 714 bytes
-    // per tool result, plenty for list_files to page gracefully (see the pagination
-    // test above), yet would have been wrongly refused by that earlier threshold.
-    // This test instead reproduces the genuinely degenerate case: a specification
-    // large enough that even a single-byte read chunk would not fit.
-    const oversizedSpecification: TaskSpecification = {
-      ...specification,
-      implementationPrompt: `Implement the approved scope. ${'x'.repeat(26_400)}`
-    };
-    const tightLease = lease();
-
-    const preflight = preflightOrnithPrompt({
-      specification: oversizedSpecification,
-      ruleEvidence: null,
-      acceptedPlanReviewAddenda: null,
-      correctionFindings: null,
-      round: 1,
-      maxRounds: 3,
-      lease: tightLease
-    });
-    expect(preflight.ok).toBe(false);
-    if (preflight.ok) return;
-    expect(preflight.kind).toBe('tool_result_budget_too_small');
-    expect(preflight.reason).toMatch(/split the specification|smaller.*sub-task/i);
-
-    let calls = 0;
-    const leaseService: OrnithInferenceLeaseService = {
-      acquireOrnithLease: async () => tightLease,
-      recheckOrnithLease: async () => true,
-      inferForOrnith: async (_lease, request) => {
-        calls += 1;
-        return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'not reached' }));
-      }
-    };
-
-    const result = await new OrnithImplementationService().implement({
-      ...baseRequest(leaseService, new AbortController().signal),
-      specification: oversizedSpecification,
-      lease: tightLease
-    });
-
-    expect(calls).toBe(0);
-    expect(result.assessment.reasonCodes).toContain('limit_context_exceeded');
-    expect(result.assessment.disposition).toBe('fail');
-    expect(result.finalMessage).toMatch(/split the specification|smaller.*sub-task/i);
-  });
-
   it('warns once and then stops an identical read-only action loop without dispatching duplicates', async () => {
     let calls = 0;
     const events: AgentProgressEvent[] = [];

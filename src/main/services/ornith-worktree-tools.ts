@@ -550,16 +550,24 @@ export class OrnithWorktreeTools {
         : manifest.filter((name) => name === prefix || name.startsWith(`${prefix}/`));
       const cursor = action.cursor ?? 0;
 
+      // Track the "files" array's own content size incrementally (each entry's quoted,
+      // escaped JSON length plus its separating comma) instead of re-stringifying the
+      // whole growing array on every candidate — the latter is O(n) work per iteration
+      // (O(n^2) overall) for what is otherwise a single linear pass.
       const page: string[] = [];
+      let filesArrayContentBytes = 0;
       let index = cursor;
       while (page.length < action.limit && index < matching.length) {
         const candidateNextCursor = index + 1 < matching.length ? index + 1 : null;
-        const candidateBytes = Buffer.byteLength(
-          JSON.stringify({ files: [...page, matching[index]], nextCursor: candidateNextCursor, total: matching.length }),
+        const skeletonBytes = Buffer.byteLength(
+          JSON.stringify({ files: [], nextCursor: candidateNextCursor, total: matching.length }),
           'utf8'
         );
+        const entryBytes = Buffer.byteLength(JSON.stringify(matching[index]), 'utf8') + (page.length > 0 ? 1 : 0);
+        const candidateBytes = skeletonBytes + filesArrayContentBytes + entryBytes;
         if (candidateBytes > maxResultBytes) break;
         page.push(matching[index]!);
+        filesArrayContentBytes += entryBytes;
         index += 1;
       }
 
@@ -583,7 +591,7 @@ export class OrnithWorktreeTools {
             nextCursor,
             total: matching.length,
             truncated: true,
-            reason: 'One entry did not fit the remaining tool-result byte budget and was skipped (not deleted — it is still counted in "total"). Continue with the returned nextCursor.'
+            reason: 'One entry at this position did not fit the remaining tool-result byte budget and could not be named here (it is still counted in "total", not deleted). This listing is INCOMPLETE at this prefix as a result: if the task depends on a file you have not otherwise located, it may be the one skipped here. Continue with the returned nextCursor.'
           },
           readBytes: 0,
           writeBytes: 0,
