@@ -139,7 +139,7 @@ export type OrnithDenialCode = (typeof ORNITH_DENIAL_CODES)[number];
 export function containsAbsoluteMachinePath(value: string): boolean {
   return /[A-Za-z]:[\\/]/.test(value) ||
     /\\\\[^\\/\s]+[\\/]/.test(value) ||
-    /(^|[\s=:[({,"'])\/(?!\/)[^\s)\]}"'>,;]*/m.test(value);
+    /(^|[\s=:[({,"'])\/(?!\/)[^\s)\]}"'>,;]+/m.test(value);
 }
 
 /** Replace machine-absolute path tokens in bounded, non-authoritative prose. */
@@ -147,7 +147,7 @@ export function redactAbsoluteMachinePaths(value: string): string {
   return value
     .replace(/\\\\[^\\/\s]+[\\/][^\s)\]}"'>,;]*/g, '[absolute-path-omitted]')
     .replace(/[A-Za-z]:[\\/][^\s)\]}"'>,;]*/g, '[absolute-path-omitted]')
-    .replace(/(^|[\s=:[({,"'])\/(?!\/)[^\s)\]}"'>,;]*/gm, '$1[absolute-path-omitted]');
+    .replace(/(^|[\s=:[({,"'])\/(?!\/)[^\s)\]}"'>,;]+/gm, '$1[absolute-path-omitted]');
 }
 
 /** True when `value` contains a C0 control character or DEL. No regex literal, so no escape-sequence corruption risk. */

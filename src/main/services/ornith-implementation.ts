@@ -112,6 +112,88 @@ interface RollingResult {
   readonly resultText: string;
 }
 
+const BOUND_TASK_WORKTREE_MARKER = '[bound task worktree]';
+
+function isBoundPathStartBoundary(value: string, index: number): boolean {
+  if (index === 0) return true;
+  return /[\s=:[({,"']/.test(value[index - 1] ?? '');
+}
+
+function isBoundPathEndBoundary(value: string, index: number): boolean {
+  if (index >= value.length) return true;
+  const character = value[index] ?? '';
+  if (/[\\/\s,;:!?()[\]{}"'<>]/.test(character)) return true;
+  return character === '.' && (index + 1 >= value.length || /\s/.test(value[index + 1] ?? ''));
+}
+
+/**
+ * Replace only a path that Relay has already bound and independently verified.
+ * Unknown host paths remain untouched so the general absolute-path check below
+ * still rejects them. A known root may be followed by a relative descendant;
+ * replacing just the root preserves that instruction without exposing a host
+ * location or directing the model at the non-isolated source checkout.
+ */
+function replaceBoundMachinePath(value: string, boundPath: string): string {
+  const trimmed = boundPath.replace(/[\\/]+$/, '');
+  if (
+    trimmed.length === 0 ||
+    /^[A-Za-z]:$/.test(trimmed) ||
+    /^(?:\\\\|\/\/)[^\\/]+$/.test(trimmed)
+  ) return value;
+  const forms = [...new Set([
+    trimmed,
+    trimmed.replaceAll('\\', '/'),
+    trimmed.replaceAll('/', '\\')
+  ])].sort((left, right) => right.length - left.length);
+
+  let output = value;
+  for (const form of forms) {
+    const caseInsensitive = /^[A-Za-z]:[\\/]/.test(form) || form.startsWith('\\\\');
+    let cursor = 0;
+    for (;;) {
+      const haystack = caseInsensitive ? output.toLowerCase() : output;
+      const needle = caseInsensitive ? form.toLowerCase() : form;
+      const index = haystack.indexOf(needle, cursor);
+      if (index < 0) break;
+      const end = index + form.length;
+      if (isBoundPathStartBoundary(output, index) && isBoundPathEndBoundary(output, end)) {
+        output = `${output.slice(0, index)}${BOUND_TASK_WORKTREE_MARKER}${output.slice(end)}`;
+        cursor = index + BOUND_TASK_WORKTREE_MARKER.length;
+      } else {
+        cursor = end;
+      }
+    }
+  }
+  return output;
+}
+
+export function normalizeOrnithPromptInput(
+  request: OrnithPromptPreflightInput,
+  boundPaths: readonly string[]
+): OrnithPromptPreflightInput {
+  const safe = (value: string): string => boundPaths
+    .reduce((current, boundPath) => replaceBoundMachinePath(current, boundPath), value);
+  return {
+    specification: {
+      ...request.specification,
+      title: safe(request.specification.title),
+      summary: safe(request.specification.summary),
+      acceptanceCriteria: request.specification.acceptanceCriteria.map(safe),
+      constraints: request.specification.constraints.map(safe),
+      assumptions: request.specification.assumptions.map(safe),
+      suggestedTests: request.specification.suggestedTests.map(safe),
+      implementationPrompt: safe(request.specification.implementationPrompt)
+    },
+    ruleEvidence: request.ruleEvidence === null ? null : safe(request.ruleEvidence),
+    acceptedPlanReviewAddenda:
+      request.acceptedPlanReviewAddenda === null ? null : safe(request.acceptedPlanReviewAddenda),
+    correctionFindings: request.correctionFindings === null ? null : safe(request.correctionFindings),
+    round: request.round,
+    maxRounds: request.maxRounds,
+    lease: request.lease
+  };
+}
+
 function renderSpecification(specification: TaskSpecification): string {
   return `=== THE APPROVED SPECIFICATION ===
 Title: ${specification.title}
@@ -385,6 +467,10 @@ export class OrnithImplementationService {
     });
 
     const deadline = Date.now() + request.loopDeadlineMs;
+    const promptInput = normalizeOrnithPromptInput(
+      request,
+      [request.worktreePath, request.repositoryPath]
+    );
     const rolling: RollingResult[] = [];
     let turnsUsed = 0;
     let nonterminalActionsUsed = 0;
@@ -410,14 +496,15 @@ export class OrnithImplementationService {
       }
     });
 
-    // These sources are authoritative and must be included byte-for-byte.
-    // Unsafe host paths or credentials therefore cause refusal before the
-    // first inference instead of being silently rewritten.
+    // These sources are authoritative. The only transport substitution is an
+    // exact, already-verified project/worktree root, represented by one stable
+    // logical marker. Unknown host paths and credentials still cause refusal
+    // before the first inference rather than being silently rewritten.
     const promptSources = [
-      renderSpecification(request.specification),
-      request.acceptedPlanReviewAddenda,
-      request.ruleEvidence,
-      request.correctionFindings
+      renderSpecification(promptInput.specification),
+      promptInput.acceptedPlanReviewAddenda,
+      promptInput.ruleEvidence,
+      promptInput.correctionFindings
     ].filter((value): value is string => value !== null);
     if (promptSources.some((value) => containsSecretShape(value) || containsAbsoluteMachinePath(value))) {
       return finish(
@@ -428,7 +515,7 @@ export class OrnithImplementationService {
       );
     }
 
-    const promptPreflight = preflightOrnithPrompt(request);
+    const promptPreflight = preflightOrnithPrompt(promptInput);
     if (!promptPreflight.ok) {
       return finish(
         'fail',
@@ -487,7 +574,7 @@ export class OrnithImplementationService {
         );
       }
 
-      const promptText = buildOrnithPromptText(request, rolling, {
+      const promptText = buildOrnithPromptText(promptInput, rolling, {
         turns: Math.max(0, ORNITH_LIMITS.maxModelTurns - turnsUsed),
         actions: Math.max(0, ORNITH_LIMITS.maxNonterminalActions - nonterminalActionsUsed),
         verifications: Math.max(0, ORNITH_LIMITS.maxVerificationCalls - verificationsUsed),
