@@ -196,6 +196,13 @@ describe('publishing when approved', () => {
     const after = harness.tasks.findById(taskId);
     expect(after?.status).toBe('READY_TO_PUBLISH');
     expect(after?.lastError).toContain('already exists');
+
+    const failedRun = harness.runs.listByTask(taskId).findLast((run) => run.runType === 'github');
+    expect(failedRun?.status).toBe('failed');
+    expect(JSON.parse(failedRun?.structuredResult ?? '{}')).toEqual({
+      action: 'create_repository',
+      url: null
+    });
   });
 });
 

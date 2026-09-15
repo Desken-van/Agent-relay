@@ -73,7 +73,7 @@ export function Notice({
   tone,
   children
 }: {
-  tone: 'info' | 'warn' | 'error';
+  tone: 'info' | 'success' | 'warn' | 'error';
   children: ReactNode;
 }): React.JSX.Element {
   return <div className={`notice notice--${tone}`}>{children}</div>;

@@ -322,7 +322,11 @@ export class PublishService {
       return { ...outcome, action: request.action, approvalId: approval.id, performed: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      handle.finish({ status: 'failed', errorMessage: message });
+      handle.finish({
+        status: 'failed',
+        errorMessage: message,
+        structuredResult: { action: request.action, url: null }
+      });
 
       // Return to READY_TO_PUBLISH rather than FAILED: the user can fix the
       // cause (log in to gh, push first) and try the same step again.
