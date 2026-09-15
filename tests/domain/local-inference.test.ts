@@ -572,6 +572,15 @@ describe('local inference request', () => {
     );
     expect(parsed.chatTemplateParameters).toEqual({ enable_thinking: false });
   });
+
+  it('accepts only the closed application-owned structured-output profile', () => {
+    expect(
+      localInferenceRequestSchema.safeParse(request({ structuredOutput: 'ornith_action_v1' })).success
+    ).toBe(true);
+    expect(
+      localInferenceRequestSchema.safeParse(request({ structuredOutput: 'arbitrary_schema' })).success
+    ).toBe(false);
+  });
 });
 
 describe('local inference prompt', () => {

@@ -373,6 +373,148 @@ export const ornithActionSchema = z.discriminatedUnion('action', [
 export type OrnithAction = z.infer<typeof ornithActionSchema>;
 export type OrnithActionKind = OrnithAction['action'];
 
+/**
+ * The runtime-side grammar for one Ornith action. This intentionally constrains
+ * JSON structure and numeric/cardinality bounds only; the Zod schemas above
+ * remain authoritative for path, credential-shape, byte and semantic checks.
+ * Avoiding regex/ref features also keeps llama.cpp schema-to-grammar conversion
+ * on its small, deterministic subset.
+ */
+export const ORNITH_ACTION_JSON_SCHEMA = {
+  type: 'object',
+  oneOf: [
+    {
+      type: 'object',
+      properties: {
+        version: { const: ORNITH_PROTOCOL_VERSION },
+        action: { const: 'list_files' },
+        prefix: { type: 'string' },
+        cursor: { type: 'integer', minimum: 0 },
+        limit: { type: 'integer', minimum: 1, maximum: ORNITH_LIMITS.maxListFilesLimit }
+      },
+      required: ['version', 'action', 'prefix', 'limit'],
+      additionalProperties: false
+    },
+    {
+      type: 'object',
+      properties: {
+        version: { const: ORNITH_PROTOCOL_VERSION },
+        action: { const: 'read_file' },
+        path: { type: 'string' },
+        offset: { type: 'integer', minimum: 0 },
+        limit: { type: 'integer', minimum: 1, maximum: ORNITH_LIMITS.maxReadBytes }
+      },
+      required: ['version', 'action', 'path', 'offset', 'limit'],
+      additionalProperties: false
+    },
+    {
+      type: 'object',
+      properties: {
+        version: { const: ORNITH_PROTOCOL_VERSION },
+        action: { const: 'search_text' },
+        query: { type: 'string', minLength: 1, maxLength: ORNITH_LIMITS.maxSearchQueryLength },
+        caseSensitive: { type: 'boolean' },
+        files: { type: 'array', items: { type: 'string' }, maxItems: ORNITH_LIMITS.maxSearchFiles },
+        limit: { type: 'integer', minimum: 1, maximum: ORNITH_LIMITS.maxSearchMatches }
+      },
+      required: ['version', 'action', 'query', 'caseSensitive', 'limit'],
+      additionalProperties: false
+    },
+    {
+      type: 'object',
+      properties: {
+        version: { const: ORNITH_PROTOCOL_VERSION },
+        action: { const: 'create_file' },
+        path: { type: 'string' },
+        content: { type: 'string' }
+      },
+      required: ['version', 'action', 'path', 'content'],
+      additionalProperties: false
+    },
+    {
+      type: 'object',
+      properties: {
+        version: { const: ORNITH_PROTOCOL_VERSION },
+        action: { const: 'replace_text' },
+        path: { type: 'string' },
+        sha256: { type: 'string' },
+        replacements: {
+          type: 'array',
+          minItems: 1,
+          maxItems: ORNITH_LIMITS.maxReplacements,
+          items: {
+            type: 'object',
+            properties: { oldText: { type: 'string' }, newText: { type: 'string' } },
+            required: ['oldText', 'newText'],
+            additionalProperties: false
+          }
+        }
+      },
+      required: ['version', 'action', 'path', 'sha256', 'replacements'],
+      additionalProperties: false
+    },
+    {
+      type: 'object',
+      properties: {
+        version: { const: ORNITH_PROTOCOL_VERSION },
+        action: { const: 'delete_file' },
+        path: { type: 'string' },
+        sha256: { type: 'string' }
+      },
+      required: ['version', 'action', 'path', 'sha256'],
+      additionalProperties: false
+    },
+    {
+      type: 'object',
+      properties: {
+        version: { const: ORNITH_PROTOCOL_VERSION },
+        action: { const: 'git_status' }
+      },
+      required: ['version', 'action'],
+      additionalProperties: false
+    },
+    {
+      type: 'object',
+      properties: {
+        version: { const: ORNITH_PROTOCOL_VERSION },
+        action: { const: 'git_diff' },
+        paths: { type: 'array', items: { type: 'string' }, maxItems: ORNITH_LIMITS.maxGitDiffPaths }
+      },
+      required: ['version', 'action'],
+      additionalProperties: false
+    },
+    {
+      type: 'object',
+      properties: {
+        version: { const: ORNITH_PROTOCOL_VERSION },
+        action: { const: 'run_verification' }
+      },
+      required: ['version', 'action'],
+      additionalProperties: false
+    },
+    {
+      type: 'object',
+      properties: {
+        version: { const: ORNITH_PROTOCOL_VERSION },
+        action: { const: 'finish' },
+        summary: { type: 'string', minLength: 1, maxLength: ORNITH_LIMITS.maxFinishSummaryChars }
+      },
+      required: ['version', 'action', 'summary'],
+      additionalProperties: false
+    },
+    {
+      type: 'object',
+      properties: {
+        version: { const: ORNITH_PROTOCOL_VERSION },
+        action: { const: 'blocked' },
+        reason: { type: 'string', minLength: 1, maxLength: ORNITH_LIMITS.maxBlockedReasonChars }
+      },
+      required: ['version', 'action', 'reason'],
+      additionalProperties: false
+    }
+  ]
+} as const;
+
 export const ORNITH_ACTION_KINDS: readonly OrnithActionKind[] = [
   'list_files',
   'read_file',

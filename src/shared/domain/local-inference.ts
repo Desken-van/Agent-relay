@@ -678,6 +678,14 @@ export const localInferencePromptSchema = localInferenceMessageSchema.shape.cont
 export type LocalInferencePrompt = z.infer<typeof localInferencePromptSchema>;
 
 /**
+ * Application-owned structured-output profiles understood by the retained
+ * runtime adapter. A closed identifier keeps arbitrary renderer/model supplied
+ * JSON schemas out of the generic local-inference boundary.
+ */
+export const localInferenceStructuredOutputSchema = z.enum(['ornith_action_v1']);
+export type LocalInferenceStructuredOutput = z.infer<typeof localInferenceStructuredOutputSchema>;
+
+/**
  * One inference request.
  *
  * Note what is absent and cannot be added without changing this schema: tools,
@@ -700,7 +708,8 @@ export const localInferenceRequestSchema = z
       LOCAL_INFERENCE_LIMITS.outputTokensMax,
       'The request output token cap'
     ).optional(),
-    chatTemplateParameters: chatTemplateParametersSchema.optional()
+    chatTemplateParameters: chatTemplateParametersSchema.optional(),
+    structuredOutput: localInferenceStructuredOutputSchema.optional()
   })
   .strict();
 
