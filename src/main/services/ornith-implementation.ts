@@ -251,10 +251,9 @@ Rules:
   Use the returned files, cursor, or status to choose a different next action.
 - A "list_files" result's "nextCursor" tells you whether there is more: if it is a number,
   your NEXT "list_files" call for that SAME "prefix" must set "cursor" to exactly that
-  number to continue; if it is null, that prefix is fully listed and must not be repeated.
-  If a "list_files" result instead comes back with "truncated": true and no files (the
-  entry at that cursor was too large to return), retry with a narrower "prefix" or a
-  smaller "limit" rather than repeating the identical request.
+  number to continue (this applies even when "truncated" is true and "files" is empty —
+  one entry was too large to list and was skipped, but "nextCursor" still moved past it);
+  if "nextCursor" is null, that prefix is fully listed and must not be repeated.
 - Call "finish" only when the acceptance criteria are met. Call "blocked" only when you
   cannot proceed and must stop.
 - Every reply is judged on its own: nothing you say outside the JSON is read.`;

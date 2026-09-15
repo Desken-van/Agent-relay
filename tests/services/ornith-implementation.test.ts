@@ -485,28 +485,24 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(secondPrompt).not.toContain('request a smaller page or read chunk');
   });
 
-  it('preflight refuses before any inference call when the prompt fits but leaves too little room to page tool results usefully', async () => {
-    // Reproduces the reported real-run condition mechanically: a large, monolithic
-    // specification (comparable to the "durable hierarchical project roadmaps" task)
-    // against a context limit generous enough that the prompt itself fits, but leaves
-    // only a few hundred bytes per tool result — nowhere near enough to page a
-    // directory listing usefully. This must be refused before the first inference call,
-    // with guidance toward decomposing the specification, not toward the single "raise
-    // the context limit" remediation that would only defer the same failure to a
-    // larger specification.
-    const largeSpecification: TaskSpecification = {
-      title: 'Implement durable hierarchical project roadmaps',
-      summary: 'x'.repeat(2_000),
-      acceptanceCriteria: Array.from({ length: 20 }, (_, i) => `Criterion ${i}: ${'y'.repeat(150)}`),
-      constraints: Array.from({ length: 10 }, (_, i) => `Constraint ${i}: ${'z'.repeat(150)}`),
-      assumptions: Array.from({ length: 5 }, (_, i) => `Assumption ${i}`),
-      suggestedTests: Array.from({ length: 10 }, (_, i) => `Test ${i}: ${'w'.repeat(100)}`),
-      implementationPrompt: 'q'.repeat(15_000)
+  it('preflight refuses before any inference call when the prompt fits but leaves too little room for any tool result at all', async () => {
+    // This is deliberately a narrow, extreme case, not "any task with a tight
+    // budget": review of an earlier, higher threshold showed it refused legitimate
+    // small single-file tasks (e.g. a modest context window with a larger
+    // configured output-token reserve) that never needed list_files at all — a
+    // 15KB-implementation-prompt spec at a 32768-token context landed at 714 bytes
+    // per tool result, plenty for list_files to page gracefully (see the pagination
+    // test above), yet would have been wrongly refused by that earlier threshold.
+    // This test instead reproduces the genuinely degenerate case: a specification
+    // large enough that even a single-byte read chunk would not fit.
+    const oversizedSpecification: TaskSpecification = {
+      ...specification,
+      implementationPrompt: `Implement the approved scope. ${'x'.repeat(26_400)}`
     };
-    const tightLease = lease({ contextLimitTokens: 32_768, maxOutputTokens: 4_096 });
+    const tightLease = lease();
 
     const preflight = preflightOrnithPrompt({
-      specification: largeSpecification,
+      specification: oversizedSpecification,
       ruleEvidence: null,
       acceptedPlanReviewAddenda: null,
       correctionFindings: null,
@@ -531,7 +527,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
 
     const result = await new OrnithImplementationService().implement({
       ...baseRequest(leaseService, new AbortController().signal),
-      specification: largeSpecification,
+      specification: oversizedSpecification,
       lease: tightLease
     });
 

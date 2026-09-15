@@ -592,7 +592,7 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(seen.size).toBe(tightForModel.files.length + resumedForModel.files.length);
     });
 
-    it('returns a small metadata-preserving stub, not the generic truncation stub, when even one entry does not fit', async () => {
+    it('skips past a single entry that does not fit instead of stalling on it forever', async () => {
       const boundary = tools();
       const result = await boundary.listFiles(
         { version: 1, action: 'list_files', prefix: '', limit: 200 },
@@ -605,14 +605,29 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       // Fixed-shape stub (two integers, a boolean, and a constant-length message) —
       // small by construction regardless of how tiny the requested budget was.
       expect(Buffer.byteLength(JSON.stringify(result.forModel), 'utf8')).toBeLessThanOrEqual(400);
+      // nextCursor must advance past the unlistable entry (index 0), not stay at it —
+      // otherwise a model that faithfully resubmits `cursor: nextCursor` would send
+      // the identical request forever instead of making progress.
       expect(result.forModel).toMatchObject({
         files: [],
-        nextCursor: 0,
+        nextCursor: 1,
         total: 41,
         truncated: true
       });
       const forModel = result.forModel as { reason: string };
       expect(forModel.reason).toContain('byte budget');
+
+      // Resuming from the reported nextCursor must reach real, listable entries —
+      // proving the skip is an escape hatch, not a dead end.
+      const resumed = await boundary.listFiles(
+        { version: 1, action: 'list_files', prefix: '', limit: 200, cursor: 1 },
+        undefined,
+        300
+      );
+      expect(resumed).toMatchObject({ ok: true });
+      if (!resumed.ok) throw new Error('unreachable');
+      const resumedForModel = resumed.forModel as { files: string[] };
+      expect(resumedForModel.files.length).toBeGreaterThan(0);
     });
   });
 });

@@ -564,22 +564,30 @@ export class OrnithWorktreeTools {
       }
 
       if (page.length === 0 && index < matching.length) {
-        // Not even the single next entry fits the remaining byte budget. Return a
-        // fixed-shape, always-small stub that still carries `nextCursor` (left at
-        // `cursor`, since nothing was skipped) and `total` rather than falling
-        // through to the fully generic truncation stub that drops them.
+        // Not even the single next entry fits the remaining byte budget — an
+        // unusually long path. Leaving `nextCursor` at `cursor` here would make the
+        // model resubmit an identical request forever (the no-progress guard would
+        // then stop the run on an entry that was never actually unreachable, just
+        // unlistable by name). Skip past it instead: advance `nextCursor` by one so
+        // the rest of the listing stays reachable, and keep `total` unchanged so the
+        // skip is visible rather than silently shrinking the count. The one skipped
+        // path's own content remains reachable through other means (e.g. search_text
+        // or read_file, if the model already knows or can otherwise learn its name);
+        // list_files' job here is to keep the enumeration itself making progress.
+        const skippedIndex = index;
+        const nextCursor = skippedIndex + 1 < matching.length ? skippedIndex + 1 : null;
         return {
           ok: true,
           forModel: {
             files: [],
-            nextCursor: cursor,
+            nextCursor,
             total: matching.length,
             truncated: true,
-            reason: 'The next entry did not fit the remaining tool-result byte budget. Retry this same list_files request (same prefix and cursor) once more budget is available.'
+            reason: 'One entry did not fit the remaining tool-result byte budget and was skipped (not deleted — it is still counted in "total"). Continue with the returned nextCursor.'
           },
           readBytes: 0,
           writeBytes: 0,
-          auditSummary: `list_files prefix="${prefix}" -> 0 of ${matching.length} (next entry exceeded byte budget)`
+          auditSummary: `list_files prefix="${prefix}" -> 0 of ${matching.length} (entry at index ${skippedIndex} skipped: exceeded byte budget)`
         };
       }
 
