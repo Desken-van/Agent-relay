@@ -288,6 +288,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       Math.floor((16_384 - ORNITH_LIMITS.contextSafetyTokens) / 4)
     );
     for (const request of requests) {
+      expect(request.structuredOutput).toBe('ornith_action_v1');
       expect(request.maxOutputTokens).toBe(expectedOutputTokens);
       const bytes = request.messages.reduce(
         (sum, message) => sum + Buffer.byteLength(message.content, 'utf8'),
@@ -488,6 +489,35 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(events.some((event) => event.text.includes('loop stopped'))).toBe(true);
   });
 
+  it('does not reread an identical file chunk while the model ignores its result', async () => {
+    writeFileSync(join(worktree, 'repeat.txt'), 'repeat me', 'utf8');
+    let calls = 0;
+    const repeated = JSON.stringify({
+      version: 1,
+      action: 'read_file',
+      path: 'repeat.txt',
+      offset: 0,
+      limit: 64
+    });
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        calls += 1;
+        return completed(request, repeated);
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal)
+    );
+
+    expect(calls).toBe(3);
+    expect(result.assessment.reasonCodes).toContain('no_progress_loop');
+    expect(result.ornithAudit.actions).toBe(3);
+    expect(result.ornithAudit.readBytes).toBe(Buffer.byteLength('repeat me'));
+  });
+
   it('does not retry malformed output or execute a following action', async () => {
     let calls = 0;
     const leaseService: OrnithInferenceLeaseService = {
@@ -536,11 +566,11 @@ describe('OrnithImplementationService limits and cancellation', () => {
     const content = 'x'.repeat(ORNITH_LIMITS.maxFileBytes);
     writeFileSync(join(worktree, 'large.txt'), content, 'utf8');
     let calls = 0;
-    const actions = Array.from({ length: 5 }, () => JSON.stringify({
+    const actions = Array.from({ length: 5 }, (_unused, offset) => JSON.stringify({
       version: 1,
       action: 'read_file',
       path: 'large.txt',
-      offset: 0,
+      offset,
       limit: 1
     }));
     actions.push(JSON.stringify({ version: 1, action: 'finish', summary: 'must not be reached' }));

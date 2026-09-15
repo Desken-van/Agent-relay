@@ -247,7 +247,7 @@ Rules:
   re-verifies afterward regardless.
 - Use a narrow prefix or a small page when listing files. If a tool result says it was
   truncated, retry with a smaller limit or a more specific prefix.
-- Never repeat an identical list_files, git_status, or git_diff action after it succeeds.
+- Never repeat an identical list_files, read_file, search_text, git_status, or git_diff action after it succeeds.
   Use the returned files, cursor, or status to choose a different next action.
 - Call "finish" only when the acceptance criteria are met. Call "blocked" only when you
   cannot proceed and must stop.
@@ -628,7 +628,8 @@ export class OrnithImplementationService {
         version: LOCAL_INFERENCE_CONTRACT_VERSION,
         requestId,
         messages: toMessages(promptText),
-        maxOutputTokens: promptBudget.maxOutputTokens
+        maxOutputTokens: promptBudget.maxOutputTokens,
+        structuredOutput: 'ornith_action_v1'
       };
 
       turnsUsed += 1;
@@ -986,6 +987,8 @@ export class OrnithImplementationService {
 
 function isNoProgressGuardAction(action: OrnithAction): boolean {
   return action.action === 'list_files' ||
+    action.action === 'read_file' ||
+    action.action === 'search_text' ||
     action.action === 'git_status' ||
     action.action === 'git_diff';
 }

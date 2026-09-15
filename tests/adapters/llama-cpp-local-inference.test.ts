@@ -31,6 +31,7 @@ import {
   LOCAL_INFERENCE_CONTRACT_VERSION,
   type LocalInferenceRequest
 } from '../../src/shared/domain/local-inference';
+import { ORNITH_ACTION_JSON_SCHEMA } from '../../src/shared/domain/ornith';
 import { FAKE_LOCAL_INFERENCE_RUNTIME } from '../helpers/fake-local-inference';
 
 /* -------------------------------------------------------------------------- */
@@ -493,6 +494,7 @@ describe('local inference request', () => {
     // Never the machine-local model source.
     expect(JSON.stringify(body)).not.toContain('ornith-8b-q4');
     expect('chat_template_kwargs' in body).toBe(false);
+    expect('response_format' in body).toBe(false);
   });
 
   it('lowers but never raises the configured output cap', async () => {
@@ -514,6 +516,20 @@ describe('local inference request', () => {
     expect(JSON.parse(String(posts(calls)[0]?.init.body)).chat_template_kwargs).toEqual({
       enable_thinking: false,
       preserve_thinking: true
+    });
+  });
+
+  it('maps the closed Ornith profile to a strict runtime-owned JSON schema', async () => {
+    const { provider, calls } = await started(() => json(completion()), { maxRequestBytes: 50_000 });
+    await provider.infer(request({ structuredOutput: 'ornith_action_v1' }));
+
+    expect(JSON.parse(String(posts(calls)[0]?.init.body)).response_format).toEqual({
+      type: 'json_schema',
+      json_schema: {
+        name: 'ornith_action_v1',
+        strict: true,
+        schema: ORNITH_ACTION_JSON_SCHEMA
+      }
     });
   });
 

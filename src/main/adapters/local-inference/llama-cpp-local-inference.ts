@@ -58,6 +58,7 @@ import {
   type LocalInferenceState
 } from '../../../shared/domain/local-inference';
 import { redactSecrets } from '../../../shared/util/redact';
+import { ORNITH_ACTION_JSON_SCHEMA } from '../../../shared/domain/ornith';
 import {
   unsafeProviderIdentity,
   unsafeProviderLocatorId,
@@ -1064,7 +1065,19 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
       // values, and a template parameter that means "off" has to arrive as off.
       ...(effectiveChatTemplateParameters === undefined
         ? {}
-        : { chat_template_kwargs: effectiveChatTemplateParameters })
+        : { chat_template_kwargs: effectiveChatTemplateParameters }),
+      ...(parsed.structuredOutput === 'ornith_action_v1'
+        ? {
+            response_format: {
+              type: 'json_schema',
+              json_schema: {
+                name: 'ornith_action_v1',
+                strict: true,
+                schema: ORNITH_ACTION_JSON_SCHEMA
+              }
+            }
+          }
+        : {})
     });
 
     const requestBytes = Buffer.byteLength(bodyText, 'utf8');
