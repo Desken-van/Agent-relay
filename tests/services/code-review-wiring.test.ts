@@ -95,12 +95,26 @@ class CountingClient implements ExternalMcpClient {
 }
 
 describe('the trusted code-review configuration', () => {
-  it('pins the exact ten-tool profile from the main process', () => {
+  it('pins the audited Coai 0.22 plan profile by name', () => {
+    expect(COAI_PLAN_PROFILE).toEqual([
+      'providers',
+      'open',
+      'review_plan',
+      'review_code',
+      'review_document',
+      'consult',
+      'resolve',
+      'status',
+      'ask_human'
+    ]);
+  });
+
+  it('pins the exact twelve-tool profile from the main process', () => {
     const config = externalCodeReviewConfig(settings());
 
     expect(config.allowedTools).toEqual(COAI_ADDRESSABLE_PROFILE);
-    expect(config.allowedTools).toHaveLength(10);
-    // The seven plan tools are a prefix, not the profile: code review needs the
+    expect(config.allowedTools).toHaveLength(12);
+    // The nine plan tools are a prefix, not the profile: code review needs the
     // three that make a round addressable.
     expect(config.allowedTools).not.toEqual(COAI_PLAN_PROFILE);
     expect(config.executablePath).toBe('C:\\tools\\coai-mcp.exe');
@@ -169,7 +183,7 @@ describe('the code reviewer the app actually runs', () => {
     expect(status.kind === 'unknown' && status.reason).toMatch(/not configured/i);
   });
 
-  it('reports the installed legacy server as unsupported, without calling a tool', async () => {
+  it('reports the installed plan-only server as unsupported, without calling a tool', async () => {
     const client = new CountingClient();
     client.tools = COAI_PLAN_PROFILE;
     const reviewer = new SettingsBoundCodeReviewer({ settings: () => settings(), client });
@@ -218,17 +232,17 @@ describe('the code reviewer the app actually runs', () => {
 });
 
 describe('the profile both gates are configured with', () => {
-  it('is the seven-tool one while code review is off', () => {
+  it('is the nine-tool one while code review is off', () => {
     const off = settings({ externalPlanReviewEnabled: true, externalCodeReviewEnabled: false });
 
     expect(externalPlanReviewConfig(off).allowedTools).toEqual(COAI_PLAN_PROFILE);
-    expect(externalPlanReviewConfig(off).allowedTools).toHaveLength(7);
+    expect(externalPlanReviewConfig(off).allowedTools).toHaveLength(9);
     // And code review is simply not configurable then.
     expect(() => externalCodeReviewConfig(off)).toThrow(/disabled/i);
   });
 
-  it('is the ten-tool one for BOTH gates once code review is on', () => {
-    // The defect this pins: the plan gate used to hardcode seven, so enabling
+  it('is the twelve-tool one for BOTH gates once code review is on', () => {
+    // The defect this pins: the plan gate used to hardcode nine, so enabling
     // code review pointed the two gates at one server with two different exact
     // tool lists — and the transport, which compares exactly, would refuse the
     // plan gate against the very server that supports both.
@@ -268,7 +282,7 @@ describe('the profile both gates are configured with', () => {
       () => new CoaiPlanReviewer(client, { ...config, allowedTools: [...COAI_PLAN_PROFILE, 'extra'] })
     ).toThrow(/audited profiles/i);
     expect(
-      () => new CoaiPlanReviewer(client, { ...config, allowedTools: COAI_PLAN_PROFILE.slice(0, 6) })
+      () => new CoaiPlanReviewer(client, { ...config, allowedTools: COAI_PLAN_PROFILE.slice(0, 8) })
     ).toThrow(/audited profiles/i);
   });
 });
@@ -310,12 +324,12 @@ describe('the two gates describe one server', () => {
       expect(config.cwd).toBe('C:/work');
     }
 
-    // And the profile stays exact: ten tools, because code review is on.
+    // And the profile stays exact: twelve tools, because code review is on.
     expect(plan.allowedTools).toEqual(COAI_ADDRESSABLE_PROFILE);
     expect(code.allowedTools).toEqual(COAI_ADDRESSABLE_PROFILE);
   });
 
-  it('leaves the plan gate on the seven-tool profile when code review is off', () => {
+  it('leaves the plan gate on the nine-tool profile when code review is off', () => {
     const plan = externalPlanReviewConfig(
       settings({ externalPlanReviewEnabled: true, externalCodeReviewEnabled: false })
     );

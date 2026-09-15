@@ -244,7 +244,7 @@ export class SettingsBoundCodeReviewer implements ExternalCodeReviewer {
         'External code review is not enabled, so no round can be reserved or run.',
         {
           remediation:
-            'Enable external code review in Settings and point it at an MCP server that advertises the addressable ten-tool profile.'
+            'Enable external code review in Settings and point it at an MCP server that advertises the addressable twelve-tool profile.'
         }
       );
     }

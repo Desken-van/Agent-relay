@@ -319,13 +319,13 @@ describe('Coai plan reviewer adapter', () => {
           allowedTools: [...COAI_PLAN_PROFILE, 'something_new']
         })
     ).toThrow(/audited profiles/i);
-    // Ten names with a duplicate standing in for a missing one is still not the
-    // ten-tool profile, however the counts line up.
+    // Twelve names with a duplicate standing in for a missing one is still not
+    // the twelve-tool profile, however the counts line up.
     expect(
       () =>
         new CoaiPlanReviewer(new FakeMcpClient(), {
           ...config,
-          allowedTools: [...COAI_ADDRESSABLE_PROFILE.slice(0, 9), 'run_round']
+          allowedTools: [...COAI_ADDRESSABLE_PROFILE.slice(0, 11), 'run_round']
         })
     ).toThrow(/audited profiles/i);
   });

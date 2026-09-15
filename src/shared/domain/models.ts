@@ -408,8 +408,8 @@ export const settingsSchema = z.object({
   /**
    * Opt-in, and separate from plan review because the capability is separate.
    *
-   * Code review needs the addressable ten-tool profile; plan review needs seven.
-   * A deployment whose server has only the seven can run the plan gate and must
+   * Code review needs the addressable twelve-tool profile; plan review needs nine.
+   * A deployment whose server has only the nine can run the plan gate and must
    * still be refused code review, so one flag could not answer for both.
    * Defaults to false: an integration nobody enabled must not reach a provider.
    */

@@ -68,7 +68,7 @@ function tool(name: string): ExternalMcpTool {
 class FakeMcpClient implements ExternalMcpClient {
   readonly calls: { tool: string; args: Readonly<Record<string, unknown>> }[] = [];
   responses: ExternalMcpCallResult[] = [];
-  /** What `tools/list` reports. The ten-tool profile unless a test says otherwise. */
+  /** What `tools/list` reports. The twelve-tool profile unless a test says otherwise. */
   tools: readonly string[] = COAI_ADDRESSABLE_PROFILE;
   discoveryError: Error | null = null;
   callError: Error | null = null;
@@ -173,25 +173,25 @@ describe('the Coai code reviewer adapter', () => {
   it('refuses to be built on anything but the exact addressable profile', () => {
     expect(() => new CoaiCodeReviewer(new FakeMcpClient(), config)).not.toThrow();
 
-    // The legacy server. It has `review_code`, and that is exactly the tool this
+    // The plan-only server. It has `review_code`, and that is exactly the tool this
     // adapter must never fall back to.
     expect(
       () => new CoaiCodeReviewer(new FakeMcpClient(), { ...config, allowedTools: COAI_PLAN_PROFILE })
-    ).toThrow(/ten-tool profile/i);
+    ).toThrow(/twelve-tool profile/i);
     expect(
       () =>
         new CoaiCodeReviewer(new FakeMcpClient(), {
           ...config,
           allowedTools: [...COAI_ADDRESSABLE_PROFILE, 'something_new']
         })
-    ).toThrow(/ten-tool profile/i);
+    ).toThrow(/twelve-tool profile/i);
     expect(
       () =>
         new CoaiCodeReviewer(new FakeMcpClient(), {
           ...config,
-          allowedTools: [...COAI_ADDRESSABLE_PROFILE.slice(0, 9), 'run_round']
+          allowedTools: [...COAI_ADDRESSABLE_PROFILE.slice(0, 11), 'run_round']
         })
-    ).toThrow(/ten-tool profile/i);
+    ).toThrow(/twelve-tool profile/i);
   });
 
   it('never claims to read uncommitted work, and files rounds under one identity', () => {
@@ -215,7 +215,7 @@ describe('the Coai code reviewer adapter', () => {
     expect(client.toolsCalled).toEqual([]);
   });
 
-  it('reports the legacy server as unsupported, naming what is missing', async () => {
+  it('reports the plan-only server as unsupported, naming what is missing', async () => {
     const client = new FakeMcpClient();
     client.tools = COAI_PLAN_PROFILE;
 

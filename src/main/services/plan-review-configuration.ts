@@ -114,11 +114,11 @@ export function assertExternalPlanReviewSettings(settings: Settings): void {
  *
  * One server serves both gates, so the profile is decided by what is switched
  * on rather than by which gate is asking. With code review off, that is the
- * seven plan tools; with it on, the ten. It is never a subset, a minimum or a
+ * nine plan tools; with it on, the twelve. It is never a subset, a minimum or a
  * superset: the transport compares the server's list to this one exactly, and a
  * profile nobody audited fails closed either way.
  *
- * The alternative — pinning the plan gate to seven for ever — would refuse the
+ * The alternative — pinning the plan gate to nine for ever — would refuse the
  * addressable server outright, so enabling code review would silently break
  * plan review against the very server that supports both.
  */

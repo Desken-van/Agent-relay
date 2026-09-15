@@ -16,7 +16,7 @@
  */
 
 /**
- * The seven-tool plan profile — what the currently installed Coai server is.
+ * The nine-tool Coai 0.22 plan profile — what the currently installed server is.
  *
  * Plan review works against exactly this, and code review provably cannot: the
  * three tools an addressable round needs are absent, and `review_code` alone
@@ -27,13 +27,15 @@ export const COAI_PLAN_PROFILE = [
   'open',
   'review_plan',
   'review_code',
+  'review_document',
+  'consult',
   'resolve',
   'status',
   'ask_human'
 ] as const;
 
 /**
- * The ten-tool addressable profile — the seven above plus the round lifecycle.
+ * The twelve-tool addressable profile — the nine above plus the round lifecycle.
  *
  * `reserve_round` names a round before anything runs, `run_round` dispatches
  * exactly that name, and `round_status` reads exactly that name back. Agent

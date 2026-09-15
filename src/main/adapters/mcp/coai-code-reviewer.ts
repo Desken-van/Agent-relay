@@ -171,10 +171,10 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
     if (!isAuditedProfile(config.allowedTools, COAI_ADDRESSABLE_PROFILE)) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
-        'The Coai code reviewer requires its exact audited ten-tool profile.',
+        'The Coai code reviewer requires its exact audited twelve-tool profile.',
         {
           remediation:
-            'Code review needs reserve_round, run_round and round_status alongside the seven plan tools.'
+            'Code review needs reserve_round, run_round and round_status alongside the nine plan tools.'
         }
       );
     }
@@ -198,7 +198,7 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
    * Can a round run right now? Read-only, and never a consuming call.
    *
    * Discovery alone answers it: the transport refuses a server whose tool list
-   * is not exactly this profile, so a legacy seven-tool server fails here —
+   * is not exactly this profile, so a plan-only nine-tool server fails here —
    * before `CodeReviewService` writes any durable intent — and the reason names
    * what is missing rather than saying the call failed.
    */
