@@ -690,22 +690,104 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(tightForModel.truncated).toBe(true);
     });
 
-    it('never lets a byte-tight search_text result collapse to the generic metadata-free stub', async () => {
+    it('fails closed rather than returning the dead-end {matches:[],truncated:true} when every real match is individually oversized', async () => {
       const boundary = tools();
-      // A budget too small for even one {path,line} match plus the {matches:[],
-      // truncated:true} skeleton around it would, for list_files, need a fail-closed
-      // denial — but search_text's empty-result skeleton is tiny (no long explanatory
-      // reason string), so even a very tight budget can honestly report zero matches.
+      // Each of the 30 fixture files has one match, and each {path,line} entry for
+      // them is 42 bytes — a 40-byte budget cannot fit even one. Silently returning
+      // ok:true with an empty array here would be a dead end (no cursor to skip past
+      // whichever match blocked it), so this must fail the action closed instead.
       const result = await boundary.searchText(
         { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 30 },
         undefined,
         undefined,
         40
       );
+      expect(result).toMatchObject({ ok: false, code: 'limit_result_exceeded' });
+      if (result.ok) throw new Error('unreachable');
+      expect(result.reason).toContain('search-fixture-');
+      expect(result.reason).not.toMatch(/[A-Za-z]:[\\/]|\\\\/); // no absolute machine path
+    });
+
+    it('fails closed before scanning when maxResultBytes cannot even hold the empty-result skeleton', async () => {
+      const boundary = tools();
+      // {"matches":[],"truncated":true} alone is 31 bytes; nothing this call could
+      // ever return would fit a 20-byte budget, matched or not. This must be an
+      // upfront, unconditional refusal rather than letting resultTextFor's own
+      // fit-by-construction invariant check fail later with an internal error.
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 30 },
+        undefined,
+        undefined,
+        20
+      );
+      expect(result).toMatchObject({ ok: false, code: 'limit_result_exceeded' });
+      if (result.ok) throw new Error('unreachable');
+      expect(result.reason).toContain('31');
+      expect(result.reason).toContain('20');
+    });
+
+    it('skips an oversized first match and keeps scanning to find a later, smaller one that fits', async () => {
+      const longName = `${'x'.repeat(150)}.txt`;
+      writeFileSync(join(worktree, longName), 'needle appears here too\n', 'utf8');
+      const shortName = 'z-short.txt';
+      writeFileSync(join(worktree, shortName), 'needle appears here as well\n', 'utf8');
+      const boundary = tools();
+
+      const result = await boundary.searchText(
+        {
+          version: 1,
+          action: 'search_text',
+          query: 'needle',
+          caseSensitive: false,
+          limit: 30,
+          // Explicit order: the oversized entry is scanned strictly before the small
+          // one, proving the small one is still reached rather than the search
+          // stopping at the first oversized candidate.
+          files: [longName, shortName]
+        },
+        undefined,
+        undefined,
+        150 // fits the skeleton and the short entry, not the long one
+      );
       expect(result).toMatchObject({ ok: true });
       if (!result.ok) throw new Error('unreachable');
-      expect(Buffer.byteLength(JSON.stringify(result.forModel), 'utf8')).toBeLessThanOrEqual(40);
-      expect(result.forModel).toMatchObject({ truncated: true });
+      expect(Buffer.byteLength(JSON.stringify(result.forModel), 'utf8')).toBeLessThanOrEqual(150);
+      const forModel = result.forModel as { matches: { path: string; line: number }[]; truncated: boolean };
+      expect(forModel.matches).toEqual([{ path: shortName, line: 1 }]);
+      expect(forModel.truncated).toBe(true); // the long match was real and was omitted
+    });
+
+    it('packs a mix of fitting and budget-skipped matches, preserving exact byte-bound compliance', async () => {
+      const longNames = Array.from({ length: 3 }, (_, i) => `${'y'.repeat(150)}-${i}.txt`);
+      const shortNames = Array.from({ length: 5 }, (_, i) => `short-${i}.txt`);
+      for (const name of [...longNames, ...shortNames]) {
+        writeFileSync(join(worktree, name), 'needle is here\n', 'utf8');
+      }
+      const boundary = tools();
+      // Interleaved order: long, short, long, short, ... — proves skipping a long
+      // entry does not stop the scan from reaching short entries on either side of it.
+      const interleaved: string[] = [];
+      for (let i = 0; i < 5; i += 1) {
+        if (longNames[i]) interleaved.push(longNames[i]!);
+        interleaved.push(shortNames[i]!);
+      }
+
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 30, files: interleaved },
+        undefined,
+        undefined,
+        150 // fits some (not all) short entries and the skeleton, never a long one
+      );
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('unreachable');
+      expect(Buffer.byteLength(JSON.stringify(result.forModel), 'utf8')).toBeLessThanOrEqual(250);
+      const forModel = result.forModel as { matches: { path: string; line: number }[]; truncated: boolean };
+      expect(forModel.matches.length).toBeGreaterThan(0);
+      expect(forModel.matches.length).toBeLessThan(shortNames.length);
+      for (const match of forModel.matches) {
+        expect(shortNames).toContain(match.path); // never a long (skipped) entry
+      }
+      expect(forModel.truncated).toBe(true);
     });
   });
 });

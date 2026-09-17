@@ -697,9 +697,18 @@ export class OrnithWorktreeTools {
    * `listFiles`, `search_text` has no cursor and was never a full-enumeration contract:
    * `truncated` already means "there may be more, narrow your query and retry", so
    * packing fewer matches than exist and marking `truncated: true` is honest within
-   * that existing contract, not a new kind of data loss — it never omits a match VALUE
-   * silently the way an unlisted manifest entry would (nothing here claims a match
-   * doesn't exist; it says there wasn't room to show it this turn).
+   * that existing contract, not a new kind of data loss.
+   *
+   * A single candidate match that cannot fit is SKIPPED, not treated as a reason to
+   * stop the whole search (review found that stopping at the first oversized candidate
+   * made this a dead end: no cursor exists to skip past it, so a model retrying the
+   * identical query got the identical empty result forever). Skipping one candidate
+   * still leaves room for smaller ones later, so scanning continues. Two cases fail
+   * closed with `limit_result_exceeded` instead of returning `ok:true`, because no
+   * `ok:true` shape can honestly represent them: the empty-result skeleton itself not
+   * fitting `maxResultBytes` at all, and every real match found being individually too
+   * large to fit — the latter would otherwise be the exact dead end just described,
+   * silently disguised as a normal "nothing matched" result.
    */
   async searchText(
     action: Extract<OrnithAction, { action: 'search_text' }>,
@@ -717,15 +726,25 @@ export class OrnithWorktreeTools {
         }
       }
 
+      // Hoisted once: invariant for the whole call, not per candidate line.
+      const skeletonBytes = Buffer.byteLength(JSON.stringify({ matches: [], truncated: true }), 'utf8');
+      if (skeletonBytes > maxResultBytes) {
+        return denied(
+          'limit_result_exceeded',
+          `An empty search_text result ("matches":[]) needs ${skeletonBytes} bytes, but only ${maxResultBytes} ` +
+            'bytes remain for this tool result. No search can be reported within the current budget.'
+        );
+      }
+
       const needle = action.caseSensitive ? action.query : action.query.toLowerCase();
       const matches: { path: string; line: number }[] = [];
       let matchesArrayContentBytes = 0;
-      let budgetLimited = false;
+      let anySkippedDueToBudget = false;
+      let firstSkipped: { path: string; line: number; requiredBytes: number } | null = null;
       let readBytesTotal = 0;
 
-      searchFiles:
       for (const path of candidates) {
-        if (matches.length >= action.limit || budgetLimited) break;
+        if (matches.length >= action.limit) break;
         const resolved = await this.resolveSafe(path, { mustExist: true, forWrite: false }, bounded);
         if (!resolved.ok) continue;
         let content: string;
@@ -757,20 +776,33 @@ export class OrnithWorktreeTools {
           const line = action.caseSensitive ? lines[index] : lines[index]?.toLowerCase();
           if (line === undefined || !line.includes(needle)) continue;
           const candidate = { path, line: index + 1 };
-          const skeletonBytes = Buffer.byteLength(JSON.stringify({ matches: [], truncated: true }), 'utf8');
+          // Exact per-candidate size: path content varies, so unlike the skeleton this
+          // cannot be hoisted, but it is computed only once per real candidate match,
+          // not per budget check.
           const entryBytes = Buffer.byteLength(JSON.stringify(candidate), 'utf8') + (matches.length > 0 ? 1 : 0);
           if (skeletonBytes + matchesArrayContentBytes + entryBytes > maxResultBytes) {
-            budgetLimited = true;
-            break searchFiles;
+            anySkippedDueToBudget = true;
+            firstSkipped ??= { path, line: index + 1, requiredBytes: skeletonBytes + entryBytes };
+            continue; // skip only this one candidate; smaller later ones may still fit
           }
           matches.push(candidate);
           matchesArrayContentBytes += entryBytes;
         }
       }
 
+      if (matches.length === 0 && anySkippedDueToBudget) {
+        return denied(
+          'limit_result_exceeded',
+          `search_text found at least one match but could not fit any of them within the ${maxResultBytes}-byte ` +
+            `tool-result budget — for example, "${firstSkipped!.path}" line ${firstSkipped!.line} alone would ` +
+            `need ${firstSkipped!.requiredBytes} bytes. Narrow the query, restrict "files" to fewer candidates, ` +
+            'or retry once more budget is available.'
+        );
+      }
+
       return {
         ok: true,
-        forModel: { matches, truncated: matches.length >= action.limit || budgetLimited },
+        forModel: { matches, truncated: matches.length >= action.limit || anySkippedDueToBudget },
         readBytes: readBytesTotal,
         writeBytes: 0,
         auditSummary: `search_text -> ${matches.length} match(es) across ${candidates.length} file(s)`

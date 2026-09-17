@@ -669,6 +669,47 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(secondPrompt).toMatch(/"matches":\[\{"path":"s\d{3}\.txt"/);
       expect(secondPrompt).not.toContain('request a smaller page or read chunk');
     });
+
+    it('fails a search_text-driven run closed when every real match is individually oversized, instead of a dead-end empty result', async () => {
+      const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
+      const oversizedSpecification: TaskSpecification = {
+        ...specification,
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_775)}` // -> 384-byte budget
+      };
+      // Multi-byte (3 UTF-8 bytes each) names: short enough in UTF-16 code units to
+      // stay well under Windows' MAX_PATH, long enough in UTF-8 bytes that every
+      // {path,line} match entry alone exceeds the 384-byte budget.
+      for (let index = 0; index < 3; index += 1) {
+        writeFileSync(join(worktree, `${'文'.repeat(120)}${index}.txt`), 'needle appears here\n', 'utf8');
+      }
+
+      let calls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(bigLease),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          calls += 1;
+          return completed(
+            request,
+            JSON.stringify({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 40 })
+          );
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        specification: oversizedSpecification,
+        lease: lease(bigLease)
+      });
+
+      // The action is denied on its first attempt: not a loop, not a partial
+      // "success" — an honest, immediate failure once it is clear nothing found can
+      // be represented within budget.
+      expect(calls).toBe(1);
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.reasonCodes).toContain('limit_result_exceeded');
+      expect(result.ornithAudit.changedFiles).toBe(0);
+    });
   });
 
   it('warns once and then stops an identical read-only action loop without dispatching duplicates', async () => {
