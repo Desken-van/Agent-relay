@@ -136,6 +136,7 @@ beforeAll(() => {
       '      if (mode === "paged" && !message.params.cursor) { result(message.id, { tools: [alpha], nextCursor: "two" }); continue; }',
       '      if (mode === "paged") { result(message.id, { tools: [beta] }); continue; }',
       '      if (mode === "unexpected") { result(message.id, { tools: [alpha, beta, { ...beta, name: "rogue" }] }); continue; }',
+      '      if (mode === "unexpected-broken-extra") { result(message.id, { tools: [alpha, beta, { name: "rogue", inputSchema: { type: "object", properties: { value: { type: "string", frobnicate: true } } } }] }); continue; }',
       '      if (mode === "missing") { result(message.id, { tools: [alpha] }); continue; }',
       '      if (mode === "duplicate") { result(message.id, { tools: [alpha, alpha, beta] }); continue; }',
       '      if (mode === "invalid-tool") { result(message.id, { tools: [{ ...alpha, title: 42 }, beta] }); continue; }',
@@ -304,6 +305,17 @@ describe('stdio MCP client', () => {
     // not break every integration that never asked for it.
     const discovery = await client.discover(config('unexpected'));
     expect(discovery.tools.map((tool) => tool.name)).toEqual(['alpha', 'beta', 'rogue']);
+  });
+
+  it('dispatches a required tool normally even when an unrelated, non-required tool has a schema this client cannot compile', async () => {
+    // 'unexpected-broken-extra' advertises alpha+beta (both required, both
+    // genuinely valid) plus 'rogue' — nobody's required set — whose schema
+    // uses the same unknown keyword the "unknown-keyword" compile-failure
+    // case above is refused for. assertSchemaCompiles only iterates
+    // config.allowedTools, so rogue's uncompilable schema must never be
+    // reached, and alpha must dispatch exactly as if rogue did not exist.
+    const response = await client.call(config('unexpected-broken-extra'), 'alpha', { value: 'x' });
+    expect(response.isError).toBe(false);
   });
 
   it('never allows the extra tool to actually be called, tolerated or not', async () => {
