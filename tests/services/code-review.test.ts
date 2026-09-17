@@ -1040,6 +1040,23 @@ describe('code-review recovery, capture stability and boundary hygiene', () => {
     await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
   });
 
+  it('records a contract drift discovered while the round is still running, without settling it', async () => {
+    const value = await stranded();
+    const reserved = value.reviews.latestRound(value.task.id)!.contractFingerprint;
+    const drifted = 'e'.repeat(64);
+    value.reviewer.roundStatusAnswer = { kind: 'running', contractFingerprint: drifted };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('running');
+    // The reserved fingerprint survives untouched...
+    expect(outcome.round.contractFingerprint).toBe(reserved);
+    // ...and the drift is made explicit rather than only surfacing once the
+    // round eventually completes.
+    expect(outcome.round.contractMismatchAt).not.toBeNull();
+  });
+
   it('stays blocked and says why when the provider knows nothing', async () => {
     const value = await stranded();
     value.reviewer.roundStatusAnswer = {
@@ -1763,6 +1780,20 @@ describe('code-review round identity at the provider', () => {
 
     await expect(value.service.review(value.task.id)).resolves.toBeTruthy();
     expect(value.reviewer.calls).toHaveLength(2);
+  });
+
+  it('records a contract drift discovered while proving the round never started', async () => {
+    const value = await stranded();
+    const reserved = value.reviews.latestRound(value.task.id)!.contractFingerprint;
+    const drifted = 'e'.repeat(64);
+    value.reviewer.roundStatusAnswer = { kind: 'not_started', contractFingerprint: drifted };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('failed');
+    expect(outcome.unsettledReason).toBe('not-started');
+    expect(outcome.round.contractFingerprint).toBe(reserved);
+    expect(outcome.round.contractMismatchAt).not.toBeNull();
   });
 });
 

@@ -1052,6 +1052,19 @@ export class CodeReviewService {
   }
 
   /**
+   * The non-throwing counterpart to {@link assertContractStable}, for
+   * reconciliation's `running`/`not_started` reads: the round is not being
+   * settled either way, so there is nothing to refuse — only a drift to
+   * record durably, exactly as `completed`'s own reconciliation branch
+   * already does further down. `reserved === null` (a round dispatched
+   * before this build recorded fingerprints) is not a mismatch, matching
+   * `assertContractStable`'s own leniency.
+   */
+  private contractDriftAt(reserved: string | null, fresh: string): string | null {
+    return reserved !== null && reserved !== fresh ? this.deps.clock.nowIso() : null;
+  }
+
+  /**
    * Check an answer the way storage requires, and record why if it fails.
    *
    * Shared by a live dispatch and by reconciliation, because the two must apply
@@ -1336,9 +1349,14 @@ export class CodeReviewService {
     if (status.kind === 'running') {
       // Still executing. The round keeps its phase, and nothing may start
       // another: this is the one state where a second dispatch is certain to
-      // double a call that has not finished.
+      // double a call that has not finished. `status.contractFingerprint` is
+      // the CURRENT contract this read just proved (see its doc comment on
+      // ExternalCodeRoundStatus) — compared here against the one reserved at
+      // beginRound so a drift is recorded even while the round is still in
+      // flight, not only once it completes.
       const held = this.deps.reviews.updateRound(round.id, {
-        lastError: redactAndTruncate(RECONCILE_RUNNING, 10_000)
+        lastError: redactAndTruncate(RECONCILE_RUNNING, 10_000),
+        contractMismatchAt: this.contractDriftAt(round.contractFingerprint, status.contractFingerprint)
       });
       return this.unsettled(held, 'running');
     }
@@ -1350,7 +1368,8 @@ export class CodeReviewService {
       // automatic repeat — the operator starts the next round by hand.
       const closed = this.deps.reviews.updateRound(round.id, {
         status: 'failed',
-        lastError: redactAndTruncate(RECONCILE_NOT_STARTED, 10_000)
+        lastError: redactAndTruncate(RECONCILE_NOT_STARTED, 10_000),
+        contractMismatchAt: this.contractDriftAt(round.contractFingerprint, status.contractFingerprint)
       });
       return this.unsettled(closed, 'not-started');
     }
