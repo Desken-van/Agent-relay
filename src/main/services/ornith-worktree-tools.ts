@@ -783,7 +783,11 @@ export class OrnithWorktreeTools {
           if (skeletonBytes + matchesArrayContentBytes + entryBytes > maxResultBytes) {
             anySkippedDueToBudget = true;
             firstSkipped ??= { path, line: index + 1, requiredBytes: skeletonBytes + entryBytes };
-            continue; // skip only this one candidate; smaller later ones may still fit
+            // Not `continue`: `path` is fixed for the rest of this file and line
+            // numbers only increase, so every later line's entry in THIS file is at
+            // least as large as this one's — none of them could fit either. Move on
+            // to the next candidate file instead of checking each remaining line.
+            break;
           }
           matches.push(candidate);
           matchesArrayContentBytes += entryBytes;
@@ -791,12 +795,15 @@ export class OrnithWorktreeTools {
       }
 
       if (matches.length === 0 && anySkippedDueToBudget) {
+        // firstSkipped.requiredBytes is skeletonBytes + this one entry, with no
+        // earlier accepted matches folded in (matches.length === 0 here is exactly
+        // why we reached this branch) — "alone" is accurate, not an approximation.
         return denied(
           'limit_result_exceeded',
           `search_text found at least one match but could not fit any of them within the ${maxResultBytes}-byte ` +
-            `tool-result budget — for example, "${firstSkipped!.path}" line ${firstSkipped!.line} alone would ` +
-            `need ${firstSkipped!.requiredBytes} bytes. Narrow the query, restrict "files" to fewer candidates, ` +
-            'or retry once more budget is available.'
+            `tool-result budget — for example, ${JSON.stringify(firstSkipped!.path)} line ${firstSkipped!.line} ` +
+            `alone would need ${firstSkipped!.requiredBytes} bytes. Narrow the query, restrict "files" to fewer ` +
+            `of the ${candidates.length} candidate(s) examined, or retry once more budget is available.`
         );
       }
 
