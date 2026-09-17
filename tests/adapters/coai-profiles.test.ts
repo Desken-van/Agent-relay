@@ -340,6 +340,27 @@ describe('computeCoaiContractFingerprint', () => {
     expect(forward).toBe(reversed);
   });
 
+  it('treats a dependentSchemas entry the same way — its name never switches its own subschema into data mode', () => {
+    // dependentSchemas maps property NAMES to a subschema that applies when
+    // that property is present — the same MAP shape as `properties`, and a
+    // dependent property is just as free to be named "default" without that
+    // meaning anything about its own subschema's `enum`.
+    const forward = fingerprint([
+      tool('reserve_round', {
+        type: 'object',
+        dependentSchemas: { default: { type: 'string', enum: ['a', 'b'] } }
+      })
+    ]);
+    const reversed = fingerprint([
+      tool('reserve_round', {
+        type: 'object',
+        dependentSchemas: { default: { type: 'string', enum: ['b', 'a'] } }
+      })
+    ]);
+
+    expect(forward).toBe(reversed);
+  });
+
   it('produces the same fingerprint for a required list, an enum and a type union in any order', () => {
     const forward = fingerprint([
       tool('reserve_round', {

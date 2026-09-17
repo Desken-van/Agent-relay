@@ -200,10 +200,12 @@ const SCHEMA_DATA_ONLY_KEYS = new Set(['const', 'default', 'examples']);
 /**
  * Keys whose value is a MAP from an ARBITRARY name to a subschema —
  * `properties` maps property names, `patternProperties` maps regex
- * patterns, and `$defs`/`definitions` map reusable-schema names — never a
- * schema's own keyword set. The map's KEYS carry no meaning `canonicalizeAt`
- * should ever act on; only its VALUES are schemas, and each is walked in
- * SCHEMA mode regardless of what its key happens to be spelled.
+ * patterns, `$defs`/`definitions` map reusable-schema names, and
+ * `dependentSchemas` maps property names to the subschema that applies when
+ * that property is present — never a schema's own keyword set. The map's
+ * KEYS carry no meaning `canonicalizeAt` should ever act on; only its VALUES
+ * are schemas, and each is walked in SCHEMA mode regardless of what its key
+ * happens to be spelled.
  *
  * This is the fix for the location-awareness gap a name-only check would
  * still have: a property is free to be NAMED `default`, `const`, `examples`,
@@ -213,9 +215,16 @@ const SCHEMA_DATA_ONLY_KEYS = new Set(['const', 'default', 'examples']);
  * `enum`, which must still be sorted as the set it is. Checking the key
  * `"default"` against {@link SCHEMA_DATA_ONLY_KEYS} without first knowing
  * whether that key was reached as a schema's own keyword or as one entry of
- * a `properties` map would wrongly switch that subschema into data mode.
+ * a `properties` (or `dependentSchemas`) map would wrongly switch that
+ * subschema into data mode.
  */
-const SCHEMA_MAP_KEYS = new Set(['properties', 'patternProperties', '$defs', 'definitions']);
+const SCHEMA_MAP_KEYS = new Set([
+  'properties',
+  'patternProperties',
+  '$defs',
+  'definitions',
+  'dependentSchemas'
+]);
 
 /** A stable ordering key for an already-canonicalized JSON value, used only to sort order-insensitive arrays deterministically. */
 function canonicalSortKey(value: unknown): string {
