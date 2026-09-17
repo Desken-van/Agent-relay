@@ -773,8 +773,13 @@ export class OrnithWorktreeTools {
         if (!haystack.includes(needle)) continue;
         const lines = content.split('\n');
         for (let index = 0; index < lines.length && matches.length < action.limit; index += 1) {
-          const line = action.caseSensitive ? lines[index] : lines[index]?.toLowerCase();
-          if (line === undefined || !line.includes(needle)) continue;
+          // Named distinctly from `candidate.line` below (a line NUMBER, index+1):
+          // this is the line's TEXT, used only for the needle check on this line and
+          // never itself serialized — the two "line"s sharing a name previously read
+          // as if a matched line's text became part of the returned entry, when it
+          // never does.
+          const lineText = action.caseSensitive ? lines[index] : lines[index]?.toLowerCase();
+          if (lineText === undefined || !lineText.includes(needle)) continue;
           const candidate = { path, line: index + 1 };
           // Exact per-candidate size: path content varies, so unlike the skeleton this
           // cannot be hoisted, but it is computed only once per real candidate match,
@@ -798,12 +803,19 @@ export class OrnithWorktreeTools {
         // firstSkipped.requiredBytes is skeletonBytes + this one entry, with no
         // earlier accepted matches folded in (matches.length === 0 here is exactly
         // why we reached this branch) — "alone" is accurate, not an approximation.
+        //
+        // Deliberately NOT suggesting "search fewer files": an entry's size is
+        // determined by its own repository-relative path length (plus the fixed
+        // skeleton and this file's line number), not by how many candidates were
+        // examined — reducing the candidate COUNT without excluding the specific
+        // long-path file would reproduce the identical failure.
         return denied(
           'limit_result_exceeded',
-          `search_text found at least one match but could not fit any of them within the ${maxResultBytes}-byte ` +
-            `tool-result budget — for example, ${JSON.stringify(firstSkipped!.path)} line ${firstSkipped!.line} ` +
-            `alone would need ${firstSkipped!.requiredBytes} bytes. Narrow the query, restrict "files" to fewer ` +
-            `of the ${candidates.length} candidate(s) examined, or retry once more budget is available.`
+          `search_text found at least one match, but no single {path,line} entry it found fits within the ` +
+            `${maxResultBytes}-byte tool-result budget — for example, ${JSON.stringify(firstSkipped!.path)} line ` +
+            `${firstSkipped!.line} alone would need ${firstSkipped!.requiredBytes} bytes. This is not a matter of ` +
+            'searching fewer files: reduce it by choosing a candidate with a shorter repository-relative path if ' +
+            'one is known, or retry once more tool-result budget is available.'
         );
       }
 
