@@ -251,12 +251,10 @@ Rules:
   "nextCursor" rule below, not this one.)
 - Never repeat an identical list_files, read_file, search_text, git_status, or git_diff action after it succeeds.
   Use the returned files, cursor, or status to choose a different next action.
-- A "list_files" result's "nextCursor" is the ONLY thing that tells you whether there is
-  more, including when "truncated" is true: if "nextCursor" is a number, your NEXT
-  "list_files" call for that SAME "prefix" must set "cursor" to exactly that number to
-  continue (this applies even when "files" is empty — one entry was too large to list and
-  was skipped, but "nextCursor" still moved past it, so the listing is incomplete at that
-  position); if "nextCursor" is null, that prefix is fully listed and must not be repeated.
+- A "list_files" result's "nextCursor" is the ONLY thing that tells you whether there is more:
+  if it is a number, your NEXT "list_files" call for that SAME "prefix" must set "cursor" to
+  exactly that number to continue; if it is null, that prefix is fully listed and must not be
+  repeated.
 - Call "finish" only when the acceptance criteria are met. Call "blocked" only when you
   cannot proceed and must stop.
 - Every reply is judged on its own: nothing you say outside the JSON is read.`;
@@ -952,7 +950,7 @@ export class OrnithImplementationService {
         }
       });
 
-      const resultText = boundedJson(toolResult.forModel, promptBudget.maxToolResultBytes);
+      const resultText = resultTextFor(action.action, toolResult.forModel, promptBudget.maxToolResultBytes);
       rolling.push({ turn: turnsUsed, action: action.action, resultText });
     }
   }
@@ -974,7 +972,7 @@ export class OrnithImplementationService {
           budget
         );
       case 'search_text':
-        return tools.searchText(action, signal, budget);
+        return tools.searchText(action, signal, budget, maxToolResultBytes);
       case 'create_file':
         return tools.createFile(action, signal, budget);
       case 'replace_text':
@@ -1029,6 +1027,34 @@ function boundedJson(value: unknown, maxBytes: number): string {
   } catch {
     return '(unserializable result)';
   }
+}
+
+/** Actions whose `OrnithWorktreeTools` method packs its own result to already fit the
+ *  budget it is given (`nextCursor`/`total` for list_files, `truncated` for
+ *  search_text), so falling through to the generic byte-cap-and-replace stub would
+ *  erase continuation-bearing fields these actions specifically rely on. */
+const SELF_PACKED_ACTIONS: ReadonlySet<OrnithAction['action']> = new Set(['list_files', 'search_text']);
+
+/**
+ * See `SELF_PACKED_ACTIONS`. For those actions this does not degrade a budget-fit
+ * violation to the generic `boundedJson` stub, which would erase `nextCursor`/`total`
+ * or `truncated` exactly like the defect the pagination fix exists to close; instead
+ * it treats a violation of the fit-by-construction invariant as the programming
+ * defect it would be, failing loudly rather than silently.
+ */
+function resultTextFor(actionKind: OrnithAction['action'], forModel: unknown, maxToolResultBytes: number): string {
+  if (!SELF_PACKED_ACTIONS.has(actionKind)) return boundedJson(forModel, maxToolResultBytes);
+  const text = JSON.stringify(forModel);
+  const bytes = Buffer.byteLength(text, 'utf8');
+  if (bytes > maxToolResultBytes) {
+    throw new AgentRelayError(
+      'INTERNAL',
+      `${actionKind} produced a ${bytes}-byte result against a ${maxToolResultBytes}-byte budget it was given to ` +
+        'pack against. This violates that method\'s own fit-by-construction invariant and is a packing defect, ' +
+        'not a runtime condition to truncate away.'
+    );
+  }
+  return text;
 }
 
 function safeProviderFailureReason(reason: string): string {

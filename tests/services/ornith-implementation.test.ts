@@ -485,6 +485,192 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(secondPrompt).not.toContain('request a smaller page or read chunk');
   });
 
+  describe('list_files pagination across the full implement() pipeline at specific tight budgets', () => {
+    // preflightOrnithPrompt's own minRollingFeedbackBytes gate (>= 1024 bytes of
+    // rolling budget must remain) means maxToolResultBytes can mathematically never
+    // go below floor((1024 - ROLLING_HISTORY_OVERHEAD_BYTES(256)) / 2) = 384 bytes
+    // from any call that returns ok:true — verified empirically below. 256 and 300
+    // are therefore not reachable from a passing preflight call at all; 384 stands in
+    // as the tightest budget preflight can actually hand to a live run. The mechanism
+    // itself (listFiles / searchText packing, the resultTextFor invariant guard) is
+    // separately tested directly at exactly 256/300/16/etc in
+    // tests/adapters/ornith-worktree-tools.test.ts, where the budget is supplied
+    // directly rather than derived from preflight.
+    const budgetCases: { label: string; chars: number; expectedBudget: number }[] = [
+      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 124_775, expectedBudget: 384 },
+      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 124_728, expectedBudget: 407 },
+      { label: '408 bytes (right at the old fallback stub size)', chars: 124_726, expectedBudget: 408 },
+      { label: '471 bytes ("408+": comfortably normal)', chars: 124_600, expectedBudget: 471 }
+    ];
+
+    for (const { label, chars, expectedBudget } of budgetCases) {
+      it(`pages a 150-file listing to completion with no gaps or duplicates at ${label}`, async () => {
+        const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
+        const oversizedSpecification: TaskSpecification = {
+          ...specification,
+          implementationPrompt: `Implement the approved scope. ${'x'.repeat(chars)}`
+        };
+
+        // Sanity-check the harness is actually exercising the claimed budget before
+        // trusting anything downstream.
+        const preflight = preflightOrnithPrompt({
+          specification: oversizedSpecification,
+          ruleEvidence: null,
+          acceptedPlanReviewAddenda: null,
+          correctionFindings: null,
+          round: 1,
+          maxRounds: 3,
+          lease: bigLease
+        });
+        expect(preflight.ok).toBe(true);
+        if (!preflight.ok) return;
+        expect(preflight.budget.maxToolResultBytes).toBe(expectedBudget);
+
+        // Short names so a normal page can hold at least one entry even at the
+        // tightest budget under test (384 bytes): this exercises ordinary packing,
+        // not the separate fail-closed path for a single oversized entry.
+        for (let index = 0; index < 150; index += 1) {
+          writeFileSync(join(worktree, `f${String(index).padStart(3, '0')}.ts`), 'export {};\n', 'utf8');
+        }
+
+        const requests: LocalInferenceRequest[] = [];
+        const seenFiles = new Set<string>();
+        const leaseService: OrnithInferenceLeaseService = {
+          acquireOrnithLease: async () => lease(bigLease),
+          recheckOrnithLease: async () => true,
+          inferForOrnith: async (_lease, request) => {
+            requests.push(request);
+            const promptText = request.messages.map((message) => message.content).join('\n');
+            for (const match of promptText.matchAll(/"(f\d{3}\.ts)"/g)) seenFiles.add(match[1]!);
+            if (requests.length === 1) {
+              return completed(request, JSON.stringify({ version: 1, action: 'list_files', prefix: '', limit: 200 }));
+            }
+            const cursorMatches = [...promptText.matchAll(/"nextCursor":\s*(\d+|null)/g)];
+            const lastCursor = cursorMatches.at(-1)?.[1] ?? null;
+            if (lastCursor !== null && lastCursor !== 'null') {
+              return completed(
+                request,
+                JSON.stringify({ version: 1, action: 'list_files', prefix: '', limit: 200, cursor: Number(lastCursor) })
+              );
+            }
+            return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Paged through the listing.' }));
+          }
+        };
+
+        const result = await new OrnithImplementationService().implement({
+          ...baseRequest(leaseService, new AbortController().signal),
+          specification: oversizedSpecification,
+          lease: lease(bigLease)
+        });
+
+        expect(result.assessment.disposition).toBe('pass');
+        expect(requests.length).toBeGreaterThan(1);
+        const allPromptText = requests.map((request) => request.messages.map((message) => message.content).join('\n')).join('\n---\n');
+        // The removed generic stub's own wording must never appear: proof the
+        // now-fail-closed/denied oversized-entry path was never hit here (these files
+        // are short) and that the old metadata-erasing fallback is not reachable via
+        // this route either.
+        expect(allPromptText).not.toContain('request a smaller page or read chunk');
+        // All 150 files were actually seen across the run's prompts — no gaps.
+        expect(seenFiles.size).toBe(150);
+      });
+    }
+
+    it('fails the whole run closed, with no files changed, rather than silently completing an incomplete enumeration', async () => {
+      const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
+      const oversizedSpecification: TaskSpecification = {
+        ...specification,
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_775)}` // -> 384-byte budget
+      };
+      const preflight = preflightOrnithPrompt({
+        specification: oversizedSpecification,
+        ruleEvidence: null,
+        acceptedPlanReviewAddenda: null,
+        correctionFindings: null,
+        round: 1,
+        maxRounds: 3,
+        lease: bigLease
+      });
+      expect(preflight.ok).toBe(true);
+      if (!preflight.ok) return;
+      expect(preflight.budget.maxToolResultBytes).toBe(384);
+
+      // A single legal, existing path whose own JSON representation alone exceeds the
+      // 384-byte budget. `prefix` set to its exact name means the very first
+      // list_files call resolves to just this one entry, regardless of what else
+      // exists in the manifest or how it sorts alphabetically. 130 multi-byte (3
+      // UTF-8 bytes each) characters keep the actual filesystem path short (well
+      // under Windows' ~260-character MAX_PATH) while still exceeding the byte
+      // budget once JSON-encoded: 130 real characters is a legal, if unusual, file
+      // name, not a path-length attack.
+      const oversizedName = '文'.repeat(130);
+      writeFileSync(join(worktree, oversizedName), 'export {};\n', 'utf8');
+
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(bigLease),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) =>
+          completed(request, JSON.stringify({ version: 1, action: 'list_files', prefix: oversizedName, limit: 200 }))
+      };
+
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        specification: oversizedSpecification,
+        lease: lease(bigLease)
+      });
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.reasonCodes).toContain('limit_result_exceeded');
+      // Denied, not silently degraded to an incomplete "success": no file was created,
+      // read, or modified — the run stopped before claiming anything about the
+      // repository it could not actually back up.
+      expect(result.ornithAudit.changedFiles).toBe(0);
+      expect(result.ornithAudit.readBytes).toBe(0);
+    });
+
+    it('marks a byte-budget-truncated search_text result truncated instead of silently collapsing it to the generic stub', async () => {
+      const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
+      const oversizedSpecification: TaskSpecification = {
+        ...specification,
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_775)}` // -> 384-byte budget
+      };
+      for (let index = 0; index < 40; index += 1) {
+        writeFileSync(join(worktree, `s${String(index).padStart(3, '0')}.txt`), 'needle appears here\n', 'utf8');
+      }
+
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(bigLease),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          return completed(
+            request,
+            requests.length === 1
+              ? JSON.stringify({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 40 })
+              : JSON.stringify({ version: 1, action: 'finish', summary: 'Saw a truncated search result.' })
+          );
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        specification: oversizedSpecification,
+        lease: lease(bigLease)
+      });
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(requests).toHaveLength(2);
+      const secondPrompt = requests[1]!.messages.map((message) => message.content).join('\n');
+      expect(secondPrompt).toContain('PRIOR TOOL RESULTS');
+      // Real, honest partial data reached the model: some matches, explicitly marked
+      // truncated — never the old metadata-free generic stub.
+      expect(secondPrompt).toContain('"truncated":true');
+      expect(secondPrompt).toMatch(/"matches":\[\{"path":"s\d{3}\.txt"/);
+      expect(secondPrompt).not.toContain('request a smaller page or read chunk');
+    });
+  });
+
   it('warns once and then stops an identical read-only action loop without dispatching duplicates', async () => {
     let calls = 0;
     const events: AgentProgressEvent[] = [];

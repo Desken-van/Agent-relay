@@ -592,42 +592,120 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(seen.size).toBe(tightForModel.files.length + resumedForModel.files.length);
     });
 
-    it('skips past a single entry that does not fit instead of stalling on it forever', async () => {
+    it('fails closed, rather than silently skipping, when a single entry cannot fit any budget', async () => {
       const boundary = tools();
+      // 16 bytes cannot hold even the smallest possible {files:[],nextCursor,total}
+      // skeleton, let alone one filename inside it.
       const result = await boundary.listFiles(
         { version: 1, action: 'list_files', prefix: '', limit: 200 },
         undefined,
-        // Smaller than even the shortest single entry plus its JSON wrapper.
         16
+      );
+      // Silently advancing past the entry (an earlier design) would let a run finish
+      // having never enumerated a real, existing path — a false-positive-completion
+      // risk. Silently returning it wrapped in a fixed explanatory stub is also wrong:
+      // that stub is itself ~409 bytes and would not fit budgets between the 256-byte
+      // internal floor and ~407 bytes either, reproducing the exact metadata-loss bug
+      // this fix exists to close, just for a rarer trigger. Denying the action ends the
+      // run honestly instead, through the same path every other Ornith denial already
+      // uses.
+      expect(result).toMatchObject({ ok: false, code: 'limit_result_exceeded' });
+    });
+
+    it('paginates a larger listing across many pages with no gaps, no duplicates, and preserved order', async () => {
+      for (let index = 40; index < 120; index += 1) {
+        writeFileSync(join(worktree, `roadmap-long-file-name-${String(index).padStart(3, '0')}.tsx`), 'export {};\n');
+      }
+      const boundary = tools();
+      const full = await boundary.listFiles({ version: 1, action: 'list_files', prefix: '', limit: 200 });
+      expect(full).toMatchObject({ ok: true });
+      if (!full.ok) throw new Error('unreachable');
+      const fullForModel = full.forModel as { files: string[]; total: number };
+      expect(fullForModel.total).toBe(121); // 120 fixtures + fixture.txt
+
+      const seen: string[] = [];
+      let cursor: number | undefined;
+      let pages = 0;
+      for (;;) {
+        const page = await boundary.listFiles(
+          { version: 1, action: 'list_files', prefix: '', limit: 200, cursor },
+          undefined,
+          220 // tight enough to force several pages across 121 entries
+        );
+        expect(page).toMatchObject({ ok: true });
+        if (!page.ok) throw new Error('unreachable');
+        const pageForModel = page.forModel as { files: string[]; nextCursor: number | null; total: number };
+        expect(Buffer.byteLength(JSON.stringify(page.forModel), 'utf8')).toBeLessThanOrEqual(220);
+        expect(pageForModel.files.length).toBeGreaterThan(0);
+        seen.push(...pageForModel.files);
+        pages += 1;
+        if (pageForModel.nextCursor === null) break;
+        cursor = pageForModel.nextCursor;
+        expect(pages).toBeLessThan(50); // guard against an infinite loop if cursor ever stalls
+      }
+
+      expect(pages).toBeGreaterThan(1); // must have actually needed multiple pages
+      expect(seen).toEqual(fullForModel.files); // exact order preserved, no gaps
+      expect(new Set(seen).size).toBe(seen.length); // no duplicates
+    });
+  });
+
+  describe('searchText byte-budget packing', () => {
+    beforeEach(() => {
+      for (let index = 0; index < 30; index += 1) {
+        writeFileSync(
+          join(worktree, `search-fixture-${String(index).padStart(3, '0')}.txt`),
+          'needle appears once per file\n'
+        );
+      }
+    });
+
+    it('packs fewer matches than the requested limit under a tight byte budget, and marks the result truncated', async () => {
+      const boundary = tools();
+      // limit=35 against 30 real matches so a complete result is unambiguous: hitting
+      // exactly `limit` is itself treated as possibly-truncated (there might be more
+      // beyond it), a pre-existing, unrelated behavior this test does not exercise.
+      const full = await boundary.searchText({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 35 });
+      expect(full).toMatchObject({ ok: true });
+      if (!full.ok) throw new Error('unreachable');
+      const fullForModel = full.forModel as { matches: unknown[]; truncated: boolean };
+      expect(fullForModel.matches.length).toBe(30);
+      expect(fullForModel.truncated).toBe(false);
+
+      const tight = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 35 },
+        undefined,
+        undefined,
+        400
+      );
+      expect(tight).toMatchObject({ ok: true });
+      if (!tight.ok) throw new Error('unreachable');
+      const serializedBytes = Buffer.byteLength(JSON.stringify(tight.forModel), 'utf8');
+      expect(serializedBytes).toBeLessThanOrEqual(400);
+      const tightForModel = tight.forModel as { matches: unknown[]; truncated: boolean };
+      expect(tightForModel.matches.length).toBeGreaterThan(0);
+      expect(tightForModel.matches.length).toBeLessThan(30);
+      // The budget cut it short before the declared limit was reached — this must be
+      // visible as `truncated: true`, not silently presented as a complete result.
+      expect(tightForModel.truncated).toBe(true);
+    });
+
+    it('never lets a byte-tight search_text result collapse to the generic metadata-free stub', async () => {
+      const boundary = tools();
+      // A budget too small for even one {path,line} match plus the {matches:[],
+      // truncated:true} skeleton around it would, for list_files, need a fail-closed
+      // denial — but search_text's empty-result skeleton is tiny (no long explanatory
+      // reason string), so even a very tight budget can honestly report zero matches.
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 30 },
+        undefined,
+        undefined,
+        40
       );
       expect(result).toMatchObject({ ok: true });
       if (!result.ok) throw new Error('unreachable');
-      // Fixed-shape stub (two integers, a boolean, and a constant-length message) —
-      // small by construction regardless of how tiny the requested budget was.
-      expect(Buffer.byteLength(JSON.stringify(result.forModel), 'utf8')).toBeLessThanOrEqual(600);
-      // nextCursor must advance past the unlistable entry (index 0), not stay at it —
-      // otherwise a model that faithfully resubmits `cursor: nextCursor` would send
-      // the identical request forever instead of making progress.
-      expect(result.forModel).toMatchObject({
-        files: [],
-        nextCursor: 1,
-        total: 41,
-        truncated: true
-      });
-      const forModel = result.forModel as { reason: string };
-      expect(forModel.reason).toContain('byte budget');
-
-      // Resuming from the reported nextCursor must reach real, listable entries —
-      // proving the skip is an escape hatch, not a dead end.
-      const resumed = await boundary.listFiles(
-        { version: 1, action: 'list_files', prefix: '', limit: 200, cursor: 1 },
-        undefined,
-        300
-      );
-      expect(resumed).toMatchObject({ ok: true });
-      if (!resumed.ok) throw new Error('unreachable');
-      const resumedForModel = resumed.forModel as { files: string[] };
-      expect(resumedForModel.files.length).toBeGreaterThan(0);
+      expect(Buffer.byteLength(JSON.stringify(result.forModel), 'utf8')).toBeLessThanOrEqual(40);
+      expect(result.forModel).toMatchObject({ truncated: true });
     });
   });
 });

@@ -573,30 +573,35 @@ export class OrnithWorktreeTools {
 
       if (page.length === 0 && index < matching.length) {
         // Not even the single next entry fits the remaining byte budget — an
-        // unusually long path. Leaving `nextCursor` at `cursor` here would make the
-        // model resubmit an identical request forever (the no-progress guard would
-        // then stop the run on an entry that was never actually unreachable, just
-        // unlistable by name). Skip past it instead: advance `nextCursor` by one so
-        // the rest of the listing stays reachable, and keep `total` unchanged so the
-        // skip is visible rather than silently shrinking the count. The one skipped
-        // path's own content remains reachable through other means (e.g. search_text
-        // or read_file, if the model already knows or can otherwise learn its name);
-        // list_files' job here is to keep the enumeration itself making progress.
-        const skippedIndex = index;
-        const nextCursor = skippedIndex + 1 < matching.length ? skippedIndex + 1 : null;
-        return {
-          ok: true,
-          forModel: {
-            files: [],
-            nextCursor,
-            total: matching.length,
-            truncated: true,
-            reason: 'One entry at this position did not fit the remaining tool-result byte budget and could not be named here (it is still counted in "total", not deleted). This listing is INCOMPLETE at this prefix as a result: if the task depends on a file you have not otherwise located, it may be the one skipped here. Continue with the returned nextCursor.'
-          },
-          readBytes: 0,
-          writeBytes: 0,
-          auditSummary: `list_files prefix="${prefix}" -> 0 of ${matching.length} (entry at index ${skippedIndex} skipped: exceeded byte budget)`
-        };
+        // unusually long path. Two designs were tried and rejected before this one:
+        //
+        // 1. Leave `nextCursor` at `cursor` and return ok:true — the model resubmits
+        //    an identical request forever; the no-progress guard stops the run on an
+        //    entry that was never actually unreachable, just unlistable by name.
+        // 2. Skip past it (advance `nextCursor`, return ok:true with an empty page) —
+        //    this DOES let enumeration keep moving, but has two independent problems.
+        //    First, it silently omits one legal, existing path from the only tool that
+        //    can name it: a model relying on list_files to discover what exists can
+        //    finish "successfully" having never seen a file its task depended on —
+        //    exactly the false-positive-completion risk `ok:true` is supposed to rule
+        //    out. Second, even the SKIP NOTICE ITSELF is not exempt from this budget:
+        //    a fixed, human-readable explanation of what happened does not fit inside
+        //    the ~256-byte floor `preflightOrnithPrompt` can legitimately produce,
+        //    so the message meant to explain the loss would itself get discarded by
+        //    the caller's own generic byte-budget truncation — reintroducing the
+        //    exact metadata-loss failure this whole fix exists to close, just for a
+        //    rarer trigger.
+        //
+        // Fail closed instead: this one action is denied, ending the run honestly
+        // (the caller's `!toolResult.ok` branch already treats every denial this way)
+        // rather than letting it complete having silently skipped part of the
+        // repository, or letting the explanation of that skip itself be silently lost.
+        return denied(
+          'limit_result_exceeded',
+          `The file at manifest position ${index} of ${matching.length} under prefix "${prefix}" cannot be ` +
+            'represented within the remaining tool-result byte budget for this run (its path is unusually long). ' +
+            'Repository enumeration cannot honestly continue past this point at the current budget.'
+        );
       }
 
       const nextCursor = index < matching.length ? index : null;
@@ -684,7 +689,24 @@ export class OrnithWorktreeTools {
     }
   }
 
-  async searchText(action: Extract<OrnithAction, { action: 'search_text' }>, signal?: AbortSignal, budget = DEFAULT_OPERATION_BUDGET): Promise<OrnithToolResult> {
+  /**
+   * `maxResultBytes` bounds the serialized `{matches, truncated}` payload the same way
+   * `listFiles`'s does: matches are packed incrementally against the EXACT serialized
+   * size, so the result fits by construction rather than being truncated away afterward
+   * by the generic byte-budget check — the same defect class `listFiles` had. Unlike
+   * `listFiles`, `search_text` has no cursor and was never a full-enumeration contract:
+   * `truncated` already means "there may be more, narrow your query and retry", so
+   * packing fewer matches than exist and marking `truncated: true` is honest within
+   * that existing contract, not a new kind of data loss — it never omits a match VALUE
+   * silently the way an unlisted manifest entry would (nothing here claims a match
+   * doesn't exist; it says there wasn't room to show it this turn).
+   */
+  async searchText(
+    action: Extract<OrnithAction, { action: 'search_text' }>,
+    signal?: AbortSignal,
+    budget = DEFAULT_OPERATION_BUDGET,
+    maxResultBytes = Number.POSITIVE_INFINITY
+  ): Promise<OrnithToolResult> {
     const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.searchTimeoutMs, signal);
     try {
       const manifest = await this.ensureManifest(bounded);
@@ -697,10 +719,13 @@ export class OrnithWorktreeTools {
 
       const needle = action.caseSensitive ? action.query : action.query.toLowerCase();
       const matches: { path: string; line: number }[] = [];
+      let matchesArrayContentBytes = 0;
+      let budgetLimited = false;
       let readBytesTotal = 0;
 
+      searchFiles:
       for (const path of candidates) {
-        if (matches.length >= action.limit) break;
+        if (matches.length >= action.limit || budgetLimited) break;
         const resolved = await this.resolveSafe(path, { mustExist: true, forWrite: false }, bounded);
         if (!resolved.ok) continue;
         let content: string;
@@ -730,15 +755,22 @@ export class OrnithWorktreeTools {
         const lines = content.split('\n');
         for (let index = 0; index < lines.length && matches.length < action.limit; index += 1) {
           const line = action.caseSensitive ? lines[index] : lines[index]?.toLowerCase();
-          if (line !== undefined && line.includes(needle)) {
-            matches.push({ path, line: index + 1 });
+          if (line === undefined || !line.includes(needle)) continue;
+          const candidate = { path, line: index + 1 };
+          const skeletonBytes = Buffer.byteLength(JSON.stringify({ matches: [], truncated: true }), 'utf8');
+          const entryBytes = Buffer.byteLength(JSON.stringify(candidate), 'utf8') + (matches.length > 0 ? 1 : 0);
+          if (skeletonBytes + matchesArrayContentBytes + entryBytes > maxResultBytes) {
+            budgetLimited = true;
+            break searchFiles;
           }
+          matches.push(candidate);
+          matchesArrayContentBytes += entryBytes;
         }
       }
 
       return {
         ok: true,
-        forModel: { matches, truncated: matches.length >= action.limit },
+        forModel: { matches, truncated: matches.length >= action.limit || budgetLimited },
         readBytes: readBytesTotal,
         writeBytes: 0,
         auditSummary: `search_text -> ${matches.length} match(es) across ${candidates.length} file(s)`
