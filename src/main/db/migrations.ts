@@ -1019,18 +1019,20 @@ export const MIGRATIONS: readonly Migration[] = [
     up(db) {
       // Codex-assisted automatic triage recommendations for a plan-review
       // gate's undecided findings — see `PlanReviewGateService.triage()`.
-      // `triage_json` is the durable recommendation set; `triage_for_revision`
-      // is the gate's OWN `revision` immediately after the write that stored
-      // it (not before — every write bumps `revision`, so tagging the
-      // revision read before the write would make a triage result read as
-      // stale the instant it was persisted). A read compares the gate's
-      // CURRENT `revision` against `triage_for_revision`: any mismatch means
-      // something changed the gate since, and the stored recommendations are
-      // refused rather than applied. Plain ALTER TABLE: nullable additions
-      // with no new CHECK constraint.
+      // `triage_json` is the durable recommendation set; `triage_for_findings`
+      // is the EXACT `findings_json` string the recommendations were computed
+      // against. Deliberately not a revision number: `revision` bumps on
+      // every durable write to the row, including this one and including
+      // fields a triage result does not depend on (e.g. `last_error`), so a
+      // revision-based check would make a result — including one just
+      // written — read as stale the instant anything else touched the row.
+      // A read instead compares the gate's CURRENT `findings_json` against
+      // `triage_for_findings`: only a genuinely different set of findings
+      // (a new round) invalidates a stored result. Plain ALTER TABLE:
+      // nullable additions with no new CHECK constraint.
       db.exec(`
         ALTER TABLE plan_review_gates ADD COLUMN triage_json TEXT;
-        ALTER TABLE plan_review_gates ADD COLUMN triage_for_revision INTEGER;
+        ALTER TABLE plan_review_gates ADD COLUMN triage_for_findings TEXT;
       `);
     }
   }

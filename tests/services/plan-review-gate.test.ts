@@ -1679,10 +1679,11 @@ describe('durable external plan review gate', () => {
       expect(value.codex.triageCalls[0]?.findings).toHaveLength(2);
       expect(value.reviewer.resolveCalls).toHaveLength(0);
 
-      // triageForRevision is the revision AFTER this write, not the one read
-      // before analysis started — this write itself bumps the gate's revision.
+      // This write itself bumps the gate's revision, exactly like any other.
       expect(result.revision).toBe(gate.revision + 1);
-      expect(result.triageForRevision).toBe(result.revision);
+      // triageForFindings names WHAT was analyzed (the findings themselves),
+      // not a revision number, so it stays valid across unrelated writes.
+      expect(result.triageForFindings).toBe(result.findingsJson);
       const parsed = JSON.parse(result.triageJson!);
       expect(parsed.recommendations).toEqual([
         { finding: 0, recommendation: 'accept', reason: 'Matches acceptance criterion 1.', evidenceRef: 'criterion 1', confidence: 'high' },
@@ -1692,7 +1693,32 @@ describe('durable external plan review gate', () => {
       // Survives a fresh read — a remount/restart reads the same durable row.
       const reread = value.harness.planReviewGates.findByTask(task.id)!;
       expect(reread.triageJson).toBe(result.triageJson);
-      expect(reread.triageForRevision).toBe(result.triageForRevision);
+      expect(reread.triageForFindings).toBe(result.triageForFindings);
+    });
+
+    it('keeps a stored recommendation current after an unrelated write bumps the gate revision', async () => {
+      // A revision-based staleness check would break this: ANY later write to
+      // the row (including one wholly unrelated to the findings) bumps
+      // `revision`, so a check comparing against `revision` would make even a
+      // just-persisted result look stale the moment something else touched
+      // the gate. `triageForFindings` — the actual content analyzed — must
+      // not be affected by that.
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      value.codex.triageQueue.push([
+        { findingRef: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+        { findingRef: 1, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+      ]);
+      const afterTriage = await value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision });
+
+      // An unrelated field write, bumping revision without touching findings.
+      const afterUnrelatedWrite = value.harness.planReviewGates.update(afterTriage.id, {
+        lastError: 'unrelated diagnostic note'
+      });
+      expect(afterUnrelatedWrite.revision).toBe(afterTriage.revision + 1);
+      expect(afterUnrelatedWrite.triageJson).toBe(afterTriage.triageJson);
+      expect(afterUnrelatedWrite.triageForFindings).toBe(afterUnrelatedWrite.findingsJson);
+      expect(afterUnrelatedWrite.findingsJson).toBe(afterTriage.findingsJson);
     });
 
     it('analyzes only the requested subset when findingIndexes is given', async () => {

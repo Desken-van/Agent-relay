@@ -1,4 +1,4 @@
-import { copyFile, lstat, mkdir, readFile, realpath, symlink } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readFile, realpath, rm, symlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { AgentRelayError } from '../../shared/domain/errors';
 import {
@@ -262,6 +262,10 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
     maxOutputBytes: number,
     progress: (event: AgentProgressEvent) => void
   ): Promise<WorktreeDependencyInstallOutcome> {
+    if (signal.aborted) {
+      return this.installOutcome('cancelled', 'Dependency installation was cancelled.', await this.checkStatus(target));
+    }
+
     const before = await this.checkStatus(target);
     if (!WORKTREE_DEPENDENCY_INSTALLABLE_BLOCKER_STATES.has(before.state)) {
       return this.installOutcome('refused', `Nothing to install: ${before.detail}`, before);
@@ -305,9 +309,11 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
     });
 
     if (result.cancelled || signal.aborted) {
+      await this.cleanupFailedInstall(target);
       return this.installOutcome('cancelled', 'Dependency installation was cancelled.', await this.checkStatus(target));
     }
     if (result.timedOut) {
+      await this.cleanupFailedInstall(target);
       return this.installOutcome('timed_out', 'Dependency installation timed out.', await this.checkStatus(target));
     }
     if (result.failed || result.exitCode !== 0) {
@@ -318,6 +324,7 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
       // running `npm install` instead (that would rewrite the worktree's own
       // lockfile unprompted).
       const driftedManifest = /EUSAGE|in sync|can only install packages when/i.test(combined);
+      await this.cleanupFailedInstall(target);
       const after = await this.checkStatus(target);
       return this.installOutcome(
         driftedManifest ? 'manifest_drift' : 'package_manager_failed',
@@ -338,6 +345,29 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
     }
     await this.prepareWindowsNativeHelpers(target.repositoryPath, target.worktreePath);
     return this.installOutcome('succeeded', 'Dependencies installed in the task worktree.', after);
+  }
+
+  /**
+   * `npm ci` can be killed (cancellation, timeout) or exit non-zero after it
+   * has already created a partially populated `node_modules`. Left in place,
+   * that directory would make a later {@link checkStatus} report `ready_local`
+   * even though nothing usable was installed, and — because `ready_local` is
+   * not an installable blocker state — permanently block retrying. Remove
+   * only a plain directory at the exact task-worktree path; a symlink (the
+   * fast-link this method never creates) is left untouched, and a removal
+   * failure is swallowed since it leaves status no worse than before this
+   * cleanup existed.
+   */
+  private async cleanupFailedInstall(target: WorktreeDependencyTarget): Promise<void> {
+    const nodeModulesTarget = join(target.worktreePath, 'node_modules');
+    if (await existingNodeModules(nodeModulesTarget) !== 'directory') return;
+    try {
+      await rm(nodeModulesTarget, { recursive: true, force: true });
+    } catch {
+      // Best-effort: a locked file on a lingering handle leaves the stale
+      // directory in place, which checkStatus already tolerated before this
+      // cleanup was added.
+    }
   }
 
   private installOutcome(

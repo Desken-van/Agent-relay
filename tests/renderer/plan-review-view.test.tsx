@@ -212,7 +212,7 @@ describe('the external plan-review panel', () => {
         reconciledAt: null,
         revision: 0,
         triageJson: null,
-        triageForRevision: null,
+        triageForFindings: null,
         createdAt: '2026-09-06T00:00:00.000Z',
         updatedAt: '2026-09-06T00:00:00.000Z'
       },
@@ -369,7 +369,7 @@ describe('the external plan-review panel', () => {
         gate: {
           ...detail.gate!,
           revision: 1,
-          triageForRevision: 1,
+          triageForFindings: detail.gate!.findingsJson,
           triageJson: JSON.stringify({
             recommendations: [
               { finding: 0, recommendation: 'accept', reason: 'Matches criterion 1.', evidenceRef: 'criterion 1', confidence: 'high' },
@@ -408,7 +408,7 @@ describe('the external plan-review panel', () => {
         gate: {
           ...detail.gate!,
           revision: 1,
-          triageForRevision: 1,
+          triageForFindings: detail.gate!.findingsJson,
           triageJson: JSON.stringify({
             recommendations: [
               { finding: 0, recommendation: 'reject', reason: 'Already satisfied.', evidenceRef: 'e', confidence: 'high' },
@@ -438,15 +438,16 @@ describe('the external plan-review panel', () => {
       expect((decisions[1] as HTMLSelectElement).value).toBe('accept');
     });
 
-    it('does not treat a stored recommendation as current once its revision no longer matches the gate (e.g. after a remount)', async () => {
-      // The gate's OWN revision has moved past `triageForRevision` — exactly
-      // what a later, unrelated durable write (a new round, a resolve)
+    it('does not treat a stored recommendation as current once the findings it analyzed no longer match the gate (e.g. after a remount)', async () => {
+      // `triageForFindings` names a DIFFERENT findings snapshot than the
+      // gate's current one — exactly what a later round (different findings)
       // produces. A fresh mount (a remount/restart) must not show this as a
       // live recommendation.
       const stale: PlanReviewDetail = {
         ...twoFindingGate({
           revision: 5,
-          triageForRevision: 1,
+          findingsJson: 'current-findings-v2',
+          triageForFindings: 'earlier-findings-v1',
           triageJson: JSON.stringify({
             recommendations: [
               { finding: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
@@ -465,11 +466,12 @@ describe('the external plan-review panel', () => {
       expect(screen.queryByText(/recommended accept/)).toBeNull();
     });
 
-    it('shows a freshly stored recommendation again after a remount, when its revision still matches', async () => {
+    it('shows a freshly stored recommendation again after a remount, when its analyzed findings still match', async () => {
       const current: PlanReviewDetail = {
         ...twoFindingGate({
           revision: 1,
-          triageForRevision: 1,
+          findingsJson: 'current-findings-v2',
+          triageForFindings: 'current-findings-v2',
           triageJson: JSON.stringify({
             recommendations: [
               { finding: 0, recommendation: 'accept', reason: 'Matches criterion 1.', evidenceRef: 'e', confidence: 'high' },
@@ -937,7 +939,7 @@ describe('the external plan-review panel', () => {
           reconciledAt: null,
           revision: 0,
           triageJson: null,
-          triageForRevision: null,
+          triageForFindings: null,
           createdAt: '2026-09-06T00:00:00.000Z',
           updatedAt: '2026-09-06T00:00:00.000Z'
         }

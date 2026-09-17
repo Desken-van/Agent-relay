@@ -146,15 +146,16 @@ export const planReviewGateSchema = z
     /** Codex-assisted automatic triage recommendations — see `planReviewTriageResultSchema`. */
     triageJson: z.string().nullable(),
     /**
-     * The gate's OWN `revision` immediately AFTER the write that stored
-     * `triageJson` — not the revision that was read before analysis started.
-     * Every write bumps `revision`, so tagging the pre-write revision would
-     * make a freshly persisted result read as stale the instant it landed.
-     * A reader compares this against the gate's CURRENT `revision`: any
-     * mismatch means something changed the gate since, and the stored
-     * recommendations must be refused rather than applied.
+     * The EXACT `findingsJson` string the recommendations in `triageJson`
+     * were computed against — not a revision number. `revision` bumps on
+     * every durable write to this row, including fields a triage result
+     * does not depend on, so a revision-based check would make even a
+     * freshly written result read as stale the instant anything else
+     * touched the row. A reader compares this against the gate's CURRENT
+     * `findingsJson`: only a genuinely different set of findings (a new
+     * round) invalidates a stored result.
      */
-    triageForRevision: z.number().int().nonnegative().nullable(),
+    triageForFindings: z.string().nullable(),
     createdAt: isoDateTime,
     updatedAt: isoDateTime
   })

@@ -8,7 +8,8 @@ import { taskSchema } from '../../src/shared/domain/models';
 import type { TaskDetail } from '../../src/shared/ipc';
 import type { WorktreeDependencyStatus } from '../../src/shared/domain/worktree-dependencies';
 import type { TaskSpecification } from '../../src/shared/schemas/codex';
-import { installBridge, ok, renderApp } from './harness';
+import { deferred, installBridge, ok, renderApp } from './harness';
+import type { Task } from '../../src/shared/domain/models';
 
 afterEach(() => {
   cleanup();
@@ -138,5 +139,41 @@ describe('Run screen — dependency blocker', () => {
     await screen.findByText('Actions');
     expect(screen.queryByRole('button', { name: /Install dependencies in task worktree/ })).toBeNull();
     expect(screen.queryByText(/dependency manifest differs/)).toBeNull();
+  });
+
+  it('shows an in-progress notice while installing, refetches on failure, and never silently unblocks the primary action', async () => {
+    const install = deferred<ReturnType<typeof ok<'workflow:installDependencies'>>>();
+    let statusCalls = 0;
+    const bridge = installBridge({
+      'dependencies:status': () => {
+        statusCalls += 1;
+        // First read (on mount) reports the blocker; the read AFTER the
+        // failed install below must report it again, not a stale success.
+        return ok<'dependencies:status'>({ state: 'manifest_mismatch', detail: 'The worktree dependency manifest differs from the registered checkout.' });
+      },
+      'workflow:installDependencies': () => install.promise
+    });
+    renderApp(<SeededRun detail={buildDetail()} />);
+
+    const button = await screen.findByRole('button', { name: /Install dependencies in task worktree/ });
+    await waitFor(() => expect(statusCalls).toBe(1));
+    fireEvent.click(button);
+
+    // While the (potentially minutes-long) install is in flight, the notice
+    // must say so instead of repeating the pre-install blocker text — the
+    // button's own spinner/disabled state is not the only feedback a user
+    // reads here.
+    expect(await screen.findByText(/Installing dependencies in this task worktree/)).toBeTruthy();
+    expect(screen.queryByText(/manifest differs from the registered checkout/)).toBeNull();
+
+    install.resolve(ok<'workflow:installDependencies'>({ ...buildDetail().task, lastError: 'npm ci failed (exit 1).' } satisfies Task));
+
+    // A failed install must re-read the real dependency state (not clear it
+    // to null and silently unblock implementation) — the blocker notice
+    // reappears from a fresh `dependencies:status` call, and the install
+    // button remains present because dependencies are still not usable.
+    await waitFor(() => expect(bridge.callsTo('dependencies:status')).toHaveLength(2));
+    expect(await screen.findByText(/manifest differs from the registered checkout/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Install dependencies in task worktree/ })).toBeTruthy();
   });
 });

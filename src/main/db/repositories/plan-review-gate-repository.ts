@@ -12,7 +12,7 @@ const COLUMNS = `id, task_id, specification_sha256, rule_evidence_sha256,
                  session_id, server_name, server_version,
                  contract_fingerprint, contract_mismatch_at, status, verdict,
                  findings_json, decisions_json, reviewers, gating_count, threshold,
-                 last_error, reconciled_at, revision, triage_json, triage_for_revision,
+                 last_error, reconciled_at, revision, triage_json, triage_for_findings,
                  created_at, updated_at`;
 
 interface GateRow {
@@ -36,7 +36,7 @@ interface GateRow {
   reconciled_at: string | null;
   revision: number;
   triage_json: string | null;
-  triage_for_revision: number | null;
+  triage_for_findings: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -63,7 +63,7 @@ function toGate(row: GateRow): PlanReviewGate {
     reconciledAt: row.reconciled_at,
     revision: row.revision,
     triageJson: row.triage_json,
-    triageForRevision: row.triage_for_revision,
+    triageForFindings: row.triage_for_findings,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -96,14 +96,14 @@ export class SqlitePlanReviewGateRepository implements PlanReviewGateRepository 
            session_id, server_name, server_version,
            contract_fingerprint, contract_mismatch_at, status, verdict,
            findings_json, decisions_json, reviewers, gating_count, threshold,
-           last_error, reconciled_at, revision, triage_json, triage_for_revision,
+           last_error, reconciled_at, revision, triage_json, triage_for_findings,
            created_at, updated_at)
          VALUES (
            @id, @taskId, @specificationSha256, @ruleEvidenceSha256,
            @sessionId, @serverName, @serverVersion,
            @contractFingerprint, @contractMismatchAt, @status, @verdict,
            @findingsJson, @decisionsJson, @reviewers, @gatingCount, @threshold,
-           @lastError, @reconciledAt, @revision, @triageJson, @triageForRevision,
+           @lastError, @reconciledAt, @revision, @triageJson, @triageForFindings,
            @createdAt, @updatedAt)`
       )
       .run({ ...gate, revision: 0, createdAt: now, updatedAt: now });
@@ -171,7 +171,7 @@ export class SqlitePlanReviewGateRepository implements PlanReviewGateRepository 
            reconciled_at = @reconciledAt,
            revision = @revision,
            triage_json = @triageJson,
-           triage_for_revision = @triageForRevision,
+           triage_for_findings = @triageForFindings,
            updated_at = @updatedAt
          WHERE id = @id AND revision = @currentRevision`
       )

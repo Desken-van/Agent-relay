@@ -337,24 +337,28 @@ export function RunView(): React.JSX.Element {
 
   // Passive, read-only: shows the dependency blocker (and its install action)
   // before the user ever attempts implementation, rather than only after a
-  // failed attempt. Refetched whenever the task changes and once more after
-  // an install completes; never starts anything on its own.
+  // failed attempt. Refetched whenever the task changes; `installDependencies`
+  // below additionally re-fetches directly once the install settles, since
+  // `workflow:installDependencies` returns only a `Task` — `acceptTask` never
+  // touches `detail.runs`, so a key derived from it would never change and
+  // the effect would never re-fire on its own.
   const [dependencyStatus, setDependencyStatus] = useState<{
     taskId: string;
     status: WorktreeDependencyStatus;
   } | null>(null);
   const hasWorktree = detail?.task.worktreePath != null;
-  const dependencyStatusRefreshKey = detail?.runs.length ?? 0;
-  useEffect(() => {
-    if (!selectedTaskId || !hasWorktree) return undefined;
-    let cancelled = false;
-    void call('dependencies:status', { taskId: selectedTaskId }).then((response) => {
-      if (!cancelled && response.ok) {
-        setDependencyStatus({ taskId: selectedTaskId, status: response.data });
-      }
+  const fetchDependencyStatus = useCallback((taskId: string): void => {
+    void call('dependencies:status', { taskId }).then((response) => {
+      if (response.ok) setDependencyStatus({ taskId, status: response.data });
     });
-    return () => { cancelled = true; };
-  }, [selectedTaskId, hasWorktree, dependencyStatusRefreshKey]);
+  }, []);
+  useEffect(() => {
+    if (!selectedTaskId || !hasWorktree) return;
+    fetchDependencyStatus(selectedTaskId);
+    // Deliberately keyed on the task id and worktree presence only — see the
+    // comment above for why `detail`'s own fields cannot drive this reliably.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTaskId, hasWorktree]);
   const currentDependencyStatus = dependencyStatus?.taskId === selectedTaskId ? dependencyStatus.status : null;
   const dependencyBlocker = currentDependencyStatus && WORKTREE_DEPENDENCY_INSTALLABLE_BLOCKER_STATES.has(currentDependencyStatus.state)
     ? currentDependencyStatus
@@ -363,11 +367,18 @@ export function RunView(): React.JSX.Element {
   const installDependenciesClaim = useRef(false);
   const installDependencies = (): void => {
     if (!selectedTaskId) return;
+    const taskId = selectedTaskId;
     void perform('install-dependencies', 'Installing dependencies failed', async () => {
-      const updated = await expect('workflow:installDependencies', { taskId: selectedTaskId });
-      acceptTask(updated);
-      if (!updated.lastError) notify({ tone: 'success', title: 'Dependencies installed' });
-      setDependencyStatus(null); // force a fresh read rather than trusting a stale local guess
+      try {
+        const updated = await expect('workflow:installDependencies', { taskId });
+        acceptTask(updated);
+        if (!updated.lastError) notify({ tone: 'success', title: 'Dependencies installed' });
+      } finally {
+        // Always re-read the real state afterward — success, failure, or a
+        // thrown error all leave the worktree in some actual state, and only
+        // a fresh read (never a local guess) may report it.
+        fetchDependencyStatus(taskId);
+      }
     });
   };
 
@@ -571,7 +582,11 @@ export function RunView(): React.JSX.Element {
           {dependencyBlocker ? (
             <Notice tone="warn">
               <div className="stack stack--tight" style={{ width: '100%' }}>
-                <div>{dependencyBlocker.detail}</div>
+                <div>
+                  {busy['install-dependencies']
+                    ? 'Installing dependencies in this task worktree…'
+                    : dependencyBlocker.detail}
+                </div>
                 <div className="row">
                   <button
                     type="button"
@@ -990,11 +1005,12 @@ export function PlanReviewPanel({
   const undecidedIndexes = findings
     .map((_, index) => index)
     .filter((index) => !decisions[index]?.action);
-  // Only current for THIS exact round: `triageForRevision` is the gate's own
-  // revision immediately after the write that stored it, so any later change
-  // to the gate (a fresh round, a resolve) moves `revision` past it and the
-  // stored recommendations are no longer shown as current.
-  const currentTriage = gate && gate.triageForRevision === gate.revision
+  // Only current for THIS exact set of findings: `triageForFindings` is the
+  // exact `findingsJson` the recommendations were computed against, not a
+  // revision number — a revision-based check would make even a
+  // freshly-written result look stale the instant anything else touched the
+  // gate. Only a genuinely new round (different findings) invalidates it.
+  const currentTriage = gate && gate.triageForFindings === gate.findingsJson
     ? parsePlanReviewTriage(gate.triageJson)
     : null;
   const triageByFinding = new Map(currentTriage?.recommendations.map((r) => [r.finding, r]) ?? []);

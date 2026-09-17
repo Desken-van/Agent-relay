@@ -48,7 +48,7 @@ import {
   type UnsafeProviderTextReason
 } from '../../shared/util/provider-text';
 import { CodeReviewNotDispatchedError } from './code-review-provider';
-import { specificationIdentity } from './plan-review-gate';
+import { specificationIdentity } from './specification-identity';
 import {
   hashSnapshotFile,
   nodeSnapshotFileOps,
@@ -1628,7 +1628,12 @@ export class CodeReviewService {
     let targets: readonly CodeReviewFinding[];
     if (request.findingIds) {
       const byId = new Map(all.map((f) => [f.id, f]));
-      targets = request.findingIds.map((id) => {
+      // Deduped: a caller sending the same id twice must not double the
+      // findings sent to Codex, nor make `validateTriageCoverage` demand two
+      // recommendations for one ref (its own duplicate-ref check would then
+      // fail a perfectly well-formed response).
+      const uniqueIds = [...new Set(request.findingIds)];
+      targets = uniqueIds.map((id) => {
         const found = byId.get(id);
         if (!found) {
           throw new AgentRelayError('VALIDATION_FAILED', `Finding ${id} is not a live finding for the current subject.`);
@@ -1649,7 +1654,7 @@ export class CodeReviewService {
     // findings WHILE Codex is thinking is detected below rather than silently
     // applied to evidence that has since moved.
     const revisionBefore = new Map(targets.map((f) => [f.id, f.revision]));
-    const requestedIds = targets.map((f) => f.id);
+    const requestedIds = new Set(targets.map((f) => f.id));
 
     const specification = specificationIdentity(task.specificationJson).specification;
     const triageableFindings: TriageableFinding[] = targets.map((f) => ({
@@ -1663,7 +1668,7 @@ export class CodeReviewService {
       fix: f.fix.length > 0 ? f.fix : null
     }));
     const priorDecisions = all
-      .filter((f) => !requestedIds.includes(f.id))
+      .filter((f) => !requestedIds.has(f.id))
       .map((f) => decisionByFinding.get(f.id))
       .filter((d): d is NonNullable<typeof d> => d !== null && d !== undefined)
       .map((d) => ({ findingRef: d.findingId, action: d.action, reason: d.reason }));
@@ -1721,12 +1726,12 @@ export class CodeReviewService {
    */
   private validateTriageCoverage(
     recommendations: readonly FindingTriageRecommendation[],
-    requestedIds: readonly string[]
+    requestedIds: ReadonlySet<string>
   ): readonly FindingTriageRecommendation[] {
     const seen = new Set<string>();
     for (const recommendation of recommendations) {
       const ref = recommendation.findingRef;
-      if (typeof ref !== 'string' || !requestedIds.includes(ref)) {
+      if (typeof ref !== 'string' || !requestedIds.has(ref)) {
         throw new AgentRelayError('PARSE_FAILED', 'Codex returned a recommendation for a finding that was not requested.');
       }
       if (seen.has(ref)) {
@@ -1734,7 +1739,7 @@ export class CodeReviewService {
       }
       seen.add(ref);
     }
-    if (seen.size !== requestedIds.length) {
+    if (seen.size !== requestedIds.size) {
       throw new AgentRelayError('PARSE_FAILED', 'Codex did not return a recommendation for every requested finding.');
     }
     return recommendations;

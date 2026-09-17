@@ -820,6 +820,12 @@ export class OrnithWorktreeTools {
 
       for (const path of candidates) {
         if (matches.length >= action.limit) break;
+        // Cheap, synchronous: several of this loop's own calls (`lstat`,
+        // `resolvePathOnly`) take no signal, so without this the loop would
+        // keep doing real filesystem work for the rest of a large candidate
+        // list after the timeout already fired, only stopping once an
+        // abort-aware read eventually throws.
+        if (bounded.aborted) return denied('timeout', 'The repository operation timed out.');
         if (!(await stillCurrent())) {
           return denied('checkout_identity_changed', 'The checkout identity changed.');
         }
@@ -1268,6 +1274,7 @@ export class OrnithWorktreeTools {
       const additions: string[] = [];
       const stillCurrent = this.identityRecheckCadence(bounded);
       for (const path of untrackedRaw.split(String.fromCharCode(0)).filter(Boolean)) {
+        if (bounded.aborted) return denied('timeout', 'The repository operation timed out.');
         if (!(await stillCurrent())) {
           return denied('checkout_identity_changed', 'The checkout identity changed.');
         }

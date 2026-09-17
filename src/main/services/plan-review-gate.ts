@@ -1,6 +1,5 @@
 /** Optional, durable external plan-review gate. */
 
-import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { AgentRelayError } from '../../shared/domain/errors';
 import type { Task } from '../../shared/domain/models';
@@ -16,7 +15,8 @@ import {
 } from '../../shared/domain/plan-review';
 import type { RuleEvidenceSnapshot } from '../../shared/domain/rule-evidence';
 import { containsSecretShape, redactAndTruncate } from '../../shared/util/redact';
-import { taskSpecificationSchema, type FindingTriageRecommendation, type TaskSpecification } from '../../shared/schemas/codex';
+import type { FindingTriageRecommendation, TaskSpecification } from '../../shared/schemas/codex';
+import { specificationIdentity } from './specification-identity';
 import type {
   AgentRunContext,
   Clock,
@@ -276,30 +276,6 @@ export interface PlanReviewTriageRequest {
   readonly findingIndexes?: readonly number[];
 }
 
-function hash(value: string): string {
-  return createHash('sha256').update(value).digest('hex');
-}
-
-export function specificationIdentity(raw: string | null): {
-  specification: TaskSpecification;
-  canonical: string;
-  sha256: string;
-} {
-  if (raw === null) {
-    throw new AgentRelayError('VALIDATION_FAILED', 'This task has no specification to review.');
-  }
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch (error) {
-    throw new AgentRelayError('PARSE_FAILED', 'The stored specification is not valid JSON.', {
-      cause: error
-    });
-  }
-  const specification = taskSpecificationSchema.parse(value);
-  const canonical = JSON.stringify(specification);
-  return { specification, canonical, sha256: hash(canonical) };
-}
 
 export function readBoundRuleEvidence(
   taskId: string,
@@ -550,7 +526,7 @@ export class PlanReviewGateService {
       lastError: null,
       reconciledAt: null,
       triageJson: null,
-      triageForRevision: null
+      triageForFindings: null
     });
   }
 
@@ -611,7 +587,7 @@ export class PlanReviewGateService {
         // A new round means new findings; a triage of the previous round's
         // findings describes rows that no longer exist.
         triageJson: null,
-        triageForRevision: null
+        triageForFindings: null
       });
       const session = await this.deps.reviewer.open(reviewSubject, signal);
       gate = this.deps.gates.update(gate.id, {
@@ -1064,17 +1040,20 @@ export class PlanReviewGateService {
 
     const validated = this.validateTriageOutcome(outcome.recommendations, requestedIndexes);
 
-    // Persisted with `triageForRevision` set to the revision the row WILL
-    // have after this write (current + 1), not the one read before analysis
-    // started — every write bumps `revision`, so tagging the pre-write value
-    // would make a result read as stale the instant it was stored. If the
-    // gate moved (another decision, a new round, a resolve) while the Codex
-    // call was in flight, this conditional write is refused and the analysis
-    // is discarded rather than applied to evidence that no longer describes
-    // the current round.
+    // `triageForFindings` is set to the exact `findingsJson` this analysis
+    // was computed against — captured before the Codex call, and never a
+    // revision number: `revision` bumps on every durable write to this row,
+    // including this one, so predicting a post-write value would couple this
+    // service to the repository's own bump-by-one implementation, and any
+    // OTHER field changing later would make a still-valid result look stale.
+    // The conditional write itself still guards against the gate moving
+    // (another decision, a new round, a resolve) while the Codex call was in
+    // flight — if it did, `gate.revision` is no longer current and the write
+    // is refused, discarding the analysis rather than applying it to
+    // evidence that may no longer describe the current round.
     const applied = this.deps.gates.updateIfUnchanged(
       gate.id,
-      { triageJson: JSON.stringify(validated), triageForRevision: gate.revision + 1 },
+      { triageJson: JSON.stringify(validated), triageForFindings: gate.findingsJson },
       gate.revision
     );
     if (applied === null) {
