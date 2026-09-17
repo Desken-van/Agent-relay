@@ -14,6 +14,7 @@
 
 import { isAbsolute } from 'node:path';
 import Ajv2020, { type ErrorObject } from 'ajv/dist/2020.js';
+import addFormats from 'ajv-formats';
 import { AgentRelayError } from '../../../shared/domain/errors';
 import type {
   ExternalMcpCallResult,
@@ -309,9 +310,18 @@ function validateToolSet(
  * safety reason. Every OTHER strict sub-check stays on: an unrecognised
  * keyword, `required` naming an undeclared property, and every other
  * malformed construct this build's own tests exercise are still refused.
+ *
+ * `addFormats` registers the standard `format` vocabulary (`email`, `uri`,
+ * `date-time`, `uuid`, and the rest) so a tool schema that uses one of these
+ * ordinary, extremely common annotations compiles instead of being refused
+ * outright: under `strict: true`, Ajv treats an UNREGISTERED format name as
+ * a compile-time error, not a silent no-op, and Ajv's own core ships with no
+ * format implementations at all. Without this, any required tool whose
+ * schema used `format` would make the whole operation unusable. Applied
+ * fresh to each new instance, same as every other Ajv option here.
  */
 function schemaValidator(): Ajv2020 {
-  return new Ajv2020({ strict: true, strictTypes: false });
+  return addFormats(new Ajv2020({ strict: true, strictTypes: false }));
 }
 
 /**

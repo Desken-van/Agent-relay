@@ -78,6 +78,11 @@ beforeAll(() => {
       // that refusing it would be a real compatibility cost for no safety
       // gain, so this proves it genuinely compiles and validates.
       '  "type-union": { type: "object", properties: { value: { type: ["string", "null"] } } },',
+      // Ajv core ships with NO format implementations at all; under
+      // `strict: true` an unregistered format name is a COMPILE-time error,
+      // not a silent no-op — so this construct proves ajv-formats is wired
+      // in, not merely that `format` is tolerated as an inert annotation.
+      '  "format-email": { type: "object", properties: { value: { type: "string", format: "email" } } },',
       '  supported: { type: "object", minProperties: 1, properties: {',
       '    value: { type: "number", minimum: 0, maximum: 10 },',
       '    tags: { type: "array", items: { type: "string" }, uniqueItems: true }',
@@ -504,7 +509,8 @@ describe('stdio MCP client', () => {
       { extra: 'x' },
       { extra: 5 }
     ],
-    ['a bare type union', 'type-union', { value: null }, { value: 5 }]
+    ['a bare type union', 'type-union', { value: null }, { value: 5 }],
+    ['an email format annotation', 'format-email', { value: 'a@b.com' }, { value: 'not-an-email' }]
   ] as const)('genuinely evaluates a required tool whose schema uses %s, dispatching only when the argument conforms', async (_what, construct, good, bad) => {
     const goodMarker = join(directory, `dispatched-${construct}-good.marker`);
     const goodConfig = config('unsupported-schema', {
