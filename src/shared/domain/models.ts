@@ -145,7 +145,8 @@ export const RUN_TYPES = [
   'review',
   'correction',
   'git',
-  'github'
+  'github',
+  'dependencies'
 ] as const;
 export const RUN_STATUSES = ['running', 'succeeded', 'failed', 'cancelled'] as const;
 

@@ -248,6 +248,7 @@ function lateBound(factories: ReturnType<typeof adapterFactories>): {
         factories.codex().createSpecification(request, context),
       reviewImplementation: (request, context) =>
         factories.codex().reviewImplementation(request, context),
+      triageFindings: (request, context) => factories.codex().triageFindings(request, context),
       diagnose: () => factories.codex().diagnose()
     },
     claude: {
@@ -317,26 +318,6 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   // marked running and tasks stuck in a busy status, and nothing later clears
   // them. Running here means it is finished before IPC is registered and before
   // a window exists, so no new work can race the recovery.
-  const codeReview = new CodeReviewService({
-    tasks,
-    projects,
-    reviews: codeReviews,
-    // Read-only by contract: it never stages, commits or checks anything out.
-    snapshots: new GitCodeSnapshotSource(runner),
-    // Settings-bound and resolved per call: enabling the integration, or
-    // clearing its executable, takes effect on the next call rather than the
-    // next restart. Nothing the renderer sends reaches this.
-    reviewer: new SettingsBoundCodeReviewer({
-      settings: () => settings.get(),
-      client: new StdioMcpClient(
-        runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner()
-      )
-    }),
-    claims: codeReviewClaims,
-    clock,
-    ids
-  });
-
   const reconciliation = reconcileInterruptedWork({
     tasks,
     runs,
@@ -354,6 +335,28 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   });
 
   const adapters = lateBound(adapterFactories(settings, runner));
+
+  const codeReview = new CodeReviewService({
+    tasks,
+    projects,
+    reviews: codeReviews,
+    // Read-only by contract: it never stages, commits or checks anything out.
+    snapshots: new GitCodeSnapshotSource(runner),
+    // Settings-bound and resolved per call: enabling the integration, or
+    // clearing its executable, takes effect on the next call rather than the
+    // next restart. Nothing the renderer sends reaches this.
+    reviewer: new SettingsBoundCodeReviewer({
+      settings: () => settings.get(),
+      client: new StdioMcpClient(
+        runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner()
+      )
+    }),
+    claims: codeReviewClaims,
+    codex: adapters.codex,
+    settings,
+    clock,
+    ids
+  });
 
   const projectService = new ProjectService({
     projects,
@@ -395,9 +398,11 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     isSourceBusy: (taskId) => runtime.orchestrator?.isRunning(taskId) ?? false
   });
 
+  const worktreeDependencyPreparer = new LocalWorktreeDependencyPreparer(runner);
   const orchestrator = new Orchestrator({
     verification,
-    worktreeDependencies: new LocalWorktreeDependencyPreparer(runner),
+    worktreeDependencies: worktreeDependencyPreparer,
+    worktreeDependencyInstaller: worktreeDependencyPreparer,
     projects,
     tasks,
     runs,
@@ -536,6 +541,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
           ),
           config
         ),
+        codex: adapters.codex,
+        settings,
         clock,
         ids
       }),

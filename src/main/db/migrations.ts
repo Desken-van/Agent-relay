@@ -1012,6 +1012,27 @@ export const MIGRATIONS: readonly Migration[] = [
         ALTER TABLE code_review_rounds ADD COLUMN contract_mismatch_at TEXT;
       `);
     }
+  },
+  {
+    version: 17,
+    name: 'plan-review-triage',
+    up(db) {
+      // Codex-assisted automatic triage recommendations for a plan-review
+      // gate's undecided findings — see `PlanReviewGateService.triage()`.
+      // `triage_json` is the durable recommendation set; `triage_for_revision`
+      // is the gate's OWN `revision` immediately after the write that stored
+      // it (not before — every write bumps `revision`, so tagging the
+      // revision read before the write would make a triage result read as
+      // stale the instant it was persisted). A read compares the gate's
+      // CURRENT `revision` against `triage_for_revision`: any mismatch means
+      // something changed the gate since, and the stored recommendations are
+      // refused rather than applied. Plain ALTER TABLE: nullable additions
+      // with no new CHECK constraint.
+      db.exec(`
+        ALTER TABLE plan_review_gates ADD COLUMN triage_json TEXT;
+        ALTER TABLE plan_review_gates ADD COLUMN triage_for_revision INTEGER;
+      `);
+    }
   }
 ];
 

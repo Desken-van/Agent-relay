@@ -14,11 +14,12 @@ const CODE_REVIEW_CHANNELS = [
   'codeReview:capture',
   'codeReview:review',
   'codeReview:reconcile',
-  'codeReview:decide'
+  'codeReview:decide',
+  'codeReview:triage'
 ] as const;
 
 describe('the code-review IPC contract', () => {
-  it('registers exactly the five bounded operations', () => {
+  it('registers exactly the six bounded operations', () => {
     for (const channel of CODE_REVIEW_CHANNELS) {
       expect(isIpcChannel(channel)).toBe(true);
       expect(ipcInputSchemas[channel]).toBeDefined();
@@ -103,6 +104,21 @@ describe('the code-review IPC contract', () => {
             : { taskId: 'task-1' };
         expect(ipcInputSchemas[channel].safeParse({ ...base, ...extra }).success).toBe(false);
       }
+    }
+  });
+
+  it('accepts only durable identifiers for triage, optionally narrowed to specific finding ids', () => {
+    const schema = ipcInputSchemas['codeReview:triage'];
+    expect(schema.safeParse({ taskId: 'task-1' }).success).toBe(true);
+    expect(schema.safeParse({ taskId: 'task-1', findingIds: ['f-1', 'f-2'] }).success).toBe(true);
+    for (const invalid of [
+      { taskId: 'task-1', findingIds: [''] },
+      { taskId: 'task-1', findingIds: [1] },
+      { taskId: 'task-1', findingIds: [{ id: 'f-1' }] },
+      { taskId: '' },
+      {}
+    ]) {
+      expect(schema.safeParse(invalid).success).toBe(false);
     }
   });
 

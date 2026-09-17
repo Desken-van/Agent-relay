@@ -82,6 +82,45 @@ export const codexReviewResultSchema = z.object({
 export type CodexReviewResult = z.infer<typeof codexReviewResultSchema>;
 
 /* -------------------------------------------------------------------------- */
+/* Automatic finding triage                                                    */
+/* -------------------------------------------------------------------------- */
+
+export const TRIAGE_RECOMMENDATIONS = ['accept', 'reject', 'needs_user'] as const;
+export const TRIAGE_CONFIDENCES = ['high', 'medium', 'low', 'uncertain'] as const;
+
+export type TriageRecommendation = (typeof TRIAGE_RECOMMENDATIONS)[number];
+export type TriageConfidence = (typeof TRIAGE_CONFIDENCES)[number];
+
+/**
+ * One independent recommendation for one undecided finding. `findingRef` is
+ * either a plan-review finding's 0-based index or a code-review finding's
+ * stable id — the caller validates it names one of the specific undecided
+ * findings it asked about; this schema only bounds its shape.
+ */
+export const findingTriageRecommendationSchema = z
+  .object({
+    findingRef: z.union([z.number().int().nonnegative(), z.string().min(1).max(100)]),
+    recommendation: z
+      .enum(TRIAGE_RECOMMENDATIONS)
+      .describe('accept = valid, actionable, in scope. reject = false premise, duplicate, out of scope, or already satisfied. needs_user = a product/architecture choice or genuine uncertainty.'),
+    reason: z.string().min(1).max(2_000).describe('Concise reason for the recommendation.'),
+    evidenceRef: z.string().min(1).max(500).describe('A concrete reference into the reviewed material that supports this recommendation.'),
+    confidence: z.enum(TRIAGE_CONFIDENCES)
+  })
+  .strict();
+
+export type FindingTriageRecommendation = z.infer<typeof findingTriageRecommendationSchema>;
+
+/** Wrapped in an object, not a bare array, so the same brace-scanning `extractJsonObject` parses it. */
+export const findingTriageResultSchema = z
+  .object({
+    results: z.array(findingTriageRecommendationSchema).min(1).max(256)
+  })
+  .strict();
+
+export type FindingTriageResult = z.infer<typeof findingTriageResultSchema>;
+
+/* -------------------------------------------------------------------------- */
 /* JSON Schema projections handed to the Codex SDK                             */
 /* -------------------------------------------------------------------------- */
 
@@ -99,6 +138,9 @@ export const taskSpecificationJsonSchema = (): Record<string, unknown> =>
 
 export const codexReviewResultJsonSchema = (): Record<string, unknown> =>
   toCodexOutputSchema(codexReviewResultSchema);
+
+export const findingTriageResultJsonSchema = (): Record<string, unknown> =>
+  toCodexOutputSchema(findingTriageResultSchema);
 
 /* -------------------------------------------------------------------------- */
 /* Tolerant parsing                                                            */
@@ -214,4 +256,8 @@ export function parseTaskSpecification(text: string): ParseOutcome<TaskSpecifica
 
 export function parseCodexReviewResult(text: string): ParseOutcome<CodexReviewResult> {
   return parseStructured(codexReviewResultSchema, text);
+}
+
+export function parseFindingTriageResult(text: string): ParseOutcome<FindingTriageResult> {
+  return parseStructured(findingTriageResultSchema, text);
 }

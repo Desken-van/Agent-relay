@@ -8,7 +8,7 @@ import {
 import type { LocalInferenceStateKind } from '@shared/domain/local-inference';
 import type { GitChangeSet } from '@shared/domain/git';
 import { APPROVAL_ACTIONS, type ApprovalAction, type Run, type Task } from '@shared/domain/models';
-import type { PlanReviewDecision } from '@shared/domain/plan-review';
+import { parsePlanReviewTriage, type PlanReviewDecision } from '@shared/domain/plan-review';
 import {
   runGuidance,
   type PlanReviewPreparation,
@@ -17,6 +17,10 @@ import {
   type RunPrimaryAction
 } from '@shared/domain/run-guidance';
 import { isBusy, isTerminal } from '@shared/domain/workflow';
+import {
+  WORKTREE_DEPENDENCY_INSTALLABLE_BLOCKER_STATES,
+  type WorktreeDependencyStatus
+} from '@shared/domain/worktree-dependencies';
 import type { PlanReviewDetail, PublishConfirmation, PublishOutcome, TaskDetail } from '@shared/ipc';
 import type { CodexReviewResult, FindingSeverity, TaskSpecification } from '@shared/schemas/codex';
 import { ApiError, call, describeError, expect } from '../lib/api';
@@ -243,6 +247,8 @@ export function RunView(): React.JSX.Element {
   /** Non-null while the one primary action is in flight; names the action key. */
   const [primaryPending, setPrimaryPending] = useState<RunActionKey | null>(null);
   const planPrimaryDispatch = useRef<((key: RunActionKey) => void) | null>(null);
+  /** Synchronous double-click guard for "Continue anyway", mirroring `PrimaryActionButton`'s claim. */
+  const continueAnywayClaim = useRef(false);
   const registerPlanDispatcher = useCallback((dispatcher: ((key: RunActionKey) => void) | null) => {
     planPrimaryDispatch.current = dispatcher;
   }, []);
@@ -328,6 +334,42 @@ export function RunView(): React.JSX.Element {
       window.clearInterval(timer);
     };
   }, [implementationProviderForReadiness, selectedTaskId]);
+
+  // Passive, read-only: shows the dependency blocker (and its install action)
+  // before the user ever attempts implementation, rather than only after a
+  // failed attempt. Refetched whenever the task changes and once more after
+  // an install completes; never starts anything on its own.
+  const [dependencyStatus, setDependencyStatus] = useState<{
+    taskId: string;
+    status: WorktreeDependencyStatus;
+  } | null>(null);
+  const hasWorktree = detail?.task.worktreePath != null;
+  const dependencyStatusRefreshKey = detail?.runs.length ?? 0;
+  useEffect(() => {
+    if (!selectedTaskId || !hasWorktree) return undefined;
+    let cancelled = false;
+    void call('dependencies:status', { taskId: selectedTaskId }).then((response) => {
+      if (!cancelled && response.ok) {
+        setDependencyStatus({ taskId: selectedTaskId, status: response.data });
+      }
+    });
+    return () => { cancelled = true; };
+  }, [selectedTaskId, hasWorktree, dependencyStatusRefreshKey]);
+  const currentDependencyStatus = dependencyStatus?.taskId === selectedTaskId ? dependencyStatus.status : null;
+  const dependencyBlocker = currentDependencyStatus && WORKTREE_DEPENDENCY_INSTALLABLE_BLOCKER_STATES.has(currentDependencyStatus.state)
+    ? currentDependencyStatus
+    : null;
+  const dependencyUnsupported = currentDependencyStatus?.state === 'unsupported_package_manager' ? currentDependencyStatus : null;
+  const installDependenciesClaim = useRef(false);
+  const installDependencies = (): void => {
+    if (!selectedTaskId) return;
+    void perform('install-dependencies', 'Installing dependencies failed', async () => {
+      const updated = await expect('workflow:installDependencies', { taskId: selectedTaskId });
+      acceptTask(updated);
+      if (!updated.lastError) notify({ tone: 'success', title: 'Dependencies installed' });
+      setDependencyStatus(null); // force a fresh read rather than trusting a stale local guess
+    });
+  };
 
   if (!selectedTaskId || !detail) {
     return (
@@ -526,6 +568,35 @@ export function RunView(): React.JSX.Element {
       {/* ------------------------------- main ------------------------------- */}
       <div className="run-layout__main">
         <Card title="Actions">
+          {dependencyBlocker ? (
+            <Notice tone="warn">
+              <div className="stack stack--tight" style={{ width: '100%' }}>
+                <div>{dependencyBlocker.detail}</div>
+                <div className="row">
+                  <button
+                    type="button"
+                    className="btn btn--sm"
+                    disabled={anyBusy || running}
+                    onClick={() => {
+                      if (installDependenciesClaim.current) return;
+                      installDependenciesClaim.current = true;
+                      try {
+                        installDependencies();
+                      } finally {
+                        window.setTimeout(() => { installDependenciesClaim.current = false; }, 0);
+                      }
+                    }}
+                  >
+                    {busy['install-dependencies'] ? <Spinner /> : null}
+                    Install dependencies in task worktree
+                  </button>
+                </div>
+              </div>
+            </Notice>
+          ) : null}
+          {dependencyUnsupported ? (
+            <Notice tone="warn">{dependencyUnsupported.detail}</Notice>
+          ) : null}
           <RunFlowOverview guidance={guidance} />
           <ProviderControls key={`providers-${task.id}`} task={task} busy={anyBusy || running}
             onChanged={acceptTask} />
@@ -546,7 +617,20 @@ export function RunView(): React.JSX.Element {
               <div className="stack stack--tight" style={{ width: '100%' }}>
                 <div style={{ whiteSpace: 'pre-wrap' }}>{dirtyPrompt}</div>
                 <div className="row">
-                  <button type="button" className="btn btn--sm" onClick={() => sendToClaude(true)}>
+                  <button
+                    type="button"
+                    className="btn btn--sm"
+                    disabled={otherOperationBusy || primaryPending !== null}
+                    onClick={() => {
+                      if (continueAnywayClaim.current) return;
+                      continueAnywayClaim.current = true;
+                      try {
+                        sendToClaude(true);
+                      } finally {
+                        window.setTimeout(() => { continueAnywayClaim.current = false; }, 0);
+                      }
+                    }}
+                  >
                     Continue anyway
                   </button>
                   <button
@@ -566,9 +650,16 @@ export function RunView(): React.JSX.Element {
               <PrimaryActionButton
                 action={guidance.action}
                 pending={primaryPending === guidance.action.key}
-                blocked={otherOperationBusy}
+                blocked={otherOperationBusy || (
+                  dependencyBlocker !== null &&
+                  (guidance.action.key === 'run_implementation' || guidance.action.key === 'send_corrections')
+                )}
                 onClick={dispatchPrimary}
               />
+              {dependencyBlocker !== null &&
+              (guidance.action.key === 'run_implementation' || guidance.action.key === 'send_corrections') ? (
+                <p className="hint">Install dependencies in this task worktree first (above) before running {providerLabel(task.implementationProvider)}.</p>
+              ) : null}
             </div>
           ) : null}
 
@@ -854,7 +945,13 @@ export function PlanReviewPanel({
   const [error, setError] = useState<string | null>(null);
   const [dirtyPrompt, setDirtyPrompt] = useState<string | null>(null);
   const [draftState, setDraftState] = useState<DecisionDrafts>({ roundKey: null, drafts: {} });
-  const roundKey = detail?.gate ? `${detail.gate.id}:${detail.gate.revision}` : null;
+  // Keyed on the findings actually rendered, not `gate.revision`: a decision
+  // is an answer to a specific finding, and only a NEW set of findings (a
+  // fresh round) makes an old answer stop applying. `revision` bumps on every
+  // durable write to the row — including a triage analysis, which changes no
+  // finding — and keying on it would wipe in-progress manual decisions the
+  // instant "Analyze undecided findings" completes.
+  const roundKey = detail?.gate ? `${detail.gate.id}:${JSON.stringify(detail.findings)}` : null;
   const decisions = draftState.roundKey === roundKey ? draftState.drafts : NO_DRAFTS;
   const setDecisions = useCallback(
     (update: (current: Record<number, DecisionDraft>) => Record<number, DecisionDraft>): void => {
@@ -890,6 +987,25 @@ export function PlanReviewPanel({
     return decision?.action === 'accept' ||
       (decision?.action === 'reject' && decision.reason.trim().length > 0);
   });
+  const undecidedIndexes = findings
+    .map((_, index) => index)
+    .filter((index) => !decisions[index]?.action);
+  // Only current for THIS exact round: `triageForRevision` is the gate's own
+  // revision immediately after the write that stored it, so any later change
+  // to the gate (a fresh round, a resolve) moves `revision` past it and the
+  // stored recommendations are no longer shown as current.
+  const currentTriage = gate && gate.triageForRevision === gate.revision
+    ? parsePlanReviewTriage(gate.triageJson)
+    : null;
+  const triageByFinding = new Map(currentTriage?.recommendations.map((r) => [r.finding, r]) ?? []);
+  const triageSummary = currentTriage
+    ? {
+        accept: currentTriage.recommendations.filter((r) => r.recommendation === 'accept').length,
+        reject: currentTriage.recommendations.filter((r) => r.recommendation === 'reject').length,
+        needsUser: currentTriage.recommendations.filter((r) => r.recommendation === 'needs_user').length,
+        unclassified: findings.length - currentTriage.recommendations.length
+      }
+    : null;
   const guidanceState = planReviewPreparationState({
     task,
     integrationEnabled,
@@ -1242,6 +1358,7 @@ export function PlanReviewPanel({
             <button
               type="button"
               className="btn btn--sm"
+              title="Blind bulk action: fills every undecided finding with Accept, without looking at any of them."
               disabled={busy !== null || allDecided}
               onClick={() => setDecisions((current) => {
                 const next = { ...current };
@@ -1251,7 +1368,7 @@ export function PlanReviewPanel({
                 return next;
               })}
             >
-              Accept all undecided findings
+              Accept all undecided findings (blind)
             </button>
             <button
               type="button"
@@ -1261,9 +1378,56 @@ export function PlanReviewPanel({
             >
               Clear decisions
             </button>
+            {gate && integrationEnabled ? (
+              <button
+                type="button"
+                className="btn btn--sm"
+                disabled={busy !== null || undecidedIndexes.length === 0}
+                title="Independent Codex analysis: recommends accept/reject/needs a human for each undecided finding, with reasons. Never resolves anything on its own."
+                onClick={() => void act('triage', () => expect('planReview:triage', {
+                  taskId: task.id,
+                  gateId: gate.id,
+                  expectedRevision: gate.revision,
+                  findingIndexes: undecidedIndexes
+                }))}
+              >
+                {busy === 'triage' ? <Spinner /> : null} Analyze undecided findings
+              </button>
+            ) : null}
           </div>
+          {triageSummary ? (
+            <div className="row muted" style={{ marginTop: 4 }}>
+              Analysis: {triageSummary.accept} recommended accept · {triageSummary.reject} recommended reject ·
+              {' '}{triageSummary.needsUser} need a human · {triageSummary.unclassified} not analyzed
+              {undecidedIndexes.some((index) => triageByFinding.has(index) && triageByFinding.get(index)!.recommendation !== 'needs_user') ? (
+                <button
+                  type="button"
+                  className="btn btn--sm btn--ghost"
+                  style={{ marginLeft: 8 }}
+                  disabled={busy !== null}
+                  onClick={() => setDecisions((current) => {
+                    const next = { ...current };
+                    for (const index of undecidedIndexes) {
+                      const recommendation = triageByFinding.get(index);
+                      if (!recommendation) continue;
+                      if (recommendation.recommendation !== 'accept' && recommendation.recommendation !== 'reject') continue;
+                      if (next[index]?.action) continue;
+                      next[index] = {
+                        action: recommendation.recommendation,
+                        reason: recommendation.recommendation === 'reject' ? recommendation.reason : ''
+                      };
+                    }
+                    return next;
+                  })}
+                >
+                  Apply all recommendations to undecided findings
+                </button>
+              ) : null}
+            </div>
+          ) : null}
           {findings.map((finding, index) => {
             const decision = decisions[index] ?? { action: '', reason: '' };
+            const recommendation = triageByFinding.get(index);
             return (
               <div className="finding" key={`${index}:${finding.title}`}>
                 <div className="finding__head">
@@ -1273,6 +1437,36 @@ export function PlanReviewPanel({
                 </div>
                 <div className="finding__desc selectable">{finding.why}</div>
                 <div className="muted selectable" style={{ marginTop: 6 }}>Suggested: {finding.fix}</div>
+                {recommendation ? (
+                  <div
+                    className={`muted selectable ${recommendation.recommendation === 'needs_user' ? 'tag--warn' : ''}`}
+                    style={{ marginTop: 6, padding: 6, border: '1px solid var(--border, #444)', borderRadius: 4 }}
+                  >
+                    <strong>
+                      {recommendation.recommendation === 'accept' ? 'Recommended: accept'
+                        : recommendation.recommendation === 'reject' ? 'Recommended: reject'
+                        : 'Needs a human decision'}
+                    </strong>{' '}
+                    ({recommendation.confidence} confidence) — {recommendation.reason}
+                    <div>Evidence: {recommendation.evidenceRef}</div>
+                    {(recommendation.recommendation === 'accept' || recommendation.recommendation === 'reject') && !decision.action ? (
+                      <button
+                        type="button"
+                        className="btn btn--sm btn--ghost"
+                        style={{ marginTop: 4 }}
+                        onClick={() => setDecisions((current) => ({
+                          ...current,
+                          [index]: {
+                            action: recommendation.recommendation as 'accept' | 'reject',
+                            reason: recommendation.recommendation === 'reject' ? recommendation.reason : ''
+                          }
+                        }))}
+                      >
+                        Apply recommendation
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
                 <div className="grid-2" style={{ marginTop: 10 }}>
                   <Field label="Decision">
                     <select

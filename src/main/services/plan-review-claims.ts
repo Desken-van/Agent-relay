@@ -26,8 +26,8 @@
 
 import { AgentRelayError } from '../../shared/domain/errors';
 
-/** The three operations that reach the provider and must not overlap. */
-export type PlanReviewOperation = 'review' | 'reconcile' | 'resolve';
+/** The operations that reach an external provider (Coai or Codex) and must not overlap. */
+export type PlanReviewOperation = 'review' | 'reconcile' | 'resolve' | 'triage';
 
 export class PlanReviewClaims {
   private readonly held = new Map<string, PlanReviewOperation>();

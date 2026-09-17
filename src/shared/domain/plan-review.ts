@@ -143,11 +143,55 @@ export const planReviewGateSchema = z
      * advance at all, so every write would carry the same timestamp.
      */
     revision: z.number().int().nonnegative(),
+    /** Codex-assisted automatic triage recommendations — see `planReviewTriageResultSchema`. */
+    triageJson: z.string().nullable(),
+    /**
+     * The gate's OWN `revision` immediately AFTER the write that stored
+     * `triageJson` — not the revision that was read before analysis started.
+     * Every write bumps `revision`, so tagging the pre-write revision would
+     * make a freshly persisted result read as stale the instant it landed.
+     * A reader compares this against the gate's CURRENT `revision`: any
+     * mismatch means something changed the gate since, and the stored
+     * recommendations must be refused rather than applied.
+     */
+    triageForRevision: z.number().int().nonnegative().nullable(),
     createdAt: isoDateTime,
     updatedAt: isoDateTime
   })
   .strict();
 export type PlanReviewGate = z.infer<typeof planReviewGateSchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Automatic finding triage                                                    */
+/* -------------------------------------------------------------------------- */
+
+export const planReviewTriageRecommendationSchema = z
+  .object({
+    /** 0-based index into the gate's `findingsJson` array. */
+    finding: z.number().int().nonnegative(),
+    recommendation: z.enum(['accept', 'reject', 'needs_user']),
+    reason: z.string().min(1).max(2_000),
+    evidenceRef: z.string().min(1).max(500),
+    confidence: z.enum(['high', 'medium', 'low', 'uncertain'])
+  })
+  .strict();
+export type PlanReviewTriageRecommendation = z.infer<typeof planReviewTriageRecommendationSchema>;
+
+export const planReviewTriageResultSchema = z
+  .object({
+    recommendations: z.array(planReviewTriageRecommendationSchema).max(256)
+  })
+  .strict();
+export type PlanReviewTriageResult = z.infer<typeof planReviewTriageResultSchema>;
+
+export function parsePlanReviewTriage(json: string | null): PlanReviewTriageResult | null {
+  if (json === null) return null;
+  try {
+    return planReviewTriageResultSchema.parse(JSON.parse(json));
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Whether a task's latest gate still speaks for the specification it has now.

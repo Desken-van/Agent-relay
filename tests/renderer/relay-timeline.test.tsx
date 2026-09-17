@@ -229,4 +229,55 @@ describe('Relay timeline — provider vs snapshot verification stay distinct', (
     expect(screen.queryByText(/provider verification/)).toBeNull();
     await screen.findByText(/^Events/);
   });
+
+  it('names the real reason inline when a round failed before verification was ever reached, instead of an unexplained "not run"', async () => {
+    installBridge();
+    const run = makeRun({
+      agent: 'ornith',
+      runType: 'implementation',
+      status: 'failed',
+      structuredResult: JSON.stringify({
+        assessment: {
+          version: 1,
+          disposition: 'fail',
+          verificationStatus: 'not_run',
+          publishBlock: 'configuration',
+          reasonCodes: ['timeout'],
+          verification: null,
+          denials: []
+        }
+      })
+    });
+    renderApp(<RelayTimeline runs={[run]} />);
+
+    expect(screen.queryByText(/provider verification not run/)).toBeNull();
+    const tag = screen.getByText(/verification not reached \(timeout\)/);
+    expect(tag.className).toContain('tag--warn');
+    await screen.findByText(/^Events/);
+  });
+
+  it('still renders the plain "not run" tag when nothing else failed (an unrelated older run, or a genuinely diagnostic-only round)', async () => {
+    installBridge();
+    const run = makeRun({
+      agent: 'ornith',
+      runType: 'implementation',
+      status: 'succeeded',
+      structuredResult: JSON.stringify({
+        assessment: {
+          version: 1,
+          disposition: 'pass',
+          verificationStatus: 'not_run',
+          publishBlock: 'none',
+          reasonCodes: [],
+          verification: null,
+          denials: []
+        }
+      })
+    });
+    renderApp(<RelayTimeline runs={[run]} />);
+
+    expect(screen.getByText(/provider verification not run/)).toBeTruthy();
+    expect(screen.queryByText(/verification not reached/)).toBeNull();
+    await screen.findByText(/^Events/);
+  });
 });

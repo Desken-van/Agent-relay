@@ -496,11 +496,17 @@ describe('OrnithImplementationService limits and cancellation', () => {
     // separately tested directly at exactly 256/300/16/etc in
     // tests/adapters/ornith-worktree-tools.test.ts, where the budget is supplied
     // directly rather than derived from preflight.
+    // chars values are recalibrated whenever ORNITH_PROTOCOL_INSTRUCTIONS' fixed
+    // byte length changes (most recently: the read-only-timeout-recovery rule),
+    // since that text is part of the same authoritative/fixed prompt budget this
+    // filler trades off against. Recompute empirically (binary-search
+    // `preflightOrnithPrompt` for the `chars` that yields each target budget)
+    // rather than hand-deriving the offset.
     const budgetCases: { label: string; chars: number; expectedBudget: number }[] = [
-      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 124_775, expectedBudget: 384 },
-      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 124_728, expectedBudget: 407 },
-      { label: '408 bytes (right at the old fallback stub size)', chars: 124_726, expectedBudget: 408 },
-      { label: '471 bytes ("408+": comfortably normal)', chars: 124_600, expectedBudget: 471 }
+      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 124_415, expectedBudget: 384 },
+      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 124_369, expectedBudget: 407 },
+      { label: '408 bytes (right at the old fallback stub size)', chars: 124_367, expectedBudget: 408 },
+      { label: '471 bytes ("408+": comfortably normal)', chars: 124_241, expectedBudget: 471 }
     ];
 
     for (const { label, chars, expectedBudget } of budgetCases) {
@@ -580,7 +586,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_775)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_415)}` // -> 384-byte budget
       };
       const preflight = preflightOrnithPrompt({
         specification: oversizedSpecification,
@@ -632,7 +638,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_775)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_415)}` // -> 384-byte budget
       };
       for (let index = 0; index < 40; index += 1) {
         writeFileSync(join(worktree, `s${String(index).padStart(3, '0')}.txt`), 'needle appears here\n', 'utf8');
@@ -674,7 +680,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_775)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_415)}` // -> 384-byte budget
       };
       // Multi-byte (3 UTF-8 bytes each) names: short enough in UTF-16 code units to
       // stay well under Windows' MAX_PATH, long enough in UTF-8 bytes that every
@@ -1090,5 +1096,142 @@ describe('OrnithImplementationService limits and cancellation', () => {
     setTimeout(() => controller.abort(), 20);
 
     await expect(pending).rejects.toMatchObject({ code: 'CANCELLED' });
+  });
+
+  describe('read-only timeout classification and bounded recovery', () => {
+    const originalSearchTimeoutMs = ORNITH_LIMITS.searchTimeoutMs;
+    const originalMaxRecoveryAttempts = ORNITH_LIMITS.maxReadOnlyRecoveryAttempts;
+
+    afterEach(() => {
+      (ORNITH_LIMITS as { searchTimeoutMs: number }).searchTimeoutMs = originalSearchTimeoutMs;
+      (ORNITH_LIMITS as { maxReadOnlyRecoveryAttempts: number }).maxReadOnlyRecoveryAttempts = originalMaxRecoveryAttempts;
+    });
+
+    it('feeds a read-only timeout back as recoverable and finishes once the model pivots to a different action', async () => {
+      // 1ms is far below the real cost of even a single `git rev-parse` spawn,
+      // so the very first search_text call's own checkout-identity check times
+      // out deterministically and honestly — no fake hang is required, since
+      // real git subprocess latency is exactly the cost this fix exists to
+      // bound. Only searchText's own timeout window shrinks: the loop's
+      // separate pre-dispatch identity check uses gitTimeoutMs (unaffected),
+      // and `finish` never touches the filesystem at all.
+      (ORNITH_LIMITS as { searchTimeoutMs: number }).searchTimeoutMs = 1;
+      let calls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          calls += 1;
+          if (calls === 1) {
+            return completed(request, JSON.stringify({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 }));
+          }
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Pivoted away from the timed-out search.' }));
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement(
+        baseRequest(leaseService, new AbortController().signal)
+      );
+
+      expect(calls).toBe(2);
+      expect(result.assessment.disposition).toBe('pass');
+      expect(result.ornithAudit.outcomes[0]).toMatchObject({ action: 'search_text', ok: false, code: 'timeout' });
+    });
+
+    it('exhausts the read-only recovery budget and ends the run classified as configuration, not security', async () => {
+      (ORNITH_LIMITS as { searchTimeoutMs: number }).searchTimeoutMs = 1;
+      let calls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        // A distinct query every turn so the pre-dispatch identical-action
+        // guard never intervenes — this exercises the recovery BUDGET running
+        // out, not the separate identical-repeat guard.
+        inferForOrnith: async (_lease, request) => {
+          calls += 1;
+          return completed(request, JSON.stringify({ version: 1, action: 'search_text', query: `needle-${calls}`, caseSensitive: false, limit: 10 }));
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement(
+        baseRequest(leaseService, new AbortController().signal)
+      );
+
+      // One initial attempt plus `maxReadOnlyRecoveryAttempts` recoveries, then terminal.
+      expect(calls).toBe(1 + ORNITH_LIMITS.maxReadOnlyRecoveryAttempts);
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.publishBlock).toBe('configuration');
+      expect(result.assessment.reasonCodes).toContain('timeout');
+      expect(result.finalMessage).toContain('search_text');
+      expect(result.finalMessage).toContain('timeout');
+      expect(result.ornithAudit.changedFiles).toBe(0);
+    });
+
+    it('rejects an identical repeated search after a failure without re-invoking the tool', async () => {
+      (ORNITH_LIMITS as { searchTimeoutMs: number }).searchTimeoutMs = 1;
+      const repeated = JSON.stringify({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 });
+      let calls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          calls += 1;
+          if (calls <= 2) return completed(request, repeated);
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Done after the identical repeat was refused.' }));
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement(
+        baseRequest(leaseService, new AbortController().signal)
+      );
+
+      expect(calls).toBe(3);
+      expect(result.assessment.disposition).toBe('pass');
+      // Turn 1: real dispatch, timed out (carries a code). Turn 2: identical
+      // repeat, skipped without dispatch (no code — nothing actually ran).
+      expect(result.ornithAudit.outcomes[0]).toMatchObject({ action: 'search_text', ok: false, code: 'timeout' });
+      expect(result.ornithAudit.outcomes[1]).toMatchObject({ action: 'search_text', ok: false });
+      expect(result.ornithAudit.outcomes[1]?.code).toBeUndefined();
+    });
+
+    it('classifies a resource-limit denial as configuration with an exact, specific message', async () => {
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) =>
+          completed(request, JSON.stringify({ version: 1, action: 'read_file', path: 'does-not-exist.txt', offset: 0, limit: 64 }))
+      };
+
+      const result = await new OrnithImplementationService().implement(
+        baseRequest(leaseService, new AbortController().signal)
+      );
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.publishBlock).toBe('configuration');
+      expect(result.assessment.reasonCodes).toContain('file_not_found');
+      expect(result.finalMessage).toContain('read_file');
+      expect(result.finalMessage).toContain('file_not_found');
+      expect(result.finalMessage).not.toContain('unsafe or over-limit');
+    });
+
+    it('classifies a credential-shaped read denial as security with an exact, specific message', async () => {
+      writeFileSync(join(worktree, 'secret.txt'), 'ghp_1234567890abcdef1234567890abcd\n', 'utf8');
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) =>
+          completed(request, JSON.stringify({ version: 1, action: 'read_file', path: 'secret.txt', offset: 0, limit: 64 }))
+      };
+
+      const result = await new OrnithImplementationService().implement(
+        baseRequest(leaseService, new AbortController().signal)
+      );
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.publishBlock).toBe('security');
+      expect(result.assessment.reasonCodes).toContain('disallowed_action');
+      expect(result.finalMessage).toContain('read_file');
+      expect(result.finalMessage).toContain('disallowed_action');
+    });
   });
 });

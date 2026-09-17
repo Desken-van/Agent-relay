@@ -48,6 +48,7 @@ import {
   type UnsafeProviderTextReason
 } from '../../shared/util/provider-text';
 import { CodeReviewNotDispatchedError } from './code-review-provider';
+import { specificationIdentity } from './plan-review-gate';
 import {
   hashSnapshotFile,
   nodeSnapshotFileOps,
@@ -55,10 +56,12 @@ import {
   type SnapshotFileOps
 } from '../adapters/git/git-code-snapshot';
 import type {
+  AgentRunContext,
   Clock,
   CodeReviewRepository,
   CodeSnapshotLimits,
   CodeSnapshotSource,
+  CodexAdapter,
   ExternalCodeReviewer,
   IdGenerator,
   ProjectRepository,
@@ -70,8 +73,11 @@ import type {
   ExternalCodeRoundLocator,
   RawCodeSnapshot,
   RoundFindingRecord,
-  TaskRepository
+  SettingsRepository,
+  TaskRepository,
+  TriageableFinding
 } from '../ports';
+import type { FindingTriageRecommendation } from '../../shared/schemas/codex';
 
 /**
  * Bounded by count, never by content.
@@ -236,16 +242,20 @@ function sha256(value: string | Buffer): string {
  * What survives a restart is the round's durable status, and an unresolved
  * status already refuses a new dispatch.
  */
-export class CodeReviewClaims {
-  private readonly held = new Set<string>();
+/** The operations that reach an external provider (Coai or Codex) and must not overlap. */
+export type CodeReviewOperation = 'review' | 'reconcile' | 'triage';
 
-  acquire(taskId: string): () => void {
-    if (this.held.has(taskId)) {
-      throw new AgentRelayError('BUSY', 'A code review is already running for this task.', {
-        remediation: 'Wait for the round in flight to finish, then read the review again.'
+export class CodeReviewClaims {
+  private readonly held = new Map<string, CodeReviewOperation>();
+
+  acquire(taskId: string, operation: CodeReviewOperation): () => void {
+    const current = this.held.get(taskId);
+    if (current !== undefined) {
+      throw new AgentRelayError('BUSY', `A code review ${current} is already running for this task.`, {
+        remediation: 'Wait for the operation in flight to finish, then read the review again.'
       });
     }
-    this.held.add(taskId);
+    this.held.set(taskId, operation);
     let released = false;
     return () => {
       if (released) return;
@@ -277,6 +287,16 @@ export interface CodeReviewDeps {
    * that reliably. Production passes nothing and gets the real filesystem.
    */
   readonly fileOps?: SnapshotFileOps;
+  /** For `triage()` only — a fresh, read-only, independent analysis call. Optional
+   *  so existing tests that never exercise triage need not fake it. */
+  readonly codex?: Pick<CodexAdapter, 'triageFindings'>;
+  readonly settings?: SettingsRepository;
+}
+
+export interface CodeReviewTriageRequest {
+  /** Exactly which findings to analyze. Omitted means every currently
+   *  undecided, live finding for the current subject. */
+  readonly findingIds?: readonly string[];
 }
 
 export interface DecideCodeFindingRequest {
@@ -743,7 +763,7 @@ export class CodeReviewService {
    */
   async review(taskId: string, signal?: AbortSignal): Promise<CodeReviewRoundOutcome> {
     this.assertMutableTask(taskId);
-    const release = this.deps.claims.acquire(taskId);
+    const release = this.deps.claims.acquire(taskId, 'review');
     try {
       return await this.runReview(taskId, signal);
     } finally {
@@ -1275,7 +1295,7 @@ export class CodeReviewService {
    */
   async reconcile(taskId: string, signal?: AbortSignal): Promise<CodeReviewRoundOutcome> {
     this.assertMutableTask(taskId);
-    const release = this.deps.claims.acquire(taskId);
+    const release = this.deps.claims.acquire(taskId, 'reconcile');
     try {
       return await this.runReconcile(taskId, signal);
     } finally {
@@ -1549,6 +1569,175 @@ export class CodeReviewService {
     }
 
     return { finding: applied.finding, action: request.action };
+  }
+
+  /**
+   * Codex-assisted, independent recommendations for a bounded set of
+   * undecided, live findings — never a decision, never a resolve. A fresh,
+   * read-only Codex call every time: no implementation session or tool
+   * access is reused or granted. Nothing is persisted: there is no durable
+   * "triage" record for code review (unlike the plan-review gate), so this
+   * always computes a fresh answer and staleness is checked immediately
+   * before returning rather than via a conditional write.
+   */
+  async triage(
+    taskId: string,
+    request: CodeReviewTriageRequest = {},
+    signal?: AbortSignal
+  ): Promise<readonly FindingTriageRecommendation[]> {
+    const release = this.deps.claims.acquire(taskId, 'triage');
+    try {
+      return await this.runTriage(taskId, request, signal);
+    } finally {
+      release();
+    }
+  }
+
+  private async runTriage(
+    taskId: string,
+    request: CodeReviewTriageRequest,
+    signal?: AbortSignal
+  ): Promise<readonly FindingTriageRecommendation[]> {
+    if (!this.deps.codex || !this.deps.settings) {
+      throw new AgentRelayError('TOOL_MISSING', 'Automatic finding triage is not configured in this build.');
+    }
+    const task = this.assertMutableTask(taskId);
+    if (task.worktreePath === null) {
+      throw new AgentRelayError('WORKTREE_INVALID', 'This task has no worktree yet.');
+    }
+
+    const identity = await this.subjectIdentity(taskId);
+    if (identity.identity === 'incomplete') {
+      throw new AgentRelayError('VALIDATION_FAILED', SUBJECT_INCOMPLETE, {
+        remediation: 'Capture an exact subject before analyzing its findings.'
+      });
+    }
+    if (identity.identity !== 'current' || identity.stored === null) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'The reviewed code no longer matches the captured subject, so its findings cannot be analyzed.',
+        { remediation: 'Capture the subject again and run a fresh round before analyzing.' }
+      );
+    }
+    const subjectSha256 = identity.stored.subjectSha256;
+
+    const all = this.deps.reviews.listFindings(taskId).filter((f) => f.subjectSha256 === subjectSha256);
+    const decisionByFinding = new Map(all.map((f) => [f.id, this.deps.reviews.latestDecision(f.id)] as const));
+    const undecided = all.filter((f) => decisionByFinding.get(f.id) === null);
+
+    let targets: readonly CodeReviewFinding[];
+    if (request.findingIds) {
+      const byId = new Map(all.map((f) => [f.id, f]));
+      targets = request.findingIds.map((id) => {
+        const found = byId.get(id);
+        if (!found) {
+          throw new AgentRelayError('VALIDATION_FAILED', `Finding ${id} is not a live finding for the current subject.`);
+        }
+        if (decisionByFinding.get(id) !== null) {
+          throw new AgentRelayError('VALIDATION_FAILED', `Finding ${id} already has a decision recorded and cannot be analyzed.`);
+        }
+        return found;
+      });
+    } else {
+      targets = undecided;
+    }
+    if (targets.length === 0) {
+      throw new AgentRelayError('VALIDATION_FAILED', 'There are no undecided findings to analyze.');
+    }
+
+    // Snapshotted before dispatch, so a decision recorded on any of these
+    // findings WHILE Codex is thinking is detected below rather than silently
+    // applied to evidence that has since moved.
+    const revisionBefore = new Map(targets.map((f) => [f.id, f.revision]));
+    const requestedIds = targets.map((f) => f.id);
+
+    const specification = specificationIdentity(task.specificationJson).specification;
+    const triageableFindings: TriageableFinding[] = targets.map((f) => ({
+      ref: f.id,
+      severity: f.severity,
+      category: f.category,
+      file: f.file.length > 0 ? f.file : null,
+      line: f.line,
+      title: f.title,
+      body: f.body,
+      fix: f.fix.length > 0 ? f.fix : null
+    }));
+    const priorDecisions = all
+      .filter((f) => !requestedIds.includes(f.id))
+      .map((f) => decisionByFinding.get(f.id))
+      .filter((d): d is NonNullable<typeof d> => d !== null && d !== undefined)
+      .map((d) => ({ findingRef: d.findingId, action: d.action, reason: d.reason }));
+
+    const settings = this.deps.settings.get();
+    const context: AgentRunContext = {
+      signal: signal ?? new AbortController().signal,
+      timeoutMs: settings.processTimeoutMs,
+      onProgress: () => undefined
+    };
+
+    const outcome = await this.deps.codex.triageFindings(
+      {
+        worktreePath: task.worktreePath,
+        specification,
+        findings: triageableFindings,
+        priorDecisions,
+        model: settings.codexModel
+      },
+      context
+    );
+
+    const validated = this.validateTriageCoverage(outcome.recommendations, requestedIds);
+
+    // Refused if the subject or any targeted finding moved while the
+    // (potentially long-running) Codex call was in flight — the read-only
+    // analogue of `resolve`'s conditional write.
+    const after = await this.subjectIdentity(taskId);
+    if (after.identity !== 'current' || after.stored === null || after.stored.subjectSha256 !== subjectSha256) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'The reviewed code changed while the analysis was running; the result was discarded.',
+        { remediation: 'Try the analysis again against the current subject.' }
+      );
+    }
+    for (const target of targets) {
+      const current = this.deps.reviews.findFindingById(target.id);
+      if (current === null || current.revision !== revisionBefore.get(target.id)) {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'A finding was decided while the analysis was running; the result was discarded.',
+          { remediation: 'Reload and try the analysis again.' }
+        );
+      }
+    }
+
+    return validated;
+  }
+
+  /**
+   * Fails closed on anything short of exactly one well-formed recommendation
+   * per requested finding: a partial response, an unrequested ref, or a
+   * duplicate all discard the WHOLE result. A partial automatic triage
+   * silently presented as complete is worse than none.
+   */
+  private validateTriageCoverage(
+    recommendations: readonly FindingTriageRecommendation[],
+    requestedIds: readonly string[]
+  ): readonly FindingTriageRecommendation[] {
+    const seen = new Set<string>();
+    for (const recommendation of recommendations) {
+      const ref = recommendation.findingRef;
+      if (typeof ref !== 'string' || !requestedIds.includes(ref)) {
+        throw new AgentRelayError('PARSE_FAILED', 'Codex returned a recommendation for a finding that was not requested.');
+      }
+      if (seen.has(ref)) {
+        throw new AgentRelayError('PARSE_FAILED', 'Codex returned more than one recommendation for the same finding.');
+      }
+      seen.add(ref);
+    }
+    if (seen.size !== requestedIds.length) {
+      throw new AgentRelayError('PARSE_FAILED', 'Codex did not return a recommendation for every requested finding.');
+    }
+    return recommendations;
   }
 
   /* ------------------------------------------------------------------------ */

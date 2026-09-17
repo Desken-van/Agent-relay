@@ -27,7 +27,9 @@ import type { ToolDiagnostic } from '../../../shared/domain/diagnostics';
 import { AgentRelayError } from '../../../shared/domain/errors';
 import {
   codexReviewResultJsonSchema,
+  findingTriageResultJsonSchema,
   parseCodexReviewResult,
+  parseFindingTriageResult,
   parseTaskSpecification,
   taskSpecificationJsonSchema
 } from '../../../shared/schemas/codex';
@@ -38,11 +40,13 @@ import type {
   CodexReviewOutcome,
   CodexReviewRequest,
   CodexSpecificationRequest,
-  CodexSpecificationResult
+  CodexSpecificationResult,
+  CodexTriageOutcome,
+  CodexTriageRequest
 } from '../../ports';
 import { locateExecutable } from '../process/executable-locator';
 import type { ProcessRunner } from '../process/process-runner';
-import { buildReviewPrompt, buildSpecificationPrompt } from './prompts';
+import { buildReviewPrompt, buildSpecificationPrompt, buildTriagePrompt } from './prompts';
 import { CodexImplementationEvidence } from './implementation-evidence';
 import { parseShellToolRule } from '../../../shared/domain/claude-tool-rules';
 import type { ImplementationRequest, ImplementationResult } from '../../ports';
@@ -411,6 +415,52 @@ export class CodexSdkAdapter implements CodexAdapter {
     return {
       threadId: outcome.threadId,
       review: parsed.value,
+      rawResponse: outcome.finalResponse
+    };
+  }
+
+  async triageFindings(
+    request: CodexTriageRequest,
+    context: AgentRunContext
+  ): Promise<CodexTriageOutcome> {
+    const prompt = buildTriagePrompt({
+      specification: request.specification,
+      ruleEvidence: request.ruleEvidence,
+      findings: request.findings,
+      priorDecisions: request.priorDecisions
+    });
+
+    const outcome = await this.runTurn(
+      // Always null: a fresh, independent analysis, never a continuation of
+      // any implementation, review, or specification thread.
+      null,
+      prompt,
+      this.threadOptions(request.model, {
+        // Not configurable, same as reviewImplementation: a read-only analysis
+        // must not be able to edit what it is triaging.
+        sandboxMode: 'read-only',
+        workingDirectory: request.worktreePath,
+        approvalPolicy: 'never',
+        networkAccessEnabled: false
+      }),
+      findingTriageResultJsonSchema(),
+      context
+    );
+
+    const parsed = parseFindingTriageResult(outcome.finalResponse);
+    if (!parsed.ok || !parsed.value) {
+      throw new AgentRelayError(
+        'PARSE_FAILED',
+        parsed.error ?? 'Codex did not return usable triage recommendations.',
+        {
+          remediation: 'Try "Analyze undecided findings" again — this starts a fresh analysis.',
+          details: parsed.raw ? redactSecrets(parsed.raw).slice(0, 2000) : undefined
+        }
+      );
+    }
+
+    return {
+      recommendations: parsed.value.results,
       rawResponse: outcome.finalResponse
     };
   }

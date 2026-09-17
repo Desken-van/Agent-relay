@@ -629,7 +629,7 @@ describe('code-review relational integrity', () => {
 
 describe('the code-review migration', () => {
   it('keeps code review at version 7 in the forward-only migration sequence', () => {
-    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
     expect(MIGRATIONS[6]?.name).toBe('code-review-evidence');
     expect(MIGRATIONS[7]?.name).toBe('task-provider-routing');
     expect(MIGRATIONS[8]?.name).toBe('local-inference-settings');
@@ -640,6 +640,7 @@ describe('the code-review migration', () => {
     expect(MIGRATIONS[13]?.name).toBe('review-blocked-status');
     expect(MIGRATIONS[14]?.name).toBe('ornith-provider-version-collision-repair');
     expect(MIGRATIONS[15]?.name).toBe('coai-contract-fingerprint');
+    expect(MIGRATIONS[16]?.name).toBe('plan-review-triage');
   });
 
   it('upgrades a real database file that stops at version 6, keeping its rows', () => {
@@ -677,7 +678,7 @@ describe('the code-review migration', () => {
             version: number;
           }[]
         ).map((row) => row.version);
-        expect(applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        expect(applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
 
         // The pre-existing row survived the upgrade untouched.
         expect(upgraded.prepare('SELECT name FROM projects WHERE id = ?').get('p1')).toEqual({

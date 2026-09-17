@@ -19,7 +19,7 @@ import type {
 } from '../../src/shared/domain/plan-review';
 import type { RuleEvidenceSnapshot } from '../../src/shared/domain/rule-evidence';
 import { AgentRelayError } from '../../src/shared/domain/errors';
-import { makeSpecification } from '../helpers/fakes';
+import { FakeCodexAdapter, makeSpecification } from '../helpers/fakes';
 import { createHarness, type Harness } from '../helpers/harness';
 
 interface Deferred {
@@ -227,6 +227,7 @@ function setup() {
   const harness = createHarness();
   harnesses.push(harness);
   const reviewer = new FakePlanReviewer();
+  const codex = new FakeCodexAdapter();
   const claims = new PlanReviewClaims();
   const build = (): PlanReviewGateService =>
     new PlanReviewGateService({
@@ -235,6 +236,8 @@ function setup() {
       ruleEvidence: harness.taskRuleEvidence,
       gates: harness.planReviewGates,
       reviewer,
+      codex,
+      settings: harness.settings,
       clock: harness.clock,
       ids: harness.ids,
       claims
@@ -255,11 +258,13 @@ function setup() {
       ruleEvidence: harness.taskRuleEvidence,
       gates: harness.planReviewGates,
       reviewer,
+      codex,
+      settings: harness.settings,
       clock: harness.clock,
       ids: harness.ids,
       claims: new PlanReviewClaims()
     });
-  return { harness, reviewer, service, claims, build, unguarded };
+  return { harness, reviewer, codex, service, claims, build, unguarded };
 }
 
 async function ready(setupResult: ReturnType<typeof setup>, rules = snapshot()) {
@@ -1639,6 +1644,207 @@ describe('durable external plan review gate', () => {
       // ...and the mismatch is made explicit rather than silently absorbed.
       expect(reconciled.contractMismatchAt).not.toBeNull();
       expect(reconciled.lastError).toMatch(/still executing/i);
+    });
+  });
+
+  /* ------------------------------------------------------------------------ */
+  /* Codex-assisted automatic finding triage                                    */
+  /* ------------------------------------------------------------------------ */
+
+  describe('automatic finding triage', () => {
+    async function awaitingTwoFindings(value: ReturnType<typeof setup>) {
+      const { task } = await ready(value);
+      value.reviewer.round = {
+        ...value.reviewer.round,
+        gatingCount: 2,
+        threshold: 0,
+        findings: [finding('First finding'), finding('Second finding')]
+      };
+      const gate = await value.service.review(task.id);
+      expect(gate.status).toBe('awaiting_resolve');
+      return { task, gate };
+    }
+
+    it('persists independent recommendations for every requested finding, without ever resolving', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      value.codex.triageQueue.push([
+        { findingRef: 0, recommendation: 'accept', reason: 'Matches acceptance criterion 1.', evidenceRef: 'criterion 1', confidence: 'high' },
+        { findingRef: 1, recommendation: 'needs_user', reason: 'Architecture choice.', evidenceRef: 'finding 1 body', confidence: 'low' }
+      ]);
+
+      const result = await value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision });
+
+      expect(value.codex.triageCalls).toHaveLength(1);
+      expect(value.codex.triageCalls[0]?.findings).toHaveLength(2);
+      expect(value.reviewer.resolveCalls).toHaveLength(0);
+
+      // triageForRevision is the revision AFTER this write, not the one read
+      // before analysis started — this write itself bumps the gate's revision.
+      expect(result.revision).toBe(gate.revision + 1);
+      expect(result.triageForRevision).toBe(result.revision);
+      const parsed = JSON.parse(result.triageJson!);
+      expect(parsed.recommendations).toEqual([
+        { finding: 0, recommendation: 'accept', reason: 'Matches acceptance criterion 1.', evidenceRef: 'criterion 1', confidence: 'high' },
+        { finding: 1, recommendation: 'needs_user', reason: 'Architecture choice.', evidenceRef: 'finding 1 body', confidence: 'low' }
+      ]);
+
+      // Survives a fresh read — a remount/restart reads the same durable row.
+      const reread = value.harness.planReviewGates.findByTask(task.id)!;
+      expect(reread.triageJson).toBe(result.triageJson);
+      expect(reread.triageForRevision).toBe(result.triageForRevision);
+    });
+
+    it('analyzes only the requested subset when findingIndexes is given', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      value.codex.triageQueue.push([
+        { findingRef: 1, recommendation: 'reject', reason: 'Already satisfied.', evidenceRef: 'finding 1', confidence: 'medium' }
+      ]);
+
+      await value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision, findingIndexes: [1] });
+
+      expect(value.codex.triageCalls[0]?.findings).toHaveLength(1);
+      expect(value.codex.triageCalls[0]?.findings[0]?.ref).toBe(1);
+    });
+
+    it('refuses a stale gate/revision before ever calling Codex', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+
+      await expect(
+        value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision + 1 })
+      ).rejects.toThrow(/no longer the current one/i);
+      await expect(
+        value.service.triage(task.id, { gateId: 'wrong-gate', expectedRevision: gate.revision })
+      ).rejects.toThrow(/no longer the current one/i);
+      expect(value.codex.triageCalls).toHaveLength(0);
+    });
+
+    it('discards the analysis, rather than applying it, when the gate changed while Codex was in flight', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      const inFlight = deferred();
+      value.codex.triageGate = inFlight.promise;
+      value.codex.triageQueue.push([
+        { findingRef: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+        { findingRef: 1, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+      ]);
+
+      const triaging = value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision });
+      await Promise.resolve();
+
+      // The round is resolved by another window/process (its own claims, same
+      // database) while the analysis is still running — the in-flight triage
+      // already holds this service's own claim, so the change must come
+      // through an independent one.
+      await value.unguarded().resolve(task.id, {
+        gateId: gate.id,
+        expectedRevision: gate.revision,
+        decisions: [
+          { finding: 0, action: 'accept', reason: '' },
+          { finding: 1, action: 'accept', reason: '' }
+        ]
+      });
+
+      inFlight.resolve(undefined);
+      await expect(triaging).rejects.toThrow(/changed while the analysis was running|no longer the current one/i);
+
+      const current = value.harness.planReviewGates.findByTask(task.id)!;
+      expect(current.triageJson).toBeNull();
+    });
+
+    it('fails closed on a partial response missing a requested finding', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      value.codex.triageQueue.push([
+        { findingRef: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+        // finding 1 is missing.
+      ]);
+
+      await expect(
+        value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision })
+      ).rejects.toThrow(/every requested finding/i);
+      expect(value.harness.planReviewGates.findByTask(task.id)!.triageJson).toBeNull();
+    });
+
+    it('fails closed on a recommendation for a finding that was not requested', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      value.codex.triageQueue.push([
+        { findingRef: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+        { findingRef: 5, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+      ]);
+
+      await expect(
+        value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision, findingIndexes: [0] })
+      ).rejects.toThrow(/not requested/i);
+    });
+
+    it('fails closed on a duplicated recommendation for the same finding', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      value.codex.triageQueue.push([
+        { findingRef: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+        { findingRef: 0, recommendation: 'reject', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+        { findingRef: 1, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+      ]);
+
+      await expect(
+        value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision })
+      ).rejects.toThrow(/more than one recommendation/i);
+    });
+
+    it('fails closed on a malformed recommendation shape', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      value.codex.triageQueue.push([
+        // @ts-expect-error deliberately malformed for this test
+        { findingRef: 0, recommendation: 'maybe', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+        { findingRef: 1, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+      ]);
+
+      await expect(
+        value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision })
+      ).rejects.toThrow(/do not match the expected shape/i);
+    });
+
+    it('refuses while a review of the same task is in flight, and vice versa', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      const inFlight = deferred();
+      value.codex.triageGate = inFlight.promise;
+      value.codex.triageQueue.push([
+        { findingRef: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+        { findingRef: 1, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+      ]);
+      const triaging = value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision });
+      await Promise.resolve();
+
+      await expect(value.service.reconcile(task.id)).rejects.toMatchObject({ code: 'BUSY' });
+      expect(value.reviewer.statusCalls).toHaveLength(0);
+
+      inFlight.resolve(undefined);
+      await triaging;
+    });
+
+    it('refuses when Codex is not configured for this build', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      const unconfigured = new PlanReviewGateService({
+        tasks: value.harness.tasks,
+        projects: value.harness.projects,
+        ruleEvidence: value.harness.taskRuleEvidence,
+        gates: value.harness.planReviewGates,
+        reviewer: value.reviewer,
+        clock: value.harness.clock,
+        ids: value.harness.ids,
+        claims: new PlanReviewClaims()
+      });
+
+      await expect(
+        unconfigured.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision })
+      ).rejects.toMatchObject({ code: 'TOOL_MISSING' });
     });
   });
 });

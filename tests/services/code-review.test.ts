@@ -56,6 +56,7 @@ import {
   COAI_PROVIDER_ID
 } from '../../src/main/adapters/mcp/coai-profiles';
 import { createHarness, type Harness } from '../helpers/harness';
+import { FakeCodexAdapter, makeSpecification } from '../helpers/fakes';
 
 const BASE = '1'.repeat(40);
 
@@ -328,7 +329,8 @@ function setup() {
     status: 'READY_FOR_IMPLEMENTATION',
     worktreePath: harness.worktreesRoot,
     branchName: 'agent/task-1',
-    baseBranch: 'main'
+    baseBranch: 'main',
+    specificationJson: JSON.stringify(makeSpecification())
   });
   // The worktree and the project share one repository by default, and the
   // worktree sits on the branch the task records. Tests that care make them
@@ -2776,5 +2778,146 @@ describe('Coai contract fingerprint evidence', () => {
     expect(outcome.round.contractMismatchAt).not.toBeNull();
     expect(outcome.findings).toHaveLength(0);
     expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Codex-assisted automatic finding triage                                    */
+/* -------------------------------------------------------------------------- */
+
+describe('code-review automatic finding triage', () => {
+  async function withTwoLiveFindings() {
+    const value = setup();
+    const codex = new FakeCodexAdapter();
+    const triageService = value.build({ codex, settings: value.harness.settings });
+    value.reviewer.answer = {
+      ...value.reviewer.answer,
+      findings: [finding({ title: 'First finding' }), finding({ title: 'Second finding' })]
+    };
+    const outcome = await reviewOnce(value);
+    return { value, codex, triageService, findings: outcome.findings };
+  }
+
+  it('sends every currently undecided, live finding when none are named, and never decides anything', async () => {
+    const { value, codex, triageService, findings } = await withTwoLiveFindings();
+    const recommendations = await triageService.triage(value.task.id);
+
+    expect(codex.triageCalls).toHaveLength(1);
+    expect(codex.triageCalls[0]?.findings.map((f) => f.ref).sort()).toEqual(
+      findings.map((f) => f.id).sort()
+    );
+    expect(recommendations).toHaveLength(2);
+    // Nothing was decided: every finding is still undecided afterward.
+    for (const f of findings) {
+      expect(value.reviews.latestDecision(f.id)).toBeNull();
+    }
+  });
+
+  it('analyzes only the requested subset when findingIds is given', async () => {
+    const { value, codex, triageService, findings } = await withTwoLiveFindings();
+    await triageService.triage(value.task.id, { findingIds: [findings[0]!.id] });
+
+    expect(codex.triageCalls[0]?.findings).toHaveLength(1);
+    expect(codex.triageCalls[0]?.findings[0]?.ref).toBe(findings[0]!.id);
+  });
+
+  it('refuses a finding that already has a decision recorded', async () => {
+    const { value, triageService, findings } = await withTwoLiveFindings();
+    await value.service.decide(value.task.id, {
+      findingId: findings[0]!.id,
+      action: 'accept',
+      reason: 'Already handled manually.',
+      expectedRevision: findings[0]!.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+
+    await expect(
+      triageService.triage(value.task.id, { findingIds: [findings[0]!.id] })
+    ).rejects.toThrow(/already has a decision/i);
+  });
+
+  it('refuses a finding id that does not belong to the current live subject', async () => {
+    const { value, triageService } = await withTwoLiveFindings();
+    await expect(
+      triageService.triage(value.task.id, { findingIds: ['not-a-real-finding'] })
+    ).rejects.toThrow(/not a live finding/i);
+  });
+
+  it('discards the analysis when a finding is decided while Codex is in flight', async () => {
+    const { value, codex, triageService, findings } = await withTwoLiveFindings();
+    let resolveGate: (value?: unknown) => void = () => undefined;
+    codex.triageGate = new Promise((resolve) => { resolveGate = resolve; });
+
+    const triaging = triageService.triage(value.task.id);
+    await Promise.resolve();
+
+    // Decided by another window/process while the analysis is running.
+    await value.service.decide(value.task.id, {
+      findingId: findings[0]!.id,
+      action: 'accept',
+      reason: 'Decided elsewhere while analysis ran.',
+      expectedRevision: findings[0]!.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+
+    resolveGate();
+    await expect(triaging).rejects.toThrow(/decided while the analysis was running/i);
+  });
+
+  it('fails closed on a partial response missing a requested finding', async () => {
+    const { value, codex, triageService, findings } = await withTwoLiveFindings();
+    codex.triageQueue.push([
+      { findingRef: findings[0]!.id, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+      // findings[1] missing.
+    ]);
+
+    await expect(triageService.triage(value.task.id)).rejects.toThrow(/every requested finding/i);
+  });
+
+  it('fails closed on a recommendation for a finding that was not requested', async () => {
+    const { value, codex, triageService, findings } = await withTwoLiveFindings();
+    codex.triageQueue.push([
+      { findingRef: findings[0]!.id, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+      { findingRef: 'some-other-id', recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+    ]);
+
+    await expect(
+      triageService.triage(value.task.id, { findingIds: [findings[0]!.id] })
+    ).rejects.toThrow(/not requested/i);
+  });
+
+  it('never calls resolve/decide, approves nothing, and starts no correction', async () => {
+    const { value, codex, triageService, findings } = await withTwoLiveFindings();
+    codex.triageQueue.push([
+      { findingRef: findings[0]!.id, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+      { findingRef: findings[1]!.id, recommendation: 'reject', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+    ]);
+
+    await triageService.triage(value.task.id);
+
+    expect(value.reviews.listDecisions(findings[0]!.id)).toHaveLength(0);
+    expect(value.reviews.listDecisions(findings[1]!.id)).toHaveLength(0);
+    const task = value.harness.tasks.findById(value.task.id)!;
+    expect(task.status).toBe('READY_FOR_IMPLEMENTATION');
+  });
+
+  it('refuses when Codex is not configured for this build', async () => {
+    const { value } = await withTwoLiveFindings();
+    await expect(value.service.triage(value.task.id)).rejects.toMatchObject({ code: 'TOOL_MISSING' });
+  });
+
+  it('refuses to run a second triage while one is already in flight for the task', async () => {
+    const { value, codex, triageService } = await withTwoLiveFindings();
+    let resolveGate: (value?: unknown) => void = () => undefined;
+    codex.triageGate = new Promise((resolve) => { resolveGate = resolve; });
+    const first = triageService.triage(value.task.id);
+    await Promise.resolve();
+
+    await expect(triageService.triage(value.task.id)).rejects.toMatchObject({ code: 'BUSY' });
+
+    resolveGate();
+    await first;
   });
 });

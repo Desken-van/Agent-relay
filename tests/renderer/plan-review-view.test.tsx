@@ -211,6 +211,8 @@ describe('the external plan-review panel', () => {
         lastError: null,
         reconciledAt: null,
         revision: 0,
+        triageJson: null,
+        triageForRevision: null,
         createdAt: '2026-09-06T00:00:00.000Z',
         updatedAt: '2026-09-06T00:00:00.000Z'
       },
@@ -334,6 +336,168 @@ describe('the external plan-review panel', () => {
       'disabled',
       false
     );
+  });
+
+  describe('Codex-assisted automatic triage', () => {
+    function twoFindingGate(overrides: Record<string, unknown> = {}): PlanReviewDetail {
+      return {
+        ...gateWith('awaiting_resolve', {
+          verdict: 'revise',
+          reviewers: 'codex:architecture',
+          gatingCount: 1,
+          threshold: 1,
+          ...overrides
+        }),
+        findings: [
+          {
+            severity: 'major', category: 'reliability', file: 'src/service.ts', line: 42,
+            title: 'First finding', why: 'Body one.', fix: 'Fix one.', providers: ['codex'], role: 'SecurityReliability'
+          },
+          {
+            severity: 'minor', category: 'ux', file: 'src/view.tsx', line: 12,
+            title: 'Second finding', why: 'Body two.', fix: 'Fix two.', providers: ['codex'], role: 'UX'
+          }
+        ]
+      };
+    }
+
+    it('sends only durable identifiers and the undecided finding indexes, and shows the returned recommendations', async () => {
+      const detail = twoFindingGate();
+      bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
+      bridge.set('planReview:triage', () => ok<'planReview:triage'>({
+        ...detail,
+        gate: {
+          ...detail.gate!,
+          revision: 1,
+          triageForRevision: 1,
+          triageJson: JSON.stringify({
+            recommendations: [
+              { finding: 0, recommendation: 'accept', reason: 'Matches criterion 1.', evidenceRef: 'criterion 1', confidence: 'high' },
+              { finding: 1, recommendation: 'needs_user', reason: 'Architecture choice.', evidenceRef: 'body two', confidence: 'low' }
+            ]
+          })
+        }
+      }));
+      render(
+        <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+      );
+
+      const analyzeButton = await screen.findByRole('button', { name: /Analyze undecided findings/i });
+      fireEvent.click(analyzeButton);
+
+      await waitFor(() => expect(bridge.callsTo('planReview:triage')).toHaveLength(1));
+      expect(bridge.callsTo('planReview:triage')[0]?.input).toEqual({
+        taskId: 'task-1',
+        gateId: 'gate-1',
+        expectedRevision: 0,
+        findingIndexes: [0, 1]
+      });
+
+      expect(await screen.findByText(/Recommended: accept/)).toBeTruthy();
+      expect(screen.getByText(/Matches criterion 1\./)).toBeTruthy();
+      expect(screen.getByText(/Needs a human decision/)).toBeTruthy();
+      expect(screen.getByText(/1 recommended accept/)).toBeTruthy();
+      expect(screen.getByText(/1 need a human/)).toBeTruthy();
+    });
+
+    it('applies a recommendation without overwriting a decision the operator already made', async () => {
+      const detail = twoFindingGate();
+      bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
+      bridge.set('planReview:triage', () => ok<'planReview:triage'>({
+        ...detail,
+        gate: {
+          ...detail.gate!,
+          revision: 1,
+          triageForRevision: 1,
+          triageJson: JSON.stringify({
+            recommendations: [
+              { finding: 0, recommendation: 'reject', reason: 'Already satisfied.', evidenceRef: 'e', confidence: 'high' },
+              { finding: 1, recommendation: 'accept', reason: 'Matches scope.', evidenceRef: 'e', confidence: 'medium' }
+            ]
+          })
+        }
+      }));
+      render(
+        <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+      );
+
+      // The operator decides finding 0 manually, BEFORE analysis runs.
+      const decisions = await screen.findAllByLabelText('Decision');
+      fireEvent.change(decisions[0]!, { target: { value: 'accept' } });
+
+      fireEvent.click(screen.getByRole('button', { name: /Analyze undecided findings/i }));
+      await screen.findByText(/Recommended: reject/);
+
+      // Only finding 1 (still undecided) offers an apply affordance; finding 0's
+      // manual "accept" is never replaced by the recommended "reject".
+      const applyButtons = screen.getAllByRole('button', { name: /^Apply recommendation$/ });
+      expect(applyButtons).toHaveLength(1);
+      fireEvent.click(applyButtons[0]!);
+
+      expect((decisions[0] as HTMLSelectElement).value).toBe('accept');
+      expect((decisions[1] as HTMLSelectElement).value).toBe('accept');
+    });
+
+    it('does not treat a stored recommendation as current once its revision no longer matches the gate (e.g. after a remount)', async () => {
+      // The gate's OWN revision has moved past `triageForRevision` — exactly
+      // what a later, unrelated durable write (a new round, a resolve)
+      // produces. A fresh mount (a remount/restart) must not show this as a
+      // live recommendation.
+      const stale: PlanReviewDetail = {
+        ...twoFindingGate({
+          revision: 5,
+          triageForRevision: 1,
+          triageJson: JSON.stringify({
+            recommendations: [
+              { finding: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+              { finding: 1, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+            ]
+          })
+        })
+      };
+      bridge.set('planReview:get', () => ok<'planReview:get'>(stale));
+      render(
+        <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+      );
+
+      await screen.findByRole('button', { name: /Analyze undecided findings/i });
+      expect(screen.queryByText(/Recommended: accept/)).toBeNull();
+      expect(screen.queryByText(/recommended accept/)).toBeNull();
+    });
+
+    it('shows a freshly stored recommendation again after a remount, when its revision still matches', async () => {
+      const current: PlanReviewDetail = {
+        ...twoFindingGate({
+          revision: 1,
+          triageForRevision: 1,
+          triageJson: JSON.stringify({
+            recommendations: [
+              { finding: 0, recommendation: 'accept', reason: 'Matches criterion 1.', evidenceRef: 'e', confidence: 'high' },
+              { finding: 1, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+            ]
+          })
+        })
+      };
+      bridge.set('planReview:get', () => ok<'planReview:get'>(current));
+      render(
+        <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+      );
+
+      expect(await screen.findByText(/Matches criterion 1\./)).toBeTruthy();
+    });
+
+    it('keeps "Accept all undecided" visibly distinct from the analysis action', async () => {
+      bridge.set('planReview:get', () => ok<'planReview:get'>(twoFindingGate()));
+      render(
+        <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+      );
+
+      const blindButton = await screen.findByRole('button', { name: /Accept all undecided findings/i });
+      const analyzeButton = screen.getByRole('button', { name: /Analyze undecided findings/i });
+      expect(blindButton).not.toBe(analyzeButton);
+      expect(blindButton.textContent).toMatch(/blind/i);
+      expect(blindButton.getAttribute('title')).toMatch(/without looking at any of them/i);
+    });
   });
 
   it('offers a read-only reconciliation for an unknown outcome, and never a repeat', async () => {
@@ -772,6 +936,8 @@ describe('the external plan-review panel', () => {
           lastError: null,
           reconciledAt: null,
           revision: 0,
+          triageJson: null,
+          triageForRevision: null,
           createdAt: '2026-09-06T00:00:00.000Z',
           updatedAt: '2026-09-06T00:00:00.000Z'
         }

@@ -7,7 +7,8 @@ const PLAN_REVIEW_CHANNELS = [
   'planReview:prepare',
   'planReview:review',
   'planReview:resolve',
-  'planReview:reconcile'
+  'planReview:reconcile',
+  'planReview:triage'
 ] as const;
 
 describe('the external plan-review IPC contract', () => {
@@ -51,7 +52,7 @@ describe('the external plan-review IPC contract', () => {
     expect(schema.safeParse({}).success).toBe(false);
   });
 
-  it('registers exactly the six bounded operations', () => {
+  it('registers exactly the seven bounded operations', () => {
     expect(IPC_CHANNELS.filter((channel) => channel.startsWith('planReview:')).sort()).toEqual(
       [...PLAN_REVIEW_CHANNELS].sort()
     );
@@ -77,9 +78,30 @@ describe('the external plan-review IPC contract', () => {
         const base =
           channel === 'planReview:resolve'
             ? { taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0, decisions: [] }
-            : { taskId: 'task-1' };
+            : channel === 'planReview:triage'
+              ? { taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0 }
+              : { taskId: 'task-1' };
         expect(ipcInputSchemas[channel].safeParse({ ...base, ...extra }).success).toBe(false);
       }
+    }
+  });
+
+  it('accepts only durable identifiers for triage, optionally narrowed to specific finding indexes', () => {
+    const schema = ipcInputSchemas['planReview:triage'];
+    expect(schema.safeParse({ taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0 }).success).toBe(true);
+    expect(
+      schema.safeParse({ taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0, findingIndexes: [0, 2] }).success
+    ).toBe(true);
+    // Not a prompt, not raw finding text, not a repository path — only indexes.
+    for (const invalid of [
+      { taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0, findingIndexes: [-1] },
+      { taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0, findingIndexes: ['0'] },
+      { taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0, findingIndexes: [{ title: 'x' }] },
+      { taskId: 'task-1', gateId: 'gate-1', expectedRevision: -1 },
+      { taskId: 'task-1', expectedRevision: 0 },
+      { taskId: 'task-1', gateId: 'gate-1' }
+    ]) {
+      expect(schema.safeParse(invalid).success).toBe(false);
     }
   });
 

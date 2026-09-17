@@ -65,7 +65,7 @@ import type {
   CodeSnapshotChange,
   ProviderCodeFinding
 } from '../shared/domain/code-review';
-import type { CodexReviewResult, TaskSpecification } from '../shared/schemas/codex';
+import type { CodexReviewResult, FindingTriageRecommendation, TaskSpecification } from '../shared/schemas/codex';
 
 /* -------------------------------------------------------------------------- */
 /* Infrastructure primitives                                                   */
@@ -291,6 +291,45 @@ export interface CodexReviewOutcome {
   readonly rawResponse: string;
 }
 
+/** One undecided finding, in the one shape both plan-review and code-review
+ *  findings can be mapped into for triage — the adapter and its prompt never
+ *  need to know which kind of review it came from. */
+export interface TriageableFinding {
+  /** A plan-review finding's 0-based index, or a code-review finding's stable id. */
+  readonly ref: number | string;
+  readonly severity: string;
+  readonly category: string;
+  readonly file: string | null;
+  readonly line: number | null;
+  readonly title: string;
+  readonly body: string;
+  readonly fix: string | null;
+}
+
+/** A decision already recorded against some other finding in the same round/gate. */
+export interface TriageableDecision {
+  readonly findingRef: number | string;
+  readonly action: string;
+  readonly reason: string | null;
+}
+
+export interface CodexTriageRequest {
+  /** Read-only sandbox root. A task worktree for code review; the project
+   *  checkout for plan review, which has none yet. */
+  readonly worktreePath: string;
+  readonly specification: TaskSpecification;
+  readonly ruleEvidence?: string;
+  /** Exactly the undecided findings being triaged — never the full history. */
+  readonly findings: readonly TriageableFinding[];
+  readonly priorDecisions: readonly TriageableDecision[];
+  readonly model: string | null;
+}
+
+export interface CodexTriageOutcome {
+  readonly recommendations: readonly FindingTriageRecommendation[];
+  readonly rawResponse: string;
+}
+
 export type { CodexModelCatalogResult, CodexModelOption };
 
 export interface CodexModelCatalog {
@@ -314,6 +353,17 @@ export interface CodexAdapter {
     request: CodexReviewRequest,
     context: AgentRunContext
   ): Promise<CodexReviewOutcome>;
+
+  /**
+   * Recommend accept/reject/needs_user for a bounded set of undecided
+   * findings. MUST run with `sandboxMode: 'read-only'` and MUST always start a
+   * fresh thread (never resumes an implementation/review/specification
+   * thread) — this is independent analysis, not a continuation of anything.
+   */
+  triageFindings(
+    request: CodexTriageRequest,
+    context: AgentRunContext
+  ): Promise<CodexTriageOutcome>;
 
   diagnose(): Promise<ToolDiagnostic>;
 }
