@@ -66,6 +66,7 @@ import type {
   CodeSnapshotManifestEntry,
   CompletedRoundResult,
   ExternalCodeReviewRound,
+  ExternalCodeRoundIdentity,
   ExternalCodeRoundLocator,
   RawCodeSnapshot,
   RoundFindingRecord,
@@ -158,6 +159,12 @@ const ANSWER_MALFORMED =
 
 const ATTESTATION_MISMATCH =
   'The reviewer did not attest that it read the subject this round dispatched, so its answer was not accepted. Nothing was recorded as a confirmed result.';
+
+const CONTRACT_DRIFTED =
+  'The Coai server’s tool contract changed between reserving this round and reading its answer back, so the answer was not accepted. Start a new round once the server is confirmed stable.';
+
+const RECONCILE_CONTRACT_DRIFTED =
+  'The provider’s current tool contract differs from the one this round was reserved under, so its answer was not applied. The round stays unresolved.';
 
 const DUPLICATE_CONFLICT =
   'The reviewer reported one finding twice with different round-specific details, so the answer contradicts itself and was not persisted.';
@@ -333,7 +340,12 @@ const externalRoundLocatorSchema = z
   .object({
     providerId: z.string().min(1).max(128),
     sessionId: z.string().min(1).max(128),
-    roundId: z.string().min(1).max(128)
+    roundId: z.string().min(1).max(128),
+    // Computed by THIS client, never server-supplied — see
+    // computeCoaiContractFingerprint in adapters/mcp/coai-profiles.ts —
+    // but still shape-checked here like every other field this service
+    // durably persists.
+    contractFingerprint: z.string().regex(/^[0-9a-f]{64}$/)
   })
   .strict();
 
@@ -368,7 +380,7 @@ function unstorableLocator(locator: ExternalCodeRoundLocator): string | null {
   return null;
 }
 
-function sameLocator(a: ExternalCodeRoundLocator, b: ExternalCodeRoundLocator): boolean {
+function sameLocator(a: ExternalCodeRoundIdentity, b: ExternalCodeRoundIdentity): boolean {
   return (
     a.providerId === b.providerId && a.sessionId === b.sessionId && a.roundId === b.roundId
   );
@@ -840,6 +852,8 @@ export class CodeReviewService {
       providerRoundId: null,
       serverName: null,
       serverVersion: null,
+      contractFingerprint: null,
+      contractMismatchAt: null,
       reviewers: null,
       gatingCount: null,
       threshold: null,
@@ -917,7 +931,11 @@ export class CodeReviewService {
       status: 'reviewing',
       providerId: locator.providerId,
       sessionId: locator.sessionId,
-      providerRoundId: locator.roundId
+      providerRoundId: locator.roundId,
+      // Bound here, at reservation — the earliest point this durable round
+      // exists — and never overwritten by a later call's own reading; see
+      // `assertContractStable` below, called before any answer is applied.
+      contractFingerprint: locator.contractFingerprint
     });
 
     let answer;
@@ -977,6 +995,12 @@ export class CodeReviewService {
       });
     }
 
+    // Did the SERVER'S CONTRACT change between reserving this round and
+    // running it? An answer produced under a schema this build never agreed
+    // to for THIS round is not trustworthy evidence, whatever it says — see
+    // `assertContractStable`.
+    this.assertContractStable(dispatched.contractFingerprint, answer.contractFingerprint, dispatched.id);
+
     // Re-verify the subject before the result is applied. Four outcomes, and
     // they are genuinely four: the code demonstrably moved, it demonstrably did
     // not, it could not be read at all, or it could not be read exactly.
@@ -995,6 +1019,49 @@ export class CodeReviewService {
       repeatedFindings: applied.findings.length - applied.created,
       subjectAfter: after.identity
     };
+  }
+
+  /**
+   * Refuse an answer produced under a contract different from the one this
+   * round was RESERVED under.
+   *
+   * `reserved` is bound once, at `beginRound`, before the non-idempotent
+   * `run_round` call — see the reservation-success write above. `fresh` is
+   * what THIS read (a live `reviewCode`, or reconciliation's `roundStatus`)
+   * just proved. They can legitimately differ from an ordinary schema change
+   * at the server between the two calls, and an answer produced under a
+   * schema this build never agreed to for THIS round is not safe to trust,
+   * whatever it says — the same property `stdio-mcp-client.ts`'s per-call
+   * schema validation already has for the SINGLE call about to be made; this
+   * is the SESSION-level counterpart, covering the reserve→run/status gap a
+   * per-call check cannot see.
+   *
+   * `reserved === null` (a round dispatched before this build recorded
+   * fingerprints) is not a mismatch — there is nothing to compare against, so
+   * nothing is refused on this account alone.
+   */
+  private assertContractStable(reserved: string | null, fresh: string, roundId: string): void {
+    if (reserved === null || reserved === fresh) return;
+    this.deps.reviews.updateRound(roundId, {
+      contractMismatchAt: this.deps.clock.nowIso(),
+      lastError: redactAndTruncate(CONTRACT_DRIFTED, 10_000)
+    });
+    throw new AgentRelayError('VALIDATION_FAILED', CONTRACT_DRIFTED, {
+      remediation: 'Confirm the Coai server is stable, then start a new round.'
+    });
+  }
+
+  /**
+   * The non-throwing counterpart to {@link assertContractStable}, for
+   * reconciliation's `running`/`not_started` reads: the round is not being
+   * settled either way, so there is nothing to refuse — only a drift to
+   * record durably, exactly as `completed`'s own reconciliation branch
+   * already does further down. `reserved === null` (a round dispatched
+   * before this build recorded fingerprints) is not a mismatch, matching
+   * `assertContractStable`'s own leniency.
+   */
+  private contractDriftAt(reserved: string | null, fresh: string): string | null {
+    return reserved !== null && reserved !== fresh ? this.deps.clock.nowIso() : null;
   }
 
   /**
@@ -1249,7 +1316,7 @@ export class CodeReviewService {
       });
       return this.unsettled(held, 'no-locator');
     }
-    const locator: ExternalCodeRoundLocator = {
+    const locator: ExternalCodeRoundIdentity = {
       providerId: round.providerId,
       sessionId: round.sessionId,
       roundId: round.providerRoundId
@@ -1282,9 +1349,14 @@ export class CodeReviewService {
     if (status.kind === 'running') {
       // Still executing. The round keeps its phase, and nothing may start
       // another: this is the one state where a second dispatch is certain to
-      // double a call that has not finished.
+      // double a call that has not finished. `status.contractFingerprint` is
+      // the CURRENT contract this read just proved (see its doc comment on
+      // ExternalCodeRoundStatus) — compared here against the one reserved at
+      // beginRound so a drift is recorded even while the round is still in
+      // flight, not only once it completes.
       const held = this.deps.reviews.updateRound(round.id, {
-        lastError: redactAndTruncate(RECONCILE_RUNNING, 10_000)
+        lastError: redactAndTruncate(RECONCILE_RUNNING, 10_000),
+        contractMismatchAt: this.contractDriftAt(round.contractFingerprint, status.contractFingerprint)
       });
       return this.unsettled(held, 'running');
     }
@@ -1296,7 +1368,8 @@ export class CodeReviewService {
       // automatic repeat — the operator starts the next round by hand.
       const closed = this.deps.reviews.updateRound(round.id, {
         status: 'failed',
-        lastError: redactAndTruncate(RECONCILE_NOT_STARTED, 10_000)
+        lastError: redactAndTruncate(RECONCILE_NOT_STARTED, 10_000),
+        contractMismatchAt: this.contractDriftAt(round.contractFingerprint, status.contractFingerprint)
       });
       return this.unsettled(closed, 'not-started');
     }
@@ -1326,6 +1399,20 @@ export class CodeReviewService {
         lastError: redactAndTruncate(RECONCILE_ATTESTATION, 10_000)
       });
       return this.unsettled(held, 'attestation-mismatch');
+    }
+
+    // Same standard `assertContractStable` applies to a live dispatch, in
+    // reconciliation's own idiom: the round stays unresolved (never a thrown
+    // exception, never `failed`) rather than applying an answer this build
+    // never agreed the server's schema for. The historical `contractFingerprint`
+    // recorded at reservation is left exactly as it was — only the explicit
+    // mismatch marker is written.
+    if (round.contractFingerprint !== null && round.contractFingerprint !== status.round.contractFingerprint) {
+      const held = this.deps.reviews.updateRound(round.id, {
+        contractMismatchAt: this.deps.clock.nowIso(),
+        lastError: redactAndTruncate(RECONCILE_CONTRACT_DRIFTED, 10_000)
+      });
+      return this.unsettled(held, 'contract-drifted');
     }
 
     const validated = this.validateAnswer(status.round, subject, round.id);

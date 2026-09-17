@@ -3,6 +3,7 @@
 import { AgentRelayError } from '../../shared/domain/errors';
 import type { Settings } from '../../shared/domain/models';
 import type { ExternalMcpServerConfig } from '../ports';
+import { COAI_CODE_REVIEW_TOOLS } from '../adapters/mcp/coai-profiles';
 import { assertExternalPlanReviewSettings, coaiServerConfig } from './plan-review-configuration';
 
 /**
@@ -34,12 +35,19 @@ export function externalCodeReviewConfig(settings: Settings): ExternalMcpServerC
   }
 
   // The same server as the plan gate, so the same builder: one executable, one
-  // argv, one transport capacity, and the exact audited profile chosen by what
-  // is enabled — so neither gate can be configured into refusing the server the
-  // other is talking to. The transport compares that profile exactly, which is
-  // why a plan-only nine-tool server cannot be talked to at all. That is the
-  // honest outcome rather than a degraded one.
-  return coaiServerConfig(settings, 'coai-code-review', settings.coaiMcpExecutablePath);
+  // argv, one transport capacity. The tool requirement is NOT shared with the
+  // plan gate's own setting, on purpose — code review always declares only the
+  // three addressable round tools it needs, independent of whether plan
+  // review happens to be enabled too, and independent of anything else the
+  // server also advertises. A server that does not have all three cannot be
+  // used for code review at all (required, not exact — see
+  // coai-profiles.ts): that is the honest outcome rather than a degraded one.
+  return coaiServerConfig(
+    settings,
+    'coai-code-review',
+    settings.coaiMcpExecutablePath,
+    COAI_CODE_REVIEW_TOOLS
+  );
 }
 
 /** Is external code review switched on and configured well enough to try? */

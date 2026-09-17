@@ -9,7 +9,8 @@ import type {
 import type { Db } from '../database';
 
 const COLUMNS = `id, task_id, specification_sha256, rule_evidence_sha256,
-                 session_id, server_name, server_version, status, verdict,
+                 session_id, server_name, server_version,
+                 contract_fingerprint, contract_mismatch_at, status, verdict,
                  findings_json, decisions_json, reviewers, gating_count, threshold,
                  last_error, reconciled_at, revision, created_at, updated_at`;
 
@@ -21,6 +22,8 @@ interface GateRow {
   session_id: string | null;
   server_name: string | null;
   server_version: string | null;
+  contract_fingerprint: string | null;
+  contract_mismatch_at: string | null;
   status: PlanReviewGate['status'];
   verdict: PlanReviewGate['verdict'];
   findings_json: string | null;
@@ -44,6 +47,8 @@ function toGate(row: GateRow): PlanReviewGate {
     sessionId: row.session_id,
     serverName: row.server_name,
     serverVersion: row.server_version,
+    contractFingerprint: row.contract_fingerprint,
+    contractMismatchAt: row.contract_mismatch_at,
     status: row.status,
     verdict: row.verdict,
     findingsJson: row.findings_json,
@@ -83,12 +88,14 @@ export class SqlitePlanReviewGateRepository implements PlanReviewGateRepository 
       .prepare(
         `INSERT INTO plan_review_gates (
            id, task_id, specification_sha256, rule_evidence_sha256,
-           session_id, server_name, server_version, status, verdict,
+           session_id, server_name, server_version,
+           contract_fingerprint, contract_mismatch_at, status, verdict,
            findings_json, decisions_json, reviewers, gating_count, threshold,
            last_error, reconciled_at, revision, created_at, updated_at)
          VALUES (
            @id, @taskId, @specificationSha256, @ruleEvidenceSha256,
-           @sessionId, @serverName, @serverVersion, @status, @verdict,
+           @sessionId, @serverName, @serverVersion,
+           @contractFingerprint, @contractMismatchAt, @status, @verdict,
            @findingsJson, @decisionsJson, @reviewers, @gatingCount, @threshold,
            @lastError, @reconciledAt, @revision, @createdAt, @updatedAt)`
       )
@@ -144,6 +151,8 @@ export class SqlitePlanReviewGateRepository implements PlanReviewGateRepository 
            session_id = @sessionId,
            server_name = @serverName,
            server_version = @serverVersion,
+           contract_fingerprint = @contractFingerprint,
+           contract_mismatch_at = @contractMismatchAt,
            status = @status,
            verdict = @verdict,
            findings_json = @findingsJson,

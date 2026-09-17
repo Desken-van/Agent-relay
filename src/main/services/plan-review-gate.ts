@@ -102,6 +102,18 @@ const INTERRUPTED_ROUND =
   'The provider records a plan round that started and never finished. It produced no findings and nothing awaits decisions, so a new round may be started by hand. Nothing was repeated.';
 
 /**
+ * The Coai tool contract changed between two calls of the SAME live
+ * operation — `open` and `review_plan`, or `review_plan` and `resolve` — so
+ * whatever the later call produced was not proven against the contract the
+ * earlier one bound. Applying it anyway would let a verdict or a resolution
+ * be measured against tools that no longer mean what they meant a moment
+ * ago; refusing it here, before either result reaches the gate's own
+ * findings or status, is the only place that can still cost nothing.
+ */
+const CONTRACT_DRIFTED_MID_OPERATION =
+  'The Coai server’s tool contract changed partway through this operation, so its answer was not applied. The gate stays where it was; reconcile once the server is confirmed stable.';
+
+/**
  * What a status answer proves, or that it proves nothing.
  *
  * Every reading below is a claim about the world that some durable transition
@@ -507,6 +519,8 @@ export class PlanReviewGateService {
       sessionId: null,
       serverName: null,
       serverVersion: null,
+      contractFingerprint: null,
+      contractMismatchAt: null,
       status: 'prepared',
       verdict: null,
       findingsJson: null,
@@ -579,6 +593,11 @@ export class PlanReviewGateService {
         sessionId: session.sessionId,
         serverName: session.serverName,
         serverVersion: session.serverVersion,
+        // Compared against whatever the row already held — null for a fresh
+        // gate, or a previous round's fingerprint for one being re-opened —
+        // so a contract that changed since the last time this task was
+        // reviewed is flagged rather than silently adopted.
+        ...this.contractEvidence(gate.contractFingerprint, session.contractFingerprint),
         status: 'reviewing'
       });
       const round = await this.deps.reviewer.reviewPlan(reviewSubject, text, signal);
@@ -588,6 +607,12 @@ export class PlanReviewGateService {
           'The external reviewer returned credential-shaped text; the round was not persisted.'
         );
       }
+      // Checked against what `open` bound moments ago, within THIS operation —
+      // not against an earlier round's evidence, which `contractEvidence` above
+      // already compared and merely flagged. A drift here means review_plan's
+      // verdict and findings were produced under a contract this gate never
+      // agreed to, so they must not be applied.
+      this.assertContractStable(gate.contractFingerprint, round.contractFingerprint, gate.id);
       // Unconditional, and deliberately so. This write is not an inference
       // from a snapshot that may have gone stale — it is the call that caused
       // the new state, holding the claim that makes it the only writer. A
@@ -706,16 +731,37 @@ export class PlanReviewGateService {
       });
     }
 
+    // Whether the server's CURRENT contract disagrees with what this gate was
+    // bound to — independent of `sessionId`, since a fingerprint never
+    // encodes session identity. Shared by the session-mismatch branch below
+    // and by `identity`, so a simultaneous session mismatch and contract
+    // drift still durably records the drift instead of the session problem
+    // silently crowding it out.
+    const contractMismatchAt = (): string | null =>
+      gate.contractFingerprint !== null && gate.contractFingerprint !== state.contractFingerprint
+        ? this.deps.clock.nowIso()
+        : null;
+
     // A session this gate never recorded cannot speak for it. The identity is
     // adopted only where there was none — a gate stuck in `opening` never got
     // one — and the read-back is already scoped to this repository and branch.
     if (gate.sessionId !== null && gate.sessionId !== state.sessionId) {
-      return settle({ lastError: redactAndTruncate(SESSION_MISMATCH, 10_000) });
+      return settle({
+        lastError: redactAndTruncate(SESSION_MISMATCH, 10_000),
+        contractMismatchAt: contractMismatchAt()
+      });
     }
+    // `serverName`/`serverVersion`/`contractFingerprint` are deliberately
+    // ABSENT from this object. `status` is a read-only PROBE of whatever
+    // server answers right now — it is not the operation that reviewed this
+    // gate, and reconciliation must never let it silently rewrite the
+    // evidence a real `open`/`review_plan`/`resolve` call already recorded.
+    // A contract that has genuinely changed since is surfaced explicitly via
+    // `contractMismatchAt` below, alongside the UNCHANGED historical value —
+    // never in place of it.
     const identity = {
       sessionId: gate.sessionId ?? state.sessionId,
-      serverName: state.serverName,
-      serverVersion: state.serverVersion
+      contractMismatchAt: contractMismatchAt()
     };
 
     // A round still executing settles nothing at all, and is the one state in
@@ -881,6 +927,13 @@ export class PlanReviewGateService {
           'Coai resolve returned a state that does not close the pending plan round.'
         );
       }
+      // Checked against the fingerprint `review_plan` bound onto this same
+      // awaiting-resolve round — not a fresh probe's opinion. A drift here
+      // means the decisions the caller made were rendered against findings
+      // whose contract the provider has since moved past, so applying this
+      // resolution's outcome would settle the gate on a foundation nobody
+      // ever agreed to.
+      this.assertContractStable(gate.contractFingerprint, result.contractFingerprint, resolving.id);
       // `reconciledAt` is cleared: this outcome was driven from here, with
       // decisions recorded in this row, and must stay distinguishable from one
       // that was only read back out of the provider.
@@ -900,6 +953,53 @@ export class PlanReviewGateService {
       });
       throw error;
     }
+  }
+
+  /**
+   * The fields a LIVE dispatch (`open`, `review_plan`, `resolve` — never a
+   * read-only `status` probe; see `runReconcile`) writes for the contract it
+   * just proved: the fresh fingerprint always replaces the old one, because a
+   * live call is genuinely new evidence, but `contractMismatchAt` is set
+   * explicitly whenever it disagrees with what was already recorded rather
+   * than the disagreement being silently absorbed.
+   */
+  private contractEvidence(
+    previous: string | null,
+    fresh: string
+  ): { contractFingerprint: string; contractMismatchAt: string | null } {
+    return {
+      contractFingerprint: fresh,
+      contractMismatchAt: previous !== null && previous !== fresh ? this.deps.clock.nowIso() : null
+    };
+  }
+
+  /**
+   * Refuses to let a later call's answer settle the gate when the contract it
+   * was just proven against is not the one an earlier call in this SAME
+   * operation already bound.
+   *
+   * `bound` is null only when nothing has bound a contract yet, which cannot
+   * happen at either call site below — both run after `contractEvidence` has
+   * already written a fresh, non-null fingerprint moments earlier in the same
+   * operation — but a null is treated as nothing to compare against rather
+   * than assumed impossible, matching `contractEvidence`'s own leniency.
+   *
+   * Records the drift durably (without touching the ORIGINAL fingerprint —
+   * the update patch below omits it on purpose) and throws, so the caller's
+   * outer catch leaves the gate exactly where the dispatch got to. That is
+   * `runReview`'s `reviewing` or `runResolve`'s `resolving`: unresolved,
+   * available to `reconcile`, and never silently advanced on a foundation the
+   * gate never agreed to.
+   */
+  private assertContractStable(bound: string | null, fresh: string, gateId: string): void {
+    if (bound === null || bound === fresh) return;
+    this.deps.gates.update(gateId, {
+      contractMismatchAt: this.deps.clock.nowIso(),
+      lastError: redactAndTruncate(CONTRACT_DRIFTED_MID_OPERATION, 10_000)
+    });
+    throw new AgentRelayError('VALIDATION_FAILED', CONTRACT_DRIFTED_MID_OPERATION, {
+      remediation: 'Confirm the Coai server is stable, then reconcile or start a new review.'
+    });
   }
 
   private requireReadyTask(taskId: string): Task {

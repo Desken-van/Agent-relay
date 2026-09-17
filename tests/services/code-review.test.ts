@@ -52,11 +52,15 @@ import { AgentRelayError } from '../../src/shared/domain/errors';
 import { CoaiCodeReviewer } from '../../src/main/adapters/mcp/coai-code-reviewer';
 import {
   COAI_ADDRESSABLE_PROFILE,
+  COAI_CODE_REVIEW_TOOLS,
   COAI_PROVIDER_ID
 } from '../../src/main/adapters/mcp/coai-profiles';
 import { createHarness, type Harness } from '../helpers/harness';
 
 const BASE = '1'.repeat(40);
+
+/** A fixed, valid-shaped contract fingerprint — its value is asserted on only where a test names it. */
+const FINGERPRINT = 'f'.repeat(64);
 
 const ESCAPE = String.fromCharCode(27);
 
@@ -206,12 +210,17 @@ class FakeCodeReviewer implements ExternalCodeReviewer {
     instruction: 'resolve every finding',
     serverName: 'coai-mcp',
     serverVersion: '1.2.3',
+    contractFingerprint: FINGERPRINT,
     tokensIn: 100,
     tokensOut: 20
   };
 
   /** What the read-only round read-back reports. */
-  roundStatusAnswer: ExternalCodeRoundStatus = { kind: 'unknown', reason: 'not configured' };
+  roundStatusAnswer: ExternalCodeRoundStatus = {
+    kind: 'unknown',
+    reason: 'not configured',
+    contractFingerprint: null
+  };
   /**
    * What each read-back was asked about.
    *
@@ -241,7 +250,8 @@ class FakeCodeReviewer implements ExternalCodeReviewer {
       this.locators[index] ?? {
         providerId: this.providerId,
         sessionId: `session-${index + 1}`,
-        roundId: `round-${index + 1}`
+        roundId: `round-${index + 1}`,
+        contractFingerprint: FINGERPRINT
       }
     );
   }
@@ -1017,7 +1027,7 @@ describe('code-review recovery, capture stability and boundary hygiene', () => {
 
   it('leaves a round the provider says is still running exactly where it was', async () => {
     const value = await stranded();
-    value.reviewer.roundStatusAnswer = { kind: 'running' };
+    value.reviewer.roundStatusAnswer = { kind: 'running', contractFingerprint: FINGERPRINT };
 
     const outcome = await value.service.reconcile(value.task.id);
 
@@ -1030,9 +1040,30 @@ describe('code-review recovery, capture stability and boundary hygiene', () => {
     await expect(value.service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
   });
 
+  it('records a contract drift discovered while the round is still running, without settling it', async () => {
+    const value = await stranded();
+    const reserved = value.reviews.latestRound(value.task.id)!.contractFingerprint;
+    const drifted = 'e'.repeat(64);
+    value.reviewer.roundStatusAnswer = { kind: 'running', contractFingerprint: drifted };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('reviewing');
+    expect(outcome.unsettledReason).toBe('running');
+    // The reserved fingerprint survives untouched...
+    expect(outcome.round.contractFingerprint).toBe(reserved);
+    // ...and the drift is made explicit rather than only surfacing once the
+    // round eventually completes.
+    expect(outcome.round.contractMismatchAt).not.toBeNull();
+  });
+
   it('stays blocked and says why when the provider knows nothing', async () => {
     const value = await stranded();
-    value.reviewer.roundStatusAnswer = { kind: 'unknown', reason: 'the session is gone' };
+    value.reviewer.roundStatusAnswer = {
+      kind: 'unknown',
+      reason: 'the session is gone',
+      contractFingerprint: null
+    };
 
     const outcome = await value.service.reconcile(value.task.id);
 
@@ -1612,7 +1643,7 @@ describe('code-review round identity at the provider', () => {
     expect(lost.id).not.toBe(first.round.id);
     expect(lost.providerRoundId).not.toBe(first.round.providerRoundId);
 
-    value.reviewer.roundStatusAnswer = { kind: 'running' };
+    value.reviewer.roundStatusAnswer = { kind: 'running', contractFingerprint: FINGERPRINT };
     await value.service.reconcile(value.task.id);
 
     // Asked about exactly one round, and it is this one - not the earlier round
@@ -1658,7 +1689,8 @@ describe('code-review round identity at the provider', () => {
     value.reviewer.answerLocator = {
       providerId: 'coai',
       sessionId: 'session-1',
-      roundId: 'round-77'
+      roundId: 'round-77',
+      contractFingerprint: FINGERPRINT
     };
 
     await expect(value.service.review(value.task.id)).rejects.toThrow(/different round/i);
@@ -1734,7 +1766,7 @@ describe('code-review round identity at the provider', () => {
 
   it('releases a round only when the provider proves it never started', async () => {
     const value = await stranded();
-    value.reviewer.roundStatusAnswer = { kind: 'not_started' };
+    value.reviewer.roundStatusAnswer = { kind: 'not_started', contractFingerprint: FINGERPRINT };
 
     const outcome = await value.service.reconcile(value.task.id);
 
@@ -1748,6 +1780,20 @@ describe('code-review round identity at the provider', () => {
 
     await expect(value.service.review(value.task.id)).resolves.toBeTruthy();
     expect(value.reviewer.calls).toHaveLength(2);
+  });
+
+  it('records a contract drift discovered while proving the round never started', async () => {
+    const value = await stranded();
+    const reserved = value.reviews.latestRound(value.task.id)!.contractFingerprint;
+    const drifted = 'e'.repeat(64);
+    value.reviewer.roundStatusAnswer = { kind: 'not_started', contractFingerprint: drifted };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.round.status).toBe('failed');
+    expect(outcome.unsettledReason).toBe('not-started');
+    expect(outcome.round.contractFingerprint).toBe(reserved);
+    expect(outcome.round.contractMismatchAt).not.toBeNull();
   });
 });
 
@@ -1792,13 +1838,14 @@ describe('code-review locator durability', () => {
 
   it('never dispatches on a locator with an empty or missing part', async () => {
     for (const locator of [
-      { providerId: 'coai', sessionId: '', roundId: 'round-1' },
-      { providerId: 'coai', sessionId: 'session-1', roundId: '' },
-      { providerId: '', sessionId: 'session-1', roundId: 'round-1' },
-      { providerId: 'coai', sessionId: 'session-1' } as unknown as {
+      { providerId: 'coai', sessionId: '', roundId: 'round-1', contractFingerprint: FINGERPRINT },
+      { providerId: 'coai', sessionId: 'session-1', roundId: '', contractFingerprint: FINGERPRINT },
+      { providerId: '', sessionId: 'session-1', roundId: 'round-1', contractFingerprint: FINGERPRINT },
+      { providerId: 'coai', sessionId: 'session-1', contractFingerprint: FINGERPRINT } as unknown as {
         providerId: string;
         sessionId: string;
         roundId: string;
+        contractFingerprint: string;
       }
     ]) {
       const value = setup();
@@ -1822,7 +1869,12 @@ describe('code-review locator durability', () => {
     const value = setup();
     await value.service.captureSubject(value.task.id);
     value.reviewer.locators = [
-      { providerId: 'somebody-else', sessionId: 'session-1', roundId: 'round-1' }
+      {
+        providerId: 'somebody-else',
+        sessionId: 'session-1',
+        roundId: 'round-1',
+        contractFingerprint: FINGERPRINT
+      }
     ];
 
     await expect(value.service.review(value.task.id)).rejects.toThrow(/usable identity/i);
@@ -2027,7 +2079,7 @@ describe('a contradictory read-back, from the transport to the durable round', (
     enabled: true,
     executablePath: 'C:/tools/coai-mcp.exe',
     args: ['--stdio'],
-    allowedTools: COAI_ADDRESSABLE_PROFILE,
+    allowedTools: COAI_CODE_REVIEW_TOOLS,
     timeoutMs: 30_000,
     maxMessageBytes: 100_000,
     maxContentBytes: 100_000,
@@ -2040,7 +2092,11 @@ describe('a contradictory read-back, from the transport to the durable round', (
     readonly responses: ExternalMcpCallResult[] = [];
 
     async discover(): Promise<ExternalMcpDiscovery> {
-      return { server: SERVER, tools: COAI_ADDRESSABLE_PROFILE.map(mcpTool) };
+      return {
+        server: SERVER,
+        tools: COAI_ADDRESSABLE_PROFILE.map(mcpTool),
+        contractFingerprint: FINGERPRINT
+      };
     }
 
     async call(
@@ -2056,7 +2112,13 @@ describe('a contradictory read-back, from the transport to the durable round', (
   }
 
   function payload(tool: string, value: unknown): ExternalMcpCallResult {
-    return { server: SERVER, tool: mcpTool(tool), isError: false, content: [JSON.stringify(value)] };
+    return {
+      server: SERVER,
+      tool: mcpTool(tool),
+      isError: false,
+      content: [JSON.stringify(value)],
+      contractFingerprint: FINGERPRINT
+    };
   }
 
   /**
@@ -2273,7 +2335,7 @@ describe('a reviewer-supplied reason never reaches storage', () => {
 
   it('persists none of an unknown reason, whatever the reviewer put in it', async () => {
     const value = await strandedRound();
-    value.reviewer.roundStatusAnswer = { kind: 'unknown', reason: HOSTILE };
+    value.reviewer.roundStatusAnswer = { kind: 'unknown', reason: HOSTILE, contractFingerprint: null };
 
     const outcome = await value.service.reconcile(value.task.id);
 
@@ -2293,7 +2355,7 @@ describe('a reviewer-supplied reason never reaches storage', () => {
 
   it('reads the same durable row back with nothing of it either', async () => {
     const value = await strandedRound();
-    value.reviewer.roundStatusAnswer = { kind: 'unknown', reason: HOSTILE };
+    value.reviewer.roundStatusAnswer = { kind: 'unknown', reason: HOSTILE, contractFingerprint: null };
 
     await value.service.reconcile(value.task.id);
 
@@ -2304,14 +2366,14 @@ describe('a reviewer-supplied reason never reaches storage', () => {
 
   it('leaves running and not_started saying exactly what they said before', async () => {
     const running = await strandedRound();
-    running.reviewer.roundStatusAnswer = { kind: 'running' };
+    running.reviewer.roundStatusAnswer = { kind: 'running', contractFingerprint: FINGERPRINT };
     const held = await running.service.reconcile(running.task.id);
     expect(held.unsettledReason).toBe('running');
     expect(held.round.status).toBe('reviewing');
     expect(held.round.lastError).toMatch(/still running/i);
 
     const released = await strandedRound();
-    released.reviewer.roundStatusAnswer = { kind: 'not_started' };
+    released.reviewer.roundStatusAnswer = { kind: 'not_started', contractFingerprint: FINGERPRINT };
     const closed = await released.service.reconcile(released.task.id);
     expect(closed.unsettledReason).toBe('not-started');
     expect(closed.round.status).toBe('failed');
@@ -2446,7 +2508,9 @@ describe('a locator this build refuses to write down', () => {
   }) => {
     const value = setup();
     await value.service.captureSubject(value.task.id);
-    value.reviewer.locators = [{ providerId: value.reviewer.providerId, ...locator }];
+    value.reviewer.locators = [
+      { providerId: value.reviewer.providerId, ...locator, contractFingerprint: FINGERPRINT }
+    ];
 
     await expect(value.service.review(value.task.id)).rejects.toMatchObject({
       code: 'PARSE_FAILED'
@@ -2467,7 +2531,8 @@ describe('a locator this build refuses to write down', () => {
       {
         providerId: value.reviewer.providerId,
         sessionId: '9f2c1e7a-3b4d-4e5f-8a9b-0c1d2e3f4a5b',
-        roundId: 'round_42.retry-3'
+        roundId: 'round_42.retry-3',
+        contractFingerprint: FINGERPRINT
       }
     ];
 
@@ -2500,7 +2565,13 @@ describe('a reviewer that goes away between reserving and dispatching', () => {
   const SERVER = { name: 'coai-mcp', version: '0.19.0', protocolVersion: '2024-11-05' };
 
   function payload(tool: string, value: unknown): ExternalMcpCallResult {
-    return { server: SERVER, tool: mcpTool(tool), isError: false, content: [JSON.stringify(value)] };
+    return {
+      server: SERVER,
+      tool: mcpTool(tool),
+      isError: false,
+      content: [JSON.stringify(value)],
+      contractFingerprint: FINGERPRINT
+    };
   }
 
   /** A transport that can also run a hook at the moment a call goes out. */
@@ -2510,7 +2581,11 @@ describe('a reviewer that goes away between reserving and dispatching', () => {
     onCall: ((name: string) => void) | null = null;
 
     async discover(): Promise<ExternalMcpDiscovery> {
-      return { server: SERVER, tools: COAI_ADDRESSABLE_PROFILE.map(mcpTool) };
+      return {
+        server: SERVER,
+        tools: COAI_ADDRESSABLE_PROFILE.map(mcpTool),
+        contractFingerprint: FINGERPRINT
+      };
     }
 
     async call(_config: ExternalMcpServerConfig, name: string): Promise<ExternalMcpCallResult> {
@@ -2638,5 +2713,68 @@ describe('a reviewer that goes away between reserving and dispatching', () => {
     expect(client.calls.filter((name) => name === 'run_round')).toHaveLength(1);
     await expect(service.review(value.task.id)).rejects.toThrow(/already been dispatched/i);
     expect(client.calls.filter((name) => name === 'run_round')).toHaveLength(1);
+  });
+});
+
+describe('Coai contract fingerprint evidence', () => {
+  it('persists the contract fingerprint bound at reservation through to the completed round', async () => {
+    const value = setup();
+    const outcome = await reviewOnce(value);
+
+    expect(outcome.round.contractFingerprint).toBe(FINGERPRINT);
+    expect(outcome.round.contractMismatchAt).toBeNull();
+
+    // Durable, not merely returned: read back from storage independently.
+    const stored = value.reviews.latestRound(value.task.id);
+    expect(stored?.contractFingerprint).toBe(FINGERPRINT);
+    expect(stored?.contractMismatchAt).toBeNull();
+  });
+
+  it('stops safely, without applying the answer, when the contract drifts between reserving and running the round', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.answer = { ...value.reviewer.answer, contractFingerprint: 'e'.repeat(64) };
+
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/tool contract changed/i);
+
+    // Left exactly where the dispatch got to — `reviewing`, not `completed` —
+    // and the ORIGINAL fingerprint reservation bound, never silently replaced
+    // by the answer's differing one.
+    const round = value.reviews.latestRound(value.task.id)!;
+    expect(round.status).toBe('reviewing');
+    expect(round.contractFingerprint).toBe(FINGERPRINT);
+    expect(round.contractMismatchAt).not.toBeNull();
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
+  });
+
+  it('reconciliation reports a contract mismatch without applying the stale answer, preserving the reserved fingerprint', async () => {
+    const value = setup();
+    await value.service.captureSubject(value.task.id);
+    value.reviewer.error = new Error('the reviewer never answered');
+    await expect(value.service.review(value.task.id)).rejects.toThrow(/never answered/);
+    value.reviewer.error = null;
+
+    const subject = value.reviews.latestSubject(value.task.id)!;
+    const drifted = 'e'.repeat(64);
+    value.reviewer.roundStatusAnswer = {
+      kind: 'completed',
+      round: {
+        ...value.reviewer.answer,
+        findings: [finding()],
+        reviewedSubjectSha256: subject.subjectSha256,
+        contractFingerprint: drifted
+      }
+    };
+
+    const outcome = await value.service.reconcile(value.task.id);
+
+    expect(outcome.unsettledReason).toBe('contract-drifted');
+    expect(outcome.round.status).toBe('reviewing');
+    // The historical evidence survives untouched...
+    expect(outcome.round.contractFingerprint).toBe(FINGERPRINT);
+    // ...and the mismatch is made explicit rather than silently absorbed.
+    expect(outcome.round.contractMismatchAt).not.toBeNull();
+    expect(outcome.findings).toHaveLength(0);
+    expect(value.reviews.listFindings(value.task.id)).toHaveLength(0);
   });
 });

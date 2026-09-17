@@ -72,6 +72,7 @@ import type {
   TaskRuleEvidenceRepository
 } from './ports';
 import { ToolDiagnosticsService } from './services/diagnostics-service';
+import { CoaiCapabilityService } from './services/coai-capability-service';
 import { ContinuationService, reconcileContinuationClaims } from './services/continuation-service';
 import { OperationsDiagnosticsService } from './services/operations-diagnostics-service';
 import { OperationsRegistry } from './services/operations-registry';
@@ -113,6 +114,8 @@ export function defaultSettings(paths: ApplicationPaths): Settings {
     coaiMcpExecutablePath: null,
     coaiMcpArguments: [],
     coaiMcpWorkingDirectory: null,
+    coaiLastKnownContractFingerprint: null,
+    coaiLastKnownContractCheckedAt: null,
     conventionsRepositoryPath: null,
     conventionsExpectedRevision: null,
     conventionsRulePaths: [],
@@ -167,6 +170,8 @@ export interface Application {
   readonly operationDiagnostics: OperationsDiagnosticsService;
   readonly codexModels: CodexModelCatalog;
   readonly ruleEvidenceCollector: RuleEvidenceService;
+  /** Read-only Coai connection/capability diagnostic for Settings. Never calls a tool. */
+  readonly coaiCapability: CoaiCapabilityService;
   createPlanReviewGate(config: ExternalMcpServerConfig): PlanReviewGateService;
   /**
    * What startup reconciliation corrected, if anything.
@@ -481,6 +486,13 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     clock
   );
 
+  const coaiCapability = new CoaiCapabilityService({
+    settings,
+    client: new StdioMcpClient(
+      runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner()
+    )
+  });
+
   return {
     db,
     settings,
@@ -507,6 +519,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     operationDiagnostics,
     codexModels,
     ruleEvidenceCollector,
+    coaiCapability,
     // Built once, here, and closed over by every service the factory makes.
     // A per-call instance would give each IPC invocation its own private map
     // and arbitrate nothing, which is the whole failure this guards against.

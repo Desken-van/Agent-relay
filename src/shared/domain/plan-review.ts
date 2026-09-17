@@ -99,6 +99,24 @@ export const planReviewGateSchema = z
     sessionId: z.string().min(1).max(128).nullable(),
     serverName: z.string().min(1).max(200).nullable(),
     serverVersion: z.string().min(1).max(200).nullable(),
+    /**
+     * The EXACT Coai contract this gate's review was proved against — see
+     * `computeCoaiContractFingerprint` in `adapters/mcp/coai-profiles.ts`.
+     * Bound at `open()` and never silently replaced by a later probe's own
+     * reading (in particular, never by reconciliation's read-only `status`
+     * call): a historical fingerprint is evidence about what was actually
+     * reviewed, not a cache of "whatever the server currently reports."
+     */
+    contractFingerprint: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+    /**
+     * Set the moment ANY later probe (a subsequent live call, or
+     * reconciliation's `status` read) proves the server's current contract
+     * differs from {@link contractFingerprint}. Cleared back to null once a
+     * probe proves they agree again. Never itself a reason to discard
+     * `contractFingerprint` — it is the explicit "this needs a human look"
+     * signal Finding 4 requires, kept separate from the evidence it is about.
+     */
+    contractMismatchAt: isoDateTime.nullable(),
     status: z.enum(PLAN_REVIEW_STATUSES),
     verdict: z.enum(PLAN_REVIEW_VERDICTS).nullable(),
     findingsJson: z.string().nullable(),

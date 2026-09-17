@@ -123,8 +123,9 @@ describe('migrations', () => {
       });
 
       // Migrations 12 (Ornith), 13 (this test's review-limit subject),
-      // 14 (review-blocked-status), and 15 (compatibility repair) are pending.
-      expect(runMigrations(legacy)).toBe(4);
+      // 14 (review-blocked-status), 15 (compatibility repair), and 16
+      // (Coai contract fingerprint) are pending.
+      expect(runMigrations(legacy)).toBe(5);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_LIMIT_REACHED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');
       expect(() => tasks.create({
@@ -194,8 +195,9 @@ describe('migrations', () => {
       });
 
       // Migrations 13 (review-limit-status), 14 (this test's review-blocked
-      // subject), and 15 (compatibility repair) are still pending.
-      expect(runMigrations(legacy)).toBe(3);
+      // subject), 15 (compatibility repair), and 16 (Coai contract
+      // fingerprint) are still pending.
+      expect(runMigrations(legacy)).toBe(4);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_BLOCKED');
       expect(tasks.findById(staleEvidence.id)?.status).toBe('FAILED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');
