@@ -768,17 +768,24 @@ describe('durable external plan review gate', () => {
     expect(value.reviewer.reviewCalls).toHaveLength(2);
   });
 
-  it('applies nothing when the provider answers for another session', async () => {
+  it('applies nothing when the provider answers for another session, but still records a simultaneous contract drift', async () => {
     const value = setup();
     const { task } = await ready(value);
     await value.service.review(task.id);
     value.reviewer.resolveError = new Error('resolve answer lost');
     await expect(resolveCurrent(value, task.id)).rejects.toThrow(/lost/);
     const before = value.harness.planReviewGates.findByTask(task.id);
+    expect(before?.contractMismatchAt).toBeNull();
 
+    // A session mismatch and a contract drift are independent facts — a
+    // fingerprint never encodes session identity — so both must be
+    // observable from the same reconciliation read, not one crowding out
+    // the other.
+    const drifted = 'd'.repeat(64);
     value.reviewer.state = {
       ...value.reviewer.state,
       sessionId: 'a-different-session',
+      contractFingerprint: drifted,
       stage: 'CodeReview',
       awaitingResolve: false,
       planProceeded: true,
@@ -789,6 +796,11 @@ describe('durable external plan review gate', () => {
     expect(gate.status).toBe('resolving');
     expect(gate.sessionId).toBe(before?.sessionId);
     expect(gate.lastError).toMatch(/different session/i);
+    // The historical fingerprint survives untouched...
+    expect(gate.contractFingerprint).toBe(before?.contractFingerprint);
+    // ...and the drift is made explicit rather than silently absorbed by the
+    // session-mismatch branch.
+    expect(gate.contractMismatchAt).not.toBeNull();
   });
 
   it('refuses to open approval on a contradictory provider state', async () => {

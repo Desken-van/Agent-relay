@@ -731,11 +731,25 @@ export class PlanReviewGateService {
       });
     }
 
+    // Whether the server's CURRENT contract disagrees with what this gate was
+    // bound to — independent of `sessionId`, since a fingerprint never
+    // encodes session identity. Shared by the session-mismatch branch below
+    // and by `identity`, so a simultaneous session mismatch and contract
+    // drift still durably records the drift instead of the session problem
+    // silently crowding it out.
+    const contractMismatchAt = (): string | null =>
+      gate.contractFingerprint !== null && gate.contractFingerprint !== state.contractFingerprint
+        ? this.deps.clock.nowIso()
+        : null;
+
     // A session this gate never recorded cannot speak for it. The identity is
     // adopted only where there was none — a gate stuck in `opening` never got
     // one — and the read-back is already scoped to this repository and branch.
     if (gate.sessionId !== null && gate.sessionId !== state.sessionId) {
-      return settle({ lastError: redactAndTruncate(SESSION_MISMATCH, 10_000) });
+      return settle({
+        lastError: redactAndTruncate(SESSION_MISMATCH, 10_000),
+        contractMismatchAt: contractMismatchAt()
+      });
     }
     // `serverName`/`serverVersion`/`contractFingerprint` are deliberately
     // ABSENT from this object. `status` is a read-only PROBE of whatever
@@ -747,10 +761,7 @@ export class PlanReviewGateService {
     // never in place of it.
     const identity = {
       sessionId: gate.sessionId ?? state.sessionId,
-      contractMismatchAt:
-        gate.contractFingerprint !== null && gate.contractFingerprint !== state.contractFingerprint
-          ? this.deps.clock.nowIso()
-          : null
+      contractMismatchAt: contractMismatchAt()
     };
 
     // A round still executing settles nothing at all, and is the one state in

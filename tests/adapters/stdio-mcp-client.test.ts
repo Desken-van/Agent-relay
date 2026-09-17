@@ -441,6 +441,20 @@ describe('stdio MCP client', () => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  it('gives a compile-failure refusal a generic, actionable remediation with no provider-supplied text', async () => {
+    const marker = join(directory, 'dispatched-remediation-check.marker');
+    const unsupportedConfig = config('unsupported-schema-remediation', {
+      args: [serverScript, 'unsupported-schema', 'unknown-keyword', marker],
+      allowedTools: ['gamma']
+    });
+
+    await expect(client.call(unsupportedConfig, 'gamma', { value: 'x' })).rejects.toMatchObject({
+      code: 'VALIDATION_FAILED',
+      remediation: expect.stringContaining('2020-12')
+    });
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it('still calls a required tool once every construct its schema uses is one this client evaluates', async () => {
     // The negative control for the block above: `gamma` with a FULLY
     // supported schema (numeric and string ranges, minProperties, uniqueItems

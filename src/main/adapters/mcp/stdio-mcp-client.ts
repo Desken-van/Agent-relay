@@ -328,6 +328,15 @@ function unsafeToCompile(toolName: string): string {
 }
 
 /**
+ * Generic on purpose, unlike `unsafeToCompile`'s message: it names no
+ * keyword, value or `$ref` from the server's own schema, so it carries none
+ * of the provider-supplied text that function's doc comment explains must
+ * stay out of a thrown error.
+ */
+const UNSAFE_TO_COMPILE_REMEDIATION =
+  'Inspect the server tool schema for a construct outside the 2020-12 JSON Schema vocabulary, an unresolved $ref, or a structurally invalid keyword value.';
+
+/**
  * Bounded, safe description of the FIRST Ajv validation failure.
  *
  * Built only from `instancePath` (a path into the ARGUMENTS this client
@@ -357,7 +366,9 @@ function assertSchemaCompiles(tool: ExternalMcpTool): void {
   try {
     schemaValidator().compile(tool.inputSchema);
   } catch {
-    throw new AgentRelayError('VALIDATION_FAILED', unsafeToCompile(tool.name));
+    throw new AgentRelayError('VALIDATION_FAILED', unsafeToCompile(tool.name), {
+      remediation: UNSAFE_TO_COMPILE_REMEDIATION
+    });
   }
 }
 
@@ -386,7 +397,9 @@ function validateToolContract(tool: ExternalMcpTool, args: Readonly<Record<strin
   try {
     validate = schemaValidator().compile(tool.inputSchema);
   } catch {
-    throw new AgentRelayError('VALIDATION_FAILED', unsafeToCompile(tool.name));
+    throw new AgentRelayError('VALIDATION_FAILED', unsafeToCompile(tool.name), {
+      remediation: UNSAFE_TO_COMPILE_REMEDIATION
+    });
   }
   if (!validate(args)) {
     throw new AgentRelayError('VALIDATION_FAILED', describeValidationFailure(tool.name, validate.errors));
