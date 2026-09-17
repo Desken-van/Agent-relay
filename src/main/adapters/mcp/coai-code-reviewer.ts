@@ -15,18 +15,14 @@ import type {
   ExternalCodeReviewer,
   ExternalCodeReviewRound,
   ExternalCodeReviewSubject,
+  ExternalCodeRoundIdentity,
   ExternalCodeRoundLocator,
   ExternalCodeRoundStatus,
   ExternalMcpCallResult,
   ExternalMcpClient,
   ExternalMcpServerConfig
 } from '../../ports';
-import {
-  COAI_ADDRESSABLE_PROFILE,
-  COAI_ADDRESSABLE_TOOLS,
-  COAI_PROVIDER_ID,
-  isAuditedProfile
-} from './coai-profiles';
+import { COAI_CODE_REVIEW_TOOLS, COAI_PROVIDER_ID, isAuditedProfile } from './coai-profiles';
 import { McpToolProfileMismatchError } from './stdio-mcp-client';
 
 /** How much of a provider's prose may reach a stored reason. */
@@ -160,22 +156,21 @@ const roundStatusSchema = z.discriminatedUnion('state', [
  * The Coai code-review adapter, bound to one audited server configuration.
  *
  * Every call goes through the same bounded transport the plan gate uses: one
- * short-lived process, no shell, a fixed argv from trusted settings, and a tool
- * list that must match the configured profile exactly.
+ * short-lived process, no shell, a fixed argv from trusted settings, and a
+ * required-subset check — the server must advertise all three addressable
+ * round tools this adapter calls, but may advertise anything else besides
+ * without that being treated as incompatibility (see coai-profiles.ts and
+ * stdio-mcp-client.ts's `McpToolProfileMismatchError`).
  */
 export class CoaiCodeReviewer implements ExternalCodeReviewer {
   constructor(
     private readonly client: ExternalMcpClient,
     private readonly config: ExternalMcpServerConfig
   ) {
-    if (!isAuditedProfile(config.allowedTools, COAI_ADDRESSABLE_PROFILE)) {
+    if (!isAuditedProfile(config.allowedTools, COAI_CODE_REVIEW_TOOLS)) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
-        'The Coai code reviewer requires its exact audited twelve-tool profile.',
-        {
-          remediation:
-            'Code review needs reserve_round, run_round and round_status alongside the nine plan tools.'
-        }
+        'The Coai code reviewer requires a configuration declaring exactly its three tools: reserve_round, run_round, round_status.'
       );
     }
   }
@@ -197,20 +192,23 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
   /**
    * Can a round run right now? Read-only, and never a consuming call.
    *
-   * Discovery alone answers it: the transport refuses a server whose tool list
-   * is not exactly this profile, so a plan-only nine-tool server fails here —
-   * before `CodeReviewService` writes any durable intent — and the reason names
-   * what is missing rather than saying the call failed.
+   * Discovery alone answers it: the transport refuses a server missing any of
+   * the three required tools — so a plan-only server, or any server short even
+   * one of the three, fails here — before `CodeReviewService` writes any
+   * durable intent — and the reason names what is missing rather than saying
+   * the call failed. A server advertising unrelated extra tools besides the
+   * three required ones is NOT a reason to refuse here.
    */
   async availability(signal?: AbortSignal): Promise<CodeReviewerAvailability> {
     try {
       const discovery = await this.client.discover(this.config, signal);
-      const names = discovery.tools.map((tool) => tool.name);
-      if (!isAuditedProfile(names, COAI_ADDRESSABLE_PROFILE)) {
+      const names = new Set(discovery.tools.map((tool) => tool.name));
+      const missing = COAI_CODE_REVIEW_TOOLS.filter((name) => !names.has(name));
+      if (missing.length > 0) {
         // Unreachable through the transport, which enforces the same thing —
         // and checked anyway, because this class must not depend on another
         // layer's guard to keep its own promise.
-        return this.unavailable(this.missingSentence(names));
+        return this.unavailable(this.missingSentence(missing));
       }
 
       return { available: true, reason: null };
@@ -231,14 +229,20 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
    * it does not hide a path, and it was never meant to.
    *
    * So nothing here reads `details`, and nothing reads a server-supplied string.
-   * A tool-profile mismatch is recognised by its TYPE and answered with names
-   * from this build's own {@link COAI_ADDRESSABLE_TOOLS}; every other failure
-   * gets a fixed sentence plus its error CODE, which comes from a closed set
-   * this application defines.
+   * A tool mismatch is recognised by its TYPE and answered with names from
+   * this build's own {@link COAI_CODE_REVIEW_TOOLS}; every other failure gets
+   * a fixed sentence plus its error CODE, which comes from a closed set this
+   * application defines.
    */
   private describe(error: unknown): string {
     if (error instanceof McpToolProfileMismatchError) {
-      return `It does not advertise the audited profile. Code review needs ${this.namesFor(error)}.`;
+      // A duplicate is not a missing-tool question — extras beyond the
+      // required three are never the cause of this error any more (see
+      // stdio-mcp-client.ts), so the only two shapes left are "the server
+      // contradicted its own tool list" and "one of the three is absent".
+      return error.duplicated
+        ? 'It advertised a duplicate tool name, so nothing in its tool list can be trusted.'
+        : `It does not advertise ${this.namesFor(error)}.`;
     }
 
     // Everything else: a spawn failure, a timeout, a cancellation, a protocol
@@ -252,15 +256,14 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
   /**
    * The addressable tools to name, sourced only from this build's constant.
    *
-   * Filtered by what the transport reported missing — itself taken from the
-   * allowlist this application supplied, so still local — and falling back to
-   * all three when the mismatch was an extra or duplicated tool rather than an
-   * absent one. Either way the strings emitted are this build's own.
+   * `error.missing` is already scoped to exactly {@link COAI_CODE_REVIEW_TOOLS}
+   * — that is the only required set this adapter ever declares — so it is used
+   * directly, falling back to the full three only for the degenerate case of
+   * an empty `missing` (a duplicate-only mismatch reaching this branch, which
+   * `describe` does not do, but a defensive default costs nothing).
    */
   private namesFor(error: McpToolProfileMismatchError): string {
-    const absent = COAI_ADDRESSABLE_TOOLS.filter((tool) => error.missing.includes(tool));
-
-    return (absent.length > 0 ? absent : COAI_ADDRESSABLE_TOOLS).join(', ');
+    return (error.missing.length > 0 ? error.missing : COAI_CODE_REVIEW_TOOLS).join(', ');
   }
 
   /**
@@ -284,30 +287,34 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
     clientToken: string,
     signal?: AbortSignal
   ): Promise<ExternalCodeRoundLocator> {
-    const value = this.parse(
-      await this.client.call(
-        this.config,
-        'reserve_round',
-        {
-          repoPath: subject.worktreePath,
-          branch: subject.branch,
-          baseRef: subject.baseRef,
-          // Sent so the reservation can be checked against it below. On a fresh
-          // reservation echoing it back proves little; on a RESUMED one — the
-          // same token after a lost answer — the stored attestation comes from
-          // the original reservation, so an echo that differs is a reservation
-          // for other code being handed back under this token.
-          subjectSha256: subject.subjectSha256,
-          clientToken
-        },
-        signal
-      ),
-      reservationSchema
+    const result = await this.client.call(
+      this.config,
+      'reserve_round',
+      {
+        repoPath: subject.worktreePath,
+        branch: subject.branch,
+        baseRef: subject.baseRef,
+        // Sent so the reservation can be checked against it below. On a fresh
+        // reservation echoing it back proves little; on a RESUMED one — the
+        // same token after a lost answer — the stored attestation comes from
+        // the original reservation, so an echo that differs is a reservation
+        // for other code being handed back under this token.
+        subjectSha256: subject.subjectSha256,
+        clientToken
+      },
+      signal
     );
+    const value = this.parse(result, reservationSchema);
     this.assertOurProvider(value.locator);
     this.assertReservationMatches(value, subject);
 
-    return value.locator;
+    // Bound here, at reservation — the earliest point a durable round exists
+    // to bind it to — and never at completion. `reserve_round`'s own JSON
+    // body carries no server identity (it arrives only in the MCP
+    // initialize handshake, which `reservationSchema` never sees), but the
+    // fingerprint is computed by THIS client from that same handshake
+    // regardless of what the tool's own response body contains.
+    return { ...value.locator, contractFingerprint: result.contractFingerprint };
   }
 
   /**
@@ -377,7 +384,7 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
    * failure the locator exists to prevent.
    */
   async reviewCode(
-    locator: ExternalCodeRoundLocator,
+    locator: ExternalCodeRoundIdentity,
     _subject: ExternalCodeReviewSubject,
     scopeText: string,
     signal?: AbortSignal
@@ -410,7 +417,7 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
    * the provider says it only about a round it reserved and did not dispatch.
    */
   async roundStatus(
-    locator: ExternalCodeRoundLocator,
+    locator: ExternalCodeRoundIdentity,
     // Unused on purpose: the round is addressed by its LOCATOR, never described
     // by its subject. Describing it would be the guess this whole contract
     // exists to remove.
@@ -418,9 +425,12 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
     signal?: AbortSignal
   ): Promise<ExternalCodeRoundStatus> {
     if (locator.providerId !== this.providerId) {
+      // No call was made, so there is no fresh reading of anything —
+      // `contractFingerprint` is null rather than a guess.
       return {
         kind: 'unknown',
-        reason: 'That round was dispatched to a different provider than this one.'
+        reason: 'That round was dispatched to a different provider than this one.',
+        contractFingerprint: null
       };
     }
 
@@ -439,36 +449,46 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
       );
       value = this.parse(result, roundStatusSchema);
     } catch (error) {
-      return { kind: 'unknown', reason: this.unreadable(error) };
+      // The call, or parsing its answer, failed — no discovery is known to
+      // have completed, so there is nothing to fingerprint.
+      return { kind: 'unknown', reason: this.unreadable(error), contractFingerprint: null };
     }
 
+    // From here on `result` is a real, completed discovery+call, so every
+    // answer below carries its own fresh `contractFingerprint` — even an
+    // `unknown` one: the service compares it against the round's reserved
+    // fingerprint, and "the read succeeded but proved a mismatch elsewhere"
+    // is different evidence from "nothing was read at all".
     if (!sameLocator(value.locator, locator)) {
       return {
         kind: 'unknown',
-        reason: 'The provider answered about a different round than the one asked about.'
+        reason: 'The provider answered about a different round than the one asked about.',
+        contractFingerprint: result.contractFingerprint
       };
     }
 
     switch (value.state) {
       case 'running':
-        return { kind: 'running' };
+        return { kind: 'running', contractFingerprint: result.contractFingerprint };
 
       case 'not_started':
         // Positive evidence: the provider holds this reservation and has not
         // dispatched it. Nothing else in this method can produce this answer.
-        return { kind: 'not_started' };
+        return { kind: 'not_started', contractFingerprint: result.contractFingerprint };
 
       case 'completed': {
         if (value.review === undefined) {
           return {
             kind: 'unknown',
-            reason: 'The provider called the round completed and returned no result for it.'
+            reason: 'The provider called the round completed and returned no result for it.',
+            contractFingerprint: result.contractFingerprint
           };
         }
         if (!sameLocator(value.review.locator, locator)) {
           return {
             kind: 'unknown',
-            reason: 'The completed result carried a different locator than the round asked about.'
+            reason: 'The completed result carried a different locator than the round asked about.',
+            contractFingerprint: result.contractFingerprint
           };
         }
 
@@ -484,7 +504,8 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
             reason: redactAndTruncate(
               error instanceof Error ? error.message : String(error),
               REASON_LIMIT
-            )
+            ),
+            contractFingerprint: result.contractFingerprint
           };
         }
       }
@@ -501,13 +522,15 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
           // SHAPES; it hides neither an absolute path nor a control character,
           // and it was never meant to.
           reason:
-            'The provider reports this round as failed. What it said about the failure is not repeated here, because a provider message can carry a path, a command line or a control character.'
+            'The provider reports this round as failed. What it said about the failure is not repeated here, because a provider message can carry a path, a command line or a control character.',
+          contractFingerprint: result.contractFingerprint
         };
 
       default:
         return {
           kind: 'unknown',
-          reason: 'The provider has no usable record of this round.'
+          reason: 'The provider has no usable record of this round.',
+          contractFingerprint: result.contractFingerprint
         };
     }
   }
@@ -522,7 +545,7 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
    */
   private round(
     value: z.infer<typeof completedRoundSchema>,
-    locator: ExternalCodeRoundLocator,
+    locator: ExternalCodeRoundIdentity,
     result: ExternalMcpCallResult
   ): ExternalCodeReviewRound {
     if (!sameLocator(value.locator, locator)) {
@@ -549,6 +572,7 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
       instruction: value.instruction,
       serverName: result.server.name,
       serverVersion: result.server.version,
+      contractFingerprint: result.contractFingerprint,
       // Absent means the vendor reported nothing, and that is not zero.
       tokensIn: value.tokensIn ?? null,
       tokensOut: value.tokensOut ?? null
@@ -608,7 +632,7 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
     return `The round could not be read back (${code}). What the provider said is not repeated here, because it can carry a path, a command line or a credential.`;
   }
 
-  private assertOurProvider(locator: ExternalCodeRoundLocator): void {
+  private assertOurProvider(locator: ExternalCodeRoundIdentity): void {
     if (locator.providerId !== this.providerId) {
       throw new AgentRelayError(
         'PARSE_FAILED',
@@ -629,12 +653,8 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
     };
   }
 
-  private missingSentence(names: readonly string[]): string {
-    const missing = COAI_ADDRESSABLE_TOOLS.filter((tool) => !names.includes(tool));
-
-    return missing.length > 0
-      ? `It advertises ${names.length} tools and is missing ${missing.join(', ')}.`
-      : `It advertises ${names.length} tools, which is not the audited profile.`;
+  private missingSentence(missing: readonly string[]): string {
+    return `It is missing ${missing.join(', ')}.`;
   }
 
   /**
@@ -696,6 +716,6 @@ export class CoaiCodeReviewer implements ExternalCodeReviewer {
   }
 }
 
-function sameLocator(a: ExternalCodeRoundLocator, b: ExternalCodeRoundLocator): boolean {
+function sameLocator(a: ExternalCodeRoundIdentity, b: ExternalCodeRoundIdentity): boolean {
   return a.providerId === b.providerId && a.sessionId === b.sessionId && a.roundId === b.roundId;
 }

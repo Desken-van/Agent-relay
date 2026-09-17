@@ -15,13 +15,13 @@ import { CoaiCodeReviewer } from '../../src/main/adapters/mcp/coai-code-reviewer
 import { McpToolProfileMismatchError } from '../../src/main/adapters/mcp/stdio-mcp-client';
 import {
   COAI_ADDRESSABLE_PROFILE,
-  COAI_ADDRESSABLE_TOOLS,
+  COAI_CODE_REVIEW_TOOLS,
   COAI_PLAN_PROFILE,
   COAI_PROVIDER_ID
 } from '../../src/main/adapters/mcp/coai-profiles';
 import type {
   ExternalCodeReviewSubject,
-  ExternalCodeRoundLocator,
+  ExternalCodeRoundIdentity,
   ExternalMcpCallResult,
   ExternalMcpClient,
   ExternalMcpDiscovery,
@@ -29,12 +29,15 @@ import type {
   ExternalMcpTool
 } from '../../src/main/ports';
 
+/** A fixed, valid-shaped contract fingerprint — its value is never asserted on here. */
+const FINGERPRINT = 'f'.repeat(64);
+
 const config: ExternalMcpServerConfig = {
   id: 'coai-code-review',
   enabled: true,
   executablePath: 'C:\\tools\\coai-mcp.exe',
   args: ['--stdio'],
-  allowedTools: COAI_ADDRESSABLE_PROFILE,
+  allowedTools: COAI_CODE_REVIEW_TOOLS,
   timeoutMs: 30_000,
   maxMessageBytes: 100_000,
   maxContentBytes: 100_000,
@@ -49,7 +52,7 @@ const subject: ExternalCodeReviewSubject = {
   subjectSha256: 'b'.repeat(64)
 };
 
-const locator: ExternalCodeRoundLocator = {
+const locator: ExternalCodeRoundIdentity = {
   providerId: COAI_PROVIDER_ID,
   sessionId: 'session-1',
   roundId: 'round-1'
@@ -78,7 +81,8 @@ class FakeMcpClient implements ExternalMcpClient {
 
     return {
       server: { name: 'coai-mcp', version: '0.19.0', protocolVersion: '2024-11-05' },
-      tools: this.tools.map(tool)
+      tools: this.tools.map(tool),
+      contractFingerprint: FINGERPRINT
     };
   }
 
@@ -110,6 +114,7 @@ function result(
     tool: tool(name),
     isError: false,
     content: [JSON.stringify(value)],
+    contractFingerprint: FINGERPRINT,
     ...overrides
   };
 }
@@ -170,28 +175,29 @@ function completed(overrides: Record<string, unknown> = {}) {
 describe('the Coai code reviewer adapter', () => {
   // ---------- the capability boundary ----------
 
-  it('refuses to be built on anything but the exact addressable profile', () => {
+  it('refuses to be built on a local declaration that is not exactly its three tools', () => {
     expect(() => new CoaiCodeReviewer(new FakeMcpClient(), config)).not.toThrow();
 
-    // The plan-only server. It has `review_code`, and that is exactly the tool this
-    // adapter must never fall back to.
+    // This is a LOCAL construction-time sanity check, independent of what a
+    // real server advertises. The plan-only nine tools are not this adapter's
+    // three, so a config declaring them locally is still refused here.
     expect(
       () => new CoaiCodeReviewer(new FakeMcpClient(), { ...config, allowedTools: COAI_PLAN_PROFILE })
-    ).toThrow(/twelve-tool profile/i);
+    ).toThrow(/exactly its three tools/i);
     expect(
       () =>
         new CoaiCodeReviewer(new FakeMcpClient(), {
           ...config,
-          allowedTools: [...COAI_ADDRESSABLE_PROFILE, 'something_new']
+          allowedTools: [...COAI_CODE_REVIEW_TOOLS, 'something_new']
         })
-    ).toThrow(/twelve-tool profile/i);
+    ).toThrow(/exactly its three tools/i);
     expect(
       () =>
         new CoaiCodeReviewer(new FakeMcpClient(), {
           ...config,
-          allowedTools: [...COAI_ADDRESSABLE_PROFILE.slice(0, 11), 'run_round']
+          allowedTools: [...COAI_CODE_REVIEW_TOOLS.slice(0, 2), 'run_round']
         })
-    ).toThrow(/twelve-tool profile/i);
+    ).toThrow(/exactly its three tools/i);
   });
 
   it('never claims to read uncommitted work, and files rounds under one identity', () => {
@@ -288,20 +294,44 @@ describe('the Coai code reviewer adapter', () => {
 
   it('names the missing tools from its OWN constant, never from the server', async () => {
     // The mismatch is recognised by type. The names come from
-    // COAI_ADDRESSABLE_TOOLS; nothing the server sent is echoed, so a server
+    // COAI_CODE_REVIEW_TOOLS; nothing the server sent is echoed, so a server
     // that advertised a tool called `C:\\evil\\path` could not put it here.
     const client = new FakeMcpClient();
     client.discoveryError = new McpToolProfileMismatchError(
       'VALIDATION_FAILED',
-      'The MCP server tool list does not match the configured allowlist.',
-      { missing: [...COAI_ADDRESSABLE_TOOLS], unexpectedCount: 1, duplicated: false }
+      'The MCP server does not advertise every tool this request requires.',
+      {
+        missing: [...COAI_CODE_REVIEW_TOOLS],
+        unexpectedCount: 1,
+        duplicated: false,
+        server: { name: 'coai-mcp', version: '0.19.0', protocolVersion: '2024-11-05' }
+      }
     );
 
     const answer = await new CoaiCodeReviewer(client, config).availability();
 
     expect(answer.available).toBe(false);
-    for (const name of COAI_ADDRESSABLE_TOOLS) expect(answer.reason).toContain(name);
-    expect(answer.reason).toMatch(/does not advertise the audited profile/i);
+    for (const name of COAI_CODE_REVIEW_TOOLS) expect(answer.reason).toContain(name);
+    expect(answer.reason).toMatch(/It does not advertise/i);
+  });
+
+  it('reports a self-contradictory tool list distinctly from a missing tool', async () => {
+    const client = new FakeMcpClient();
+    client.discoveryError = new McpToolProfileMismatchError(
+      'PARSE_FAILED',
+      'The MCP server advertised a duplicate tool name.',
+      {
+        missing: [],
+        unexpectedCount: 0,
+        duplicated: true,
+        server: { name: 'coai-mcp', version: '0.19.0', protocolVersion: '2024-11-05' }
+      }
+    );
+
+    const answer = await new CoaiCodeReviewer(client, config).availability();
+
+    expect(answer.available).toBe(false);
+    expect(answer.reason).toMatch(/duplicate tool name/i);
   });
 
   // ---------- beginRound reserves and nothing else ----------
@@ -312,7 +342,7 @@ describe('the Coai code reviewer adapter', () => {
 
     const got = await new CoaiCodeReviewer(client, config).beginRound(subject, 'local-round-7');
 
-    expect(got).toEqual(locator);
+    expect(got).toEqual({ ...locator, contractFingerprint: FINGERPRINT });
     // ONE tool, and it is the one that spends nothing.
     expect(client.toolsCalled).toEqual(['reserve_round']);
     expect(client.calls[0]!.args).toEqual({
@@ -700,7 +730,7 @@ describe('the reservation is checked before anything is dispatched', () => {
 
     await expect(
       new CoaiCodeReviewer(client, config).beginRound(subject, 'local-round-7')
-    ).resolves.toEqual(locator);
+    ).resolves.toEqual({ ...locator, contractFingerprint: FINGERPRINT });
   });
 
   it('refuses a resumed reservation held against other code', async () => {

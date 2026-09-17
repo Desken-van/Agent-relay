@@ -10,7 +10,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   COAI_ADDRESSABLE_PROFILE,
+  COAI_CODE_REVIEW_TOOLS,
   COAI_PLAN_PROFILE,
+  COAI_PLAN_REVIEW_TOOLS,
   COAI_PROVIDER_ID
 } from '../../src/main/adapters/mcp/coai-profiles';
 import {
@@ -28,7 +30,7 @@ import { SettingsBoundCodeReviewer } from '../../src/main/services/code-review-p
 import type { Settings } from '../../src/shared/domain/models';
 import type {
   ExternalCodeReviewSubject,
-  ExternalCodeRoundLocator,
+  ExternalCodeRoundIdentity,
   ExternalMcpCallResult,
   ExternalMcpClient,
   ExternalMcpDiscovery,
@@ -43,7 +45,7 @@ const subject: ExternalCodeReviewSubject = {
   subjectSha256: 'b'.repeat(64)
 };
 
-const locator: ExternalCodeRoundLocator = {
+const locator: ExternalCodeRoundIdentity = {
   providerId: COAI_PROVIDER_ID,
   sessionId: 'session-1',
   roundId: 'round-1'
@@ -81,7 +83,8 @@ class CountingClient implements ExternalMcpClient {
         description: null,
         inputSchema: { type: 'object' },
         annotations: { readOnly: null, destructive: null, idempotent: null, openWorld: null }
-      }))
+      })),
+      contractFingerprint: 'a'.repeat(64)
     };
   }
 
@@ -109,13 +112,13 @@ describe('the trusted code-review configuration', () => {
     ]);
   });
 
-  it('pins the exact twelve-tool profile from the main process', () => {
+  it('pins the exact three addressable tools from the main process, and nothing about the plan profile', () => {
     const config = externalCodeReviewConfig(settings());
 
-    expect(config.allowedTools).toEqual(COAI_ADDRESSABLE_PROFILE);
-    expect(config.allowedTools).toHaveLength(12);
-    // The nine plan tools are a prefix, not the profile: code review needs the
-    // three that make a round addressable.
+    expect(config.allowedTools).toEqual(COAI_CODE_REVIEW_TOOLS);
+    expect(config.allowedTools).toHaveLength(3);
+    // Code review needs only the round lifecycle — none of the nine plan
+    // tools are required for it to be considered available.
     expect(config.allowedTools).not.toEqual(COAI_PLAN_PROFILE);
     expect(config.executablePath).toBe('C:\\tools\\coai-mcp.exe');
     expect(config.args).toEqual(['--stdio']);
@@ -231,37 +234,50 @@ describe('the code reviewer the app actually runs', () => {
   });
 });
 
-describe('the profile both gates are configured with', () => {
-  it('is the nine-tool one while code review is off', () => {
-    const off = settings({ externalPlanReviewEnabled: true, externalCodeReviewEnabled: false });
-
-    expect(externalPlanReviewConfig(off).allowedTools).toEqual(COAI_PLAN_PROFILE);
-    expect(externalPlanReviewConfig(off).allowedTools).toHaveLength(9);
-    // And code review is simply not configurable then.
-    expect(() => externalCodeReviewConfig(off)).toThrow(/disabled/i);
+describe('the two gates negotiate their own tool requirements, independently', () => {
+  it('the plan gate always declares its own four tools, whatever code review is set to', () => {
+    for (const codeReviewEnabled of [false, true]) {
+      const value = settings({ externalPlanReviewEnabled: true, externalCodeReviewEnabled: codeReviewEnabled });
+      expect(externalPlanReviewConfig(value).allowedTools, String(codeReviewEnabled)).toEqual(
+        COAI_PLAN_REVIEW_TOOLS
+      );
+    }
   });
 
-  it('is the twelve-tool one for BOTH gates once code review is on', () => {
-    // The defect this pins: the plan gate used to hardcode nine, so enabling
-    // code review pointed the two gates at one server with two different exact
-    // tool lists — and the transport, which compares exactly, would refuse the
-    // plan gate against the very server that supports both.
-    const on = settings({ externalPlanReviewEnabled: true, externalCodeReviewEnabled: true });
+  it('the code gate always declares its own three tools, whatever plan review is set to', () => {
+    for (const planReviewEnabled of [false, true]) {
+      const value = settings({
+        externalPlanReviewEnabled: planReviewEnabled,
+        externalCodeReviewEnabled: true
+      });
+      expect(externalCodeReviewConfig(value).allowedTools, String(planReviewEnabled)).toEqual(
+        COAI_CODE_REVIEW_TOOLS
+      );
+    }
+  });
 
-    const plan = externalPlanReviewConfig(on);
-    const code = externalCodeReviewConfig(on);
+  it('this is the actual defect fix: enabling code review no longer changes what the plan gate declares', () => {
+    // Before this change, `coaiToolProfile` picked ONE tool list for the whole
+    // MCP connection from `externalCodeReviewEnabled` alone, so turning code
+    // review on silently widened the PLAN gate's own declared requirement too
+    // — breaking plan review against the real, published, plan-only server the
+    // moment code review was also switched on. The two configs below must now
+    // be identical in every field except `id` and `allowedTools`, and
+    // `allowedTools` must be unaffected by the other gate's checkbox.
+    const off = externalPlanReviewConfig(
+      settings({ externalPlanReviewEnabled: true, externalCodeReviewEnabled: false })
+    );
+    const on = externalPlanReviewConfig(
+      settings({ externalPlanReviewEnabled: true, externalCodeReviewEnabled: true })
+    );
 
-    expect(plan.allowedTools).toEqual(COAI_ADDRESSABLE_PROFILE);
-    expect(code.allowedTools).toEqual(COAI_ADDRESSABLE_PROFILE);
-    expect(plan.allowedTools).toEqual(code.allowedTools);
-    // One server: same executable, same argv, same working directory.
-    expect(plan.executablePath).toBe(code.executablePath);
-    expect(plan.args).toEqual(code.args);
+    expect(off.allowedTools).toEqual(on.allowedTools);
+    expect(off.allowedTools).toEqual(COAI_PLAN_REVIEW_TOOLS);
   });
 
   it('produces a plan configuration the real plan adapter accepts', () => {
     // Through the PRODUCTION path, not a hand-built config: the adapter's own
-    // profile check is what would reject a configuration built wrongly here.
+    // sanity check is what would reject a configuration built wrongly here.
     const client = new CountingClient();
     for (const enabled of [false, true]) {
       const config = externalPlanReviewConfig(
@@ -272,18 +288,19 @@ describe('the profile both gates are configured with', () => {
     }
   });
 
-  it('still fails closed on a profile nobody audited', () => {
-    // The fix must not have become "accept whatever is configured". A list that
-    // is neither audited profile is refused exactly as before.
+  it('still fails closed on a local declaration that is not exactly its four tools', () => {
+    // The fix must not have become "accept whatever is configured locally".
+    // This is a LOCAL sanity check on CoaiPlanReviewer's own construction, not
+    // a statement about what the real server may additionally advertise.
     const client = new CountingClient();
     const config = externalPlanReviewConfig(settings({ externalPlanReviewEnabled: true }));
 
     expect(
-      () => new CoaiPlanReviewer(client, { ...config, allowedTools: [...COAI_PLAN_PROFILE, 'extra'] })
-    ).toThrow(/audited profiles/i);
+      () => new CoaiPlanReviewer(client, { ...config, allowedTools: [...COAI_PLAN_REVIEW_TOOLS, 'extra'] })
+    ).toThrow(/exactly its four tools/i);
     expect(
-      () => new CoaiPlanReviewer(client, { ...config, allowedTools: COAI_PLAN_PROFILE.slice(0, 8) })
-    ).toThrow(/audited profiles/i);
+      () => new CoaiPlanReviewer(client, { ...config, allowedTools: COAI_PLAN_REVIEW_TOOLS.slice(0, 2) })
+    ).toThrow(/exactly its four tools/i);
   });
 });
 
@@ -295,7 +312,7 @@ describe('the two gates describe one server', () => {
    * is drift, and it would show up as one gate refusing a message the other
    * accepts from the one server they share.
    */
-  it('shares executable, argv, working directory, profile and capacity', () => {
+  it('shares executable, argv, working directory and capacity — but NOT the tool requirement', () => {
     const value = settings({
       externalPlanReviewEnabled: true,
       externalCodeReviewEnabled: true,
@@ -306,11 +323,14 @@ describe('the two gates describe one server', () => {
     const plan = externalPlanReviewConfig(value);
     const code = externalCodeReviewConfig(value);
 
-    // They differ in exactly one field, and it is the one they are entitled to
-    // differ in: the id their transport is filed under.
+    // They differ in exactly two fields, and both are ones they are entitled
+    // to differ in: the id their transport is filed under, and the tools each
+    // one requires — independent capability negotiation is the whole point.
     expect(plan.id).toBe('coai-plan-review');
     expect(code.id).toBe('coai-code-review');
-    expect({ ...code, id: plan.id }).toEqual(plan);
+    expect({ ...code, id: plan.id, allowedTools: plan.allowedTools }).toEqual(plan);
+    expect(plan.allowedTools).toEqual(COAI_PLAN_REVIEW_TOOLS);
+    expect(code.allowedTools).toEqual(COAI_CODE_REVIEW_TOOLS);
 
     // The capacity is the shared constant rather than a repeated literal, so a
     // change to it cannot reach one gate and miss the other.
@@ -323,19 +343,17 @@ describe('the two gates describe one server', () => {
       expect(config.args).toEqual(value.coaiMcpArguments);
       expect(config.cwd).toBe('C:/work');
     }
-
-    // And the profile stays exact: twelve tools, because code review is on.
-    expect(plan.allowedTools).toEqual(COAI_ADDRESSABLE_PROFILE);
-    expect(code.allowedTools).toEqual(COAI_ADDRESSABLE_PROFILE);
   });
 
-  it('leaves the plan gate on the nine-tool profile when code review is off', () => {
-    const plan = externalPlanReviewConfig(
-      settings({ externalPlanReviewEnabled: true, externalCodeReviewEnabled: false })
-    );
+  it('the plan gate declares the same four tools whether code review is off or on', () => {
+    for (const externalCodeReviewEnabled of [false, true]) {
+      const plan = externalPlanReviewConfig(
+        settings({ externalPlanReviewEnabled: true, externalCodeReviewEnabled })
+      );
 
-    expect(plan.allowedTools).toEqual(COAI_PLAN_PROFILE);
-    expect(plan.maxContentBlocks).toBe(COAI_MCP_CAPACITY.maxContentBlocks);
+      expect(plan.allowedTools, String(externalCodeReviewEnabled)).toEqual(COAI_PLAN_REVIEW_TOOLS);
+      expect(plan.maxContentBlocks).toBe(COAI_MCP_CAPACITY.maxContentBlocks);
+    }
   });
 
   it('omits the working directory when none is configured', () => {

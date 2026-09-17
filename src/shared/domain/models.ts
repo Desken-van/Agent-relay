@@ -420,6 +420,20 @@ export const settingsSchema = z.object({
   coaiMcpArguments: z.array(z.string().min(1).max(2_000)).max(32),
   /** Optional absolute working directory for the MCP server. */
   coaiMcpWorkingDirectory: z.string().max(32_767).nullable(),
+  /**
+   * The canonical contract fingerprint the last successful "Recheck
+   * connection" probe observed — see `computeCoaiContractFingerprint` in
+   * `main/adapters/mcp/coai-profiles.ts`, applied to every tool this build
+   * knows about that the server actually advertised. Durable on purpose: an
+   * in-memory "changed since the previous check" comparison is lost on every
+   * restart, so a check performed for the first time in a fresh session would
+   * always read as unchanged even after a real drift. Persisting the last
+   * known value is what lets that first check still compare against
+   * something real.
+   */
+  coaiLastKnownContractFingerprint: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+  /** When {@link coaiLastKnownContractFingerprint} was last observed. */
+  coaiLastKnownContractCheckedAt: isoDateTime.nullable(),
   /** Optional conventions repository included alongside the project rules. */
   conventionsRepositoryPath: z.string().max(32_767).nullable(),
   /** Exact clean conventions revision to bind. */

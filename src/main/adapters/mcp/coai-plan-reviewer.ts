@@ -10,7 +10,7 @@ import {
   type PlanReviewDecision,
   type PlanReviewFinding
 } from '../../../shared/domain/plan-review';
-import { COAI_ADDRESSABLE_PROFILE, COAI_PLAN_PROFILE, isAuditedProfile } from './coai-profiles';
+import { COAI_PLAN_REVIEW_TOOLS, isAuditedProfile } from './coai-profiles';
 import type {
   ExternalMcpCallResult,
   ExternalMcpClient,
@@ -24,13 +24,14 @@ import type {
 } from '../../ports';
 
 /**
- * The profile the plan gate configures by default.
+ * The tools the plan gate declares by default.
  *
  * Re-exported under its original name so every existing caller keeps working;
- * the list itself now lives with the other audited profiles, beside the
- * addressable one it is a prefix of.
+ * the list itself now lives with the other Coai tool constants, and is the
+ * four tools this adapter actually calls (open, status, review_plan, resolve)
+ * rather than a full server shape — see coai-profiles.ts.
  */
-export const COAI_TOOL_ALLOWLIST = COAI_PLAN_PROFILE;
+export const COAI_TOOL_ALLOWLIST = COAI_PLAN_REVIEW_TOOLS;
 
 const stageSchema = z.enum(['PlanReview', 'CodeReview', 'Done']);
 
@@ -141,23 +142,23 @@ function isNoSessionRefusal(result: ExternalMcpCallResult): boolean {
 }
 
 /**
- * Either audited profile, and nothing between them.
+ * This adapter's own construction-time sanity check: was it built with
+ * exactly the four tools it is ever going to call, no more and no less?
  *
- * The plan tools are identical in both, so a server presenting the exact
- * twelve-tool profile serves this gate as well as the nine-tool one does — and a
- * deployment that has the newer server should not have to run two of them to
- * keep plan review working. What is NOT accepted is a superset: "the nine I
- * need are present" would admit any server that grew tools nobody here has
- * read, and its other tools may have changed too.
+ * This has nothing to do with what the real server advertises — that is
+ * negotiated per call by the transport's required-subset check against
+ * `config.allowedTools` (see stdio-mcp-client.ts and coai-profiles.ts). This
+ * check exists so a caller cannot hand `CoaiPlanReviewer` a config declaring
+ * the wrong local allowlist — too narrow, and a call this adapter needs would
+ * be refused locally before it ever reached the server; too wide, and the
+ * adapter could be permitted to call a tool (an addressable round tool, say)
+ * it was never written to use.
  */
 function assertCoaiAllowlist(config: ExternalMcpServerConfig): void {
-  if (
-    !isAuditedProfile(config.allowedTools, COAI_PLAN_PROFILE) &&
-    !isAuditedProfile(config.allowedTools, COAI_ADDRESSABLE_PROFILE)
-  ) {
+  if (!isAuditedProfile(config.allowedTools, COAI_PLAN_REVIEW_TOOLS)) {
     throw new AgentRelayError(
       'VALIDATION_FAILED',
-      'The Coai plan adapter requires one of its exact audited profiles: the nine plan tools, or those twelve.'
+      'The Coai plan adapter requires a configuration declaring exactly its four tools: open, status, review_plan, resolve.'
     );
   }
 }
@@ -216,7 +217,8 @@ export class CoaiPlanReviewer implements ExternalPlanReviewer {
     return {
       ...value,
       serverName: result.server.name,
-      serverVersion: result.server.version
+      serverVersion: result.server.version,
+      contractFingerprint: result.contractFingerprint
     };
   }
 
@@ -251,7 +253,8 @@ export class CoaiPlanReviewer implements ExternalPlanReviewer {
         interrupted: plan.filter((round) => round.status === 'interrupted').length
       },
       serverName: result.server.name,
-      serverVersion: result.server.version
+      serverVersion: result.server.version,
+      contractFingerprint: result.contractFingerprint
     };
   }
 
@@ -270,7 +273,8 @@ export class CoaiPlanReviewer implements ExternalPlanReviewer {
     return {
       ...value,
       serverName: result.server.name,
-      serverVersion: result.server.version
+      serverVersion: result.server.version,
+      contractFingerprint: result.contractFingerprint
     };
   }
 
@@ -294,7 +298,8 @@ export class CoaiPlanReviewer implements ExternalPlanReviewer {
     return {
       ...value,
       serverName: result.server.name,
-      serverVersion: result.server.version
+      serverVersion: result.server.version,
+      contractFingerprint: result.contractFingerprint
     };
   }
 }

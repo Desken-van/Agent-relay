@@ -655,6 +655,8 @@ export class ContinuationService {
       sessionId: gate.sessionId,
       serverName: gate.serverName,
       serverVersion: gate.serverVersion,
+      contractFingerprint: gate.contractFingerprint,
+      contractMismatchAt: gate.contractMismatchAt,
       status: gate.status,
       verdict: gate.verdict,
       findingsJson: gate.findingsJson,

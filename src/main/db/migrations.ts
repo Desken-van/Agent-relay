@@ -982,6 +982,36 @@ export const MIGRATIONS: readonly Migration[] = [
         );
       }
     }
+  },
+  {
+    version: 16,
+    name: 'coai-contract-fingerprint',
+    up(db) {
+      // Durable evidence of the EXACT Coai tool contract (negotiated MCP
+      // protocol version, server identity, and the canonicalized inputSchema
+      // of only the tools that operation required — see
+      // computeCoaiContractFingerprint in src/main/adapters/mcp/coai-profiles.ts)
+      // a plan-review gate or code-review round actually negotiated.
+      //
+      // Both columns are simple additions with no new CHECK constraint, so a
+      // plain ALTER TABLE is enough — neither table needs the full
+      // create-copy-drop-rename rebuild the v5 migration used, since nothing
+      // here changes an existing column or adds a constraint that references
+      // one.
+      //
+      // `contract_fingerprint` is nullable: every row written before this
+      // migration has none, and the application treats that exactly like any
+      // other never-established value rather than a special case.
+      // `contract_mismatch_at` is set only when a LATER probe proves the
+      // server's current contract differs from `contract_fingerprint` — it is
+      // never a reason to overwrite that fingerprint, only a flag beside it.
+      db.exec(`
+        ALTER TABLE plan_review_gates ADD COLUMN contract_fingerprint TEXT;
+        ALTER TABLE plan_review_gates ADD COLUMN contract_mismatch_at TEXT;
+        ALTER TABLE code_review_rounds ADD COLUMN contract_fingerprint TEXT;
+        ALTER TABLE code_review_rounds ADD COLUMN contract_mismatch_at TEXT;
+      `);
+    }
   }
 ];
 

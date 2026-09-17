@@ -4,8 +4,11 @@
  * Agent Relay owns this fake server; nothing here talks to a vendor, a model or
  * a sibling repository, and no provider quota is spent. What it proves that the
  * unit tests cannot: the capability boundary is enforced by the transport that
- * actually spawns a process, so a server whose `tools/list` is not exactly the
- * audited profile is refused before any tool is called.
+ * actually spawns a process, so a server missing any of the three required
+ * addressable tools is refused before any tool is called — while a server
+ * advertising extra tools BESIDES those three is not refused at all, because
+ * required-subset validation, not exact-match, is what the transport enforces
+ * (see stdio-mcp-client.ts's `McpToolProfileMismatchError`).
  */
 
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -15,6 +18,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CoaiCodeReviewer } from '../../src/main/adapters/mcp/coai-code-reviewer';
 import {
   COAI_ADDRESSABLE_PROFILE,
+  COAI_CODE_REVIEW_TOOLS,
   COAI_PLAN_PROFILE,
   COAI_PROVIDER_ID
 } from '../../src/main/adapters/mcp/coai-profiles';
@@ -47,7 +51,7 @@ function config(mode: string, overrides: Partial<ExternalMcpServerConfig> = {}):
     executablePath: process.execPath,
     args: [serverScript, mode],
     cwd: directory,
-    allowedTools: COAI_ADDRESSABLE_PROFILE,
+    allowedTools: COAI_CODE_REVIEW_TOOLS,
     timeoutMs: 15_000,
     maxMessageBytes: 256 * 1024,
     maxContentBytes: 256 * 1024,
@@ -104,7 +108,13 @@ beforeAll(() => {
       '      continue;',
       '    }',
       '    if (message.method === "tools/list") {',
-      '      ok(message.id, { tools: names().map((name) => ({ name, inputSchema: { type: "object" } })) });',
+      // "schema-drift": run_round now, per the SERVER's own advertised schema,
+      // requires a parameter this build has never sent. Everything else keeps
+      // its permissive schema, so only run_round is affected.
+      '      const schemaFor = (name) => (mode === "schema-drift" && name === "run_round")',
+      '        ? { type: "object", required: ["apiVersion"], properties: { apiVersion: { type: "string" } } }',
+      '        : { type: "object" };',
+      '      ok(message.id, { tools: names().map((name) => ({ name, inputSchema: schemaFor(name) })) });',
       '      continue;',
       '    }',
       '    if (message.method === "tools/call") {',
@@ -161,7 +171,6 @@ describe('the Coai code reviewer over a real MCP process', () => {
   });
 
   it.each([
-    ['an unknown extra tool', 'extra'],
     ['a missing required tool', 'missing'],
     ['a duplicate standing in for a missing one', 'duplicate']
   ])('fails closed on %s', async (_name, mode) => {
@@ -171,11 +180,39 @@ describe('the Coai code reviewer over a real MCP process', () => {
     expect(answer.reason).toMatch(/addressable code review is not supported/i);
   });
 
+  it('tolerates an unknown extra tool rather than refusing the whole server', async () => {
+    // 'extra' advertises all twelve audited tools PLUS an unrelated unknown
+    // one. Code review needs only its own three, so this must still be
+    // available — a server growing an unrelated capability must not break an
+    // otherwise-compatible operation.
+    const answer = await new CoaiCodeReviewer(client, config('extra')).availability();
+
+    expect(answer.available).toBe(true);
+  });
+
+  it('refuses a call whose SCHEMA changed, even though the tool is still present by name', async () => {
+    // 'schema-drift' advertises every required tool by name, including
+    // run_round — but run_round's own inputSchema now requires a parameter
+    // this build has never sent. Availability (name-only) still reports the
+    // server as compatible; the actual dispatch is what must catch this.
+    const reviewer = new CoaiCodeReviewer(client, config('schema-drift'));
+
+    await expect(reviewer.availability()).resolves.toEqual({ available: true, reason: null });
+
+    const locator = await reviewer.beginRound(subject, 'local-round-schema');
+    await expect(reviewer.reviewCode(locator, subject, 'scope')).rejects.toMatchObject({
+      code: 'VALIDATION_FAILED'
+    });
+  });
+
   it('reserves, runs and reads back over the real transport', async () => {
     const reviewer = new CoaiCodeReviewer(client, config('twelve'));
 
     const locator = await reviewer.beginRound(subject, 'local-round-7');
-    expect(locator).toEqual({ providerId: COAI_PROVIDER_ID, sessionId: 's-1', roundId: 'r-1' });
+    expect(locator).toMatchObject({ providerId: COAI_PROVIDER_ID, sessionId: 's-1', roundId: 'r-1' });
+    // A real fingerprint over the real fake server's schemas, not a fixture —
+    // its exact value is not asserted, only that one was actually computed.
+    expect(locator.contractFingerprint).toMatch(/^[0-9a-f]{64}$/);
 
     const round = await reviewer.reviewCode(locator, subject, 'the scope this change implements');
     expect(round.verdict).toBe('revise');
@@ -192,7 +229,7 @@ describe('the Coai code reviewer over a real MCP process', () => {
   it('carries the caller\u2019s durable token to the server, unchanged', async () => {
     // The fake echoes the token it was sent into its instruction, which is the
     // only way to see from here what actually crossed the process boundary.
-    const reviewer = new CoaiCodeReviewer(client, config('ten'));
+    const reviewer = new CoaiCodeReviewer(client, config('twelve'));
     const seen: string[] = [];
     const spy = {
       discover: client.discover.bind(client),
@@ -209,7 +246,7 @@ describe('the Coai code reviewer over a real MCP process', () => {
       }
     };
 
-    await new CoaiCodeReviewer(spy, config('ten')).beginRound(subject, 'local-round-42');
+    await new CoaiCodeReviewer(spy, config('twelve')).beginRound(subject, 'local-round-42');
     await reviewer.availability();
 
     expect(seen).toEqual(['reserved: local-round-42']);

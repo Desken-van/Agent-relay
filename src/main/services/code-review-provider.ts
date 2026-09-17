@@ -20,6 +20,7 @@ import { externalCodeReviewConfig } from './code-review-configuration';
 import type {
   ExternalMcpClient,
   CodeReviewerAvailability,
+  ExternalCodeRoundIdentity,
   ExternalCodeRoundLocator,
   ExternalCodeRoundStatus,
   ExternalCodeReviewer,
@@ -113,18 +114,19 @@ export class UnconfiguredCodeReviewer implements ExternalCodeReviewer {
    * worse than one that admits it learned nothing.
    */
   async roundStatus(
-    _locator: ExternalCodeRoundLocator,
+    _locator: ExternalCodeRoundIdentity,
     _subject: ExternalCodeReviewSubject,
     _signal?: AbortSignal
   ): Promise<ExternalCodeRoundStatus> {
     return {
       kind: 'unknown',
-      reason: 'No external code reviewer is configured in this build.'
+      reason: 'No external code reviewer is configured in this build.',
+      contractFingerprint: null
     };
   }
 
   async reviewCode(
-    _locator: ExternalCodeRoundLocator,
+    _locator: ExternalCodeRoundIdentity,
     _subject: ExternalCodeReviewSubject,
     _scopeText: string,
     _signal?: AbortSignal
@@ -198,7 +200,7 @@ export class SettingsBoundCodeReviewer implements ExternalCodeReviewer {
   }
 
   async reviewCode(
-    locator: ExternalCodeRoundLocator,
+    locator: ExternalCodeRoundIdentity,
     subject: ExternalCodeReviewSubject,
     scopeText: string,
     signal?: AbortSignal
@@ -214,7 +216,7 @@ export class SettingsBoundCodeReviewer implements ExternalCodeReviewer {
    * what became of that round, which is not the same as saying nothing ran.
    */
   async roundStatus(
-    locator: ExternalCodeRoundLocator,
+    locator: ExternalCodeRoundIdentity,
     subject: ExternalCodeReviewSubject,
     signal?: AbortSignal
   ): Promise<ExternalCodeRoundStatus> {
@@ -224,7 +226,8 @@ export class SettingsBoundCodeReviewer implements ExternalCodeReviewer {
       ? {
           kind: 'unknown',
           reason:
-            'External code review is not configured now, so this build cannot ask what became of that round.'
+            'External code review is not configured now, so this build cannot ask what became of that round.',
+          contractFingerprint: null
         }
       : reviewer.roundStatus(locator, subject, signal);
   }

@@ -1,9 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { CoaiPlanReviewer, COAI_TOOL_ALLOWLIST } from '../../src/main/adapters/mcp/coai-plan-reviewer';
-import {
-  COAI_ADDRESSABLE_PROFILE,
-  COAI_PLAN_PROFILE
-} from '../../src/main/adapters/mcp/coai-profiles';
+import { COAI_PLAN_REVIEW_TOOLS } from '../../src/main/adapters/mcp/coai-profiles';
 import type {
   ExternalMcpCallResult,
   ExternalMcpClient,
@@ -24,6 +21,9 @@ const config: ExternalMcpServerConfig = {
   maxContentBlocks: 4
 };
 
+/** A fixed, valid-shaped contract fingerprint — its value is never asserted on here. */
+const FINGERPRINT = 'f'.repeat(64);
+
 function tool(name: string): ExternalMcpTool {
   return {
     name,
@@ -39,7 +39,11 @@ class FakeMcpClient implements ExternalMcpClient {
   responses: ExternalMcpCallResult[] = [];
 
   async discover(): Promise<ExternalMcpDiscovery> {
-    return { server: { name: 'coai-mcp', version: '1.0', protocolVersion: '2024-11-05' }, tools: [] };
+    return {
+      server: { name: 'coai-mcp', version: '1.0', protocolVersion: '2024-11-05' },
+      tools: [],
+      contractFingerprint: FINGERPRINT
+    };
   }
 
   async call(
@@ -60,6 +64,7 @@ function result(name: string, value: unknown, overrides: Partial<ExternalMcpCall
     tool: tool(name),
     isError: false,
     content: [JSON.stringify(value)],
+    contractFingerprint: FINGERPRINT,
     ...overrides
   };
 }
@@ -312,38 +317,36 @@ describe('Coai plan reviewer adapter', () => {
     ).rejects.toMatchObject({ code: 'PARSE_FAILED' });
   });
 
-  it('accepts either audited profile and refuses everything between them', () => {
-    // The plan tools are identical in both, and a deployment running the newer
-    // server should not have to run a second one to keep the plan gate working.
+  it('accepts exactly its own four tools locally, and nothing between them', () => {
+    // This is a LOCAL construction-time sanity check, independent of anything
+    // a real server advertises — that is negotiated per call by the transport's
+    // required-subset check (see stdio-mcp-client.ts).
     expect(
-      () => new CoaiPlanReviewer(new FakeMcpClient(), { ...config, allowedTools: COAI_PLAN_PROFILE })
-    ).not.toThrow();
-    expect(
-      () =>
-        new CoaiPlanReviewer(new FakeMcpClient(), { ...config, allowedTools: COAI_ADDRESSABLE_PROFILE })
+      () => new CoaiPlanReviewer(new FakeMcpClient(), { ...config, allowedTools: COAI_PLAN_REVIEW_TOOLS })
     ).not.toThrow();
 
-    // A subset is not a profile, and neither is a superset: a server that grew a
-    // tool nobody here has read may have changed its others too, and the two are
-    // indistinguishable from this side.
+    // A subset is refused: this adapter would be permitted to call a tool it
+    // is missing from its own declared local allowlist.
     expect(
       () => new CoaiPlanReviewer(new FakeMcpClient(), { ...config, allowedTools: ['open', 'review_plan'] })
-    ).toThrow(/audited profiles/i);
+    ).toThrow(/exactly its four tools/i);
+    // A superset is refused too: this adapter should never be handed permission
+    // to call a tool it was never written to use.
     expect(
       () =>
         new CoaiPlanReviewer(new FakeMcpClient(), {
           ...config,
-          allowedTools: [...COAI_PLAN_PROFILE, 'something_new']
+          allowedTools: [...COAI_PLAN_REVIEW_TOOLS, 'reserve_round']
         })
-    ).toThrow(/audited profiles/i);
-    // Twelve names with a duplicate standing in for a missing one is still not
-    // the twelve-tool profile, however the counts line up.
+    ).toThrow(/exactly its four tools/i);
+    // Four names with a duplicate standing in for a missing one is still not
+    // the four required tools, however the counts line up.
     expect(
       () =>
         new CoaiPlanReviewer(new FakeMcpClient(), {
           ...config,
-          allowedTools: [...COAI_ADDRESSABLE_PROFILE.slice(0, 11), 'run_round']
+          allowedTools: [...COAI_PLAN_REVIEW_TOOLS.slice(0, 3), 'open']
         })
-    ).toThrow(/audited profiles/i);
+    ).toThrow(/exactly its four tools/i);
   });
 });

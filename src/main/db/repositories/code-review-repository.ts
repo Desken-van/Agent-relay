@@ -40,6 +40,7 @@ const OCCURRENCE_COLUMNS = `id, finding_id, round_id, subject_sha256, severity, 
 
 const ROUND_COLUMNS = `id, task_id, subject_id, subject_sha256, status, verdict,
                        provider_id, session_id, provider_round_id, server_name, server_version,
+                       contract_fingerprint, contract_mismatch_at,
                        reviewers,
                        gating_count, threshold, tokens_in, tokens_out, last_error,
                        revision, started_at, completed_at, created_at, updated_at`;
@@ -99,6 +100,8 @@ interface RoundRow {
   provider_round_id: string | null;
   server_name: string | null;
   server_version: string | null;
+  contract_fingerprint: string | null;
+  contract_mismatch_at: string | null;
   reviewers: string | null;
   gating_count: number | null;
   threshold: number | null;
@@ -200,6 +203,8 @@ function toRound(row: RoundRow): CodeReviewRound {
     providerRoundId: row.provider_round_id,
     serverName: row.server_name,
     serverVersion: row.server_version,
+    contractFingerprint: row.contract_fingerprint,
+    contractMismatchAt: row.contract_mismatch_at,
     reviewers: row.reviewers,
     gatingCount: row.gating_count,
     threshold: row.threshold,
@@ -340,12 +345,14 @@ export class SqliteCodeReviewRepository implements CodeReviewRepository {
       .prepare(
         `INSERT INTO code_review_rounds (
            id, task_id, subject_id, subject_sha256, status, verdict, provider_id,
-           session_id, provider_round_id, server_name, server_version, reviewers,
+           session_id, provider_round_id, server_name, server_version,
+           contract_fingerprint, contract_mismatch_at, reviewers,
            gating_count, threshold, tokens_in, tokens_out, last_error, revision,
            started_at, completed_at, created_at, updated_at)
          VALUES (
            @id, @taskId, @subjectId, @subjectSha256, @status, @verdict, @providerId,
-           @sessionId, @providerRoundId, @serverName, @serverVersion, @reviewers,
+           @sessionId, @providerRoundId, @serverName, @serverVersion,
+           @contractFingerprint, @contractMismatchAt, @reviewers,
            @gatingCount, @threshold, @tokensIn, @tokensOut, @lastError, @revision,
            @startedAt, @completedAt, @createdAt, @updatedAt)`
       )
@@ -429,6 +436,8 @@ export class SqliteCodeReviewRepository implements CodeReviewRepository {
            provider_round_id = @providerRoundId,
            server_name = @serverName,
            server_version = @serverVersion,
+           contract_fingerprint = @contractFingerprint,
+           contract_mismatch_at = @contractMismatchAt,
            reviewers = @reviewers,
            gating_count = @gatingCount,
            threshold = @threshold,

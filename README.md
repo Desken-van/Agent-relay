@@ -448,19 +448,38 @@ Git refuses and you are told, rather than losing it.
 | `npm run test:watch` | Vitest, watch mode |
 | `npm run lint` | ESLint over everything |
 | `npm run typecheck` | `tsc --noEmit` for both the Node and web projects |
-### External code review (INT-D-B)
+### External plan review and code review (independent capability negotiation)
 
-The provider adapter exists and is **off by default**. It requires an MCP server
-that advertises an exact twelve-tool profile — the nine Coai 0.22 plan tools plus
-`reserve_round`, `run_round` and `round_status` — because a code round must be
-named before it runs for its answer to be findable afterwards.
+Both integrations talk to the same configured Coai MCP server, but each
+negotiates its OWN capability independently — enabling or losing one never
+depends on the other's tools being present, and neither depends on a settings
+checkbox pretending to know what the real server supports. Each operation
+declares only the tools it itself calls, and the transport enforces that as a
+REQUIRED SUBSET, not an exact match against one fixed server shape or version:
+a server is free to advertise other tools besides the ones a given operation
+needs, and that never blocks the operation — it just means those extra tools
+are never called either. See `src/main/adapters/mcp/coai-profiles.ts` for the
+exact per-operation tool lists.
 
-**The installed Coai 0.22 build advertises nine.** Plan review works against it
-exactly as before; code review reports *"addressable code review is not
-supported"* and writes nothing. That answer comes from discovery, so a refusal
-costs no round and leaves nothing to reconcile. A server with a missing tool, an
-unknown extra one, or a duplicated name is refused the same way: the profile is
-audited as a whole, never as a minimum.
+Plan review requires four tools: `open`, `status`, `review_plan`, `resolve`.
+The provider adapter for durable code review exists and is **off by default**;
+it requires three: `reserve_round`, `run_round`, `round_status`, because a code
+round must be named before it runs for its answer to be findable afterwards.
+
+Whether a given installed Coai build advertises the three addressable round
+tools varies by build and changes over time — check Settings → Coai
+connection → **Recheck connection** for what the currently configured server
+actually advertises, rather than relying on a version number written here.
+When it does not, code review reports *"addressable code review is not
+supported"* and writes nothing; plan review is unaffected either way. That
+answer comes from discovery, so a refusal costs no round and leaves nothing to
+reconcile.
+
+A server missing a tool an operation requires, or advertising a duplicated
+tool name, is refused for the operation(s) that need it. An unaudited extra
+tool is never callable regardless, but its mere presence does not by itself
+refuse anything — see `McpToolProfileMismatchError` in
+`src/main/adapters/mcp/stdio-mcp-client.ts` for the full rationale.
 
 Uncommitted and untracked work is still out of reach. The provider reviews a
 commit in a worktree it pins to a SHA, so Agent Relay refuses to send it a

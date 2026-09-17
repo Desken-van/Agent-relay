@@ -908,7 +908,7 @@ export interface ExternalCodeReviewRound {
    * attestation it answers two different questions — WHICH round this is, and
    * WHAT it read — and a result that cannot answer both is not applied.
    */
-  readonly locator: ExternalCodeRoundLocator;
+  readonly locator: ExternalCodeRoundIdentity;
   /**
    * The snapshot hash the reviewer attests it actually read.
    *
@@ -928,6 +928,8 @@ export interface ExternalCodeReviewRound {
   readonly instruction: string;
   readonly serverName: string;
   readonly serverVersion: string;
+  /** The exact contract `run_round` proved when this result was produced. */
+  readonly contractFingerprint: string;
   readonly tokensIn: number | null;
   readonly tokensOut: number | null;
 }
@@ -956,7 +958,7 @@ export interface ExternalCodeReviewRound {
  * round, so recovery can name exactly the round it lost rather than describing
  * it and hoping.
  */
-export interface ExternalCodeRoundLocator {
+export interface ExternalCodeRoundIdentity {
   /**
    * Which provider this round lives at. Stable across restarts.
    *
@@ -973,9 +975,34 @@ export interface ExternalCodeRoundLocator {
   readonly roundId: string;
 }
 
+/**
+ * A round identity PLUS the contract it was reserved under.
+ *
+ * Deliberately a distinct type from {@link ExternalCodeRoundIdentity}: the
+ * identity triple is something the PROVIDER echoes back on every answer (and
+ * is checked for agreement via `sameLocator`), while `contractFingerprint` is
+ * never echoed by the provider — it is this client's own reading, produced
+ * once by `beginRound` and persisted by the caller onto the durable round row.
+ * `roundStatus` and `reviewCode` take the narrower {@link ExternalCodeRoundIdentity}
+ * because they never need it as input — each produces its OWN fresh reading
+ * (on {@link ExternalCodeRoundStatus} or the returned round), and comparing
+ * that against the one persisted at reservation is the caller's job, done in
+ * the code-review service, not the adapter's.
+ */
+export interface ExternalCodeRoundLocator extends ExternalCodeRoundIdentity {
+  /**
+   * The exact contract `beginRound` proved at reservation time — the value a
+   * caller persists onto the durable round row alongside this locator's
+   * identity. Comparing it against later reads' own fresh fingerprints is how
+   * drift between reserve and run/status is detected.
+   */
+  readonly contractFingerprint: string;
+}
+
 export type ExternalCodeRoundStatus =
   | { readonly kind: 'completed'; readonly round: ExternalCodeReviewRound }
-  | { readonly kind: 'running' }
+  /** `contractFingerprint` is the CURRENT contract this read just proved — compare against the locator's before trusting a `running` read to mean the original round is still the one in flight. */
+  | { readonly kind: 'running'; readonly contractFingerprint: string }
   /**
    * The provider is certain this locator never ran a review.
    *
@@ -984,8 +1011,9 @@ export type ExternalCodeRoundStatus =
    * attempt. `unknown` cannot, because "no record" and "a record I cannot read"
    * look identical from here.
    */
-  | { readonly kind: 'not_started' }
-  | { readonly kind: 'unknown'; readonly reason: string | null };
+  | { readonly kind: 'not_started'; readonly contractFingerprint: string }
+  /** Null when the read failed before any discovery completed — there is then no fresh contract to report at all, not merely one that was not compared. */
+  | { readonly kind: 'unknown'; readonly reason: string | null; readonly contractFingerprint: string | null };
 
 /**
  * The external code reviewer.
@@ -1061,12 +1089,12 @@ export interface ExternalCodeReviewer {
    * guessing: "no answer" is not evidence that no review ran.
    */
   roundStatus(
-    locator: ExternalCodeRoundLocator,
+    locator: ExternalCodeRoundIdentity,
     subject: ExternalCodeReviewSubject,
     signal?: AbortSignal
   ): Promise<ExternalCodeRoundStatus>;
   reviewCode(
-    locator: ExternalCodeRoundLocator,
+    locator: ExternalCodeRoundIdentity,
     subject: ExternalCodeReviewSubject,
     scopeText: string,
     signal?: AbortSignal
@@ -1097,6 +1125,14 @@ export interface ExternalMcpServerIdentity {
 export interface ExternalMcpDiscovery {
   readonly server: ExternalMcpServerIdentity;
   readonly tools: readonly ExternalMcpTool[];
+  /**
+   * A deterministic fingerprint of the exact contract this discovery proved
+   * for `config.allowedTools` — see `computeCoaiContractFingerprint` in
+   * coai-profiles.ts. Scoped to the caller's own required tool set, never the
+   * server's full advertised list, so a tool nothing here calls can never
+   * move this value.
+   */
+  readonly contractFingerprint: string;
 }
 
 export interface ExternalMcpCallResult {
@@ -1105,6 +1141,8 @@ export interface ExternalMcpCallResult {
   readonly isError: boolean;
   /** Text blocks only, already redacted and bounded by the process boundary. */
   readonly content: readonly string[];
+  /** The same fingerprint the discovery this call was validated against produced. */
+  readonly contractFingerprint: string;
 }
 
 export interface ExternalMcpServerConfig {
@@ -1113,7 +1151,18 @@ export interface ExternalMcpServerConfig {
   readonly executablePath: string;
   readonly args: readonly string[];
   readonly cwd?: string;
-  /** The exact tool set this configuration accepts. Drift fails closed. */
+  /**
+   * The tools THIS request requires and is exclusively permitted to call.
+   *
+   * Required, not exact: the server must advertise every name here (a missing
+   * one, or a duplicate anywhere in its tool list, fails closed), but is free
+   * to advertise other tools beyond it — those are never treated as a
+   * mismatch and are never callable regardless, since a call is refused
+   * locally for any tool name not in this list before anything is sent. See
+   * `McpToolProfileMismatchError` in stdio-mcp-client.ts for the full
+   * rationale: this is what keeps one integration's compatible capability
+   * working when a server grows an unrelated one.
+   */
   readonly allowedTools: readonly string[];
   readonly timeoutMs: number;
   readonly maxMessageBytes: number;
@@ -1143,6 +1192,8 @@ export interface ExternalPlanReviewSession {
   readonly planProceeded: boolean;
   readonly serverName: string;
   readonly serverVersion: string;
+  /** The exact contract this `open` call proved — see `ExternalMcpDiscovery.contractFingerprint`. */
+  readonly contractFingerprint: string;
 }
 
 export interface ExternalPlanReviewRound {
@@ -1154,6 +1205,7 @@ export interface ExternalPlanReviewRound {
   readonly instruction: string;
   readonly serverName: string;
   readonly serverVersion: string;
+  readonly contractFingerprint: string;
 }
 
 export interface ExternalPlanReviewResolution {
@@ -1163,6 +1215,7 @@ export interface ExternalPlanReviewResolution {
   readonly instruction: string;
   readonly serverName: string;
   readonly serverVersion: string;
+  readonly contractFingerprint: string;
 }
 
 /**
@@ -1202,6 +1255,14 @@ export interface ExternalPlanReviewStatus {
   readonly planRounds: ExternalPlanReviewRoundCounts;
   readonly serverName: string;
   readonly serverVersion: string;
+  /**
+   * The contract `status` itself just proved — NOT necessarily the contract
+   * the earlier `open`/`review_plan` calls proved. A caller reconciling a gate
+   * must compare this against the durable row's own recorded fingerprint
+   * explicitly; this field is evidence about the CURRENT server, not a
+   * replacement for history.
+   */
+  readonly contractFingerprint: string;
 }
 
 export interface ExternalPlanReviewer {

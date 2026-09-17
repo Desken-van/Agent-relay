@@ -107,6 +107,8 @@ function round(subjectId: string, subjectSha256 = SUBJECT_A) {
     providerRoundId: null,
     serverName: null,
     serverVersion: null,
+    contractFingerprint: null,
+    contractMismatchAt: null,
     reviewers: null,
     gatingCount: null,
     threshold: null,
@@ -222,6 +224,27 @@ describe('the durable code-review store', () => {
     });
     expect(reviews.findRoundById(second.id)?.providerRoundId).toBeNull();
     expect(reviews.findRoundById(first.id)?.providerRoundId).toBe('round-a');
+  });
+
+  it('round-trips the contract fingerprint and its mismatch marker independently, defaulting both to null', () => {
+    const created = round(subject().id);
+    expect(created.contractFingerprint).toBeNull();
+    expect(created.contractMismatchAt).toBeNull();
+
+    const fingerprint = 'f'.repeat(64);
+    reviews.updateRound(created.id, { contractFingerprint: fingerprint, contractMismatchAt: null });
+    expect(reviews.findRoundById(created.id)).toMatchObject({
+      contractFingerprint: fingerprint,
+      contractMismatchAt: null
+    });
+
+    // Marking a mismatch is a SEPARATE write from binding the fingerprint —
+    // it must never be how the historical evidence gets overwritten.
+    const mismatchAt = '2026-09-17T00:00:00.000Z';
+    reviews.updateRound(created.id, { contractMismatchAt: mismatchAt });
+    const stored = reviews.findRoundById(created.id);
+    expect(stored?.contractFingerprint).toBe(fingerprint);
+    expect(stored?.contractMismatchAt).toBe(mismatchAt);
   });
 
   it('links a repeated finding to the record it already has', () => {
@@ -606,7 +629,7 @@ describe('code-review relational integrity', () => {
 
 describe('the code-review migration', () => {
   it('keeps code review at version 7 in the forward-only migration sequence', () => {
-    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
     expect(MIGRATIONS[6]?.name).toBe('code-review-evidence');
     expect(MIGRATIONS[7]?.name).toBe('task-provider-routing');
     expect(MIGRATIONS[8]?.name).toBe('local-inference-settings');
@@ -616,6 +639,7 @@ describe('the code-review migration', () => {
     expect(MIGRATIONS[12]?.name).toBe('review-limit-status');
     expect(MIGRATIONS[13]?.name).toBe('review-blocked-status');
     expect(MIGRATIONS[14]?.name).toBe('ornith-provider-version-collision-repair');
+    expect(MIGRATIONS[15]?.name).toBe('coai-contract-fingerprint');
   });
 
   it('upgrades a real database file that stops at version 6, keeping its rows', () => {
@@ -653,7 +677,7 @@ describe('the code-review migration', () => {
             version: number;
           }[]
         ).map((row) => row.version);
-        expect(applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        expect(applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
 
         // The pre-existing row survived the upgrade untouched.
         expect(upgraded.prepare('SELECT name FROM projects WHERE id = ?').get('p1')).toEqual({
@@ -673,6 +697,17 @@ describe('the code-review migration', () => {
           'code_review_decisions'
         ]) {
           expect(tables).toContain(table);
+        }
+
+        // Migration 16's two new nullable columns landed on both tables that
+        // carry Coai evidence, on a database that predates the feature by ten
+        // versions — not only on one built fresh in memory.
+        for (const table of ['code_review_rounds', 'plan_review_gates']) {
+          const columns = (
+            upgraded.prepare(`PRAGMA table_info(${table})`).all() as { name: string; notnull: number }[]
+          ).filter((c) => c.name === 'contract_fingerprint' || c.name === 'contract_mismatch_at');
+          expect(columns, table).toHaveLength(2);
+          for (const column of columns) expect(column.notnull, `${table}.${column.name}`).toBe(0);
         }
       } finally {
         closeDatabase(upgraded);

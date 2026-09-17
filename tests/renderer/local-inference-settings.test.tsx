@@ -21,6 +21,8 @@ function baseSettings(): Settings {
     coaiMcpExecutablePath: null,
     coaiMcpArguments: [],
     coaiMcpWorkingDirectory: null,
+    coaiLastKnownContractFingerprint: null,
+    coaiLastKnownContractCheckedAt: null,
     conventionsRepositoryPath: null,
     conventionsExpectedRevision: null,
     conventionsRulePaths: [],

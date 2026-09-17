@@ -398,6 +398,18 @@ export const codeReviewRoundSchema = z
     providerRoundId: z.string().min(1).max(128).nullable(),
     serverName: z.string().min(1).max(200).nullable(),
     serverVersion: z.string().min(1).max(200).nullable(),
+    /**
+     * The EXACT Coai contract this round's RESERVATION proved — see
+     * `computeCoaiContractFingerprint` in `adapters/mcp/coai-profiles.ts`.
+     * Bound at `beginRound` (`reserve_round`), before the non-idempotent
+     * `run_round` call, and never overwritten by a later probe's own
+     * reading — completion compares its fresh reading against this one and
+     * refuses to apply an answer that disagrees, rather than silently
+     * replacing the reservation's evidence with the completion's.
+     */
+    contractFingerprint: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+    /** Set when `run_round` or `round_status` proves a contract different from {@link contractFingerprint}. */
+    contractMismatchAt: isoDateTime.nullable(),
     reviewers: z.string().max(2_000).nullable(),
     gatingCount: z.number().int().nonnegative().nullable(),
     threshold: z.number().int().nonnegative().nullable(),

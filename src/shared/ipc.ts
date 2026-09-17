@@ -15,6 +15,7 @@
 import { z } from 'zod';
 import { implementationProviderSchema, reviewProviderSchema } from './domain/execution-providers';
 import type { CodexModelCatalogResult } from './domain/codex-catalog';
+import type { CoaiConnectionDiagnostic } from './domain/coai-diagnostics';
 import type { DiagnosticsReport } from './domain/diagnostics';
 import type { SerializedError } from './domain/errors';
 import type { PublishRefusalCode } from './domain/claude-assessment';
@@ -262,6 +263,9 @@ export const ipcInputSchemas = {
 
   'diagnostics:run': z.object({ force: z.boolean().optional() }).strict(),
 
+  /** Read-only Coai connection/capability probe. Never calls a tool. */
+  'coai:checkConnection': empty,
+
   /** Picker-visible Codex models. Never starts a thread or a turn. */
   'codex:listModels': z.object({ refresh: z.boolean().optional() }).strict(),
 
@@ -489,6 +493,7 @@ export interface IpcResponseMap {
   'localInference:runTestInference': LocalInferenceOutcome;
 
   'diagnostics:run': DiagnosticsReport;
+  'coai:checkConnection': CoaiConnectionDiagnostic;
 
   'codex:listModels': CodexModelCatalogResult;
 

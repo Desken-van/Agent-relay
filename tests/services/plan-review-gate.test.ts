@@ -47,6 +47,9 @@ function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+/** A fixed, valid-shaped contract fingerprint — its value is asserted on only where a test names it. */
+const FINGERPRINT = 'f'.repeat(64);
+
 function snapshot(content = 'Run the repository verification command.\n'): RuleEvidenceSnapshot {
   const contentBytes = Buffer.byteLength(content);
   const sources = [{ id: 'project', kind: 'project' as const, revision: 'a'.repeat(40), clean: true }];
@@ -93,7 +96,8 @@ class FakePlanReviewer implements ExternalPlanReviewer {
     awaitingResolve: false,
     planProceeded: false,
     serverName: 'coai-mcp',
-    serverVersion: '1.2.3'
+    serverVersion: '1.2.3',
+    contractFingerprint: FINGERPRINT
   };
   round: ExternalPlanReviewRound = {
     verdict: 'proceed',
@@ -103,7 +107,8 @@ class FakePlanReviewer implements ExternalPlanReviewer {
     findings: [],
     instruction: 'resolve every finding',
     serverName: 'coai-mcp',
-    serverVersion: '1.2.3'
+    serverVersion: '1.2.3',
+    contractFingerprint: FINGERPRINT
   };
   resolution: ExternalPlanReviewResolution = {
     stage: 'CodeReview',
@@ -111,7 +116,8 @@ class FakePlanReviewer implements ExternalPlanReviewer {
     recordedDecisions: 0,
     instruction: 'continue',
     serverName: 'coai-mcp',
-    serverVersion: '1.2.3'
+    serverVersion: '1.2.3',
+    contractFingerprint: FINGERPRINT
   };
 
   state: ExternalPlanReviewStatus = {
@@ -121,7 +127,8 @@ class FakePlanReviewer implements ExternalPlanReviewer {
     planProceeded: false,
     planRounds: planRounds(),
     serverName: 'coai-mcp',
-    serverVersion: '1.2.3'
+    serverVersion: '1.2.3',
+    contractFingerprint: FINGERPRINT
   };
 
   /**
@@ -1528,5 +1535,98 @@ describe('durable external plan review gate', () => {
     expect(prompt).not.toContain('Do not carry this refuted finding');
     expect(prompt).not.toContain('The premise is contradicted by the existing service.');
     expect(prompt).not.toContain('USER-ACCEPTED EXTERNAL PLAN-REVIEW REQUIREMENTS');
+  });
+
+  describe('Coai contract fingerprint evidence', () => {
+    it('persists the discovered contract fingerprint through open, review and resolve when the contract is stable', async () => {
+      const value = setup();
+      const { task } = await ready(value);
+
+      const reviewed = await value.service.review(task.id);
+      expect(reviewed.contractFingerprint).toBe(FINGERPRINT);
+      expect(reviewed.contractMismatchAt).toBeNull();
+
+      const resolved = await resolveCurrent(value, task.id);
+      expect(resolved.contractFingerprint).toBe(FINGERPRINT);
+      expect(resolved.contractMismatchAt).toBeNull();
+
+      // Durable, not merely returned: read back from storage independently.
+      const stored = value.harness.planReviewGates.findByTask(task.id);
+      expect(stored?.contractFingerprint).toBe(FINGERPRINT);
+      expect(stored?.contractMismatchAt).toBeNull();
+    });
+
+    it('stops safely, without applying the round, when the contract drifts between open and review_plan', async () => {
+      const value = setup();
+      const { task } = await ready(value);
+      const drifted = 'e'.repeat(64);
+      value.reviewer.round = { ...value.reviewer.round, contractFingerprint: drifted };
+
+      await expect(value.service.review(task.id)).rejects.toThrow(/contract changed partway/i);
+
+      // Left exactly where the dispatch got to — `reviewing`, not
+      // `awaiting_resolve` — and the ORIGINAL fingerprint `open` bound, never
+      // silently replaced by review_plan's differing one.
+      const gate = value.harness.planReviewGates.findByTask(task.id)!;
+      expect(gate.status).toBe('reviewing');
+      expect(gate.contractFingerprint).toBe(FINGERPRINT);
+      expect(gate.contractMismatchAt).not.toBeNull();
+      expect(gate.verdict).toBeNull();
+      expect(gate.findingsJson).toBeNull();
+    });
+
+    it('stops safely, without applying a resolution, when the contract drifts between review_plan and resolve', async () => {
+      const value = setup();
+      const { task } = await ready(value);
+      value.reviewer.round = { ...value.reviewer.round, findings: [finding('Round finding')] };
+      await value.service.review(task.id);
+
+      const drifted = 'e'.repeat(64);
+      value.reviewer.resolution = { ...value.reviewer.resolution, contractFingerprint: drifted };
+
+      await expect(
+        resolveCurrent(value, task.id, [{ finding: 0, action: 'accept', reason: 'Fine as scoped.' }])
+      ).rejects.toThrow(/contract changed partway/i);
+
+      const gate = value.harness.planReviewGates.findByTask(task.id)!;
+      // `resolving`, not settled to any terminal stage: the decisions were
+      // recorded on the way in, but the outcome they would have produced was
+      // never applied, and the fingerprint review_plan bound is untouched.
+      expect(gate.status).toBe('resolving');
+      expect(gate.contractFingerprint).toBe(FINGERPRINT);
+      expect(gate.contractMismatchAt).not.toBeNull();
+      expect(gate.decisionsJson).not.toBeNull();
+    });
+
+    it('reconciliation preserves the historical fingerprint and reports a mismatch, without adopting the provider’s current reading', async () => {
+      const value = setup();
+      const { task } = await ready(value);
+      value.reviewer.reviewError = new Error('answer lost');
+      await expect(value.service.review(task.id)).rejects.toThrow(/lost/);
+      value.reviewer.reviewError = null;
+
+      const stranded = value.harness.planReviewGates.findByTask(task.id)!;
+      expect(stranded.status).toBe('reviewing');
+      expect(stranded.contractFingerprint).toBe(FINGERPRINT);
+
+      // The provider is read again later, and its CURRENT contract has moved
+      // on — modelled here as a still-running round, so nothing else about the
+      // reading is in question.
+      const drifted = 'e'.repeat(64);
+      value.reviewer.state = {
+        ...value.reviewer.state,
+        contractFingerprint: drifted,
+        planRounds: planRounds({ total: 1, running: 1 })
+      };
+
+      const reconciled = await value.service.reconcile(task.id);
+
+      expect(reconciled.status).toBe('reviewing');
+      // The historical evidence survives untouched...
+      expect(reconciled.contractFingerprint).toBe(FINGERPRINT);
+      // ...and the mismatch is made explicit rather than silently absorbed.
+      expect(reconciled.contractMismatchAt).not.toBeNull();
+      expect(reconciled.lastError).toMatch(/still executing/i);
+    });
   });
 });

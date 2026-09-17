@@ -1,4 +1,8 @@
 import { useMemo, useState } from 'react';
+import {
+  COAI_CONNECTION_PROBE_SETTINGS_KEYS,
+  type CoaiConnectionDiagnostic
+} from '@shared/domain/coai-diagnostics';
 import type { ToolDiagnostic } from '@shared/domain/diagnostics';
 import {
   resolveVerificationConfig,
@@ -35,6 +39,21 @@ function parseJsonOrFailure(text: string): unknown {
   }
 }
 
+/**
+ * Only the fields "Recheck connection" actually exercises — read from
+ * {@link COAI_CONNECTION_PROBE_SETTINGS_KEYS}, the SAME list the backend
+ * probe itself is built from, rather than a second hand-maintained list here
+ * that could name a different set of fields than the ones that actually
+ * change what gets dialed. Compared between the saved settings and the draft
+ * so the button can refuse to test a configuration the user has not saved
+ * yet — see `coaiSettingsUnsaved` below.
+ */
+function coaiRelevantSettings(settings: Settings): unknown {
+  const picked: Partial<Record<(typeof COAI_CONNECTION_PROBE_SETTINGS_KEYS)[number], unknown>> = {};
+  for (const key of COAI_CONNECTION_PROBE_SETTINGS_KEYS) picked[key] = settings[key];
+  return picked;
+}
+
 const TOOL_TITLES: Record<string, string> = {
   codex: 'Codex',
   claude: 'Claude Code',
@@ -67,6 +86,24 @@ export function SettingsView(): React.JSX.Element {
   const [chatTemplateParametersJsonError, setChatTemplateParametersJsonError] = useState<
     string | null
   >(null);
+  const [coaiChecking, setCoaiChecking] = useState(false);
+  const [coaiDiagnostic, setCoaiDiagnostic] = useState<CoaiConnectionDiagnostic | null>(null);
+  const [coaiCheckError, setCoaiCheckError] = useState<string | null>(null);
+
+  const checkCoaiConnection = async (): Promise<void> => {
+    setCoaiChecking(true);
+    setCoaiCheckError(null);
+    try {
+      const response = await call('coai:checkConnection', {});
+      if (response.ok) {
+        setCoaiDiagnostic(response.data);
+      } else {
+        setCoaiCheckError(response.error.message);
+      }
+    } finally {
+      setCoaiChecking(false);
+    }
+  };
 
   const tools: ToolDiagnostic[] = diagnostics
     ? [diagnostics.codex, diagnostics.claude, diagnostics.git, diagnostics.github, diagnostics.ornith]
@@ -264,6 +301,23 @@ export function SettingsView(): React.JSX.Element {
     settings !== null &&
     draft !== null &&
     JSON.stringify(settings.localInference) !== JSON.stringify(draft.localInference);
+
+  /**
+   * "Recheck connection" dials the SAVED executable, arguments, working
+   * directory and process timeout — it calls the main process, which only
+   * ever reads persisted settings (see `COAI_CONNECTION_PROBE_SETTINGS_KEYS`
+   * for exactly which fields those are, and why the review-enabled switches
+   * and the conventions fields are deliberately NOT among them: neither
+   * changes what this probe dials). With unsaved edits to any of the fields
+   * that DO, a check would silently test the configuration still on disk
+   * while the form shows something else, and whatever it reports could be
+   * mistaken for a verdict on the draft. Save first is the smaller and safer
+   * fix; the button is disabled with an explanation instead.
+   */
+  const coaiSettingsUnsaved =
+    settings !== null &&
+    draft !== null &&
+    JSON.stringify(coaiRelevantSettings(settings)) !== JSON.stringify(coaiRelevantSettings(draft));
 
   return (
     <div className="content--split" style={{ display: 'grid' }}>
@@ -743,6 +797,15 @@ export function SettingsView(): React.JSX.Element {
                   />
                 </Field>
 
+                <CoaiConnectionPanel
+                  checking={coaiChecking}
+                  diagnostic={coaiDiagnostic}
+                  checkError={coaiCheckError}
+                  contractChanged={coaiDiagnostic?.contractChangedSinceLastKnown ?? false}
+                  unsaved={coaiSettingsUnsaved}
+                  onCheck={checkCoaiConnection}
+                />
+
                 <Field label="Conventions repository" hint="Optional. Project rules are always captured; add a clean conventions repository here.">
                   <input
                     className="input input--mono"
@@ -1067,6 +1130,121 @@ function ToolCard({ tool }: { tool: ToolDiagnostic }): React.JSX.Element {
           <Notice tone="warn">{tool.remediation}</Notice>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function CapabilityTag({
+  label,
+  available
+}: {
+  label: string;
+  available: boolean;
+}): React.JSX.Element {
+  return (
+    <span className={`tag ${available ? 'tag--ok' : ''}`}>
+      {label}: {available ? 'available' : 'unavailable'}
+    </span>
+  );
+}
+
+/**
+ * Read-only Coai connection/capability check. Plan review, human escalation,
+ * durable code review and reconciliation are shown independently, on
+ * purpose — one being unavailable is never evidence about another, and this
+ * panel exists specifically so that stops being a surprise discovered mid-task.
+ */
+function CoaiConnectionPanel({
+  checking,
+  diagnostic,
+  checkError,
+  contractChanged,
+  unsaved,
+  onCheck
+}: {
+  checking: boolean;
+  diagnostic: CoaiConnectionDiagnostic | null;
+  checkError: string | null;
+  contractChanged: boolean;
+  unsaved: boolean;
+  onCheck: () => void;
+}): React.JSX.Element {
+  return (
+    <div className="field" style={{ marginTop: 4 }}>
+      <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
+        <span className="field__label">Coai connection</span>
+        <button
+          type="button"
+          className="btn btn--sm btn--ghost"
+          disabled={checking || unsaved}
+          title={unsaved ? 'Save your Coai changes first, then recheck.' : undefined}
+          onClick={onCheck}
+        >
+          {checking ? <Spinner /> : null} Recheck connection
+        </button>
+      </div>
+
+      {unsaved ? (
+        <div style={{ marginTop: 6 }}>
+          <Notice tone="warn">
+            You have unsaved Coai changes. This checks the saved configuration, not the draft above
+            — save first so a check tells you about what you are about to use.
+          </Notice>
+        </div>
+      ) : null}
+
+      {checkError ? (
+        <div style={{ marginTop: 6 }}>
+          <Notice tone="error">{checkError}</Notice>
+        </div>
+      ) : null}
+
+      {contractChanged ? (
+        <div style={{ marginTop: 6 }}>
+          <Notice tone="warn">
+            The server’s contract changed since the last time this build durably confirmed it.
+            What changed is shown below.
+          </Notice>
+        </div>
+      ) : null}
+
+      {diagnostic ? (
+        <div style={{ marginTop: 6 }}>
+          <div className="row" style={{ alignItems: 'center', gap: 8 }}>
+            <span className={`tag ${diagnostic.serverReached ? 'tag--ok' : 'tag--danger'}`}>
+              {diagnostic.serverReached ? 'reached' : 'not reached'}
+            </span>
+            {diagnostic.serverName ? (
+              <strong style={{ fontSize: 13 }}>{diagnostic.serverName}</strong>
+            ) : null}
+            {diagnostic.serverVersion ? (
+              <span className="faint mono">{diagnostic.serverVersion}</span>
+            ) : null}
+          </div>
+
+          <div className="row row--wrap" style={{ marginTop: 6, gap: 6 }}>
+            <CapabilityTag label="Plan review" available={diagnostic.planReview === 'available'} />
+            <CapabilityTag
+              label="Human escalation"
+              available={diagnostic.humanEscalation === 'available'}
+            />
+            <CapabilityTag label="Durable code review" available={diagnostic.codeReview === 'available'} />
+            <CapabilityTag label="Reconciliation" available={diagnostic.reconciliation === 'available'} />
+          </div>
+
+          <div className="muted selectable" style={{ marginTop: 6, fontSize: 12 }}>
+            {diagnostic.detail}
+          </div>
+
+          <div className="legend" style={{ marginTop: 4 }}>
+            Last checked {formatDateTime(diagnostic.checkedAt)}
+          </div>
+        </div>
+      ) : (
+        <div className="muted" style={{ marginTop: 6, fontSize: 12 }}>
+          Not checked yet this session.
+        </div>
+      )}
     </div>
   );
 }

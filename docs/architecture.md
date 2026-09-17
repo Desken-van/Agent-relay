@@ -467,8 +467,17 @@ server identity, verdict, structured findings, decisions and durable status.
 No absolute repository path is stored in either table.
 
 `CoaiPlanReviewer` is provider-specific policy over the generic INT-A transport.
-It requires the exact audited nine-tool Coai 0.22 discovery set and itself calls
-only the fixed `open`, `review_plan` and `resolve` names with typed arguments.
+It declares only the four tools it itself calls — `open`, `status`,
+`review_plan`, `resolve` — as a REQUIRED subset the server must advertise, not
+an exact match against a fixed server shape or version: the transport
+tolerates whatever other tools a server additionally advertises (see
+`McpToolProfileMismatchError` in `stdio-mcp-client.ts`), so plan review's
+compatibility does not depend on whether the installed Coai build also
+supports durable code review, `ask_human`, or anything else. `CoaiCodeReviewer`
+does the same independently, declaring only its own three addressable
+round-lifecycle tools (`reserve_round`, `run_round`, `round_status`). See
+`src/main/adapters/mcp/coai-profiles.ts` for the full per-operation tool list
+and the two labelled reference server shapes it also keeps for diagnostics.
 JSON inside the single MCP text block is parsed again; MCP `isError`,
 `{error: ...}` refusal, malformed output and workflow verdict remain different
 outcomes.

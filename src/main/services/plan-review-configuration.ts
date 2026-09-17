@@ -9,7 +9,7 @@ import type {
   RuleEvidenceLimits,
   RuleEvidenceSourceRequest
 } from '../ports';
-import { COAI_ADDRESSABLE_PROFILE, COAI_PLAN_PROFILE } from '../adapters/mcp/coai-profiles';
+import { COAI_PLAN_REVIEW_TOOLS } from '../adapters/mcp/coai-profiles';
 
 export const TASK_RULE_EVIDENCE_LIMITS: RuleEvidenceLimits = {
   maxSources: 2,
@@ -110,23 +110,6 @@ export function assertExternalPlanReviewSettings(settings: Settings): void {
 }
 
 /**
- * Which exact tool profile this configuration talks to.
- *
- * One server serves both gates, so the profile is decided by what is switched
- * on rather than by which gate is asking. With code review off, that is the
- * nine plan tools; with it on, the twelve. It is never a subset, a minimum or a
- * superset: the transport compares the server's list to this one exactly, and a
- * profile nobody audited fails closed either way.
- *
- * The alternative — pinning the plan gate to nine for ever — would refuse the
- * addressable server outright, so enabling code review would silently break
- * plan review against the very server that supports both.
- */
-export function coaiToolProfile(settings: Settings): readonly string[] {
-  return settings.externalCodeReviewEnabled ? COAI_ADDRESSABLE_PROFILE : COAI_PLAN_PROFILE;
-}
-
-/**
  * The transport capacity both gates run under, stated once.
  *
  * The two configurations describe the SAME server process reached over the same
@@ -151,10 +134,17 @@ export const COAI_MCP_TIMEOUT_MAX_MS = 30 * 60_000;
 /**
  * Everything the two gates share, built once from trusted settings.
  *
- * They differ in exactly two things: the `id` their transport is filed under,
- * and the checks each runs before it asks for a configuration at all. All the
- * rest — executable, argv, working directory, tool profile, timeout, capacity —
- * belongs to one server, so it is described in one place.
+ * They differ in the `id` their transport is filed under, the checks each
+ * runs before it asks for a configuration at all, and — as of independent
+ * capability negotiation — the required tool set each declares: the plan gate
+ * always declares its own four tools, the code gate always declares its own
+ * three, regardless of what the other gate's setting is, and regardless of
+ * what else the real server happens to advertise (required, not exact — see
+ * coai-profiles.ts and ports.ts's `ExternalMcpServerConfig.allowedTools`).
+ * Neither is a guess from a checkbox any more. All the rest — executable,
+ * argv, working directory, timeout, capacity — still belongs to one server,
+ * so it is described in one place and `allowedTools` is the one field each
+ * caller supplies for itself.
  *
  * `executablePath` is a parameter rather than read from `settings` here
  * because each gate has already narrowed it away from null with its OWN
@@ -163,7 +153,8 @@ export const COAI_MCP_TIMEOUT_MAX_MS = 30 * 60_000;
 export function coaiServerConfig(
   settings: Settings,
   id: string,
-  executablePath: string
+  executablePath: string,
+  allowedTools: readonly string[]
 ): ExternalMcpServerConfig {
   return {
     id,
@@ -173,19 +164,32 @@ export function coaiServerConfig(
     ...(settings.coaiMcpWorkingDirectory === null
       ? {}
       : { cwd: settings.coaiMcpWorkingDirectory }),
-    allowedTools: coaiToolProfile(settings),
+    allowedTools,
     timeoutMs: Math.min(settings.processTimeoutMs, COAI_MCP_TIMEOUT_MAX_MS),
     ...COAI_MCP_CAPACITY
   };
 }
 
+/**
+ * The plan gate's own MCP configuration.
+ *
+ * Declares only the four tools `CoaiPlanReviewer` actually calls
+ * (`COAI_PLAN_REVIEW_TOOLS`) — never conditioned on `externalCodeReviewEnabled`,
+ * and never widened to a bigger declared set just because the real server
+ * might also support more. The transport (stdio-mcp-client.ts) treats this as
+ * a REQUIRED subset, not an exact match: a server that additionally
+ * advertises the addressable round tools, `ask_human`, or anything else is
+ * still fully compatible with plan review, because none of that is required
+ * here — see coai-profiles.ts for why each operation now declares only what
+ * it needs instead of one shared, all-or-nothing profile.
+ */
 export function externalPlanReviewConfig(settings: Settings): ExternalMcpServerConfig {
   assertExternalPlanReviewSettings(settings);
   if (!settings.externalPlanReviewEnabled || settings.coaiMcpExecutablePath === null) {
     invalid('External plan review is disabled.');
   }
 
-  return coaiServerConfig(settings, 'coai-plan-review', settings.coaiMcpExecutablePath);
+  return coaiServerConfig(settings, 'coai-plan-review', settings.coaiMcpExecutablePath, COAI_PLAN_REVIEW_TOOLS);
 }
 
 export function configuredRuleSources(

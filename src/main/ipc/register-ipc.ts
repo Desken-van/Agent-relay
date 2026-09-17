@@ -183,6 +183,9 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
 
     'diagnostics:run': (input) => app.diagnostics.run(input.force ?? false),
 
+    // Read-only: discovery only, never a tool call. See CoaiCapabilityService.
+    'coai:checkConnection': () => app.coaiCapability.check(),
+
     // Never rejects: an unreachable catalogue comes back as available:false,
     // so a missing or broken Codex cannot stop the task form from working.
     'codex:listModels': (input) => app.codexModels.list({ refresh: input.refresh ?? false }),
