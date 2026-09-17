@@ -526,7 +526,21 @@ export class OrnithWorktreeTools {
   /* Actions                                                              */
   /* ------------------------------------------------------------------ */
 
-  async listFiles(action: Extract<OrnithAction, { action: 'list_files' }>, signal?: AbortSignal): Promise<OrnithToolResult> {
+  /**
+   * `maxResultBytes` bounds the serialized `{files, nextCursor, total}` payload so it
+   * always fits the caller's per-turn prompt budget, instead of building a full
+   * `action.limit`-sized page and leaving truncation to a later, generic byte-budget
+   * check that would otherwise discard `nextCursor`/`total` along with the files —
+   * the defect that let a weak model repeat an identical `list_files` request with
+   * no way to know pagination was even possible. Entries are packed in cursor order
+   * against the EXACT serialized size (not an estimate), so the result is correct by
+   * construction rather than approximated.
+   */
+  async listFiles(
+    action: Extract<OrnithAction, { action: 'list_files' }>,
+    signal?: AbortSignal,
+    maxResultBytes = Number.POSITIVE_INFINITY
+  ): Promise<OrnithToolResult> {
     const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.filesystemTimeoutMs, signal);
     try {
       const manifest = await this.ensureManifest(bounded);
@@ -535,8 +549,62 @@ export class OrnithWorktreeTools {
         ? manifest
         : manifest.filter((name) => name === prefix || name.startsWith(`${prefix}/`));
       const cursor = action.cursor ?? 0;
-      const page = matching.slice(cursor, cursor + action.limit);
-      const nextCursor = cursor + page.length < matching.length ? cursor + page.length : null;
+
+      // Track the "files" array's own content size incrementally (each entry's quoted,
+      // escaped JSON length plus its separating comma) instead of re-stringifying the
+      // whole growing array on every candidate — the latter is O(n) work per iteration
+      // (O(n^2) overall) for what is otherwise a single linear pass.
+      const page: string[] = [];
+      let filesArrayContentBytes = 0;
+      let index = cursor;
+      while (page.length < action.limit && index < matching.length) {
+        const candidateNextCursor = index + 1 < matching.length ? index + 1 : null;
+        const skeletonBytes = Buffer.byteLength(
+          JSON.stringify({ files: [], nextCursor: candidateNextCursor, total: matching.length }),
+          'utf8'
+        );
+        const entryBytes = Buffer.byteLength(JSON.stringify(matching[index]), 'utf8') + (page.length > 0 ? 1 : 0);
+        const candidateBytes = skeletonBytes + filesArrayContentBytes + entryBytes;
+        if (candidateBytes > maxResultBytes) break;
+        page.push(matching[index]!);
+        filesArrayContentBytes += entryBytes;
+        index += 1;
+      }
+
+      if (page.length === 0 && index < matching.length) {
+        // Not even the single next entry fits the remaining byte budget — an
+        // unusually long path. Two designs were tried and rejected before this one:
+        //
+        // 1. Leave `nextCursor` at `cursor` and return ok:true — the model resubmits
+        //    an identical request forever; the no-progress guard stops the run on an
+        //    entry that was never actually unreachable, just unlistable by name.
+        // 2. Skip past it (advance `nextCursor`, return ok:true with an empty page) —
+        //    this DOES let enumeration keep moving, but has two independent problems.
+        //    First, it silently omits one legal, existing path from the only tool that
+        //    can name it: a model relying on list_files to discover what exists can
+        //    finish "successfully" having never seen a file its task depended on —
+        //    exactly the false-positive-completion risk `ok:true` is supposed to rule
+        //    out. Second, even the SKIP NOTICE ITSELF is not exempt from this budget:
+        //    a fixed, human-readable explanation of what happened does not fit inside
+        //    the ~256-byte floor `preflightOrnithPrompt` can legitimately produce,
+        //    so the message meant to explain the loss would itself get discarded by
+        //    the caller's own generic byte-budget truncation — reintroducing the
+        //    exact metadata-loss failure this whole fix exists to close, just for a
+        //    rarer trigger.
+        //
+        // Fail closed instead: this one action is denied, ending the run honestly
+        // (the caller's `!toolResult.ok` branch already treats every denial this way)
+        // rather than letting it complete having silently skipped part of the
+        // repository, or letting the explanation of that skip itself be silently lost.
+        return denied(
+          'limit_result_exceeded',
+          `The file at manifest position ${index} of ${matching.length} under prefix "${prefix}" cannot be ` +
+            'represented within the remaining tool-result byte budget for this run (its path is unusually long). ' +
+            'Repository enumeration cannot honestly continue past this point at the current budget.'
+        );
+      }
+
+      const nextCursor = index < matching.length ? index : null;
       return {
         ok: true,
         forModel: { files: page, nextCursor, total: matching.length },
@@ -621,7 +689,33 @@ export class OrnithWorktreeTools {
     }
   }
 
-  async searchText(action: Extract<OrnithAction, { action: 'search_text' }>, signal?: AbortSignal, budget = DEFAULT_OPERATION_BUDGET): Promise<OrnithToolResult> {
+  /**
+   * `maxResultBytes` bounds the serialized `{matches, truncated}` payload the same way
+   * `listFiles`'s does: matches are packed incrementally against the EXACT serialized
+   * size, so the result fits by construction rather than being truncated away afterward
+   * by the generic byte-budget check — the same defect class `listFiles` had. Unlike
+   * `listFiles`, `search_text` has no cursor and was never a full-enumeration contract:
+   * `truncated` already means "there may be more, narrow your query and retry", so
+   * packing fewer matches than exist and marking `truncated: true` is honest within
+   * that existing contract, not a new kind of data loss.
+   *
+   * A single candidate match that cannot fit is SKIPPED, not treated as a reason to
+   * stop the whole search (review found that stopping at the first oversized candidate
+   * made this a dead end: no cursor exists to skip past it, so a model retrying the
+   * identical query got the identical empty result forever). Skipping one candidate
+   * still leaves room for smaller ones later, so scanning continues. Two cases fail
+   * closed with `limit_result_exceeded` instead of returning `ok:true`, because no
+   * `ok:true` shape can honestly represent them: the empty-result skeleton itself not
+   * fitting `maxResultBytes` at all, and every real match found being individually too
+   * large to fit — the latter would otherwise be the exact dead end just described,
+   * silently disguised as a normal "nothing matched" result.
+   */
+  async searchText(
+    action: Extract<OrnithAction, { action: 'search_text' }>,
+    signal?: AbortSignal,
+    budget = DEFAULT_OPERATION_BUDGET,
+    maxResultBytes = Number.POSITIVE_INFINITY
+  ): Promise<OrnithToolResult> {
     const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.searchTimeoutMs, signal);
     try {
       const manifest = await this.ensureManifest(bounded);
@@ -632,8 +726,21 @@ export class OrnithWorktreeTools {
         }
       }
 
+      // Hoisted once: invariant for the whole call, not per candidate line.
+      const skeletonBytes = Buffer.byteLength(JSON.stringify({ matches: [], truncated: true }), 'utf8');
+      if (skeletonBytes > maxResultBytes) {
+        return denied(
+          'limit_result_exceeded',
+          `An empty search_text result ("matches":[]) needs ${skeletonBytes} bytes, but only ${maxResultBytes} ` +
+            'bytes remain for this tool result. No search can be reported within the current budget.'
+        );
+      }
+
       const needle = action.caseSensitive ? action.query : action.query.toLowerCase();
       const matches: { path: string; line: number }[] = [];
+      let matchesArrayContentBytes = 0;
+      let anySkippedDueToBudget = false;
+      let firstSkipped: { path: string; line: number; requiredBytes: number } | null = null;
       let readBytesTotal = 0;
 
       for (const path of candidates) {
@@ -666,16 +773,55 @@ export class OrnithWorktreeTools {
         if (!haystack.includes(needle)) continue;
         const lines = content.split('\n');
         for (let index = 0; index < lines.length && matches.length < action.limit; index += 1) {
-          const line = action.caseSensitive ? lines[index] : lines[index]?.toLowerCase();
-          if (line !== undefined && line.includes(needle)) {
-            matches.push({ path, line: index + 1 });
+          // Named distinctly from `candidate.line` below (a line NUMBER, index+1):
+          // this is the line's TEXT, used only for the needle check on this line and
+          // never itself serialized — the two "line"s sharing a name previously read
+          // as if a matched line's text became part of the returned entry, when it
+          // never does.
+          const lineText = action.caseSensitive ? lines[index] : lines[index]?.toLowerCase();
+          if (lineText === undefined || !lineText.includes(needle)) continue;
+          const candidate = { path, line: index + 1 };
+          // Exact per-candidate size: path content varies, so unlike the skeleton this
+          // cannot be hoisted, but it is computed only once per real candidate match,
+          // not per budget check.
+          const entryBytes = Buffer.byteLength(JSON.stringify(candidate), 'utf8') + (matches.length > 0 ? 1 : 0);
+          if (skeletonBytes + matchesArrayContentBytes + entryBytes > maxResultBytes) {
+            anySkippedDueToBudget = true;
+            firstSkipped ??= { path, line: index + 1, requiredBytes: skeletonBytes + entryBytes };
+            // Not `continue`: `path` is fixed for the rest of this file and line
+            // numbers only increase, so every later line's entry in THIS file is at
+            // least as large as this one's — none of them could fit either. Move on
+            // to the next candidate file instead of checking each remaining line.
+            break;
           }
+          matches.push(candidate);
+          matchesArrayContentBytes += entryBytes;
         }
+      }
+
+      if (matches.length === 0 && anySkippedDueToBudget) {
+        // firstSkipped.requiredBytes is skeletonBytes + this one entry, with no
+        // earlier accepted matches folded in (matches.length === 0 here is exactly
+        // why we reached this branch) — "alone" is accurate, not an approximation.
+        //
+        // Deliberately NOT suggesting "search fewer files": an entry's size is
+        // determined by its own repository-relative path length (plus the fixed
+        // skeleton and this file's line number), not by how many candidates were
+        // examined — reducing the candidate COUNT without excluding the specific
+        // long-path file would reproduce the identical failure.
+        return denied(
+          'limit_result_exceeded',
+          `search_text found at least one match, but no single {path,line} entry it found fits within the ` +
+            `${maxResultBytes}-byte tool-result budget — for example, ${JSON.stringify(firstSkipped!.path)} line ` +
+            `${firstSkipped!.line} alone would need ${firstSkipped!.requiredBytes} bytes. This is not a matter of ` +
+            'searching fewer files: reduce it by choosing a candidate with a shorter repository-relative path if ' +
+            'one is known, or retry once more tool-result budget is available.'
+        );
       }
 
       return {
         ok: true,
-        forModel: { matches, truncated: matches.length >= action.limit },
+        forModel: { matches, truncated: matches.length >= action.limit || anySkippedDueToBudget },
         readBytes: readBytesTotal,
         writeBytes: 0,
         auditSummary: `search_text -> ${matches.length} match(es) across ${candidates.length} file(s)`
