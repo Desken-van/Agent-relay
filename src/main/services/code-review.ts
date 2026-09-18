@@ -22,6 +22,7 @@ import { AgentRelayError } from '../../shared/domain/errors';
 import {
   canonicalCodeSnapshot,
   codeFindingFingerprintInput,
+  codeReviewCurrentTriageRecommendations,
   codeReviewSnapshotSchema,
   codeReviewTriageFindingsSnapshot,
   CODE_REVIEW_UNRESOLVED_STATUSES,
@@ -1578,11 +1579,20 @@ export class CodeReviewService {
    * undecided, live findings — never a decision, never a resolve. A fresh,
    * read-only Codex call every time: no implementation session or tool
    * access is reused or granted. The result is persisted (one durable row
-   * per task, wholesale-replaced — see `CodeReviewRepository.upsertTriage`)
-   * bound to the exact subject and the exact finding identities/revisions it
-   * was computed against, so it survives a restart and a later read can tell,
-   * per finding, whether it still applies via
-   * `codeReviewCurrentTriageRecommendations`.
+   * per task, wholesale-replaced at the storage layer — see
+   * `CodeReviewRepository.upsertTriage`) bound to the exact subject and the
+   * exact finding identities/revisions it was computed against, so it
+   * survives a restart and a later read can tell, per finding, whether it
+   * still applies via `codeReviewCurrentTriageRecommendations`.
+   *
+   * A narrower call (an explicit `request.findingIds` subset) does not lose
+   * an earlier, broader analysis's still-current recommendations for the
+   * findings it did NOT re-analyze: before writing, any prior triage
+   * result's recommendations that are still current against the live
+   * findings (per `codeReviewCurrentTriageRecommendations`) and are not
+   * covered by THIS call's own targets are merged in alongside the fresh
+   * ones — the row is wholesale-replaced in storage, but the CONTENT it is
+   * replaced with is this merge, not just this call's own output.
    */
   async triage(
     taskId: string,
@@ -1719,25 +1729,44 @@ export class CodeReviewService {
       }
     }
 
+    const freshRecommendations = validated.map((r) => ({
+      // Guaranteed a string by `validateTriageCoverage` above (only a
+      // string ref can be in `requestedIds`, which holds only finding ids).
+      findingId: String(r.findingRef),
+      recommendation: r.recommendation,
+      reason: r.reason,
+      evidenceRef: r.evidenceRef,
+      confidence: r.confidence
+    }));
+
+    // A narrower re-analysis (an explicit `findingIds` subset) must not
+    // silently discard a still-current recommendation for a DIFFERENT
+    // undecided finding an earlier, broader analysis already covered — the
+    // durable row is wholesale-replaced, not merged, by `upsertTriage`
+    // itself, so the merge happens here instead. Only recommendations still
+    // current against the LIVE findings actually re-read now (not the
+    // pre-dispatch snapshot `all`, which this analysis's own targets have
+    // already proven unmoved but says nothing about the others) are kept.
+    const stillLive = this.deps.reviews.listFindings(taskId).filter((f) => f.subjectSha256 === subjectSha256);
+    const priorTriage = this.deps.reviews.getTriage(taskId);
+    const carriedOver = priorTriage
+      ? codeReviewCurrentTriageRecommendations(priorTriage, subjectSha256, stillLive)
+          .filter((r) => !requestedIds.has(r.findingId))
+      : [];
+    const liveRevisionById = new Map(stillLive.map((f) => [f.id, f.revision] as const));
+
     const triageResult: CodeReviewTriageResult = {
-      recommendations: validated.map((r) => ({
-        // Guaranteed a string by `validateTriageCoverage` above (only a
-        // string ref can be in `requestedIds`, which holds only finding ids).
-        findingId: String(r.findingRef),
-        recommendation: r.recommendation,
-        reason: r.reason,
-        evidenceRef: r.evidenceRef,
-        confidence: r.confidence
-      }))
+      recommendations: [...carriedOver, ...freshRecommendations]
     };
     this.deps.reviews.upsertTriage({
       id: this.deps.ids.next(),
       taskId,
       subjectId: after.stored.id,
       subjectSha256,
-      findingsSnapshotJson: codeReviewTriageFindingsSnapshot(
-        targets.map((f) => ({ id: f.id, revision: f.revision }))
-      ),
+      findingsSnapshotJson: codeReviewTriageFindingsSnapshot([
+        ...carriedOver.map((r) => ({ id: r.findingId, revision: liveRevisionById.get(r.findingId)! })),
+        ...targets.map((f) => ({ id: f.id, revision: f.revision }))
+      ]),
       triageJson: JSON.stringify(triageResult)
     });
 

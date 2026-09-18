@@ -2825,6 +2825,33 @@ describe('code-review automatic finding triage', () => {
     expect(codex.triageCalls[0]?.findings[0]?.ref).toBe(findings[0]!.id);
   });
 
+  it('preserves a still-current recommendation for a finding a narrower re-analysis did not cover', async () => {
+    const { value, codex, triageService, findings } = await withTwoLiveFindings();
+
+    // A broad analysis covers both findings first.
+    codex.triageQueue.push([
+      { findingRef: findings[0]!.id, recommendation: 'accept', reason: 'r0', evidenceRef: 'e', confidence: 'high' },
+      { findingRef: findings[1]!.id, recommendation: 'reject', reason: 'r1', evidenceRef: 'e', confidence: 'high' }
+    ]);
+    await triageService.triage(value.task.id);
+    expect(value.reviews.getTriage(value.task.id)?.triageJson).toMatch(findings[1]!.id);
+
+    // A narrower re-analysis targets ONLY finding 0 — finding 1 is untouched
+    // and still undecided at the same revision.
+    codex.triageQueue.push([
+      { findingRef: findings[0]!.id, recommendation: 'reject', reason: 'revised r0', evidenceRef: 'e', confidence: 'high' }
+    ]);
+    await triageService.triage(value.task.id, { findingIds: [findings[0]!.id] });
+
+    const stored = value.reviews.getTriage(value.task.id)!;
+    const parsed = parseCodeReviewTriage(stored.triageJson);
+    // Finding 0's recommendation is the FRESH one from the narrower call...
+    expect(parsed?.recommendations.find((r) => r.findingId === findings[0]!.id)?.reason).toBe('revised r0');
+    // ...and finding 1's, from the EARLIER broader call, survived being left
+    // out of this call's own targets rather than being silently dropped.
+    expect(parsed?.recommendations.find((r) => r.findingId === findings[1]!.id)?.reason).toBe('r1');
+  });
+
   it('refuses a finding that already has a decision recorded', async () => {
     const { value, triageService, findings } = await withTwoLiveFindings();
     await value.service.decide(value.task.id, {
