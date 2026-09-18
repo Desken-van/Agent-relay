@@ -264,7 +264,7 @@ function OrnithDenialLine({ data }: { data: OrnithDenialData }): React.JSX.Eleme
       Ornith action <span className="mono">{data.action}</span> denied (
       <span className="mono">{data.code}</span>) · read budget {data.readBytesUsed} /{' '}
       {data.readBytesConfigured} bytes ·{' '}
-      {data.recoverable ? 'one recovery attempt offered' : 'the run stopped'} ·{' '}
+      {data.recoverable ? 'recovering with feedback' : 'the run stopped'} ·{' '}
       {data.changedFiles === 0 ? 'no files changed yet' : `${data.changedFiles} file(s) changed`}
     </div>
   );

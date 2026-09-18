@@ -203,8 +203,8 @@ function renderSpecification(specification: TaskSpecification): string {
     ? `\n=== SCOPE ===
 The approved specification confidently limits this task to the following existing repository
 file(s). Read them directly with "read_file" — you do not need "list_files" or "search_text" to
-find them. A "search_text" call that omits "files" is automatically limited to this scope (plus
-any file you have created or edited so far this run).
+find them; a search does NOT automatically narrow itself to this list, so calling one anyway to
+"double check" costs the same as any other repository-wide search.
 ${scope.map((path) => `  - ${path}`).join('\n')}
 `
     : '';
@@ -272,9 +272,9 @@ Rules:
   already have, or call "blocked" — repeating the identical request will be refused outright.
 - "search_text" reads the FULL content of every candidate file toward the same cumulative read
   budget as "read_file" — a repository-wide search (no "files" given) is the most expensive
-  possible request. If a SCOPE section above names specific files, an unscoped search is
-  automatically limited to them; otherwise, prefer a narrow "files" list whenever you already know
-  which file matters.
+  possible request, and is NEVER automatically narrowed for you, including by a SCOPE section
+  above. If you already know which file matters, pass it in "files" explicitly, or better, skip
+  the search entirely and use "read_file" directly.
 - A "list_files" result's "nextCursor" is the ONLY thing that tells you whether there is more:
   if it is a number, your NEXT "list_files" call for that SAME "prefix" must set "cursor" to
   exactly that number to continue; if it is null, that prefix is fully listed and must not be
@@ -1075,7 +1075,7 @@ export class OrnithImplementationService {
         request.onProgress({
           type: 'tool_use',
           text: willRecover
-            ? `Ornith action ${action.action} denied (${toolResult.code}); one recovery attempt offered.`
+            ? `Ornith action ${action.action} denied (${toolResult.code}); recovering with feedback.`
             : `Ornith action ${action.action} denied (${toolResult.code}); the run stopped.`,
           data: {
             sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code, durationMs,

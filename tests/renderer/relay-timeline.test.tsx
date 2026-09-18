@@ -191,7 +191,7 @@ describe('Relay timeline — Ornith read-budget denial events', () => {
             timestamp: '2026-09-10T10:00:01.000Z',
             type: 'tool_use',
             payload: JSON.stringify({
-              text: 'Ornith action search_text denied (limit_read_bytes_exceeded); one recovery attempt offered.',
+              text: 'Ornith action search_text denied (limit_read_bytes_exceeded); recovering with feedback.',
               data: {
                 sequence: 3,
                 action: 'search_text',
@@ -216,7 +216,7 @@ describe('Relay timeline — Ornith read-budget denial events', () => {
     expect(text).toContain('search_text');
     expect(text).toContain('limit_read_bytes_exceeded');
     expect(text).toContain('4160000 / 4194304 bytes');
-    expect(text).toContain('one recovery attempt offered');
+    expect(text).toContain('recovering with feedback');
     expect(text).toContain('no files changed yet');
     expect(text).not.toContain('unsafe or over-limit');
   });
@@ -253,7 +253,7 @@ describe('Relay timeline — Ornith read-budget denial events', () => {
     const text = document.querySelector('.logs__text')?.textContent ?? '';
     expect(text).toContain('the run stopped');
     expect(text).toContain('1 file(s) changed');
-    expect(text).not.toContain('one recovery attempt offered');
+    expect(text).not.toContain('recovering with feedback');
   });
 
   it('leaves an ordinary tool_use event (no enriched denial data) rendered as plain text, unaffected', async () => {
