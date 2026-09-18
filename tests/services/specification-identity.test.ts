@@ -43,6 +43,19 @@ describe('specification identity', () => {
     expect(identity.specification.scopedFilePaths).toEqual(['docs/manual-test.md']);
   });
 
+  it('hashes the schema key order, not the stored key order, and ignores keys it does not know', () => {
+    const stored = JSON.parse(LEGACY) as Record<string, unknown>;
+    const shuffled = JSON.stringify(Object.fromEntries([...Object.entries(stored)].reverse()));
+    const withUnknown = JSON.stringify({ ...stored, somethingElse: 'stripped by the schema' });
+
+    expect(specificationIdentity(shuffled).sha256).toBe(LEGACY_SHA);
+    expect(specificationIdentity(withUnknown).sha256).toBe(LEGACY_SHA);
+
+    const populated = JSON.parse(withScope(['docs/manual-test.md'])) as Record<string, unknown>;
+    const populatedShuffled = JSON.stringify(Object.fromEntries([...Object.entries(populated)].reverse()));
+    expect(specificationIdentity(populatedShuffled).sha256).toBe(POPULATED_SCOPE_SHA);
+  });
+
   it('is stable across repeated reads of the same stored value', () => {
     expect(specificationIdentity(LEGACY).sha256).toBe(specificationIdentity(LEGACY).sha256);
   });

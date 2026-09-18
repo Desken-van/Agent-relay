@@ -1144,8 +1144,9 @@ thread.runStreamed(input, { outputSchema, signal })
   `taskSpecificationJsonSchema()` uses the strict one. Both share one field
   definition, and no behaviour depends on how Zod would emit a default into JSON
   Schema.
-* `specificationIdentity` hashes the specification **as stored**: the reader's
-  `[]` for a missing `scopedFilePaths` is not added to the canonical text. The
+* `specificationIdentity` hashes the specification **as stored**: a key the
+  stored JSON lacked — today, the reader's `[]` for a missing
+  `scopedFilePaths` — is not added to the canonical text. The
   hash is persisted with plan-review gates and compared for equality, so
   normalizing a legacy row must not make its gate obsolete. An explicitly stored
   `[]` hashes as it always did.

@@ -164,12 +164,14 @@ export function formatTerminalError(error: CodexTerminalError): string {
   return safeExcerpt(line, MAX_TERMINAL_ERROR_CHARS);
 }
 
-/** True when the provider itself said the request was not authenticated. */
+/**
+ * True when the provider itself said the request was not authenticated: HTTP
+ * 401, or an authentication error code. Neither the error type nor any message
+ * text counts — an unrelated failure must not send the user to `codex login`.
+ */
 export function isAuthenticationFailure(error: CodexTerminalError): boolean {
   if (error.status === 401) return true;
-  return /unauthori[sz]ed|authentication|invalid_api_key|not_authenticated/i.test(
-    `${error.code ?? ''} ${error.type ?? ''}`
-  );
+  return /unauthori[sz]ed|authentication|invalid_api_key|not_authenticated/i.test(error.code ?? '');
 }
 
 const PROCESS_EXIT = /^Codex Exec exited with (code \d+|signal \S+): ([\s\S]*)$/;

@@ -426,6 +426,9 @@ describe('isAuthenticationFailure', () => {
     expect(isAuthenticationFailure({ message: 'm', status: 401 })).toBe(true);
     expect(isAuthenticationFailure({ message: 'm', code: 'invalid_api_key' })).toBe(true);
     expect(isAuthenticationFailure({ message: 'unauthorized 401', status: 400, code: 'invalid_json_schema' })).toBe(false);
+    // The error type is not the provider's status or code, so it does not send the user to `codex login`.
+    expect(isAuthenticationFailure({ message: 'm', type: 'authentication_error', status: 400 })).toBe(false);
+    expect(isAuthenticationFailure({ message: 'm', type: 'authentication_error', code: 'invalid_request' })).toBe(false);
   });
 });
 
