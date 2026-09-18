@@ -755,8 +755,25 @@ export class OrnithWorktreeTools {
    * budget is meant to mean exactly "bytes actually read this run", and an
    * existing, deliberately-designed test exercises the cumulative cap via
    * repeated full-price reads of one large file at different offsets.
+   *
+   * `maxResultBytes` bounds the SERIALIZED result the same way `listFiles`'s and
+   * `searchText`'s do: the slice is packed against the exact serialized size
+   * (JSON escaping of quotes, backslashes and newlines can make a slice of
+   * N raw bytes serialize to well over N), so the result — including
+   * `totalBytes` and `nextOffset` — fits by construction instead of being
+   * replaced afterward by the generic "exceeded this runtime context budget"
+   * stub, which carries no content, no `sha256` and no way to continue. That
+   * defect made a weak model that asked for a large chunk receive nothing and
+   * fall back to paging through the file in tiny consecutive reads. Packing
+   * changes only how much of the already fully-read, fully-hashed,
+   * fully-scanned file is RETURNED; the byte charge above is unchanged.
    */
-  async readFile(action: Extract<OrnithAction, { action: 'read_file' }>, signal?: AbortSignal, budget = DEFAULT_OPERATION_BUDGET): Promise<OrnithToolResult> {
+  async readFile(
+    action: Extract<OrnithAction, { action: 'read_file' }>,
+    signal?: AbortSignal,
+    budget = DEFAULT_OPERATION_BUDGET,
+    maxResultBytes = Number.POSITIVE_INFINITY
+  ): Promise<OrnithToolResult> {
     const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.filesystemTimeoutMs, signal);
     try {
       await this.ensureManifest(bounded);
@@ -799,22 +816,46 @@ export class OrnithWorktreeTools {
         if (containsSecretShape(completeText)) {
           return denied('disallowed_action', 'The file content looks credential-shaped and was not returned.');
         }
-        const sliced = safeUtf8Slice(raw, action.offset, action.limit);
         const sha256 = createHash('sha256').update(raw).digest('hex');
+        const totalBytes = raw.byteLength;
+        const packed = packReadSlice(
+          raw,
+          action.offset,
+          action.limit,
+          (slice) => {
+            const end = slice.offset + slice.bytesRead;
+            return {
+              path: action.path,
+              offset: slice.offset,
+              bytesRead: slice.bytesRead,
+              totalBytes,
+              // The offset a following chunk starts at; `null` once the end of
+              // the file has been returned, so "is there more" never has to be
+              // inferred from `eof` alone.
+              nextOffset: end >= totalBytes ? null : end,
+              eof: end >= totalBytes,
+              content: slice.text,
+              sha256
+            };
+          },
+          maxResultBytes
+        );
+        if (packed === null) {
+          return denied(
+            'limit_result_exceeded',
+            `Even an empty read_file result for this path needs more than the ${maxResultBytes} bytes that remain for ` +
+              'this tool result. No part of the file can be reported within the current budget.'
+          );
+        }
 
         return {
           ok: true,
-          forModel: {
-            path: action.path,
-            offset: sliced.offset,
-            bytesRead: sliced.bytesRead,
-            eof: sliced.offset + sliced.bytesRead >= fileStats.size,
-            content: sliced.text,
-            sha256
-          },
+          forModel: packed,
           readBytes: raw.byteLength,
           writeBytes: 0,
-          auditSummary: `read_file path="${action.path}" offset=${sliced.offset} bytes=${sliced.bytesRead} sha256=${sha256}`
+          auditSummary:
+            `read_file path="${action.path}" offset=${packed.offset} bytes=${packed.bytesRead} ` +
+            `of ${totalBytes} sha256=${sha256}`
         };
       } finally {
         await handle.close();
@@ -1511,6 +1552,44 @@ function safeUtf8Slice(raw: Buffer, requestedOffset: number, limit: number): {
     bytesRead: bytes.byteLength,
     text: new TextDecoder('utf-8', { fatal: true }).decode(bytes)
   };
+}
+
+/**
+ * Return the largest UTF-8-safe slice of `raw` whose SERIALIZED result (as built
+ * by `build`) is at most `maxResultBytes`, or `null` when not even an empty
+ * slice fits. A binary search over the byte limit is enough: serialized size
+ * grows with the limit apart from a few bytes of noise (`eof`'s `true` versus
+ * `false`, `nextOffset`'s `null` versus a number), and the search only ever
+ * returns a candidate it has actually measured as fitting, so the guarantee
+ * is exact even where that noise makes the answer one or two bytes short of
+ * the true maximum.
+ */
+function packReadSlice<T>(
+  raw: Buffer,
+  requestedOffset: number,
+  requestedLimit: number,
+  build: (slice: { offset: number; bytesRead: number; text: string }) => T,
+  maxResultBytes: number
+): T | null {
+  const measure = (value: T): number => Buffer.byteLength(JSON.stringify(value), 'utf8');
+  const whole = build(safeUtf8Slice(raw, requestedOffset, requestedLimit));
+  if (measure(whole) <= maxResultBytes) return whole;
+
+  let best: T = build(safeUtf8Slice(raw, requestedOffset, 0));
+  if (measure(best) > maxResultBytes) return null;
+  let low = 1;
+  let high = requestedLimit - 1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = build(safeUtf8Slice(raw, requestedOffset, mid));
+    if (measure(candidate) <= maxResultBytes) {
+      best = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return best;
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {

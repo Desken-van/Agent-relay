@@ -1039,6 +1039,196 @@ describe('OrnithWorktreeTools containment and budgets', () => {
     });
   });
 
+  describe('read_file totalBytes / nextOffset and result packing', () => {
+    /** JSON-escape-heavy text: quotes, backticks, backslashes and newlines all inflate when serialized. */
+    const escapeHeavyLine = '1. Open the "Settings" page, choose `Local inference`\\and press "Start"; expect "Healthy".\n';
+    const escapeHeavy = escapeHeavyLine.repeat(420); // ~41 KB, like docs/manual-test.md in the real run
+
+    function serializedBytes(value: unknown): number {
+      return Buffer.byteLength(JSON.stringify(value), 'utf8');
+    }
+
+    type ReadResult = {
+      path: string; offset: number; bytesRead: number; totalBytes: number;
+      nextOffset: number | null; eof: boolean; content: string; sha256: string;
+    };
+
+    it('reports the file size and the offset a following chunk starts at, and null at the end of the file', async () => {
+      writeFileSync(join(worktree, 'paged.txt'), 'y'.repeat(50_000), 'utf8');
+      const boundary = tools();
+
+      const first = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'paged.txt', offset: 10, limit: 5 },
+        undefined,
+        { readBytes: 50_000, writeBytes: 0 }
+      );
+      expect(first).toMatchObject({ ok: true, readBytes: 50_000 }); // accounting unchanged: the whole file
+      if (!first.ok) throw new Error('expected a successful read');
+      expect(first.forModel).toMatchObject({ offset: 10, bytesRead: 5, totalBytes: 50_000, nextOffset: 15, eof: false });
+
+      const last = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'paged.txt', offset: 49_995, limit: 100 },
+        undefined,
+        { readBytes: 50_000, writeBytes: 0 }
+      );
+      if (!last.ok) throw new Error('expected a successful read');
+      expect(last.forModel).toMatchObject({ bytesRead: 5, totalBytes: 50_000, nextOffset: null, eof: true });
+    });
+
+    it('follows nextOffset across multi-byte characters with no gaps and no duplicated bytes', async () => {
+      const original = 'é€😀 mixed width text\n'.repeat(400);
+      writeFileSync(join(worktree, 'wide.txt'), original, 'utf8');
+      const boundary = tools();
+
+      let offset = 0;
+      let rebuilt = '';
+      let pages = 0;
+      for (;;) {
+        const page = await boundary.readFile(
+          { version: 1, action: 'read_file', path: 'wide.txt', offset, limit: 1001 }, // deliberately mid-character
+          undefined,
+          { readBytes: 1_000_000, writeBytes: 0 }
+        );
+        if (!page.ok) throw new Error('expected a successful read');
+        const forModel = page.forModel as ReadResult;
+        expect(forModel.bytesRead).toBeLessThanOrEqual(1001);
+        rebuilt += forModel.content;
+        pages += 1;
+        if (forModel.nextOffset === null) break;
+        expect(forModel.nextOffset).toBe(forModel.offset + forModel.bytesRead);
+        offset = forModel.nextOffset;
+        expect(pages).toBeLessThan(200);
+      }
+      expect(rebuilt).toBe(original);
+    });
+
+    it('packs the returned slice to the exact serialized result budget while still charging the whole file', async () => {
+      writeFileSync(join(worktree, 'escape.md'), escapeHeavy, 'utf8');
+      const raw = readFileSync(join(worktree, 'escape.md'));
+      const sha256 = createHash('sha256').update(raw).digest('hex');
+      const boundary = tools();
+
+      const result = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'escape.md', offset: 0, limit: 65_536 },
+        undefined,
+        { readBytes: 1_000_000, writeBytes: 0 },
+        2_000
+      );
+
+      expect(result).toMatchObject({ ok: true, readBytes: raw.byteLength }); // honest: the full file was read
+      if (!result.ok) throw new Error('expected a successful, packed read');
+      expect(serializedBytes(result.forModel)).toBeLessThanOrEqual(2_000);
+      const forModel = result.forModel as ReadResult;
+      expect(forModel.bytesRead).toBeGreaterThan(0);
+      expect(forModel.bytesRead).toBeLessThan(raw.byteLength);
+      expect(forModel.totalBytes).toBe(raw.byteLength);
+      expect(forModel.nextOffset).toBe(forModel.bytesRead);
+      expect(forModel.eof).toBe(false);
+      expect(forModel.sha256).toBe(sha256); // still over the COMPLETE file, not the slice
+      expect(escapeHeavy.startsWith(forModel.content)).toBe(true);
+    });
+
+    it('pages a large escape-heavy file to completion under a tight budget: every page fits, none is a stub, none overlaps', async () => {
+      writeFileSync(join(worktree, 'escape.md'), escapeHeavy, 'utf8');
+      const boundary = tools();
+
+      let offset = 0;
+      let rebuilt = '';
+      let pages = 0;
+      for (;;) {
+        const page = await boundary.readFile(
+          { version: 1, action: 'read_file', path: 'escape.md', offset, limit: 65_536 },
+          undefined,
+          { readBytes: 1_000_000, writeBytes: 0 },
+          1_500
+        );
+        if (!page.ok) throw new Error('expected a successful, packed read');
+        expect(serializedBytes(page.forModel)).toBeLessThanOrEqual(1_500);
+        const forModel = page.forModel as ReadResult;
+        expect(forModel.bytesRead).toBeGreaterThan(0);
+        expect(forModel.offset).toBe(offset);
+        rebuilt += forModel.content;
+        pages += 1;
+        if (forModel.nextOffset === null) break;
+        offset = forModel.nextOffset;
+        expect(pages).toBeLessThan(200);
+      }
+      expect(rebuilt).toBe(escapeHeavy);
+      expect(pages).toBeGreaterThan(1);
+    });
+
+    it('reproduces the real defect: a chunk that fit the raw-byte clamp but not the serialized budget now returns content instead of a stub', async () => {
+      writeFileSync(join(worktree, 'escape.md'), escapeHeavy, 'utf8');
+      const raw = readFileSync(join(worktree, 'escape.md'));
+      const budget = 10_890; // the real run's maxToolResultBytes
+      const rawClamp = budget - 512; // what the dispatcher used to pass as the byte limit
+      const naive = {
+        path: 'escape.md', offset: 0, bytesRead: rawClamp, eof: false,
+        content: raw.subarray(0, rawClamp).toString('utf8'), sha256: 'a'.repeat(64)
+      };
+      // Guard: this fixture really is one the old clamp got wrong (otherwise the test proves nothing).
+      expect(serializedBytes(naive)).toBeGreaterThan(budget);
+
+      const result = await tools().readFile(
+        { version: 1, action: 'read_file', path: 'escape.md', offset: 0, limit: rawClamp },
+        undefined,
+        { readBytes: 1_000_000, writeBytes: 0 },
+        budget
+      );
+
+      if (!result.ok) throw new Error('expected content, not a denial');
+      expect(serializedBytes(result.forModel)).toBeLessThanOrEqual(budget);
+      const forModel = result.forModel as ReadResult;
+      expect(forModel.content.length).toBeGreaterThan(0);
+      expect(forModel.sha256).toHaveLength(64);
+      expect(forModel.nextOffset).not.toBeNull();
+    });
+
+    it('fails closed rather than returning a result over budget when not even an empty result fits', async () => {
+      writeFileSync(join(worktree, 'tiny.txt'), 'hello\n', 'utf8');
+
+      const result = await tools().readFile(
+        { version: 1, action: 'read_file', path: 'tiny.txt', offset: 0, limit: 100 },
+        undefined,
+        { readBytes: 1_000, writeBytes: 0 },
+        40
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'limit_result_exceeded' });
+    });
+
+    it('still refuses a credential-shaped file when the secret lies beyond the slice being returned', async () => {
+      writeFileSync(
+        join(worktree, 'later-secret.txt'),
+        `safe start\n${'x'.repeat(200)}\ntoken=ghp_abcdefghijklmnopqrstuvwxyz1234567890\n`,
+        'utf8'
+      );
+
+      const result = await tools().readFile(
+        { version: 1, action: 'read_file', path: 'later-secret.txt', offset: 0, limit: 5 },
+        undefined,
+        { readBytes: 10_000, writeBytes: 0 },
+        1_000
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'disallowed_action' });
+      expect(JSON.stringify(result)).not.toContain('ghp_');
+    });
+
+    it('still denies a read that would exceed the remaining read budget, independent of the result budget', async () => {
+      writeFileSync(join(worktree, 'big.txt'), 'z'.repeat(5_000), 'utf8');
+
+      const result = await tools().readFile(
+        { version: 1, action: 'read_file', path: 'big.txt', offset: 0, limit: 10 },
+        undefined,
+        { readBytes: 4_999, writeBytes: 0 },
+        10_000
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    });
+  });
+
   describe('resolveAuthoritativeScope', () => {
     // `search_text` deliberately does NOT consume this (a Coai review round found
     // that narrowing an omitted search to a declared scope could permanently hide

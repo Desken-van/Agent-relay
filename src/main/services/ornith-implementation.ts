@@ -276,6 +276,14 @@ Rules:
   possible request, and is NEVER automatically narrowed for you, including by a SCOPE section
   above. If you already know which file matters, pass it in "files" explicitly, or better, skip
   the search entirely and use "read_file" directly.
+- A "read_file" result reports "totalBytes" (the file's size) and "nextOffset" (where the next
+  chunk starts; null at the end of the file). Every "read_file" is charged the file's FULL size
+  against the read budget however small the chunk, so NEVER page through a large file in small
+  consecutive chunks. If the part you need is not in the chunk you received, jump straight to the
+  relevant offset computed from "totalBytes" (to add something after the last section, read from
+  a few KB before "totalBytes"), or, when a SCOPE section names the file(s), run "search_text"
+  with "files" set to exactly those file(s) (it reports line numbers, not byte offsets). A chunk
+  may be shorter than your "limit" so the result fits; "bytesRead" says how much you got.
 - A "list_files" result's "nextCursor" is the ONLY thing that tells you whether there is more:
   if it is a number, your NEXT "list_files" call for that SAME "prefix" must set "cursor" to
   exactly that number to continue; if it is null, that prefix is fully listed and must not be
@@ -1154,11 +1162,11 @@ export class OrnithImplementationService {
       case 'list_files':
         return tools.listFiles(action, signal, maxToolResultBytes);
       case 'read_file':
-        return tools.readFile(
-          { ...action, limit: Math.min(action.limit, Math.max(1, maxToolResultBytes - 512)) },
-          signal,
-          budget
-        );
+        // Packed against the exact serialized budget inside `readFile` (see its
+        // doc comment) instead of pre-clamping the raw byte limit: a raw-byte
+        // clamp cannot know how much JSON escaping will inflate the slice, and
+        // an over-budget result used to be replaced by a content-free stub.
+        return tools.readFile(action, signal, budget, maxToolResultBytes);
       case 'search_text':
         return tools.searchText(action, signal, budget, maxToolResultBytes);
       case 'create_file':
@@ -1243,9 +1251,10 @@ function boundedJson(value: unknown, maxBytes: number): string {
 
 /** Actions whose `OrnithWorktreeTools` method packs its own result to already fit the
  *  budget it is given (`nextCursor`/`total` for list_files, `truncated` for
- *  search_text), so falling through to the generic byte-cap-and-replace stub would
- *  erase continuation-bearing fields these actions specifically rely on. */
-const SELF_PACKED_ACTIONS: ReadonlySet<OrnithAction['action']> = new Set(['list_files', 'search_text']);
+ *  search_text, `totalBytes`/`nextOffset`/`sha256` for read_file), so falling through
+ *  to the generic byte-cap-and-replace stub would erase continuation-bearing fields
+ *  these actions specifically rely on. */
+const SELF_PACKED_ACTIONS: ReadonlySet<OrnithAction['action']> = new Set(['list_files', 'search_text', 'read_file']);
 
 /**
  * See `SELF_PACKED_ACTIONS`. For those actions this does not degrade a budget-fit

@@ -503,10 +503,10 @@ describe('OrnithImplementationService limits and cancellation', () => {
     // `preflightOrnithPrompt` for the `chars` that yields each target budget)
     // rather than hand-deriving the offset.
     const budgetCases: { label: string; chars: number; expectedBudget: number }[] = [
-      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 123_689, expectedBudget: 384 },
-      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 123_643, expectedBudget: 407 },
-      { label: '408 bytes (right at the old fallback stub size)', chars: 123_641, expectedBudget: 408 },
-      { label: '471 bytes ("408+": comfortably normal)', chars: 123_515, expectedBudget: 471 }
+      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 122_925, expectedBudget: 384 },
+      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 122_879, expectedBudget: 407 },
+      { label: '408 bytes (right at the old fallback stub size)', chars: 122_877, expectedBudget: 408 },
+      { label: '471 bytes ("408+": comfortably normal)', chars: 122_751, expectedBudget: 471 }
     ];
 
     for (const { label, chars, expectedBudget } of budgetCases) {
@@ -586,7 +586,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(123_689)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_925)}` // -> 384-byte budget
       };
       const preflight = preflightOrnithPrompt({
         specification: oversizedSpecification,
@@ -638,7 +638,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(123_689)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_925)}` // -> 384-byte budget
       };
       for (let index = 0; index < 40; index += 1) {
         writeFileSync(join(worktree, `s${String(index).padStart(3, '0')}.txt`), 'needle appears here\n', 'utf8');
@@ -680,7 +680,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(123_689)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_925)}` // -> 384-byte budget
       };
       // Multi-byte (3 UTF-8 bytes each) names: short enough in UTF-16 code units to
       // stay well under Windows' MAX_PATH, long enough in UTF-8 bytes that every
@@ -1237,6 +1237,106 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(result.finalMessage).toContain('read_file');
       expect(result.finalMessage).toContain('disallowed_action');
     });
+  });
+
+  describe('read_file totalBytes / nextOffset through the full implement() loop', () => {
+    const manualLine = '1. Open the "Settings" page, choose `Local inference`\\and press "Start"; expect "Healthy".\n';
+    const endMarker = 'END-OF-MANUAL-TEST-MARKER\n';
+
+    function writeManualTest(): { bytes: number } {
+      mkdirSync(join(worktree, 'docs'), { recursive: true });
+      const content = `${manualLine.repeat(420)}${endMarker}`;
+      writeFileSync(join(worktree, 'docs', 'manual-test.md'), content, 'utf8');
+      return { bytes: Buffer.byteLength(content, 'utf8') };
+    }
+
+    it('jumps to the tail using totalBytes and edits it, with no content-free stub and no page-by-page crawl', async () => {
+      const { bytes } = writeManualTest();
+      // The real run's limits: 32K context, 4096 output tokens => ~10.9 KB tool-result budget.
+      const realLease = lease({ contextLimitTokens: 32_768, maxOutputTokens: 4_096 });
+      const prompts: string[] = [];
+      let calls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => realLease,
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          calls += 1;
+          const promptText = request.messages.map((message) => message.content).join('\n');
+          prompts.push(promptText);
+          if (calls === 1) {
+            // Exactly the request that used to come back as a content-free stub.
+            return completed(request, JSON.stringify({ version: 1, action: 'read_file', path: 'docs/manual-test.md', offset: 0, limit: 65_536 }));
+          }
+          if (calls === 2) {
+            const total = Number([...promptText.matchAll(/"totalBytes":(\d+)/g)].at(-1)?.[1]);
+            return completed(request, JSON.stringify({ version: 1, action: 'read_file', path: 'docs/manual-test.md', offset: total - 1_500, limit: 65_536 }));
+          }
+          if (calls === 3) {
+            const sha256 = [...promptText.matchAll(/"sha256":"([0-9a-f]{64})"/g)].at(-1)![1]!;
+            return completed(request, JSON.stringify({
+              version: 1, action: 'replace_text', path: 'docs/manual-test.md', sha256,
+              replacements: [{
+                oldText: 'END-OF-MANUAL-TEST-MARKER',
+                newText: 'END-OF-MANUAL-TEST-MARKER\n\n## Configured provider smoke-test checklist\n- [ ] Claude Code\n- [ ] Codex\n- [ ] Ornith'
+              }]
+            }));
+          }
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Appended the checklist.' }));
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        lease: realLease,
+        specification: { ...specification, scopedFilePaths: ['docs/manual-test.md'] }
+      });
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(result.ornithAudit.outcomes.map((o) => o.action)).toEqual(['read_file', 'read_file', 'replace_text']);
+      expect(result.ornithAudit.changedFiles).toBe(1);
+      expect(readFileSync(join(worktree, 'docs', 'manual-test.md'), 'utf8')).toContain('## Configured provider smoke-test checklist');
+      // Never the generic, content-free stub - the defect that made the real model crawl.
+      for (const prompt of prompts) {
+        expect(prompt).not.toContain('request a smaller page or read chunk');
+        expect(prompt).not.toContain('exceeded this runtime context budget');
+      }
+      // The first (large) read really returned content plus a continuation offset.
+      expect(prompts[1]).toContain('Local inference');
+      expect(prompts[1]).toMatch(/"nextOffset":\d+/);
+      expect(prompts[1]).toContain(`"totalBytes":${bytes}`);
+      // Honest accounting is unchanged: read + read + replace_text (which reads twice) each charge the whole file.
+      expect(result.ornithAudit.readBytes).toBe(bytes * 4);
+    }, 120_000);
+
+    it('tells the model about the new fields and the no-crawl rule, and every field it names really exists in a result', async () => {
+      const { bytes } = writeManualTest();
+      const prompts: string[] = [];
+      let calls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          calls += 1;
+          prompts.push(request.messages.map((message) => message.content).join('\n'));
+          return completed(
+            request,
+            calls === 1
+              ? JSON.stringify({ version: 1, action: 'read_file', path: 'docs/manual-test.md', offset: 0, limit: 200 })
+              : JSON.stringify({ version: 1, action: 'finish', summary: 'Looked.' })
+          );
+        }
+      };
+
+      await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
+
+      expect(prompts[0]).toContain('"totalBytes"');
+      expect(prompts[0]).toContain('"nextOffset"');
+      expect(prompts[0]).toContain('NEVER page through a large file in small');
+      expect(prompts[0]).toMatch(/FULL size\s+against the/);
+      // The fields the protocol promises are present, with the values the tool really computed.
+      expect(prompts[1]).toContain(`"totalBytes":${bytes}`);
+      expect(prompts[1]).toMatch(/"nextOffset":\d+/);
+    }, 120_000);
   });
 
   describe('specification scope and read-budget recovery', () => {
