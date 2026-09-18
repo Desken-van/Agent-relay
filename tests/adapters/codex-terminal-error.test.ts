@@ -16,7 +16,7 @@ import {
 } from '../../src/main/adapters/codex/terminal-error';
 import { makeSpecification } from '../helpers/fakes';
 
-const sdk = vi.hoisted(() => ({ events: [] as unknown[], throwAfter: null as Error | null }));
+const sdk = vi.hoisted(() => ({ events: [] as unknown[], throwAfter: null as Error | null, delayMs: 0 }));
 vi.mock('@openai/codex-sdk', () => ({
   Codex: class {
     startThread() {
@@ -32,6 +32,7 @@ vi.mock('@openai/codex-sdk', () => ({
           events: (async function* () {
             for (const event of sdk.events) yield event;
             // The SDK reports a non-zero exit by throwing once stdout has ended.
+            if (sdk.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, sdk.delayMs));
             if (sdk.throwAfter) throw sdk.throwAfter;
           })()
         })
@@ -56,11 +57,11 @@ const request: CodexSpecificationRequest = {
 
 function context(
   events: AgentProgressEvent[],
-  options: { signal?: AbortSignal; onProgress?: (event: AgentProgressEvent) => void } = {}
+  options: { signal?: AbortSignal; timeoutMs?: number; onProgress?: (event: AgentProgressEvent) => void } = {}
 ): AgentRunContext {
   return {
     signal: options.signal ?? new AbortController().signal,
-    timeoutMs: 5_000,
+    timeoutMs: options.timeoutMs ?? 5_000,
     onProgress: (event) => {
       options.onProgress?.(event);
       events.push(event);
@@ -135,6 +136,7 @@ async function failure(events: AgentProgressEvent[], options?: Parameters<typeof
 beforeEach(() => {
   sdk.events = [];
   sdk.throwAfter = null;
+  sdk.delayMs = 0;
 });
 
 describe('Codex failure selection: structured terminal error versus process stderr', () => {
@@ -286,6 +288,108 @@ describe('Codex failure selection: structured terminal error versus process stde
     sdk.events = [...started, { type: 'turn.failed', error: { message: 'stream disconnected before completion' } }];
     const error = await failure([]);
     expect(error.message).toBe('Codex failed: stream disconnected before completion');
+  });
+});
+
+describe('Codex failure: credentials the provider or the process echoes', () => {
+  const BEARER = 'Bearer abcdefghijklmnop123456789';
+  const GITHUB = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+
+  it('removes them from the user-facing error, the raw error events and the stderr diagnostic', async () => {
+    const events: AgentProgressEvent[] = [];
+    const echoed = JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        code: 'invalid_request',
+        message: `Incorrect key ${API_KEY} sent as Authorization: ${BEARER}`,
+        param: `header ${GITHUB}`
+      },
+      status: 400
+    });
+    sdk.events = [...started, { type: 'error', message: echoed }, { type: 'turn.failed', error: { message: echoed } }];
+    sdk.throwAfter = processExit(`${noisyStderr()}\nAuthorization: ${BEARER}\nGITHUB_TOKEN=${GITHUB}`);
+
+    const error = await failure(events);
+    const stored = JSON.stringify([error.message, error.details, error.remediation, events]);
+
+    for (const secret of [API_KEY, BEARER, 'abcdefghijklmnop123456789', GITHUB]) {
+      expect(stored).not.toContain(secret);
+    }
+    expect(error.message).toContain('[redacted]');
+    expect(events.find((event) => event.type === 'stderr')?.text).toContain('GITHUB_TOKEN=[redacted]');
+  });
+
+  it('removes them from a stderr-only fallback as well', async () => {
+    const events: AgentProgressEvent[] = [];
+    sdk.events = [...started];
+    sdk.throwAfter = processExit(`Authorization: ${BEARER}\nGITHUB_TOKEN=${GITHUB}`);
+
+    const error = await failure(events);
+
+    expect(JSON.stringify([error.message, events])).not.toContain(GITHUB);
+    expect(JSON.stringify([error.message, events])).not.toContain('abcdefghijklmnop123456789');
+  });
+});
+
+describe('Codex failure: races and ordering', () => {
+  beforeEach(() => {
+    sdk.events = [...started, ...structuredFailure];
+    sdk.throwAfter = processExit(noisyStderr());
+  });
+
+  it('reports a timeout, not the provider error, when the deadline expires first', async () => {
+    sdk.delayMs = 80;
+    const events: AgentProgressEvent[] = [];
+
+    const error = await failure(events, { timeoutMs: 20 });
+
+    expect(error.code).toBe('TIMEOUT');
+    expect(error.message).not.toContain('invalid_json_schema');
+    // Nothing is recorded for a failure the user is not told about.
+    expect(events.some((event) => event.type === 'stderr')).toBe(false);
+  });
+
+  it('reports a stop that lands while the structured failure is streaming as a cancellation', async () => {
+    const controller = new AbortController();
+    const events: AgentProgressEvent[] = [];
+
+    const error = await failure(events, {
+      signal: controller.signal,
+      onProgress: (event) => {
+        if (event.type === 'error') controller.abort();
+      }
+    });
+
+    expect(error.code).toBe('CANCELLED');
+    expect(events.filter((event) => event.type === 'error')).toHaveLength(2);
+  });
+
+  it('still fails a completed turn whose process then exits non-zero, with the process fallback', async () => {
+    const events: AgentProgressEvent[] = [];
+    sdk.events = [
+      ...started,
+      { type: 'item.completed', item: { id: 'w', type: 'error', message: `non-fatal: ${CACHE_WARNING}` } },
+      { type: 'item.completed', item: { id: 'm', type: 'agent_message', text: JSON.stringify(makeSpecification()) } },
+      completed
+    ];
+
+    const error = await failure(events);
+
+    // No structured terminal error exists (an error ITEM is a warning, not a terminal event),
+    // so the existing fallback applies and the run is not reported as a success.
+    expect(error.code).toBe('TOOL_FAILED');
+    expect(error.message.startsWith('Codex failed: Codex Exec exited with code 1: Reading prompt')).toBe(true);
+    expect(events.find((event) => event.type === 'stderr')?.text).toContain('supports_parallel_tool_calls');
+  });
+
+  it('records a diagnostic once per failure, after the raw error events', async () => {
+    const events: AgentProgressEvent[] = [];
+    await failure(events);
+
+    const types = events.map((event) => event.type);
+    expect(types.filter((type) => type === 'stderr')).toHaveLength(1);
+    expect(types.lastIndexOf('error')).toBeLessThan(types.indexOf('stderr'));
   });
 });
 
