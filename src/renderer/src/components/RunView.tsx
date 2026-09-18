@@ -1598,9 +1598,9 @@ export function CodeReviewPanel({
   const inFlightRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [draftState, setDraftState] = useState<{
-    readonly roundKey: string | null;
+    readonly subjectSha256: string | null;
     readonly drafts: Record<string, CodeDecisionDraft>;
-  }>({ roundKey: null, drafts: {} });
+  }>({ subjectSha256: null, drafts: {} });
 
   useEffect(() => {
     let active = true;
@@ -1620,25 +1620,24 @@ export function CodeReviewPanel({
   }, [task.id]);
 
   const findings = detail?.findings ?? NO_CODE_FINDINGS;
-  // Keyed on the subject and the SET of live finding ids, deliberately not
-  // on their revisions: a decided finding stays in `findings` (it just also
-  // gains a `latestDecisions` entry and stops rendering its own draft
-  // controls), so its id never leaves this set and deciding it must not
-  // discard a draft in progress for an untouched sibling. Only a genuinely
-  // different set of live findings — a new subject, or a finding newly
-  // appearing or disappearing — invalidates a stale draft.
-  const roundKey = detail?.subject
-    ? `${detail.subject.subjectSha256}:${findings.map((f) => f.id).sort().join(',')}`
-    : null;
-  const decisions = draftState.roundKey === roundKey ? draftState.drafts : NO_CODE_DECISIONS;
+  // Keyed on the subject alone — never on any property of the live findings
+  // themselves. Drafts are already stored per finding id, so an individual
+  // finding's own draft naturally stays valid for as long as its id is
+  // still worth showing controls for; nothing about a SIBLING finding
+  // deciding, appearing (a new review round adding one), or disappearing
+  // has any bearing on that. Only a genuinely different subject — code that
+  // is no longer the code these drafts were written against — invalidates
+  // them wholesale.
+  const currentSubjectSha256 = detail?.subject?.subjectSha256 ?? null;
+  const decisions = draftState.subjectSha256 === currentSubjectSha256 ? draftState.drafts : NO_CODE_DECISIONS;
   const setDecisions = useCallback(
     (update: (current: Record<string, CodeDecisionDraft>) => Record<string, CodeDecisionDraft>): void => {
       setDraftState((current) => ({
-        roundKey,
-        drafts: update(current.roundKey === roundKey ? current.drafts : {})
+        subjectSha256: currentSubjectSha256,
+        drafts: update(current.subjectSha256 === currentSubjectSha256 ? current.drafts : {})
       }));
     },
-    [roundKey]
+    [currentSubjectSha256]
   );
 
   const latestDecisions = detail?.latestDecisions ?? {};

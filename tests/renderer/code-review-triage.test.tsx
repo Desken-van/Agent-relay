@@ -457,6 +457,44 @@ describe('the external code-review panel — automatic finding triage', () => {
     expect((remainingReasonInputs[0] as HTMLInputElement).value).toBe('Draft reason for the second finding.');
   });
 
+  it('preserves an in-progress manual draft when a new finding appears for the same subject', async () => {
+    const f1 = finding({ id: 'f-1', revision: 0, title: 'First finding' });
+    const f2 = finding({ id: 'f-2', revision: 0, title: 'Second finding' });
+    // The refetch after "Analyze" now reports a brand-new third finding for
+    // the SAME subject — the set of live finding ids grows, which must not
+    // be confused with a genuinely different subject.
+    let newFindingAppeared = false;
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
+      detail({
+        subject: subject(),
+        subjectIdentity: 'current',
+        findings: newFindingAppeared
+          ? [f1, f2, finding({ id: 'f-3', revision: 0, title: 'Third finding' })]
+          : [f1, f2]
+      })
+    ));
+    bridge.set('codeReview:triage', () => {
+      newFindingAppeared = true;
+      return ok<'codeReview:triage'>({
+        recommendations: [],
+        detail: detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2] })
+      });
+    });
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+
+    await screen.findByText('Second finding');
+    const reasonInputs = screen.getAllByRole('textbox');
+    fireEvent.change(reasonInputs[1]!, { target: { value: 'Draft reason kept across a new finding.' } });
+
+    const analyze = await screen.findByRole('button', { name: /Analyze undecided findings/i });
+    fireEvent.click(analyze);
+
+    await screen.findByText('Third finding');
+    const reasonInputsAfter = screen.getAllByRole('textbox');
+    expect(reasonInputsAfter).toHaveLength(3);
+    expect((reasonInputsAfter[1] as HTMLInputElement).value).toBe('Draft reason kept across a new finding.');
+  });
+
   it('resets the busy guard and shows an error when Analyze itself fails, leaving no control stuck disabled', async () => {
     const f1 = finding({ id: 'f-1' });
     bridge.set('codeReview:get', () => ok<'codeReview:get'>(
