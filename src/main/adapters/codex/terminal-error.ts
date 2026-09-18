@@ -91,19 +91,21 @@ export function parseCodexTerminalError(raw: string): CodexTerminalError {
   return parsed ?? { message: raw.trim() };
 }
 
-const isStructured = (error: CodexTerminalError): boolean =>
-  error.code !== undefined || error.type !== undefined || error.status !== undefined;
+/** How much of the provider's own classification a report carries; a code names the cause best. */
+const specificity = (error: CodexTerminalError): number =>
+  (error.code === undefined ? 0 : 4) + (error.type === undefined ? 0 : 2) + (error.status === undefined ? 0 : 1);
 
 /**
  * Codex reports one failure twice (an `error` event, then `turn.failed`). Keep
- * the later report unless it would replace a provider-classified error with a
- * bare message: the structured one names the cause.
+ * the later report unless the earlier one carries more of the provider's own
+ * classification: a coded error is never replaced by a report with only a status
+ * or a bare message. Equal specificity takes the later report.
  */
 export function preferTerminalError(
   previous: CodexTerminalError | null,
   next: CodexTerminalError
 ): CodexTerminalError {
-  return previous !== null && isStructured(previous) && !isStructured(next) ? previous : next;
+  return previous !== null && specificity(previous) > specificity(next) ? previous : next;
 }
 
 /**

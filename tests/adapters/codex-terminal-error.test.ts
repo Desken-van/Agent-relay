@@ -255,6 +255,17 @@ describe('Codex failure selection: structured terminal error versus process stde
     expect(error.message).not.toContain('turn failed');
   });
 
+  it('keeps the coded cause when the turn.failed that follows carries only a status', async () => {
+    sdk.events = [
+      ...started,
+      { type: 'error', message: INVALID_SCHEMA_EVENT_TEXT },
+      { type: 'turn.failed', error: { message: JSON.stringify({ message: 'turn failed', status: 500 }) } }
+    ];
+    const error = await failure([]);
+    expect(error.message).toContain('invalid_json_schema');
+    expect(error.message).not.toContain('turn failed');
+  });
+
   it('lets a later structured report replace an earlier bare one', async () => {
     sdk.events = [
       ...started,
@@ -396,11 +407,22 @@ describe('preferTerminalError', () => {
     expect(preferTerminalError(structured, bare)).toBe(structured);
   });
 
+  it('does not let a status-only or type-only report replace a coded one', () => {
+    expect(preferTerminalError(structured, { message: 'turn failed', status: 500 })).toBe(structured);
+    expect(preferTerminalError(structured, { message: 'turn failed', type: 'server_error', status: 500 })).toBe(structured);
+  });
+
+  it('keeps an earlier classified report over a bare one, even without a code', () => {
+    const typed = { message: 'm', type: 't', status: 400 };
+    expect(preferTerminalError(typed, bare)).toBe(typed);
+  });
+
   it('otherwise takes the later report', () => {
     expect(preferTerminalError(null, bare)).toBe(bare);
     expect(preferTerminalError(bare, structured)).toBe(structured);
     expect(preferTerminalError(bare, { message: 'later' })).toEqual({ message: 'later' });
-    expect(preferTerminalError(structured, { message: 'x', status: 500 })).toEqual({ message: 'x', status: 500 });
+    expect(preferTerminalError(structured, { message: 'later', code: 'other' })).toEqual({ message: 'later', code: 'other' });
+    expect(preferTerminalError({ message: 'a', status: 500 }, { message: 'b', type: 'x' })).toEqual({ message: 'b', type: 'x' });
   });
 });
 
