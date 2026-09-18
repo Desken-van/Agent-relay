@@ -14,7 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ExecaProcessRunner } from '../../src/main/adapters/process/process-runner';
+import { ExecaProcessRunner, type ProcessResult, type ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
 import { OrnithWorktreeTools } from '../../src/main/services/ornith-worktree-tools';
 import { ORNITH_LIMITS } from '../../src/shared/domain/ornith';
@@ -1073,6 +1073,38 @@ describe('OrnithWorktreeTools containment and budgets', () => {
 
     it('resolves to null when no scope was declared at all', async () => {
       expect(await tools().resolveAuthoritativeScope()).toBeNull();
+    });
+
+    it('recovers from one transient manifest-build failure via its own bounded retry', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
+      let calls = 0;
+      const flakyRunner: ProcessRunner = {
+        run: (file, args, options) => {
+          calls += 1;
+          if (calls === 1) {
+            const failure: ProcessResult = {
+              command: file, exitCode: 1, stdout: '', stderr: 'transient failure',
+              timedOut: false, cancelled: false, durationMs: 1, failed: true
+            };
+            return Promise.resolve(failure);
+          }
+          return runner.run(file, args, options);
+        }
+      };
+      const boundary = new OrnithWorktreeTools({
+        worktreePath: worktree,
+        worktreesRoot,
+        repositoryPath: repository,
+        branchName: 'task',
+        runner: flakyRunner,
+        gitExecutablePath: gitPath,
+        scopedFilePathCandidates: ['scoped.txt']
+      });
+
+      // The first git call (inside the first ensureManifest attempt) fails;
+      // the retry's calls all go through to the real runner and succeed.
+      expect(await boundary.resolveAuthoritativeScope()).toEqual(['scoped.txt']);
+      expect(calls).toBeGreaterThan(1);
     });
 
     it('freezes the decision permanently once resolved, even after a failed first attempt followed by a successful retry', async () => {

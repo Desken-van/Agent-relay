@@ -422,24 +422,35 @@ export class OrnithWorktreeTools {
    * the manifest if needed. Read-only, never mutates. Intended to be called
    * once, eagerly, before the first prompt is built, so a scoped run's very
    * first turn can already name the confirmed file(s) instead of discovering
-   * them lazily on first tool dispatch. Any failure (including one this run
-   * would hit anyway, such as a broken checkout identity) resolves to `null`
-   * rather than throwing: scope is a discovery optimization, never a
-   * precondition for the run to proceed, and the loop's own per-iteration
-   * `assertCheckoutIdentity` independently and unconditionally re-detects a
-   * genuinely broken worktree on its own very next check.
+   * them lazily on first tool dispatch.
+   *
+   * Retries `ensureManifest()` up to twice before giving up: a review round
+   * found that freezing the decision after a single failure could permanently
+   * lose the scope hint for the rest of the run over a one-off transient
+   * hiccup (e.g. a momentary git-spawn delay under load), reproducing the
+   * unscoped-discovery cost this feature exists to avoid for the ENTIRE run
+   * rather than just this one check. Two attempts bounds that cost: a
+   * genuinely broken worktree fails both quickly and is then independently
+   * re-detected by the loop's own per-iteration `assertCheckoutIdentity`
+   * regardless, so nothing is masked either way — only a truly transient
+   * failure benefits from the second try. Whatever the outcome, this remains
+   * the one and only authoritative decision for this run instance, frozen so
+   * a LATER retry (e.g. from the loop's own subsequent tool dispatches) can
+   * never quietly reach a different answer than what was already reported.
    */
   async resolveAuthoritativeScope(signal?: AbortSignal): Promise<readonly string[] | null> {
-    try {
-      await this.ensureManifest(signal);
-    } catch {
-      // Fall through: `authoritativeScope` stays at whatever it already was
-      // (still `null` on a first-ever attempt, since the manifest build
-      // failing means the scope-computation block below it never ran).
+    const maxAttempts = 2;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await this.ensureManifest(signal);
+        break;
+      } catch {
+        // Fall through to the next attempt (if any); `authoritativeScope`
+        // stays at whatever it already was (still `null` on a first-ever
+        // attempt, since a failed manifest build never reaches the
+        // scope-computation block below it).
+      }
     }
-    // Whatever the outcome, this is the one and only authoritative decision
-    // for this run instance — freeze it so a later, possibly successful
-    // `ensureManifest()` retry cannot quietly reach a different answer.
     this.authoritativeScopeDecided = true;
     return this.authoritativeScope;
   }
