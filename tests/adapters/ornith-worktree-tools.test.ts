@@ -1650,6 +1650,38 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(boundary.changedFileCount()).toBe(0);
     });
 
+    it('is all-or-nothing across several replacements: a valid first one followed by an escape-suspected second one writes nothing', async () => {
+      const content = 'alpha\r\nbeta line\r\ngamma\r\n';
+      writeFileSync(join(worktree, 'multi.txt'), content);
+      const boundary = tools();
+
+      const result = await boundary.replaceText(
+        {
+          version: 1, action: 'replace_text', path: 'multi.txt', sha256: sha(content),
+          replacements: [
+            { oldText: 'alpha', newText: 'ALPHA' }, // valid, would apply in memory first
+            { oldText: `beta line${literalCrlf}gamma`, newText: 'x' } // escape-suspected
+          ]
+        },
+        undefined,
+        budget
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'replacement_escape_suspected' });
+      expect(readFileSync(join(worktree, 'multi.txt'), 'utf8')).toBe(content); // not even the first replacement landed
+      expect(boundary.changedFileCount()).toBe(0);
+    });
+
+    it('replaces a block that spans a CRLF and a bare LF in a mixed file byte-exactly, converting nothing', async () => {
+      const content = 'one\r\ntwo\nthree\r\nfour\n';
+      const spanning = 'two\nthree\r\nfour'; // what single-backslash JSON escapes for LF and CRLF decode to
+
+      const { result, bytes } = await replaceIn('mixed.txt', content, spanning, 'TWO\nTHREE\r\nFOUR');
+
+      expect(result).toMatchObject({ ok: true });
+      expect(bytes.toString('utf8')).toBe('one\r\nTWO\nTHREE\r\nFOUR\n');
+    });
+
     it('never decodes or normalizes literal backslash sequences that really are the file text', async () => {
       // A CRLF documentation file whose text legitimately contains the four-character sequence.
       const original =

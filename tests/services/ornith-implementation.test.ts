@@ -504,10 +504,10 @@ describe('OrnithImplementationService limits and cancellation', () => {
     // `preflightOrnithPrompt` for the `chars` that yields each target budget)
     // rather than hand-deriving the offset.
     const budgetCases: { label: string; chars: number; expectedBudget: number }[] = [
-      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 122_090, expectedBudget: 384 },
-      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 122_044, expectedBudget: 407 },
-      { label: '408 bytes (right at the old fallback stub size)', chars: 122_042, expectedBudget: 408 },
-      { label: '471 bytes ("408+": comfortably normal)', chars: 121_916, expectedBudget: 471 }
+      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 122_027, expectedBudget: 384 },
+      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 121_981, expectedBudget: 407 },
+      { label: '408 bytes (right at the old fallback stub size)', chars: 121_979, expectedBudget: 408 },
+      { label: '471 bytes ("408+": comfortably normal)', chars: 121_853, expectedBudget: 471 }
     ];
 
     for (const { label, chars, expectedBudget } of budgetCases) {
@@ -587,7 +587,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_090)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_027)}` // -> 384-byte budget
       };
       const preflight = preflightOrnithPrompt({
         specification: oversizedSpecification,
@@ -639,7 +639,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_090)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_027)}` // -> 384-byte budget
       };
       for (let index = 0; index < 40; index += 1) {
         writeFileSync(join(worktree, `s${String(index).padStart(3, '0')}.txt`), 'needle appears here\n', 'utf8');
@@ -681,7 +681,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_090)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_027)}` // -> 384-byte budget
       };
       // Multi-byte (3 UTF-8 bytes each) names: short enough in UTF-16 code units to
       // stay well under Windows' MAX_PATH, long enough in UTF-8 bytes that every
@@ -1830,8 +1830,8 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(prompt).toContain('"lineEnding" for the WHOLE file: "lf", "crlf", "mixed" or "none"');
       expect(prompt).toContain('"\\r\\n" (one backslash before each letter) decodes to the real CR and LF');
       expect(prompt).toContain('"\\\\r\\\\n" (doubled backslashes) decodes to four literal characters');
-      expect(prompt).toContain('(crlf: "\\r\\n", lf: "\\n")');
-      expect(prompt).toContain('never\n  copy a JSON escape from a result as literal text');
+      expect(prompt).toContain('(crlf: "\\r\\n", lf: "\\n"; mixed:\n  reproduce each break exactly as the content shows it)');
+      expect(prompt).toContain('never copy a JSON escape from a result\n  as literal text');
       expect(prompt).toContain('Agent Relay converts neither form for you');
       expect(prompt).toContain('code "replacement_escape_suspected" changed nothing and allows exactly\n  ONE retry');
     });

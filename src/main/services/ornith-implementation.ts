@@ -291,8 +291,9 @@ Rules:
   In your JSON reply, "\\r\\n" (one backslash before each letter) decodes to the real CR and LF
   characters, but "\\\\r\\\\n" (doubled backslashes) decodes to four literal characters (backslash, r,
   backslash, n) that will NOT match a line break. Write each real line break in "oldText" and
-  "newText" as the single-backslash escape that fits lineEnding (crlf: "\\r\\n", lf: "\\n"), and never
-  copy a JSON escape from a result as literal text. Agent Relay converts neither form for you. A
+  "newText" as the single-backslash escape that fits lineEnding (crlf: "\\r\\n", lf: "\\n"; mixed:
+  reproduce each break exactly as the content shows it), and never copy a JSON escape from a result
+  as literal text. Agent Relay converts neither form for you. A
   "replace_text" refused with code "replacement_escape_suspected" changed nothing and allows exactly
   ONE retry, which must differ from the refused request.
 - A "list_files" result's "nextCursor" is the ONLY thing that tells you whether there is more:
