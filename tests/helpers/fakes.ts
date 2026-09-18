@@ -44,6 +44,7 @@ export function makeSpecification(overrides: Partial<TaskSpecification> = {}): T
     constraints: ['Do not change the existing routes.'],
     suggestedTests: ['A test asserting GET /health returns 200.'],
     implementationPrompt: 'Add a /health route and a test for it.',
+    scopedFilePaths: [],
     ...overrides
   };
 }

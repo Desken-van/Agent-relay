@@ -1129,9 +1129,44 @@ thread.runStreamed(input, { outputSchema, signal })
   object, so both carry the task's model; `null` omits the key entirely.
 * **Review also runs `read-only`, and that is not configurable** — a review that
   can edit the code it is judging is not a review.
-* The same Zod schema that validates the response is projected to JSON Schema via
+* The Zod schema that validates the response is projected to JSON Schema via
   `z.toJSONSchema()` and passed as `outputSchema`, so the model is constrained on
-  the way out and checked on the way in. One definition, no drift.
+  the way out and checked on the way in. **What the model is given is a strict
+  contract.** OpenAI structured outputs reject an object schema whose `required`
+  does not list every key of `properties`, so the specification's model-facing
+  schema (`taskSpecificationResponseSchema`) has no optional field:
+  `scopedFilePaths` is required and the prompt tells the model to return `[]`
+  when it has no confident scope, never to omit it.
+* **How Agent Relay reads a specification is a separate schema**
+  (`taskSpecificationSchema`): the same fields, except that a missing
+  `scopedFilePaths` — a specification stored before the field existed — reads as
+  `[]`. Every consumer of a stored specification uses the reading schema; only
+  `taskSpecificationJsonSchema()` uses the strict one. Both share one field
+  definition, and no behaviour depends on how Zod would emit a default into JSON
+  Schema.
+* `specificationIdentity` hashes the specification **as stored**: the reader's
+  `[]` for a missing `scopedFilePaths` is not added to the canonical text. The
+  hash is persisted with plan-review gates and compared for equality, so
+  normalizing a legacy row must not make its gate obsolete. An explicitly stored
+  `[]` hashes as it always did.
+* A structural test walks every Codex model-facing schema (specification,
+  review, triage, implementation report) at every object level and fails when a
+  property is not required or `additionalProperties` is not `false`, so a future
+  optional field cannot reach the API unnoticed.
+* **The failure a user sees is the provider's, not the process's.** A failed turn
+  yields a structured `error` / `turn.failed` event (its `message` is often a
+  JSON document with the API's `code`, `type`, `param` and HTTP status) and, once
+  stdout ends, an SDK throw `Codex Exec exited with code N: <all stderr>`. The
+  structured event is the primary error (`Codex failed: [invalid_json_schema] …
+  (param …, HTTP 400)`), bounded, redacted and with the home directory replaced
+  by `~`. Stderr is diagnostics: it is stored as a bounded, redacted `stderr`
+  run event (best-effort, recorded after the error is built, so a failing event
+  store cannot replace the cause), and the raw `error` events stay in the log.
+  With no structured event (stderr-only failure, spawn error, stream ending
+  early) the earlier fallback — `Codex failed: ` plus the first 500 redacted
+  characters — applies. Authentication is classified from the provider's status
+  and code only, never from free-text stderr. A stop or timeout still outranks
+  either.
 
 ### Claude Code — CLI, print mode
 

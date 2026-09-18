@@ -31,7 +31,7 @@ describe('provider selection controls', () => {
     installBridge();
     const specification = {
       title: 'Task', summary: 'Do it safely.', assumptions: [], acceptanceCriteria: ['It works.'],
-      constraints: [], suggestedTests: ['Run the tests.'], implementationPrompt: 'Do it.'
+      constraints: [], suggestedTests: ['Run the tests.'], implementationPrompt: 'Do it.', scopedFilePaths: []
     };
     const detail: TaskDetail = {
       task: {
@@ -78,7 +78,7 @@ describe('provider selection controls', () => {
     });
     const specification = {
       title: 'Task', summary: 'Do it safely.', assumptions: [], acceptanceCriteria: ['It works.'],
-      constraints: [], suggestedTests: [], implementationPrompt: 'Do it.'
+      constraints: [], suggestedTests: [], implementationPrompt: 'Do it.', scopedFilePaths: []
     };
     const detail: TaskDetail = {
       task: {

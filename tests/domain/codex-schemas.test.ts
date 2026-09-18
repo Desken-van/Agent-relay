@@ -1,14 +1,18 @@
 import { describe, expect, it } from 'vitest';
+import { IMPLEMENTATION_REPORT_SCHEMA } from '../../src/main/adapters/codex/codex-adapter';
 import {
   codexReviewResultJsonSchema,
   codexReviewResultSchema,
   extractJsonObject,
+  findingTriageResultJsonSchema,
   parseCodexReviewResult,
   parseTaskSpecification,
   taskSpecificationJsonSchema,
+  taskSpecificationResponseSchema,
   taskSpecificationSchema
 } from '../../src/shared/schemas/codex';
 import { makeReview, makeSpecification } from '../helpers/fakes';
+import { strictSchemaViolations } from '../helpers/strict-json-schema';
 
 describe('extractJsonObject', () => {
   it('finds a bare object', () => {
@@ -111,11 +115,52 @@ describe('specification parsing', () => {
     expect(outcome.value?.scopedFilePaths).toEqual(['docs/manual-test.md']);
   });
 
-  it('accepts a specification with no scopedFilePaths at all', () => {
-    const { scopedFilePaths: _dropped, ...rest } = { ...makeSpecification(), scopedFilePaths: undefined };
-    const outcome = parseTaskSpecification(JSON.stringify(rest));
+  it('reads a legacy specification with no scopedFilePaths and normalizes it to an empty scope', () => {
+    const { scopedFilePaths: _dropped, ...legacy } = makeSpecification();
+    expect('scopedFilePaths' in legacy).toBe(false);
+
+    const outcome = parseTaskSpecification(JSON.stringify(legacy));
     expect(outcome.ok).toBe(true);
-    expect(outcome.value?.scopedFilePaths).toBeUndefined();
+    expect(outcome.value?.scopedFilePaths).toEqual([]);
+
+    // The reader every stored specification goes through agrees.
+    expect(taskSpecificationSchema.parse(legacy).scopedFilePaths).toEqual([]);
+  });
+
+  it('leaves an explicit scopedFilePaths untouched, including an explicit empty one', () => {
+    const scope = ['docs/manual-test.md', 'src/a.ts'];
+    expect(taskSpecificationSchema.parse(makeSpecification({ scopedFilePaths: scope })).scopedFilePaths).toEqual(scope);
+    expect(taskSpecificationSchema.parse(makeSpecification({ scopedFilePaths: [] })).scopedFilePaths).toEqual([]);
+  });
+
+  it('gives every parse of a legacy specification its own scope array', () => {
+    const { scopedFilePaths: _dropped, ...legacy } = makeSpecification();
+    const first = taskSpecificationSchema.parse(legacy);
+    const second = taskSpecificationSchema.parse(legacy);
+    first.scopedFilePaths.push('mutated.ts');
+    expect(second.scopedFilePaths).toEqual([]);
+    expect(taskSpecificationSchema.parse(legacy).scopedFilePaths).toEqual([]);
+  });
+
+  it('rejects a null or non-array scopedFilePaths rather than treating it as absent', () => {
+    for (const bad of [null, 'docs/a.md', 3]) {
+      const outcome = parseTaskSpecification(JSON.stringify({ ...makeSpecification(), scopedFilePaths: bad }));
+      expect(outcome.ok).toBe(false);
+      expect(outcome.error).toContain('scopedFilePaths');
+    }
+  });
+
+  it('requires scopedFilePaths in the strict response contract the model is held to', () => {
+    const { scopedFilePaths: _dropped, ...legacy } = makeSpecification();
+    const outcome = taskSpecificationResponseSchema.safeParse(legacy);
+    expect(outcome.success).toBe(false);
+    expect(JSON.stringify(outcome.error?.issues)).toContain('scopedFilePaths');
+    expect(taskSpecificationResponseSchema.safeParse(makeSpecification()).success).toBe(true);
+  });
+
+  it('reads any valid response identically through the strict and the reading schema', () => {
+    const value = makeSpecification({ scopedFilePaths: ['docs/manual-test.md'] });
+    expect(taskSpecificationSchema.parse(value)).toEqual(taskSpecificationResponseSchema.parse(value));
   });
 
   it('rejects scopedFilePaths beyond the count limit, without rejecting the rest of the specification unnecessarily', () => {
@@ -186,12 +231,83 @@ describe('review parsing', () => {
 });
 
 describe('JSON Schema projection handed to Codex', () => {
-  it('produces an object schema for the specification with all fields required', () => {
-    const schema = taskSpecificationJsonSchema() as {
-      type: string;
-      required: string[];
-      properties: Record<string, unknown>;
+  interface ObjectSchema {
+    type: string;
+    required: string[];
+    properties: Record<string, unknown>;
+    additionalProperties: unknown;
+  }
+
+  it('lists exactly the same names in the specification schema properties and required', () => {
+    const schema = taskSpecificationJsonSchema() as unknown as ObjectSchema;
+    expect([...schema.required].sort()).toEqual(Object.keys(schema.properties).sort());
+    expect(schema.additionalProperties).toBe(false);
+  });
+
+  it('requires scopedFilePaths in the schema handed to the model', () => {
+    const schema = taskSpecificationJsonSchema() as unknown as ObjectSchema;
+    expect(schema.properties.scopedFilePaths).toBeDefined();
+    expect(schema.required).toContain('scopedFilePaths');
+  });
+
+  it('tells the model to return an empty array, not to omit scopedFilePaths, in the schema itself', () => {
+    const schema = taskSpecificationJsonSchema() as unknown as {
+      properties: { scopedFilePaths: { description: string; type: string; maxItems: number } };
     };
+    const { description, type, maxItems } = schema.properties.scopedFilePaths;
+    expect(type).toBe('array');
+    expect(maxItems).toBe(20);
+    expect(description).toMatch(/empty array/i);
+    expect(description).toMatch(/always include/i);
+    expect(description).not.toMatch(/\bomit\b/i);
+    expect(description).toMatch(/not an access restriction/i);
+  });
+
+  it('sends no default keyword: the schema comes from the strict contract, not the reader', () => {
+    expect(JSON.stringify(taskSpecificationJsonSchema())).not.toContain('"default"');
+  });
+
+  it('holds every model-facing Codex schema to the strict-output rules at every object level', () => {
+    const schemas: Record<string, unknown> = {
+      specification: taskSpecificationJsonSchema(),
+      review: codexReviewResultJsonSchema(),
+      triage: findingTriageResultJsonSchema(),
+      implementationReport: IMPLEMENTATION_REPORT_SCHEMA
+    };
+    for (const [name, schema] of Object.entries(schemas)) {
+      expect({ name, violations: strictSchemaViolations(schema) }).toEqual({ name, violations: [] });
+    }
+  });
+
+  it('the strict-schema check is not vacuous: it catches an optional field, at the root and nested', () => {
+    const optionalAtRoot = {
+      type: 'object',
+      properties: { a: { type: 'string' }, b: { type: 'array', items: { type: 'string' } } },
+      required: ['a'],
+      additionalProperties: false
+    };
+    expect(strictSchemaViolations(optionalAtRoot)).toEqual(['#: properties not listed in required: b']);
+
+    const nested = {
+      type: 'object',
+      properties: {
+        list: {
+          type: 'array',
+          items: { type: 'object', properties: { x: { type: 'string' } }, required: [], additionalProperties: false }
+        },
+        maybe: { anyOf: [{ type: 'null' }, { type: 'object', properties: { y: { type: 'number' } }, required: ['y'] }] }
+      },
+      required: ['list', 'maybe'],
+      additionalProperties: false
+    };
+    expect(strictSchemaViolations(nested)).toEqual([
+      '#/properties/list/items: properties not listed in required: x',
+      '#/properties/maybe/anyOf/1: additionalProperties must be false'
+    ]);
+  });
+
+  it('produces an object schema for the specification with all fields required', () => {
+    const schema = taskSpecificationJsonSchema() as unknown as ObjectSchema;
     expect(schema.type).toBe('object');
     for (const field of [
       'title',
@@ -217,15 +333,29 @@ describe('JSON Schema projection handed to Codex', () => {
     expect(schema.required).toContain('followUpPrompt');
   });
 
-  it('keeps the JSON Schema and the Zod validator in agreement', () => {
-    // Anything the JSON Schema declares required must be required by Zod too,
-    // otherwise the model would be constrained differently from the parser.
-    const specSchema = taskSpecificationJsonSchema() as { required: string[] };
+  it('keeps the JSON Schema and the Zod validator in agreement, in both directions', () => {
+    // Required in the JSON Schema => required by Zod, otherwise the model would
+    // be constrained differently from the parser.
+    const specSchema = taskSpecificationJsonSchema() as unknown as ObjectSchema;
     for (const field of specSchema.required) {
       const stripped = { ...makeSpecification() } as Record<string, unknown>;
       delete stripped[field];
-      expect(taskSpecificationSchema.safeParse(stripped).success).toBe(false);
+      expect(taskSpecificationResponseSchema.safeParse(stripped).success).toBe(false);
     }
+
+    // Required by Zod => listed as required in the JSON Schema. This is the
+    // direction that catches an optional field being advertised to the model.
+    for (const field of Object.keys(makeSpecification())) {
+      const stripped = { ...makeSpecification() } as Record<string, unknown>;
+      delete stripped[field];
+      if (!taskSpecificationResponseSchema.safeParse(stripped).success) {
+        expect(specSchema.required).toContain(field);
+      }
+    }
+    // Every field the Zod contract defines is one the model is given, and no more.
+    expect(Object.keys(specSchema.properties).sort()).toEqual(
+      Object.keys(taskSpecificationResponseSchema.shape).sort()
+    );
 
     const reviewSchema = codexReviewResultJsonSchema() as { required: string[] };
     for (const field of reviewSchema.required) {
