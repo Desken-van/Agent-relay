@@ -993,4 +993,174 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(forModel.truncated).toBe(true);
     });
   });
+
+  describe('read_file accounting and identity-reuse policy', () => {
+    it('charges the full file size for a small offset/limit slice, because identity/security verification requires the whole file', async () => {
+      const content = 'y'.repeat(50_000);
+      writeFileSync(join(worktree, 'large.txt'), content, 'utf8');
+      const boundary = tools();
+
+      const result = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'large.txt', offset: 10, limit: 5 },
+        undefined,
+        { readBytes: 50_000, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: true, readBytes: 50_000 });
+      if (!result.ok) throw new Error('expected a successful read');
+      expect((result.forModel as { bytesRead: number }).bytesRead).toBe(5);
+    });
+
+    it('independently re-verifies a second read of the same path at a different offset, never reusing stale content', async () => {
+      writeFileSync(join(worktree, 'mutable.txt'), 'AAAAAAAAAA', 'utf8');
+      const boundary = tools();
+
+      const first = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'mutable.txt', offset: 0, limit: 5 },
+        undefined,
+        { readBytes: 1000, writeBytes: 0 }
+      );
+      expect(first).toMatchObject({ ok: true, readBytes: 10 });
+
+      // Replaced out from under the tool between two calls of the SAME run: a
+      // cache keyed only on path (no design this repository adopted) would
+      // still serve the stale content here; this tool has none, so the
+      // second call must independently re-verify and see the new bytes.
+      writeFileSync(join(worktree, 'mutable.txt'), 'BBBBBBBBBB', 'utf8');
+      const second = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'mutable.txt', offset: 5, limit: 5 },
+        undefined,
+        { readBytes: 1000, writeBytes: 0 }
+      );
+
+      expect(second).toMatchObject({ ok: true, readBytes: 10 });
+      if (!second.ok) throw new Error('expected a successful read');
+      expect((second.forModel as { content: string }).content).toBe('BBBBB');
+    });
+  });
+
+  describe('searchText authoritative scope', () => {
+    function toolsWithScope(scopedFilePathCandidates: readonly string[]): OrnithWorktreeTools {
+      return new OrnithWorktreeTools({
+        worktreePath: worktree,
+        worktreesRoot,
+        repositoryPath: repository,
+        branchName: 'task',
+        runner,
+        gitExecutablePath: gitPath,
+        scopedFilePathCandidates
+      });
+    }
+
+    it('scans only the manifest-confirmed authoritative scope when the model omits files, and records it in auditSummary', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'needle here\n', 'utf8');
+      writeFileSync(join(worktree, 'other.txt'), 'needle here too\n', 'utf8');
+      const boundary = toolsWithScope(['scoped.txt']);
+
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
+        undefined,
+        { readBytes: 100_000, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('expected a successful search');
+      const forModel = result.forModel as { matches: { path: string; line: number }[] };
+      expect(forModel.matches).toEqual([{ path: 'scoped.txt', line: 1 }]); // other.txt was never scanned
+      expect(result.auditSummary).toContain('scoped to 1 authoritative file');
+    });
+
+    it('an explicit action.files list overrides the authoritative scope entirely', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'needle here\n', 'utf8');
+      writeFileSync(join(worktree, 'other.txt'), 'needle here too\n', 'utf8');
+      const boundary = toolsWithScope(['scoped.txt']);
+
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10, files: ['other.txt'] },
+        undefined,
+        { readBytes: 100_000, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('expected a successful search');
+      const forModel = result.forModel as { matches: { path: string; line: number }[] };
+      expect(forModel.matches).toEqual([{ path: 'other.txt', line: 1 }]);
+    });
+
+    it('a nonexistent declared scope candidate is dropped, falling back to unrestricted discovery', async () => {
+      writeFileSync(join(worktree, 'real.txt'), 'needle here\n', 'utf8');
+      const boundary = toolsWithScope(['docs/does-not-exist.md']);
+
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
+        undefined,
+        { readBytes: 100_000, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('expected a successful search');
+      const forModel = result.forModel as { matches: { path: string; line: number }[] };
+      expect(forModel.matches).toEqual([{ path: 'real.txt', line: 1 }]);
+      expect(result.auditSummary).not.toContain('scoped to');
+    });
+
+    it('unions the authoritative scope with files created this run, so a search never goes blind to its own work', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'plain\n', 'utf8');
+      const boundary = toolsWithScope(['scoped.txt']);
+      const created = await boundary.createFile(
+        { version: 1, action: 'create_file', path: 'notes.txt', content: 'needle appears here\n' },
+        undefined,
+        { readBytes: 0, writeBytes: 1000 }
+      );
+      expect(created).toMatchObject({ ok: true });
+
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
+        undefined,
+        { readBytes: 100_000, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('expected a successful search');
+      const forModel = result.forModel as { matches: { path: string; line: number }[] };
+      expect(forModel.matches).toEqual([{ path: 'notes.txt', line: 1 }]);
+    });
+  });
+
+  describe('searchText mid-scan cumulative read-budget handling', () => {
+    it('returns honest partial matches and the true bytes read when the cumulative budget runs out mid-scan, never discarding progress', async () => {
+      const matchBytes = Buffer.byteLength('needle\n', 'utf8');
+      writeFileSync(join(worktree, 'a-match.txt'), 'needle\n', 'utf8');
+      writeFileSync(join(worktree, 'b-toobig.txt'), 'z'.repeat(1000), 'utf8');
+      const boundary = tools();
+
+      const result = await boundary.searchText(
+        {
+          version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10,
+          files: ['a-match.txt', 'b-toobig.txt']
+        },
+        undefined,
+        { readBytes: matchBytes, writeBytes: 0 } // fits exactly the first candidate, never the second
+      );
+
+      expect(result).toMatchObject({ ok: true, readBytes: matchBytes });
+      if (!result.ok) throw new Error('expected a partial success, not a denial');
+      const forModel = result.forModel as { matches: { path: string; line: number }[]; truncated: boolean };
+      expect(forModel.matches).toEqual([{ path: 'a-match.txt', line: 1 }]);
+      expect(forModel.truncated).toBe(true);
+    });
+
+    it('denies with limit_read_bytes_exceeded and zero progress when even the first candidate cannot fit the remaining budget', async () => {
+      writeFileSync(join(worktree, 'toobig.txt'), 'needle '.repeat(200), 'utf8');
+      const boundary = tools();
+
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10, files: ['toobig.txt'] },
+        undefined,
+        { readBytes: 5, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    });
+  });
 });

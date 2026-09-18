@@ -89,6 +89,18 @@ export const ORNITH_LIMITS = {
    *  read-only action is recoverable this way; every other denial code
    *  remains terminal. */
   maxReadOnlyRecoveryAttempts: 3,
+  /** Separate, single-shot recovery budget for a read-only action denied by
+   *  `limit_read_bytes_exceeded`: one bounded chance to pivot to a mutation
+   *  using already-verified context before the run ends. Kept independent of
+   *  `maxReadOnlyRecoveryAttempts` because the two denials have different
+   *  causes (transient timeout vs. exhausted resource budget). */
+  maxReadBudgetRecoveryAttempts: 1,
+
+  /** Discovery-scope hint: how many of a specification's declared
+   *  `scopedFilePaths` entries are honored after syntax sanitization. Matches
+   *  `taskSpecificationSchema`'s own array cap; re-checked here because the
+   *  sanitizer is reused independently of that schema. */
+  maxScopedFilePaths: 20,
 
   /** Repository manifest. */
   maxManifestFiles: 20_000,
@@ -214,6 +226,30 @@ function isValidOrnithRelativePath(value: string): boolean {
 export const ornithRelativePathSchema = z
   .string()
   .refine(isValidOrnithRelativePath, 'Not a normalized repository-relative POSIX path.');
+
+/**
+ * Reduce a specification's raw, model-authored `scopedFilePaths` claim to a
+ * safe, deduplicated, bounded candidate list, using the exact same strict
+ * syntax check a live action's `path` field must pass. This is intentionally
+ * permissive at the schema layer (`taskSpecificationSchema` only bounds count
+ * and length) and strict here: a malformed or oversized entry is dropped
+ * individually rather than failing specification parsing outright, and later,
+ * manifest-membership filtering (in `OrnithWorktreeTools`) further narrows the
+ * result to paths that actually exist. Never throws.
+ */
+export function sanitizeScopedFilePaths(candidates: readonly string[] | undefined): string[] {
+  if (!candidates || candidates.length === 0) return [];
+  const seen = new Set<string>();
+  const sanitized: string[] = [];
+  for (const candidate of candidates) {
+    if (sanitized.length >= ORNITH_LIMITS.maxScopedFilePaths) break;
+    if (seen.has(candidate)) continue;
+    if (!ornithRelativePathSchema.safeParse(candidate).success) continue;
+    seen.add(candidate);
+    sanitized.push(candidate);
+  }
+  return sanitized;
+}
 
 /** Same rule, but an empty string is accepted to mean "the worktree root". */
 export const ornithRelativePrefixSchema = z

@@ -227,6 +227,49 @@ function WarningLine({
   );
 }
 
+/** The enriched `data` shape Ornith attaches to a denied-action `tool_use` event. */
+interface OrnithDenialData {
+  readonly action: string;
+  readonly code: string;
+  readonly recoverable: boolean;
+  readonly readBytesUsed: number;
+  readonly readBytesConfigured: number;
+  readonly changedFiles: number;
+}
+
+function isOrnithDenialData(data: Record<string, unknown> | null): data is Record<string, unknown> & OrnithDenialData {
+  return (
+    data !== null &&
+    data['ok'] === false &&
+    typeof data['action'] === 'string' &&
+    typeof data['code'] === 'string' &&
+    typeof data['recoverable'] === 'boolean' &&
+    typeof data['readBytesUsed'] === 'number' &&
+    typeof data['readBytesConfigured'] === 'number' &&
+    typeof data['changedFiles'] === 'number'
+  );
+}
+
+/**
+ * A precise line for an Ornith denied-action event, replacing the plain
+ * "Ornith action X denied (code)." text with the exact facts an operator
+ * needs: which action, which code, the used/configured read budget, whether
+ * the run may still retry/pivot or has stopped, and whether anything has
+ * changed yet — never a generic "unsafe or over-limit action" message when a
+ * precise reason already exists in `data`.
+ */
+function OrnithDenialLine({ data }: { data: OrnithDenialData }): React.JSX.Element {
+  return (
+    <div className="logs__text selectable">
+      Ornith action <span className="mono">{data.action}</span> denied (
+      <span className="mono">{data.code}</span>) · read budget {data.readBytesUsed} /{' '}
+      {data.readBytesConfigured} bytes ·{' '}
+      {data.recoverable ? 'one recovery attempt offered' : 'the run stopped'} ·{' '}
+      {data.changedFiles === 0 ? 'no files changed yet' : `${data.changedFiles} file(s) changed`}
+    </div>
+  );
+}
+
 function RelayNodeBody({ run }: { run: Run }): React.JSX.Element {
   const { liveEvents } = useStore();
   const [stored, setStored] = useState<RunEvent[] | null>(null);
@@ -315,6 +358,8 @@ function RelayNodeBody({ run }: { run: Run }): React.JSX.Element {
                   </span>
                   {event.type === 'warning' ? (
                     <WarningLine text={decoded.text} data={decoded.data} />
+                  ) : event.type === 'tool_use' && isOrnithDenialData(decoded.data) ? (
+                    <OrnithDenialLine data={decoded.data} />
                   ) : (
                     <span className="logs__text selectable">{decoded.text}</span>
                   )}

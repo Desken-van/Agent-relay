@@ -113,6 +113,16 @@ export interface OrnithWorktreeToolsOptions {
   readonly branchName: string;
   readonly runner: ProcessRunner;
   readonly gitExecutablePath?: string | null;
+  /**
+   * A specification's raw `scopedFilePaths` claim, already syntax-sanitized
+   * by `sanitizeScopedFilePaths` (main/services/ornith-implementation.ts).
+   * Intersected against the real manifest once, inside `ensureManifest()`, to
+   * become `authoritativeScope` — a candidate that does not exist in this
+   * worktree is silently dropped, never treated as an error. Absent or fully
+   * unmatched means "no trustworthy scope": every existing code path then
+   * behaves exactly as it does without this option.
+   */
+  readonly scopedFilePathCandidates?: readonly string[];
   /** Deterministic race injection for security tests; never wired from IPC or model output. */
   readonly testHooks?: {
     readonly beforeMutation?: (
@@ -183,6 +193,8 @@ export class OrnithWorktreeTools {
   private readonly rootInode: bigint | number;
   private readonly fsGuard: WindowsFsGuard;
   private nativeRootIdentity: WindowsFsRootIdentity | null = null;
+  /** Manifest-confirmed subset of `scopedFilePathCandidates`, resolved once inside `ensureManifest()`. */
+  private authoritativeScope: readonly string[] | null = null;
 
   constructor(private readonly deps: OrnithWorktreeToolsOptions) {
     this.fsGuard = deps.fsGuard ?? new ExecaWindowsFsGuard(deps.runner);
@@ -385,10 +397,34 @@ export class OrnithWorktreeTools {
       const sorted = [...names].sort();
       this.manifest = sorted;
       for (const name of sorted) this.knownFiles.add(name);
+      const scopeCandidates = this.deps.scopedFilePathCandidates ?? [];
+      const validatedScope = [...new Set(scopeCandidates)].filter((path) => this.knownFiles.has(path));
+      this.authoritativeScope = validatedScope.length > 0 ? validatedScope : null;
       return sorted;
     } finally {
       dispose();
     }
+  }
+
+  /**
+   * Resolve and cache `authoritativeScope` against the real manifest, building
+   * the manifest if needed. Read-only, never mutates. Intended to be called
+   * once, eagerly, before the first prompt is built, so a scoped run's very
+   * first turn can already name the confirmed file(s) instead of discovering
+   * them lazily on first tool dispatch. Any failure (including one this run
+   * would hit anyway, such as a broken checkout identity) resolves to `null`
+   * rather than throwing: scope is a discovery optimization, never a
+   * precondition for the run to proceed, and the loop's own per-iteration
+   * `assertCheckoutIdentity` independently and unconditionally re-detects a
+   * genuinely broken worktree on its own very next check.
+   */
+  async resolveAuthoritativeScope(signal?: AbortSignal): Promise<readonly string[] | null> {
+    try {
+      await this.ensureManifest(signal);
+    } catch {
+      return null;
+    }
+    return this.authoritativeScope;
   }
 
   /* ------------------------------------------------------------------ */
@@ -678,6 +714,20 @@ export class OrnithWorktreeTools {
     }
   }
 
+  /**
+   * Charges the WHOLE file's size against the read budget even when `action`
+   * only requests a small offset/limit slice, and even on a repeat read of a
+   * path already read this run. This is intentional, not an oversight: the
+   * whole file must be opened, read once, decoded, hashed (the returned
+   * `sha256` is over the complete content) and scanned for credential-shaped
+   * text before any slice of it can be safely returned, and the post-read
+   * identity re-verification below only makes sense against that same
+   * complete read. A per-run cache to avoid re-paying this on a later slice
+   * of an unchanged file was considered and rejected: this run's cumulative
+   * budget is meant to mean exactly "bytes actually read this run", and an
+   * existing, deliberately-designed test exercises the cumulative cap via
+   * repeated full-price reads of one large file at different offsets.
+   */
   async readFile(action: Extract<OrnithAction, { action: 'read_file' }>, signal?: AbortSignal, budget = DEFAULT_OPERATION_BUDGET): Promise<OrnithToolResult> {
     const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.filesystemTimeoutMs, signal);
     try {
@@ -778,7 +828,18 @@ export class OrnithWorktreeTools {
     const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.searchTimeoutMs, signal);
     try {
       const manifest = await this.ensureManifest(bounded);
-      const candidates = action.files ?? manifest;
+      // A file this run itself created or modified is unioned into the
+      // authoritative scope (not into `manifest`, which already includes it):
+      // Codex's pre-approved scope claim can never have named a path that did
+      // not exist when the specification was written, so a search the model
+      // narrows to "the file(s) I already know about" must not go blind to
+      // its own work-in-progress within the same run.
+      const scopedCandidates = this.authoritativeScope === null
+        ? null
+        : [...new Set([...this.authoritativeScope, ...this.changedFiles])];
+      const explicitFiles = action.files;
+      const candidates = explicitFiles ?? scopedCandidates ?? manifest;
+      const scopedToAuthority = explicitFiles === undefined && scopedCandidates !== null;
       for (const path of candidates) {
         if (!this.knownFiles.has(path)) {
           return denied('file_not_found', `"${path}" is not part of the task manifest.`);
@@ -817,6 +878,10 @@ export class OrnithWorktreeTools {
       let anySkippedDueToBudget = false;
       let firstSkipped: { path: string; line: number; requiredBytes: number } | null = null;
       let readBytesTotal = 0;
+      /** Set when a candidate's own size would exceed the remaining cumulative
+       *  read budget, so the outer loop stops before touching it. See the
+       *  zero-progress-vs-partial-progress split below the loop. */
+      let readBudgetExhausted = false;
 
       for (const path of candidates) {
         if (matches.length >= action.limit) break;
@@ -836,7 +901,15 @@ export class OrnithWorktreeTools {
           const stats = await lstat(resolved.absolutePath);
           if (stats.size > ORNITH_LIMITS.maxReadBytes) continue;
           if (readBytesTotal + stats.size > budget.readBytes) {
-            return denied('limit_read_bytes_exceeded', 'Search would exceed the remaining repository byte budget.');
+            // This exact candidate is never opened or read — `readBytesTotal`
+            // below is therefore always exactly the sum of PRIOR, fully and
+            // successfully read candidates, never a partial figure for this
+            // one. Stop scanning; the zero-vs-partial-progress split below
+            // decides whether that is an honest empty denial or an honest
+            // partial success, but either way nothing already accounted for
+            // is discarded.
+            readBudgetExhausted = true;
+            break;
           }
           const safeRead = await this.readRegularFileSafely(
             resolved.absolutePath,
@@ -903,12 +976,28 @@ export class OrnithWorktreeTools {
         );
       }
 
+      // Zero progress (nothing read, nothing found) before the cumulative read
+      // budget stopped the scan: an honest, explicit denial — this is a real
+      // "this request cannot proceed" fact, eligible for the caller's bounded
+      // one-shot read-budget recovery. `readBytesTotal === 0` is sufficient to
+      // detect this: a match can only be recorded after a successful read,
+      // which always adds to `readBytesTotal` first.
+      if (readBudgetExhausted && readBytesTotal === 0) {
+        return denied(
+          'limit_read_bytes_exceeded',
+          `The remaining repository read budget (${budget.readBytes} byte(s)) could not fit even the smallest ` +
+            'unscanned candidate file. search_text made no progress.'
+        );
+      }
+
       return {
         ok: true,
-        forModel: { matches, truncated: matches.length >= action.limit || anySkippedDueToBudget },
+        forModel: { matches, truncated: matches.length >= action.limit || anySkippedDueToBudget || readBudgetExhausted },
         readBytes: readBytesTotal,
         writeBytes: 0,
-        auditSummary: `search_text -> ${matches.length} match(es) across ${candidates.length} file(s)`
+        auditSummary: scopedToAuthority
+          ? `search_text (scoped to ${candidates.length} authoritative file(s)) -> ${matches.length} match(es)`
+          : `search_text -> ${matches.length} match(es) across ${candidates.length} file(s)`
       };
     } catch (error) {
       return operationFailure(error, signal, bounded);

@@ -18,7 +18,8 @@ import {
   ornithRelativePrefixSchema,
   ornithSha256Schema,
   parseOrnithCompletion,
-  redactAbsoluteMachinePaths
+  redactAbsoluteMachinePaths,
+  sanitizeScopedFilePaths
 } from '../../src/shared/domain/ornith';
 import {
   implementationProviderSchema,
@@ -151,6 +152,41 @@ describe('ornithRelativePrefixSchema', () => {
   it('applies the same rules as the path schema when non-empty', () => {
     expect(ornithRelativePrefixSchema.safeParse('../escape').success).toBe(false);
     expect(ornithRelativePrefixSchema.safeParse('src').success).toBe(true);
+  });
+});
+
+describe('sanitizeScopedFilePaths', () => {
+  it('returns an empty array for undefined or empty input', () => {
+    expect(sanitizeScopedFilePaths(undefined)).toEqual([]);
+    expect(sanitizeScopedFilePaths([])).toEqual([]);
+  });
+
+  it('keeps every syntactically valid, distinct candidate', () => {
+    expect(sanitizeScopedFilePaths(['docs/manual-test.md', 'src/index.ts'])).toEqual([
+      'docs/manual-test.md',
+      'src/index.ts'
+    ]);
+  });
+
+  it('drops a syntactically invalid candidate without failing the rest', () => {
+    expect(sanitizeScopedFilePaths(['docs/manual-test.md', '../escape', 'C:/Windows', 'src/index.ts'])).toEqual([
+      'docs/manual-test.md',
+      'src/index.ts'
+    ]);
+  });
+
+  it('deduplicates repeated candidates', () => {
+    expect(sanitizeScopedFilePaths(['a.ts', 'a.ts', 'b.ts'])).toEqual(['a.ts', 'b.ts']);
+  });
+
+  it('caps the result at ORNITH_LIMITS.maxScopedFilePaths', () => {
+    const many = Array.from({ length: ORNITH_LIMITS.maxScopedFilePaths + 10 }, (_unused, i) => `f${i}.ts`);
+    expect(sanitizeScopedFilePaths(many)).toHaveLength(ORNITH_LIMITS.maxScopedFilePaths);
+  });
+
+  it('never throws on malformed input', () => {
+    expect(() => sanitizeScopedFilePaths(['\u0000bad', ''])).not.toThrow();
+    expect(sanitizeScopedFilePaths(['\u0000bad', ''])).toEqual([]);
   });
 });
 

@@ -26,6 +26,7 @@ import {
   ORNITH_LIMITS,
   containsAbsoluteMachinePath,
   parseOrnithCompletion,
+  sanitizeScopedFilePaths,
   type OrnithAction,
   type OrnithActionKind,
   type OrnithDenialCode
@@ -183,7 +184,8 @@ export function normalizeOrnithPromptInput(
       constraints: request.specification.constraints.map(safe),
       assumptions: request.specification.assumptions.map(safe),
       suggestedTests: request.specification.suggestedTests.map(safe),
-      implementationPrompt: safe(request.specification.implementationPrompt)
+      implementationPrompt: safe(request.specification.implementationPrompt),
+      scopedFilePaths: sanitizeScopedFilePaths(request.specification.scopedFilePaths?.map(safe))
     },
     ruleEvidence: request.ruleEvidence === null ? null : safe(request.ruleEvidence),
     acceptedPlanReviewAddenda:
@@ -196,6 +198,16 @@ export function normalizeOrnithPromptInput(
 }
 
 function renderSpecification(specification: TaskSpecification): string {
+  const scope = specification.scopedFilePaths ?? [];
+  const scopeSection = scope.length > 0
+    ? `\n=== SCOPE ===
+The approved specification confidently limits this task to the following existing repository
+file(s). Read them directly with "read_file" — you do not need "list_files" or "search_text" to
+find them. A "search_text" call that omits "files" is automatically limited to this scope (plus
+any file you have created or edited so far this run).
+${scope.map((path) => `  - ${path}`).join('\n')}
+`
+    : '';
   return `=== THE APPROVED SPECIFICATION ===
 Title: ${specification.title}
 
@@ -213,7 +225,7 @@ ${specification.assumptions.length > 0 ? specification.assumptions.map((a) => ` 
 
 Tests to add or run:
 ${specification.suggestedTests.length > 0 ? specification.suggestedTests.map((t) => `  - ${t}`).join('\n') : '  (none suggested)'}
-
+${scopeSection}
 === DETAILED INSTRUCTION ===
 ${specification.implementationPrompt}`;
 }
@@ -255,6 +267,14 @@ Rules:
   code "timeout" is recoverable a bounded number of times per run: choose a DIFFERENT, narrower
   request (fewer "files", a shorter prefix, a smaller byte range) on your next turn — repeating
   the identical request will be refused outright once, not retried.
+- A "search_text" or "read_file" that fails with code "limit_read_bytes_exceeded" gets exactly ONE
+  such recovery chance per run: on your next turn, either make the scoped edit now using context you
+  already have, or call "blocked" — repeating the identical request will be refused outright.
+- "search_text" reads the FULL content of every candidate file toward the same cumulative read
+  budget as "read_file" — a repository-wide search (no "files" given) is the most expensive
+  possible request. If a SCOPE section above names specific files, an unscoped search is
+  automatically limited to them; otherwise, prefer a narrow "files" list whenever you already know
+  which file matters.
 - A "list_files" result's "nextCursor" is the ONLY thing that tells you whether there is more:
   if it is a number, your NEXT "list_files" call for that SAME "prefix" must set "cursor" to
   exactly that number to continue; if it is null, that prefix is fully listed and must not be
@@ -522,14 +542,18 @@ const ORNITH_DENIAL_PUBLISH_BLOCK: Record<OrnithDenialCode, ClaudePublishBlock> 
 };
 
 /**
- * Only a plain `timeout` on a read-only action is fed back to the model as
- * recoverable feedback instead of ending the run — every other denial,
- * including a resource-budget `limit_*` code, stays terminal-but-explicit.
- * Read-only actions are the ones a repeat cannot corrupt anything by
- * retrying; a mutation or `run_verification` denial is never retried here.
+ * A plain `timeout`, or a `limit_read_bytes_exceeded`, on a read-only action
+ * is fed back to the model as recoverable feedback instead of ending the run
+ * outright — every other denial, including every other resource-budget
+ * `limit_*` code, stays terminal-but-explicit. Read-only actions are the ones
+ * a repeat cannot corrupt anything by retrying; a mutation or
+ * `run_verification` denial is never retried here. The two recoverable codes
+ * are tracked against SEPARATE bounded counters (see the loop) because they
+ * have different causes — a transient timeout vs. an exhausted resource
+ * budget — and a read-budget denial gets exactly one chance, not three.
  */
 function isRecoverableToolDenial(action: OrnithAction, code: OrnithDenialCode): boolean {
-  return code === 'timeout' && isNoProgressGuardAction(action);
+  return (code === 'timeout' || code === 'limit_read_bytes_exceeded') && isNoProgressGuardAction(action);
 }
 
 /** One safe, specific sentence naming the action, its exact denial code, and the tool's own reason. */
@@ -572,20 +596,21 @@ function assessmentFor(input: {
 
 export class OrnithImplementationService {
   async implement(request: OrnithImplementationRequest): Promise<OrnithImplementationResult> {
+    const deadline = Date.now() + request.loopDeadlineMs;
+    let promptInput = normalizeOrnithPromptInput(
+      request,
+      [request.worktreePath, request.repositoryPath]
+    );
     const tools = new OrnithWorktreeTools({
       worktreePath: request.worktreePath,
       worktreesRoot: request.worktreesRoot,
       repositoryPath: request.repositoryPath,
       branchName: request.branchName,
       runner: request.runner,
-      gitExecutablePath: request.gitExecutablePath ?? null
+      gitExecutablePath: request.gitExecutablePath ?? null,
+      scopedFilePathCandidates: promptInput.specification.scopedFilePaths
     });
 
-    const deadline = Date.now() + request.loopDeadlineMs;
-    const promptInput = normalizeOrnithPromptInput(
-      request,
-      [request.worktreePath, request.repositoryPath]
-    );
     const rolling: RollingResult[] = [];
     let turnsUsed = 0;
     let nonterminalActionsUsed = 0;
@@ -598,6 +623,7 @@ export class OrnithImplementationService {
     let previousReadOnlyOutcome: 'succeeded' | OrnithDenialCode | null = null;
     let consecutiveIdenticalReadOnlyActions = 0;
     let readOnlyRecoveryAttemptsUsed = 0;
+    let readBudgetRecoveryAttemptsUsed = 0;
     const outcomes: Array<{ sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }> = [];
     const finish = (
       disposition: 'pass' | 'fail', message: string,
@@ -647,6 +673,29 @@ export class OrnithImplementationService {
       );
     }
     const promptBudget = promptPreflight.budget;
+
+    // Resolve the specification's declared scope against the real manifest
+    // once, eagerly, so even the very first prompt can name the confirmed
+    // file(s) instead of the model discovering them lazily on first tool
+    // dispatch. A candidate the manifest does not confirm is dropped; if
+    // nothing survives (including a resolution failure, which `tools` itself
+    // already treats as "no scope" rather than throwing), fall back to the
+    // unmodified, unrestricted discovery behavior — scope is an optimization,
+    // never a precondition for the run to proceed.
+    const declaredScopeCandidates = promptInput.specification.scopedFilePaths ?? [];
+    if (declaredScopeCandidates.length > 0) {
+      const resolvedScope = await tools.resolveAuthoritativeScope(request.signal);
+      if (resolvedScope === null) {
+        request.onProgress({
+          type: 'progress',
+          text: 'Specification scope could not be confirmed against this worktree; using unrestricted discovery.'
+        });
+      }
+      promptInput = {
+        ...promptInput,
+        specification: { ...promptInput.specification, scopedFilePaths: resolvedScope !== null ? [...resolvedScope] : [] }
+      };
+    }
 
     for (;;) {
       if (request.signal.aborted) {
@@ -1011,25 +1060,45 @@ export class OrnithImplementationService {
       }
       if (!toolResult.ok) {
         outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code });
+
+        const isBudgetDenial = toolResult.code === 'limit_read_bytes_exceeded';
+        const recoveryAttemptsUsed = isBudgetDenial ? readBudgetRecoveryAttemptsUsed : readOnlyRecoveryAttemptsUsed;
+        const recoveryAttemptsMax = isBudgetDenial
+          ? ORNITH_LIMITS.maxReadBudgetRecoveryAttempts
+          : ORNITH_LIMITS.maxReadOnlyRecoveryAttempts;
+        const willRecover = isRecoverableToolDenial(action, toolResult.code) && recoveryAttemptsUsed < recoveryAttemptsMax;
+
+        // One event covers both facts (denied, and whether it will recover)
+        // so there is exactly one notification for this operation — never a
+        // second one moments later when the recovery branch below runs.
         request.onProgress({
           type: 'tool_use',
-          text: `Ornith action ${action.action} denied (${toolResult.code}).`,
-          data: { sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code, durationMs }
+          text: willRecover
+            ? `Ornith action ${action.action} denied (${toolResult.code}); one recovery attempt offered.`
+            : `Ornith action ${action.action} denied (${toolResult.code}); the run stopped.`,
+          data: {
+            sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code, durationMs,
+            recoverable: willRecover,
+            readBytesUsed: cumulativeReadBytes,
+            readBytesConfigured: ORNITH_LIMITS.maxCumulativeReadBytes,
+            changedFiles: tools.changedFileCount()
+          }
         });
 
-        if (
-          isRecoverableToolDenial(action, toolResult.code) &&
-          readOnlyRecoveryAttemptsUsed < ORNITH_LIMITS.maxReadOnlyRecoveryAttempts
-        ) {
-          readOnlyRecoveryAttemptsUsed += 1;
-          const remaining = ORNITH_LIMITS.maxReadOnlyRecoveryAttempts - readOnlyRecoveryAttemptsUsed;
+        if (willRecover) {
+          if (isBudgetDenial) readBudgetRecoveryAttemptsUsed += 1; else readOnlyRecoveryAttemptsUsed += 1;
+          const remaining = recoveryAttemptsMax - (recoveryAttemptsUsed + 1);
           const recoveryFeedback = {
             ok: false,
             code: toolResult.code,
-            reason:
-              `${toolResult.reason} (${describeActionParams(action)}) ${remaining} read-only recovery ` +
-              `attempt${remaining === 1 ? '' : 's'} remain this run. Narrow "files", the query, offset, or limit ` +
-              'before retrying; repeating this exact request will be refused.'
+            reason: isBudgetDenial
+              ? `${toolResult.reason} (${describeActionParams(action)}) No further reads or searches are ` +
+                'available for this request; the repository read budget for this run cannot fit it. Use the ' +
+                'verified context you already have to make the scoped edit now, or call "blocked" if you cannot ' +
+                'safely continue without it. This exact request will not be retried.'
+              : `${toolResult.reason} (${describeActionParams(action)}) ${remaining} read-only recovery ` +
+                `attempt${remaining === 1 ? '' : 's'} remain this run. Narrow "files", the query, offset, or limit ` +
+                'before retrying; repeating this exact request will be refused.'
           };
           rolling.push({ turn: turnsUsed, action: action.action, resultText: JSON.stringify(recoveryFeedback) });
           continue;

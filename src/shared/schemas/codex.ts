@@ -38,6 +38,18 @@ export const taskSpecificationSchema = z.object({
     .min(1)
     .describe(
       'A complete, self-contained instruction for the coding agent that will implement this task.'
+    ),
+  scopedFilePaths: z
+    .array(z.string().min(1).max(1024))
+    .max(20)
+    .optional()
+    .describe(
+      'When the ENTIRE implementation is confidently limited to a small, explicit list of existing ' +
+        'repository-relative file paths (for example, a documentation-only edit to one named file), ' +
+        'list every one of them here, using forward slashes relative to the repository root. This is ' +
+        'a discovery hint for the implementing agent, not an access restriction. Omit it whenever more ' +
+        'than a few files might be touched, a new file might need to be created, or you are not fully ' +
+        'certain of the exact set of paths.'
     )
 });
 

@@ -1181,6 +1181,8 @@ describe('prompt construction', () => {
     expect(prompt).toContain('read-only');
     expect(prompt).toContain('please add /health');
     expect(prompt).toContain('implementationPrompt');
+    expect(prompt).toContain('scopedFilePaths');
+    expect(prompt).toContain('discovery hint');
   });
 
   it('tells the reviewer it must not modify files and gives it the evidence', () => {
