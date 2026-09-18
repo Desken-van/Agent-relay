@@ -32,6 +32,7 @@ import { AgentRelayError, InvalidTransitionError } from '../../shared/domain/err
 import type { GitChangeSet } from '../../shared/domain/git';
 import type { Project, Settings, Task } from '../../shared/domain/models';
 import type { VerificationRecord } from '../../shared/domain/verification';
+import type { WorktreeDependencyStatus } from '../../shared/domain/worktree-dependencies';
 import {
   parsePlanReviewDecisions,
   parsePlanReviewFindings
@@ -108,7 +109,7 @@ import {
   verificationNeedsImplementationRepair
 } from '../../shared/domain/verification';
 import type { VerificationExecutor } from './worktree-verification';
-import type { WorktreeDependencyPreparer } from './worktree-dependencies';
+import type { WorktreeDependencyInstaller, WorktreeDependencyPreparer } from './worktree-dependencies';
 import type { ProtectedContinuationAction } from './continuation-service';
 import { redactAndTruncate, redactSecrets } from '../../shared/util/redact';
 import { ORNITH_LIMITS, ornithRelativePathSchema, redactAbsoluteMachinePaths } from '../../shared/domain/ornith';
@@ -138,6 +139,7 @@ export interface ContinuationActionGuard {
 export interface OrchestratorDeps {
   readonly verification?: VerificationExecutor;
   readonly worktreeDependencies?: WorktreeDependencyPreparer;
+  readonly worktreeDependencyInstaller?: WorktreeDependencyInstaller;
   readonly projects: ProjectRepository;
   readonly tasks: TaskRepository;
   readonly runs: RunRepository;
@@ -369,6 +371,66 @@ export class Orchestrator {
       if (this.requireTask(taskId).status === 'VERIFYING') this.applyEvent(this.requireTask(taskId), 'verification_aborted', { lastError: message });
       throw error;
     } finally { this.endExclusive(taskId); }
+  }
+
+  /** Read-only: never spawns anything, safe to call anytime a worktree exists. */
+  async dependencyStatus(taskId: string): Promise<WorktreeDependencyStatus> {
+    const task = this.requireTask(taskId);
+    if (!task.worktreePath) return { state: 'not_node_project', detail: 'This task has no worktree yet.' };
+    const project = this.requireProject(task.projectId);
+    const installer = this.deps.worktreeDependencyInstaller;
+    if (!installer) return { state: 'not_node_project', detail: 'Dependency status is not available in this build.' };
+    return installer.checkStatus({ repositoryPath: project.localPath, worktreePath: task.worktreePath });
+  }
+
+  /**
+   * Installs a task-local copy of dependencies with `npm ci`, scoped to this
+   * task's own worktree. Never runs while any run is active for this task —
+   * `npm ci` deletes and rewrites node_modules, which a concurrently running
+   * implementation, verification, or another install would observe mid-write.
+   * Deliberately does not transition task status: this is a preparatory,
+   * administrative step, not a stage in the relay loop.
+   */
+  async installDependencies(taskId: string): Promise<Task> {
+    const task = this.requireTask(taskId);
+    if (!task.worktreePath) throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree yet.');
+    if (isBusy(task.status)) {
+      throw new AgentRelayError('BUSY', 'This task has an agent running. Stop it before installing dependencies.');
+    }
+    if (this.deps.runs.listByTask(taskId).some((run) => run.status === 'running')) {
+      throw new AgentRelayError('BUSY', 'A run is still outstanding for this task.');
+    }
+    const installer = this.deps.worktreeDependencyInstaller;
+    if (!installer) throw new AgentRelayError('TOOL_MISSING', 'Dependency installation is not configured in this build.');
+    const settings = this.deps.settings.get();
+    const project = this.requireProject(task.projectId);
+    assertSafeWorktreePath({ worktreePath: task.worktreePath, worktreesRoot: settings.worktreesRoot, repositoryPath: project.localPath });
+
+    const controller = this.beginExclusive(taskId);
+    const handle = this.recorder(settings).start({ taskId, agent: 'system', runType: 'dependencies', round: task.currentRound });
+    try {
+      const outcome = await installer.installDependencies(
+        { repositoryPath: project.localPath, worktreePath: task.worktreePath },
+        controller.signal,
+        settings.processTimeoutMs,
+        settings.maxStoredLogBytes,
+        (event) => handle.append(event)
+      );
+      const succeeded = outcome.kind === 'succeeded';
+      handle.finish({
+        status: succeeded ? 'succeeded' : outcome.kind === 'cancelled' ? 'cancelled' : 'failed',
+        finalMessage: outcome.detail,
+        errorMessage: succeeded ? undefined : outcome.detail,
+        structuredResult: { version: 1, outcome: outcome.kind, state: outcome.status.state }
+      });
+      return this.patchTask(taskId, { lastError: succeeded ? null : outcome.detail });
+    } catch (error) {
+      const message = Orchestrator.describeError(error);
+      handle.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: message });
+      throw error;
+    } finally {
+      this.endExclusive(taskId);
+    }
   }
 
   private effectiveVerificationRun(taskId: string) {

@@ -130,6 +130,16 @@ export interface OrnithWorktreeToolsOptions {
       kind: 'create_file' | 'replace_text' | 'delete_file' | 'mkdirp',
       relativePath: string
     ) => void | Promise<void>;
+    /**
+     * Fires immediately before {@link identityRecheckCadence} performs an
+     * actual checkout-identity re-check partway through a multi-candidate
+     * scan (`searchText`, `gitDiff`'s untracked pass) — never on the calls in
+     * between, which are free. Used only to prove that a worktree swapped out
+     * from underneath a long-running scan is still caught within one
+     * recheck interval, not merely at the next model turn; never wired from
+     * IPC or model output.
+     */
+    readonly beforeIdentityRecheck?: () => void | Promise<void>;
   };
   /** Overridden only by tests that need to force the guard "unavailable" path. */
   readonly fsGuard?: WindowsFsGuard;
@@ -317,6 +327,29 @@ export class OrnithWorktreeTools {
     }
   }
 
+  /**
+   * A stateful, per-call cadence for re-confirming checkout identity across a
+   * multi-candidate scan (`searchText`, `gitDiff`'s untracked-file pass)
+   * without paying `assertCheckoutIdentity`'s `git` subprocess cost on every
+   * single candidate. The returned function resolves `true` immediately for
+   * every call except every `ORNITH_LIMITS.searchIdentityRecheckFiles`th,
+   * where it performs the real check; a caller must treat a `false` result
+   * exactly like a failed `assertCheckoutIdentity` call (deny and stop
+   * scanning at once — do not continue past it).
+   */
+  private identityRecheckCadence(signal: AbortSignal): () => Promise<boolean> {
+    let sinceLastCheck = 0;
+    return async (): Promise<boolean> => {
+      if (sinceLastCheck < ORNITH_LIMITS.searchIdentityRecheckFiles) {
+        sinceLastCheck += 1;
+        return true;
+      }
+      sinceLastCheck = 0;
+      await this.deps.testHooks?.beforeIdentityRecheck?.();
+      return this.assertCheckoutIdentity(signal);
+    };
+  }
+
   /* ------------------------------------------------------------------ */
   /* Manifest                                                            */
   /* ------------------------------------------------------------------ */
@@ -376,6 +409,14 @@ export class OrnithWorktreeTools {
    * component if it is a symlink; never trusts a name after it has been
    * checked once (the identity check re-happens against whatever `fs`
    * actually opens).
+   *
+   * Re-confirms checkout identity itself, so any single-file caller
+   * (`readFile`, `createFile`, `replaceText`, `deleteFile`) gets it for
+   * free. A caller that resolves many candidates in one action (`searchText`,
+   * `gitDiff`'s untracked-file pass) should call {@link assertCheckoutIdentity}
+   * on its own bounded cadence and use {@link resolvePathOnly} for the
+   * per-candidate work instead — see the comment on `searchText` for why a
+   * per-file call here does not scale.
    */
   private async resolveSafe(
     relativePath: string,
@@ -385,11 +426,29 @@ export class OrnithWorktreeTools {
     if (touchesDotGit(relativePath)) {
       return { ok: false, code: 'invalid_path', reason: 'The .git directory may not be accessed.' };
     }
-
-    const absolutePath = this.absolutePathFor(relativePath);
     if (!(await this.assertCheckoutIdentity(signal))) {
       return { ok: false, code: 'checkout_identity_changed', reason: 'The checkout identity changed.' };
     }
+    return this.resolvePathOnly(relativePath, options);
+  }
+
+  /**
+   * The path-safety half of {@link resolveSafe}, without the checkout-identity
+   * re-check: every existing ancestor's symlink/reparse/containment check,
+   * the final component's regular-file/symlink/hard-link check. Callers that
+   * already confirmed checkout identity once for the whole action (on their
+   * own bounded cadence — never skipped entirely) use this per candidate
+   * instead of paying a fresh `assertCheckoutIdentity` (and its `git`
+   * subprocess spawns) for every single file.
+   */
+  private async resolvePathOnly(
+    relativePath: string,
+    options: { mustExist: boolean; forWrite: boolean }
+  ): Promise<{ ok: true; absolutePath: string } | { ok: false; code: OrnithDenialCode; reason: string }> {
+    if (touchesDotGit(relativePath)) {
+      return { ok: false, code: 'invalid_path', reason: 'The .git directory may not be accessed.' };
+    }
+    const absolutePath = this.absolutePathFor(relativePath);
 
     // lstat every existing logical ancestor. realpath(parent) alone is not
     // sufficient: a junction may resolve somewhere else still inside the
@@ -726,6 +785,22 @@ export class OrnithWorktreeTools {
         }
       }
 
+      // A broad search scans up to the whole manifest. `resolveSafe` re-confirms
+      // checkout identity (several `git` subprocess spawns) on every call, which
+      // is the right cost for a single-file action but is what actually exhausted
+      // `searchTimeoutMs` here: one spawn-heavy check per candidate turned a
+      // few-hundred-file repository into hundreds of `git` invocations inside one
+      // timeout window. `ensureManifest` already checked identity once to build
+      // the manifest (or used the cached one); this checks it once more up front
+      // for a fresh call against a cached manifest, then only on a bounded
+      // cadence thereafter (`identityRecheckCadence`) — enough to still catch a
+      // worktree swapped out from underneath a long-running scan within one
+      // interval's worth of files, without paying the per-file cost.
+      if (!(await this.assertCheckoutIdentity(bounded))) {
+        return denied('checkout_identity_changed', 'The checkout identity changed.');
+      }
+      const stillCurrent = this.identityRecheckCadence(bounded);
+
       // Hoisted once: invariant for the whole call, not per candidate line.
       const skeletonBytes = Buffer.byteLength(JSON.stringify({ matches: [], truncated: true }), 'utf8');
       if (skeletonBytes > maxResultBytes) {
@@ -745,7 +820,16 @@ export class OrnithWorktreeTools {
 
       for (const path of candidates) {
         if (matches.length >= action.limit) break;
-        const resolved = await this.resolveSafe(path, { mustExist: true, forWrite: false }, bounded);
+        // Cheap, synchronous: several of this loop's own calls (`lstat`,
+        // `resolvePathOnly`) take no signal, so without this the loop would
+        // keep doing real filesystem work for the rest of a large candidate
+        // list after the timeout already fired, only stopping once an
+        // abort-aware read eventually throws.
+        if (bounded.aborted) return denied('timeout', 'The repository operation timed out.');
+        if (!(await stillCurrent())) {
+          return denied('checkout_identity_changed', 'The checkout identity changed.');
+        }
+        const resolved = await this.resolvePathOnly(path, { mustExist: true, forWrite: false });
         if (!resolved.ok) continue;
         let content: string;
         try {
@@ -1188,8 +1272,13 @@ export class OrnithWorktreeTools {
       const untrackedRaw = await this.git(untrackedArgs, bounded);
       if (untrackedRaw === null) return denied('internal_error', 'Untracked files could not be inspected.');
       const additions: string[] = [];
+      const stillCurrent = this.identityRecheckCadence(bounded);
       for (const path of untrackedRaw.split(String.fromCharCode(0)).filter(Boolean)) {
-        const resolved = await this.resolveSafe(path, { mustExist: true, forWrite: false }, bounded);
+        if (bounded.aborted) return denied('timeout', 'The repository operation timed out.');
+        if (!(await stillCurrent())) {
+          return denied('checkout_identity_changed', 'The checkout identity changed.');
+        }
+        const resolved = await this.resolvePathOnly(path, { mustExist: true, forWrite: false });
         if (!resolved.ok) return denied(resolved.code, resolved.reason);
         const stats = await lstat(resolved.absolutePath);
         if (bytesConsumed + stats.size > budget.readBytes) {

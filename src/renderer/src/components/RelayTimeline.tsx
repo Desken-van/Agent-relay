@@ -12,10 +12,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Run, RunEvent } from '@shared/domain/models';
 import { readVerification } from '@shared/domain/verification';
 import { call } from '../lib/api';
-import {
-  readClaudeAssessment,
-  type ClaudeVerificationStatus
-} from '@shared/domain/claude-assessment';
+import { readClaudeAssessment } from '@shared/domain/claude-assessment';
 import { decodeEvent, formatDuration, formatTime } from '../lib/format';
 import { useStore } from '../state/store';
 import { agentTone, Empty } from './primitives';
@@ -27,7 +24,8 @@ const RUN_LABELS: Record<Run['runType'], string> = {
   review: 'Review',
   correction: 'Correction',
   git: 'Git',
-  github: 'GitHub'
+  github: 'GitHub',
+  dependencies: 'Install dependencies'
 };
 
 const AGENT_LABELS: Record<Run['agent'], string> = {
@@ -139,14 +137,28 @@ function VerificationTag({ run }: { run: Run }): React.JSX.Element | null {
   const result = readClaudeAssessment(run.structuredResult);
   if (!result.ok) return null;
 
-  const status: ClaudeVerificationStatus = result.assessment.verificationStatus;
+  const { verificationStatus: status, publishBlock, reasonCodes } = result.assessment;
   // Agent-side verification runs inside the provider sandbox and is diagnostic.
   // Relay's separate snapshot verification is authoritative, so an unavailable
   // or failed provider check is a warning here rather than a failed run.
   const tone = status === 'passed' ? 'ok' : 'warn';
 
+  // "not run" alone reads as an unexplained problem with verification itself,
+  // but a round can just as easily fail for a reason that never reaches
+  // verification at all (a read-only tool timeout, a resource limit, a
+  // security refusal). When that is why, name the real reason on the tag
+  // itself rather than leaving it to the hover-only title.
+  if (status === 'not_run' && publishBlock !== 'none' && publishBlock !== 'verification') {
+    const reason = reasonCodes[0]?.replace(/_/g, ' ') ?? 'not reached';
+    return (
+      <span className="tag tag--warn" title={reasonCodes.join(', ')}>
+        verification not reached ({reason})
+      </span>
+    );
+  }
+
   return (
-    <span className={`tag tag--${tone}`} title={result.assessment.reasonCodes.join(', ')}>
+    <span className={`tag tag--${tone}`} title={reasonCodes.join(', ')}>
       provider verification {status.replace(/_/g, ' ')}
     </span>
   );

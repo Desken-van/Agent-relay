@@ -9,7 +9,7 @@
 import type { ToolDiagnostic } from '../../src/shared/domain/diagnostics';
 import type { GitChangeSet, RepositoryInfo, WorktreeInfo } from '../../src/shared/domain/git';
 import type { PublishConfirmation } from '../../src/shared/ipc';
-import type { CodexReviewResult, TaskSpecification } from '../../src/shared/schemas/codex';
+import type { CodexReviewResult, FindingTriageRecommendation, TaskSpecification } from '../../src/shared/schemas/codex';
 import type {
   AgentRunContext,
   ClaudeAdapter,
@@ -23,6 +23,8 @@ import type {
   CodexReviewRequest,
   CodexSpecificationRequest,
   CodexSpecificationResult,
+  CodexTriageOutcome,
+  CodexTriageRequest,
   ConfirmationService,
   CreateWorktreeRequest,
   GitAdapter,
@@ -119,6 +121,31 @@ export class FakeCodexAdapter implements CodexAdapter {
 
     const review = this.reviewQueue.shift() ?? makeReview();
     return { threadId: this.threadId, review, rawResponse: JSON.stringify(review) };
+  }
+
+  triageCalls: CodexTriageRequest[] = [];
+  /** Queue of recommendation sets, consumed one per `triageFindings` call. */
+  triageQueue: FindingTriageRecommendation[][] = [];
+  triageError: Error | null = null;
+  /** Held open until resolved, so a test can observe state while a triage call is in flight. */
+  triageGate: Promise<unknown> | null = null;
+
+  async triageFindings(
+    request: CodexTriageRequest,
+    context: AgentRunContext
+  ): Promise<CodexTriageOutcome> {
+    this.triageCalls.push(request);
+    context.onProgress({ type: 'progress', text: 'fake codex: triaging' });
+    if (this.triageGate) await this.triageGate;
+    if (this.triageError) throw this.triageError;
+    const recommendations = this.triageQueue.shift() ?? request.findings.map((finding) => ({
+      findingRef: finding.ref,
+      recommendation: 'needs_user' as const,
+      reason: 'fake default recommendation',
+      evidenceRef: 'fake evidence',
+      confidence: 'uncertain' as const
+    }));
+    return { recommendations, rawResponse: JSON.stringify({ results: recommendations }) };
   }
 
   async diagnose(): Promise<ToolDiagnostic> {

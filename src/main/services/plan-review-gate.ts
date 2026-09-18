@@ -1,22 +1,26 @@
 /** Optional, durable external plan-review gate. */
 
-import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { AgentRelayError } from '../../shared/domain/errors';
 import type { Task } from '../../shared/domain/models';
 import {
   parsePlanReviewFindings,
   planReviewDecisionSchema,
+  planReviewTriageResultSchema,
   taskRuleEvidenceBindingSchema,
   type PlanReviewDecision,
   type PlanReviewGate,
-  type PlanReviewGateIdentity
+  type PlanReviewGateIdentity,
+  type PlanReviewTriageResult
 } from '../../shared/domain/plan-review';
 import type { RuleEvidenceSnapshot } from '../../shared/domain/rule-evidence';
 import { containsSecretShape, redactAndTruncate } from '../../shared/util/redact';
-import { taskSpecificationSchema, type TaskSpecification } from '../../shared/schemas/codex';
+import type { FindingTriageRecommendation, TaskSpecification } from '../../shared/schemas/codex';
+import { specificationIdentity } from './specification-identity';
 import type {
+  AgentRunContext,
   Clock,
+  CodexAdapter,
   ExternalPlanReviewer,
   ExternalPlanReviewStatus,
   ExternalPlanReviewSubject,
@@ -24,8 +28,10 @@ import type {
   PlanReviewGatePatch,
   PlanReviewGateRepository,
   ProjectRepository,
+  SettingsRepository,
   TaskRepository,
-  TaskRuleEvidenceRepository
+  TaskRuleEvidenceRepository,
+  TriageableFinding
 } from '../ports';
 import type { PlanReviewClaims } from './plan-review-claims';
 import { renderRuleEvidence, validateRuleEvidenceSnapshot } from './rule-evidence';
@@ -255,32 +261,21 @@ export interface PlanReviewGateDeps {
    * contend for the same claim rather than each holding their own.
    */
   readonly claims: PlanReviewClaims;
+  /** For `triage()` only — a fresh, read-only, independent analysis call. Optional
+   *  so existing tests that never exercise triage need not fake it. */
+  readonly codex?: Pick<CodexAdapter, 'triageFindings'>;
+  readonly settings?: SettingsRepository;
 }
 
-function hash(value: string): string {
-  return createHash('sha256').update(value).digest('hex');
+export interface PlanReviewTriageRequest {
+  readonly gateId: string;
+  readonly expectedRevision: number;
+  /** Exactly which findings to triage. Omitted means every finding in the round —
+   *  the durable gate has no notion of "already decided" until `resolve` runs;
+   *  only the renderer's local draft knows which findings are still undecided. */
+  readonly findingIndexes?: readonly number[];
 }
 
-export function specificationIdentity(raw: string | null): {
-  specification: TaskSpecification;
-  canonical: string;
-  sha256: string;
-} {
-  if (raw === null) {
-    throw new AgentRelayError('VALIDATION_FAILED', 'This task has no specification to review.');
-  }
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch (error) {
-    throw new AgentRelayError('PARSE_FAILED', 'The stored specification is not valid JSON.', {
-      cause: error
-    });
-  }
-  const specification = taskSpecificationSchema.parse(value);
-  const canonical = JSON.stringify(specification);
-  return { specification, canonical, sha256: hash(canonical) };
-}
 
 export function readBoundRuleEvidence(
   taskId: string,
@@ -529,7 +524,9 @@ export class PlanReviewGateService {
       gatingCount: null,
       threshold: null,
       lastError: null,
-      reconciledAt: null
+      reconciledAt: null,
+      triageJson: null,
+      triageForFindings: null
     });
   }
 
@@ -586,7 +583,11 @@ export class PlanReviewGateService {
         decisionsJson: null,
         reviewers: null,
         gatingCount: null,
-        threshold: null
+        threshold: null,
+        // A new round means new findings; a triage of the previous round's
+        // findings describes rows that no longer exist.
+        triageJson: null,
+        triageForFindings: null
       });
       const session = await this.deps.reviewer.open(reviewSubject, signal);
       gate = this.deps.gates.update(gate.id, {
@@ -953,6 +954,153 @@ export class PlanReviewGateService {
       });
       throw error;
     }
+  }
+
+  /**
+   * Codex-assisted, independent recommendations for a bounded set of
+   * undecided findings — never a decision, never a resolve, never an
+   * approval or a correction. A fresh, read-only Codex call every time: no
+   * implementation session or tool access is reused or granted.
+   */
+  async triage(taskId: string, request: PlanReviewTriageRequest, signal?: AbortSignal): Promise<PlanReviewGate> {
+    const release = this.deps.claims.acquire(taskId, 'triage');
+    try {
+      return await this.runTriage(taskId, request, signal);
+    } finally {
+      release();
+    }
+  }
+
+  private async runTriage(
+    taskId: string,
+    request: PlanReviewTriageRequest,
+    signal?: AbortSignal
+  ): Promise<PlanReviewGate> {
+    if (!this.deps.codex || !this.deps.settings) {
+      throw new AgentRelayError('TOOL_MISSING', 'Automatic finding triage is not configured in this build.');
+    }
+    const task = this.requireReadyTask(taskId);
+    const project = this.deps.projects.findById(task.projectId);
+    if (project === null) throw new AgentRelayError('NOT_FOUND', `No project with id ${task.projectId}.`);
+    const gate = this.deps.gates.findByTask(taskId);
+    if (gate === null || gate.status !== 'awaiting_resolve') {
+      throw new AgentRelayError('VALIDATION_FAILED', 'No completed plan-review round awaits decisions.');
+    }
+    if (gate.id !== request.gateId || gate.revision !== request.expectedRevision) {
+      throw new AgentRelayError('VALIDATION_FAILED', STALE_ROUND, {
+        remediation: 'Reload the plan review and try again against the current round.'
+      });
+    }
+
+    const findings = parsePlanReviewFindings(gate.findingsJson);
+    const requestedIndexes = [...new Set(request.findingIndexes ?? findings.map((_, index) => index))].sort((a, b) => a - b);
+    if (requestedIndexes.length === 0) {
+      throw new AgentRelayError('VALIDATION_FAILED', 'There are no findings to analyze.');
+    }
+    if (requestedIndexes.some((index) => !Number.isInteger(index) || index < 0 || index >= findings.length)) {
+      throw new AgentRelayError('VALIDATION_FAILED', 'One or more requested finding indexes do not exist in the current round.');
+    }
+
+    const snapshot = readBoundRuleEvidence(taskId, this.deps.ruleEvidence);
+    if (snapshot === null) throw new AgentRelayError('VALIDATION_FAILED', 'No rule evidence is bound.');
+    const specification = specificationIdentity(task.specificationJson);
+
+    const triageableFindings: TriageableFinding[] = requestedIndexes.map((index) => {
+      const finding = findings[index]!;
+      return {
+        ref: index,
+        severity: finding.severity,
+        category: finding.category,
+        file: finding.file.length > 0 ? finding.file : null,
+        line: finding.line,
+        title: finding.title,
+        body: finding.why,
+        fix: finding.fix
+      };
+    });
+
+    const settings = this.deps.settings.get();
+    const context: AgentRunContext = {
+      signal: signal ?? new AbortController().signal,
+      timeoutMs: settings.processTimeoutMs,
+      onProgress: () => undefined
+    };
+
+    const outcome = await this.deps.codex.triageFindings(
+      {
+        worktreePath: project.localPath,
+        specification: specification.specification,
+        ruleEvidence: renderRuleEvidence(snapshot),
+        findings: triageableFindings,
+        priorDecisions: [],
+        model: settings.codexModel
+      },
+      context
+    );
+
+    const validated = this.validateTriageOutcome(outcome.recommendations, requestedIndexes);
+
+    // `triageForFindings` is set to the exact `findingsJson` this analysis
+    // was computed against — captured before the Codex call, and never a
+    // revision number: `revision` bumps on every durable write to this row,
+    // including this one, so predicting a post-write value would couple this
+    // service to the repository's own bump-by-one implementation, and any
+    // OTHER field changing later would make a still-valid result look stale.
+    // The conditional write itself still guards against the gate moving
+    // (another decision, a new round, a resolve) while the Codex call was in
+    // flight — if it did, `gate.revision` is no longer current and the write
+    // is refused, discarding the analysis rather than applying it to
+    // evidence that may no longer describe the current round.
+    const applied = this.deps.gates.updateIfUnchanged(
+      gate.id,
+      { triageJson: JSON.stringify(validated), triageForFindings: gate.findingsJson },
+      gate.revision
+    );
+    if (applied === null) {
+      throw new AgentRelayError('VALIDATION_FAILED', STALE_ROUND, {
+        remediation: 'The round changed while the analysis was running. Reload and try again.'
+      });
+    }
+    return applied;
+  }
+
+  /**
+   * Fails closed on anything short of exactly one well-formed recommendation
+   * per requested finding index: a partial response, an unrequested ref, a
+   * duplicate, or a malformed shape all discard the WHOLE result rather than
+   * applying whatever parsed. A partial automatic triage silently presented
+   * as complete is worse than none.
+   */
+  private validateTriageOutcome(
+    recommendations: readonly FindingTriageRecommendation[],
+    requestedIndexes: readonly number[]
+  ): PlanReviewTriageResult {
+    const parsed = planReviewTriageResultSchema.safeParse({
+      recommendations: recommendations.map((entry) => ({
+        finding: entry.findingRef,
+        recommendation: entry.recommendation,
+        reason: entry.reason,
+        evidenceRef: entry.evidenceRef,
+        confidence: entry.confidence
+      }))
+    });
+    if (!parsed.success) {
+      throw new AgentRelayError('PARSE_FAILED', 'Codex returned recommendations that do not match the expected shape.');
+    }
+    const seen = new Set<number>();
+    for (const recommendation of parsed.data.recommendations) {
+      if (!requestedIndexes.includes(recommendation.finding)) {
+        throw new AgentRelayError('PARSE_FAILED', 'Codex returned a recommendation for a finding that was not requested.');
+      }
+      if (seen.has(recommendation.finding)) {
+        throw new AgentRelayError('PARSE_FAILED', 'Codex returned more than one recommendation for the same finding.');
+      }
+      seen.add(recommendation.finding);
+    }
+    if (seen.size !== requestedIndexes.length) {
+      throw new AgentRelayError('PARSE_FAILED', 'Codex did not return a recommendation for every requested finding.');
+    }
+    return parsed.data;
   }
 
   /**

@@ -129,7 +129,8 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       historicalFindings: all,
       latestDecisions,
       totalFindingsEverRecorded: all.length,
-      identityProblem: identityProblem ?? identity.problem
+      identityProblem: identityProblem ?? identity.problem,
+      triage: app.codeReviews.getTriage(taskId)
     };
   };
   const planReviewDetail = (taskId: string): IpcResponseMap['planReview:get'] => {
@@ -225,6 +226,9 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
         ...(input.afterId === undefined ? {} : { afterId: input.afterId }),
         ...(input.limit === undefined ? {} : { limit: input.limit })
       }),
+
+    'dependencies:status': (input) => app.orchestrator.dependencyStatus(input.taskId),
+    'workflow:installDependencies': (input) => app.orchestrator.installDependencies(input.taskId),
 
     'workflow:generateSpecification': (input) =>
       app.orchestrator.generateSpecification(input.taskId),
@@ -322,12 +326,24 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       });
       return codeReviewDetail(input.taskId);
     },
+    'codeReview:triage': async (input) => {
+      const recommendations = await app.codeReview.triage(input.taskId, { findingIds: input.findingIds });
+      return { recommendations, detail: await codeReviewDetail(input.taskId) };
+    },
 
     'planReview:resolve': async (input) => {
       await planReviewService().resolve(input.taskId, {
         gateId: input.gateId,
         expectedRevision: input.expectedRevision,
         decisions: input.decisions
+      });
+      return planReviewDetail(input.taskId);
+    },
+    'planReview:triage': async (input) => {
+      await planReviewService().triage(input.taskId, {
+        gateId: input.gateId,
+        expectedRevision: input.expectedRevision,
+        findingIndexes: input.findingIndexes
       });
       return planReviewDetail(input.taskId);
     },

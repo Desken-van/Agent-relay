@@ -108,6 +108,31 @@ function providerFailureResult(): OrnithImplementationResult {
   };
 }
 
+/**
+ * What `OrnithImplementationService.implement()` now returns for a read-only
+ * `search_text` timeout once its recovery budget is exhausted (see
+ * `ornith-implementation.ts`'s `ORNITH_DENIAL_PUBLISH_BLOCK` map and the
+ * `!toolResult.ok` branch) — `configuration`, not `security`, and a message
+ * naming the action and the exact denial code rather than a generic
+ * "unsafe or over-limit" sentence.
+ */
+function timeoutToolDenialResult(): OrnithImplementationResult {
+  return {
+    sessionId: null,
+    finalMessage: 'Agent Relay stopped the Ornith "search_text" action (timeout): The repository operation timed out.',
+    assessment: {
+      version: CLAUDE_ASSESSMENT_VERSION,
+      disposition: 'fail',
+      verificationStatus: 'not_run',
+      publishBlock: 'configuration',
+      reasonCodes: ['timeout'],
+      verification: null,
+      denials: []
+    },
+    ornithAudit: { turns: 4, actions: 4, readBytes: 0, writeBytes: 0, changedFiles: 0, verifications: 0, outcomes: [] }
+  };
+}
+
 function fakeOrnithService(
   implement: (request: OrnithImplementationRequest) => Promise<OrnithImplementationResult>
 ): OrnithImplementationService {
@@ -314,6 +339,34 @@ describe('Orchestrator: Ornith provider routing', () => {
     const run = harness.runs.listByTask(task.id).find((candidate) => candidate.agent === 'ornith');
     expect(run?.status).toBe('failed');
     expect(run?.structuredResult).toContain('"dispatchOutcome":"rejected"');
+  });
+
+  it('does not consume a round and reports a correctly classified message for a read-only tool timeout', async () => {
+    const ornith = fakeOrnithService(async () => timeoutToolDenialResult());
+    harness = createHarness({
+      ornith,
+      ornithLease: healthyLeaseService(),
+      processRunner: unusedProcessRunner
+    });
+
+    const project = harness.createProject();
+    const task = harness.createTask(project.id, { implementationProvider: 'ornith' });
+    await harness.orchestrator.generateSpecification(task.id);
+    harness.orchestrator.approveSpecification(task.id);
+
+    const after = await harness.orchestrator.sendToClaude(task.id);
+
+    // A read-only timeout before any mutation must not consume a round, must
+    // not be reported as a security refusal, and must not tell the user a
+    // generic "unsafe or over-limit" story instead of the real cause.
+    expect(after).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 0 });
+    expect(after.lastError).toContain('stopped before changing any files');
+    expect(after.lastError).toContain('search_text');
+    expect(after.lastError).toContain('timeout');
+    expect(after.lastError).not.toContain('unsafe or over-limit');
+    const run = harness.runs.listByTask(task.id).find((candidate) => candidate.agent === 'ornith');
+    expect(run?.status).toBe('failed');
+    expect(run?.structuredResult).toContain('"publishBlock":"configuration"');
   });
 
   it('keeps the prior review-round count when a correction fails before mutating', async () => {

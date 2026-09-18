@@ -665,7 +665,11 @@ export class ContinuationService {
       gatingCount: gate.gatingCount,
       threshold: gate.threshold,
       lastError: gate.lastError,
-      reconciledAt: gate.reconciledAt
+      reconciledAt: gate.reconciledAt,
+      // Triage recommendations describe a specific prior round's findings,
+      // long since resolved for a `proceeded` gate; nothing carries forward.
+      triageJson: null,
+      triageForFindings: null
     });
   }
 }

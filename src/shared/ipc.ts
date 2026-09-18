@@ -20,6 +20,7 @@ import type { DiagnosticsReport } from './domain/diagnostics';
 import type { SerializedError } from './domain/errors';
 import type { PublishRefusalCode } from './domain/claude-assessment';
 import type { GitChangeSet, ProjectValidation, RepositoryInfo, WorktreeInfo } from './domain/git';
+import type { WorktreeDependencyStatus } from './domain/worktree-dependencies';
 import { localInferencePromptSchema } from './domain/local-inference';
 import type {
   LocalInferenceCapabilities,
@@ -49,14 +50,15 @@ import {
   diagnosticProbeIdSchema,
   type OperationDiagnosticRun
 } from './domain/operations-diagnostics';
-import type { CodexReviewResult, TaskSpecification } from './schemas/codex';
+import type { CodexReviewResult, FindingTriageRecommendation, TaskSpecification } from './schemas/codex';
 import {
   CODE_REVIEW_DECISION_ACTIONS,
   type CodeReviewDecision,
   type CodeReviewFinding,
   type CodeReviewRound,
   type CodeReviewSubject,
-  type CodeReviewSubjectIdentity
+  type CodeReviewSubjectIdentity,
+  type CodeReviewTriage
 } from './domain/code-review';
 import {
   planReviewDecisionSchema,
@@ -184,6 +186,19 @@ export interface CodeReviewDetail {
    * operator without a checkout path or a credential travelling with it.
    */
   readonly identityProblem: string | null;
+  /**
+   * The task's durable automatic-triage record, whatever subject it was
+   * computed against — raw, exactly as stored. Present across a restart and
+   * across every `codeReview:*` read, not only the one that requested it.
+   *
+   * Deliberately NOT pre-filtered to "still current" here, mirroring how
+   * `PlanReviewGate.triageForFindings` is exposed raw and compared against
+   * `findingsJson` by the reader: which of its recommendations still apply
+   * is a per-finding comparison against `findings`/`subject` the caller
+   * already has, computed once via `codeReviewCurrentTriageRecommendations`
+   * rather than duplicated as a second, potentially disagreeing filter.
+   */
+  readonly triage: CodeReviewTriage | null;
 }
 
 export interface PlanReviewDetail {
@@ -333,6 +348,15 @@ export const ipcInputSchemas = {
     .object({ runId: z.string().min(1), afterId: z.string().min(1).optional(), limit: z.number().int().min(1).max(5000).optional() })
     .strict(),
 
+  // Read-only: the task id only. Resolves the project/worktree path from
+  // durable task state inside the main process — never accepted from the
+  // renderer.
+  'dependencies:status': byTask,
+  // Strict on purpose, same as `workflow:continue`: only the task id. The
+  // worktree path, package manager, and executable/argv are all resolved
+  // from durable state inside the main process.
+  'workflow:installDependencies': byTask,
+
   'workflow:generateSpecification': byTask,
   'workflow:configureProviders': z.object({ taskId: z.string().min(1), expectedRevision: z.number().int().min(0),
     implementationProvider: implementationProviderSchema, reviewProvider: reviewProviderSchema }).strict(),
@@ -403,6 +427,16 @@ export const ipcInputSchemas = {
       reason: z.string().min(1).max(10_000)
     })
     .strict(),
+  // Durable identifiers only. `findingIds`, if given, narrows analysis to
+  // exactly those live findings; omitted means every currently undecided,
+  // live finding for the task's current subject — computed in the main
+  // process, never trusted from the renderer.
+  'codeReview:triage': z
+    .object({
+      taskId: z.string().min(1),
+      findingIds: z.array(z.string().min(1)).max(256).optional()
+    })
+    .strict(),
   // `gateId` and `expectedRevision` name the round the decisions answer. A
   // renderer that has been showing a round which has since been resolved and
   // replaced would otherwise submit its answers against the current one — the
@@ -414,6 +448,20 @@ export const ipcInputSchemas = {
       gateId: z.string().min(1),
       expectedRevision: z.number().int().nonnegative(),
       decisions: z.array(planReviewDecisionSchema).max(256)
+    })
+    .strict(),
+  // Durable identifiers only — never a prompt, path, or provider config. The
+  // main process reconstructs the specification, rule evidence, findings and
+  // prior decisions from repositories by `taskId` alone; `findingIndexes`, if
+  // given, narrows which of the round's findings are analyzed (the durable
+  // gate has no notion of "already decided" before `resolve` runs, so the
+  // renderer's own undecided set is the only source for this).
+  'planReview:triage': z
+    .object({
+      taskId: z.string().min(1),
+      gateId: z.string().min(1),
+      expectedRevision: z.number().int().nonnegative(),
+      findingIndexes: z.array(z.number().int().nonnegative()).max(256).optional()
     })
     .strict(),
 
@@ -514,6 +562,9 @@ export interface IpcResponseMap {
   'runs:listByTask': Run[];
   'runs:events': RunEvent[];
 
+  'dependencies:status': WorktreeDependencyStatus;
+  'workflow:installDependencies': Task;
+
   'workflow:generateSpecification': Task;
   'workflow:approveSpecification': Task;
   'workflow:sendToClaude': Task;
@@ -537,11 +588,23 @@ export interface IpcResponseMap {
   'planReview:review': PlanReviewDetail;
   'planReview:reconcile': PlanReviewDetail;
   'planReview:resolve': PlanReviewDetail;
+  'planReview:triage': PlanReviewDetail;
   'codeReview:get': CodeReviewDetail;
   'codeReview:capture': CodeReviewDetail;
   'codeReview:review': CodeReviewDetail;
   'codeReview:reconcile': CodeReviewDetail;
   'codeReview:decide': CodeReviewDetail;
+  /**
+   * Every call runs a fresh, independent Codex analysis (never reused or
+   * cached), but its result IS persisted — see `CodeReviewRepository.
+   * upsertTriage` and `CodeReviewDetail.triage`. `recommendations` here is
+   * this exact call's answer, returned directly so a caller need not wait
+   * for a second round trip; `detail` is included alongside it (rather than
+   * folding `recommendations` into `detail` itself) because the two answer
+   * different questions — this call's own fresh output, versus the durable
+   * state a later, unrelated `codeReview:get` would read back.
+   */
+  'codeReview:triage': { readonly recommendations: readonly FindingTriageRecommendation[]; readonly detail: CodeReviewDetail };
 
   'git:changes': GitChangeSet;
   'git:repositoryInfo': RepositoryInfo;

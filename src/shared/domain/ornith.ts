@@ -63,8 +63,32 @@ export const ORNITH_LIMITS = {
 
   /** Per-operation timeouts. */
   filesystemTimeoutMs: 10_000,
-  searchTimeoutMs: 15_000,
+  /**
+   * 20s, not 15s: headroom for slower disks/AV scanning now that the
+   * dominant cost (a full `assertCheckoutIdentity` per candidate file) is
+   * removed — see `searchIdentityRecheckFiles`. This alone is not the fix;
+   * it is margin on top of it.
+   */
+  searchTimeoutMs: 20_000,
   gitTimeoutMs: 30_000,
+
+  /**
+   * How many candidate files `searchText`/`gitDiff` scan between checkout-
+   * identity re-checks. Re-checking every file made a broad search re-spawn
+   * `git` (inside `assertCheckoutIdentity`) once per candidate — O(files)
+   * subprocess spawns, which is what actually exhausted `searchTimeoutMs` on
+   * a few-hundred-file repository. Re-checking on a bounded cadence instead
+   * keeps the identity guarantee (a worktree swapped mid-scan is still
+   * caught within one interval, not only at the next model turn) while
+   * making the cost O(files / interval) instead of O(files).
+   */
+  searchIdentityRecheckFiles: 25,
+
+  /** Bounded number of times a read-only action's `timeout` denial is fed
+   *  back to the model instead of ending the run. Only `timeout` on a
+   *  read-only action is recoverable this way; every other denial code
+   *  remains terminal. */
+  maxReadOnlyRecoveryAttempts: 3,
 
   /** Repository manifest. */
   maxManifestFiles: 20_000,

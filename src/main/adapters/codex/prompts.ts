@@ -9,6 +9,7 @@
 import type { GitChangeSet } from '../../../shared/domain/git';
 import type { VerificationRecord } from '../../../shared/domain/verification';
 import type { CodexReviewResult, TaskSpecification } from '../../../shared/schemas/codex';
+import type { TriageableDecision, TriageableFinding } from '../../ports';
 
 /* -------------------------------------------------------------------------- */
 /* Codex: specification                                                        */
@@ -401,4 +402,89 @@ final message and explain why, rather than silently ignoring it.
 
 End with an updated report: what you changed in this round, which findings you consider
 resolved, which you disputed and why, and the test results after your changes.`;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Codex: automatic finding triage                                             */
+/* -------------------------------------------------------------------------- */
+
+export interface TriagePromptInput {
+  readonly specification: TaskSpecification;
+  readonly ruleEvidence?: string;
+  readonly findings: readonly TriageableFinding[];
+  readonly priorDecisions: readonly TriageableDecision[];
+}
+
+function renderTriageFinding(finding: TriageableFinding): string {
+  const location = finding.file ? `${finding.file}${finding.line !== null ? `:${finding.line}` : ''}` : '(no specific location)';
+  return `--- Finding ref=${JSON.stringify(finding.ref)} ---
+Severity: ${finding.severity}
+Category: ${finding.category}
+Location: ${location}
+Title: ${finding.title}
+Body: ${finding.body}
+Suggested fix: ${finding.fix ?? '(none suggested)'}`;
+}
+
+function renderTriageDecision(decision: TriageableDecision): string {
+  return `  - ref=${JSON.stringify(decision.findingRef)}: ${decision.action}${decision.reason ? ` — ${decision.reason}` : ''}`;
+}
+
+export function buildTriagePrompt(input: TriagePromptInput): string {
+  const { specification } = input;
+  return `You are an independent TRIAGE analyst in a multi-agent relay. You are in READ-ONLY
+mode: you must not modify, create, or delete any file, and you must not run any command
+that changes state. Your entire output is a single JSON object matching the required
+schema, with exactly one recommendation for every finding listed below — no more, no
+fewer, and every "findingRef" must be copied EXACTLY from a "Finding ref=" line below.
+
+You are not the original reviewer and did not produce these findings. Your job is to
+independently judge, for each one, whether it should be accepted, rejected, or left for
+a human to decide — never to re-review the change from scratch, and never to invent a
+finding that is not listed below.
+
+${input.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${input.ruleEvidence}\n` : ''}
+
+=== THE SPECIFICATION UNDER DISCUSSION ===
+Title: ${specification.title}
+
+Summary:
+${specification.summary}
+
+Acceptance criteria:
+${specification.acceptanceCriteria.map((c, i) => `  ${i + 1}. ${c}`).join('\n')}
+
+Constraints:
+${specification.constraints.length > 0 ? specification.constraints.map((c) => `  - ${c}`).join('\n') : '  (none stated)'}
+
+Assumptions the specification made:
+${specification.assumptions.length > 0 ? specification.assumptions.map((a) => `  - ${a}`).join('\n') : '  (none stated)'}
+
+=== PRIOR DECISIONS ALREADY RECORDED (context only — these findings are not yours to re-triage) ===
+${input.priorDecisions.length > 0 ? input.priorDecisions.map(renderTriageDecision).join('\n') : '  (none)'}
+
+=== UNDECIDED FINDINGS TO TRIAGE (exactly these, exactly once each) ===
+${input.findings.map(renderTriageFinding).join('\n\n')}
+
+=== HOW TO DECIDE, FOR EACH FINDING ===
+recommendation = "accept"
+  The finding is valid, actionable, and within the specification's scope.
+
+recommendation = "reject"
+  The finding rests on a false premise, duplicates another finding or an already-recorded
+  decision, falls outside the specification's scope, is contradicted by evidence above, or
+  describes something already satisfied.
+
+recommendation = "needs_user"
+  Deciding requires a product or architecture choice, the evidence here is insufficient,
+  or you are genuinely uncertain.
+
+For every finding, also give:
+- "reason": one concise sentence explaining the recommendation.
+- "evidenceRef": a concrete reference into the material above that supports it (e.g. an
+  acceptance criterion number, a constraint, or a quoted phrase from the finding itself).
+- "confidence": "high", "medium", "low", or "uncertain".
+
+Return only the JSON object, with a "results" array containing exactly one entry per
+finding listed above.`;
 }

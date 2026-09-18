@@ -531,3 +531,159 @@ export type CodeReviewSubjectIdentity =
    * remedy is to fix what could not be read, not to capture again.
    */
   | 'incomplete';
+
+/* -------------------------------------------------------------------------- */
+/* Automatic finding triage                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One independent recommendation for one live, undecided finding.
+ *
+ * `findingId` names a stable `CodeReviewFinding.id` — never an index, since
+ * unlike the plan gate's single findings array, code-review findings are rows
+ * with their own identity that outlive any one round.
+ */
+export const codeReviewTriageRecommendationSchema = z
+  .object({
+    findingId: idSchema,
+    recommendation: z.enum(['accept', 'reject', 'needs_user']),
+    reason: z.string().min(1).max(2_000),
+    evidenceRef: z.string().min(1).max(500),
+    confidence: z.enum(['high', 'medium', 'low', 'uncertain'])
+  })
+  .strict();
+export type CodeReviewTriageRecommendation = z.infer<typeof codeReviewTriageRecommendationSchema>;
+
+export const codeReviewTriageResultSchema = z
+  .object({
+    recommendations: z.array(codeReviewTriageRecommendationSchema).max(256)
+  })
+  .strict();
+export type CodeReviewTriageResult = z.infer<typeof codeReviewTriageResultSchema>;
+
+export function parseCodeReviewTriage(json: string | null): CodeReviewTriageResult | null {
+  if (json === null) return null;
+  try {
+    return codeReviewTriageResultSchema.parse(JSON.parse(json));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The durable, one-row-per-task record of the last automatic triage run.
+ *
+ * Bound to the exact subject and the exact finding identities and revisions
+ * it was computed against, so a later read can tell — without trusting
+ * anything about elapsed time or a bumped counter unrelated to triage itself
+ * — whether the stored recommendations still speak for what is on screen.
+ * See {@link codeReviewCurrentTriageRecommendations}.
+ */
+export const codeReviewTriageSchema = z
+  .object({
+    id: idSchema,
+    taskId: idSchema,
+    subjectId: idSchema,
+    subjectSha256: z.string().regex(/^[0-9a-f]{64}$/),
+    /** Canonical, order-independent `[[id, revision], ...]` — see {@link codeReviewTriageFindingsSnapshot}. */
+    findingsSnapshotJson: z.string().min(1).max(200_000),
+    /** The raw {@link codeReviewTriageResultSchema}-shaped JSON, verbatim. */
+    triageJson: z.string().min(1).max(2_000_000),
+    createdAt: isoDateTime,
+    updatedAt: isoDateTime
+  })
+  .strict();
+export type CodeReviewTriage = z.infer<typeof codeReviewTriageSchema>;
+
+/**
+ * The exact bytes that identify WHICH findings, at WHICH revisions, a triage
+ * result was computed against.
+ *
+ * Deterministic by construction — sorted by id, written in a fixed order —
+ * so the same set of (id, revision) pairs always produces the same string
+ * regardless of how it was assembled, and any decision recorded against one
+ * of those findings (which bumps its revision) changes it. Used both when a
+ * triage result is persisted (from the exact findings just analyzed) and
+ * when a later read recomputes it from the CURRENT live findings to decide
+ * whether the stored result still applies — the same function both times, so
+ * there is only one implementation of what "unchanged" means.
+ */
+export function codeReviewTriageFindingsSnapshot(
+  findings: readonly { readonly id: string; readonly revision: number }[]
+): string {
+  return JSON.stringify(
+    [...findings]
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .map((f) => [f.id, f.revision])
+  );
+}
+
+/**
+ * Parse a {@link codeReviewTriageFindingsSnapshot} string back into a lookup
+ * of the revision each finding was analyzed at. `null` on anything that does
+ * not match the exact shape the function above produces — never trusted as
+ * partial data.
+ */
+function parseTriageFindingsSnapshot(json: string): ReadonlyMap<string, number> | null {
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (!Array.isArray(parsed)) return null;
+    const entries = new Map<string, number>();
+    for (const entry of parsed) {
+      if (
+        !Array.isArray(entry) || entry.length !== 2 ||
+        typeof entry[0] !== 'string' || typeof entry[1] !== 'number'
+      ) {
+        return null;
+      }
+      entries.set(entry[0], entry[1]);
+    }
+    return entries;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The recommendations from a stored triage result that still speak for the
+ * task's current state — filtered per finding, not gated as one all-or-
+ * nothing block.
+ *
+ * The subject is still an all-or-nothing gate: if it no longer matches the
+ * current one, nothing from the stored result applies (every finding it
+ * named belongs to code that is no longer current). But within a matching
+ * subject, each recommendation is independent of its siblings — Codex
+ * evaluates one finding's own text and evidence, not anything about the
+ * OTHER findings it was asked about in the same call — so a decision
+ * recorded on finding A (the only thing that bumps a finding's revision)
+ * has nothing to say about whether the recommendation for finding B is
+ * still accurate. Discarding the whole result the moment any ONE covered
+ * finding moves would silently hide B's still-valid recommendation too,
+ * which is exactly the wrong direction for a feature meant to let an
+ * operator apply some recommendations and leave others (in particular
+ * `needs_user` ones) for a human to read while deciding — including right
+ * after using "apply all", which is the case this design fixes: applying
+ * an accept/reject recommendation for one finding no longer erases the
+ * still-open recommendation shown for another.
+ */
+export function codeReviewCurrentTriageRecommendations(
+  triage: Pick<CodeReviewTriage, 'subjectSha256' | 'findingsSnapshotJson' | 'triageJson'> | null,
+  currentSubjectSha256: string | null,
+  liveFindings: readonly { readonly id: string; readonly revision: number }[]
+): readonly CodeReviewTriageRecommendation[] {
+  if (triage === null || currentSubjectSha256 === null) return [];
+  if (triage.subjectSha256 !== currentSubjectSha256) return [];
+  const parsed = parseCodeReviewTriage(triage.triageJson);
+  if (parsed === null) return [];
+  const analyzedRevisionById = parseTriageFindingsSnapshot(triage.findingsSnapshotJson);
+  if (analyzedRevisionById === null) return [];
+
+  const liveRevisionById = new Map(liveFindings.map((f) => [f.id, f.revision] as const));
+  return parsed.recommendations.filter((recommendation) => {
+    const analyzedAt = analyzedRevisionById.get(recommendation.findingId);
+    const liveNow = liveRevisionById.get(recommendation.findingId);
+    // Undefined on either side means: not part of what this result actually
+    // analyzed, or not live anymore (decided, or from a superseded subject).
+    return analyzedAt !== undefined && liveNow !== undefined && analyzedAt === liveNow;
+  });
+}

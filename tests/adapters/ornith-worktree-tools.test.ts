@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ExecaProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
 import { OrnithWorktreeTools } from '../../src/main/services/ornith-worktree-tools';
+import { ORNITH_LIMITS } from '../../src/shared/domain/ornith';
 
 const runner = new ExecaProcessRunner();
 const locatedGit = locateExecutable('git');
@@ -542,6 +543,117 @@ describe('OrnithWorktreeTools containment and budgets', () => {
         expect(argv).not.toContain(verb);
       }
     }
+  });
+
+  describe('searchText checkout-identity recheck cadence', () => {
+    // A broad search_text call used to re-run assertCheckoutIdentity — several
+    // `git` subprocess spawns each — once per CANDIDATE FILE. On a repository
+    // with a few hundred tracked files that alone exhausted searchTimeoutMs
+    // before any actual grepping mattered. These tests prove the fix: the cost
+    // is now bounded (not O(candidates)), and a worktree swapped out from
+    // underneath a long scan is still caught within one recheck interval.
+    it('scans 260 tracked files without an identity check per candidate file', async () => {
+      for (let index = 0; index < 260; index += 1) {
+        writeFileSync(join(worktree, `broad-${String(index).padStart(3, '0')}.txt`), 'needle appears once per file\n');
+      }
+      const recorded: string[][] = [];
+      const boundary = toolsRecordingGitArgv(recorded);
+
+      const started = Date.now();
+      const result = await boundary.searchText({
+        version: 1,
+        action: 'search_text',
+        query: 'needle',
+        caseSensitive: false,
+        // 261, not 260: hitting exactly `limit` is itself (pre-existingly, and
+        // correctly) treated as possibly-truncated, since there might be more
+        // beyond it — unrelated to what this test exercises.
+        limit: 261
+      });
+      const elapsedMs = Date.now() - started;
+
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('unreachable');
+      const forModel = result.forModel as { matches: { path: string; line: number }[]; truncated: boolean };
+      expect(forModel.matches.length).toBe(260);
+      expect(forModel.truncated).toBe(false);
+      // Generous margin (real machines vary), but this is the assertion that
+      // would have failed outright at 15s/20s before the fix: the old
+      // per-candidate identity re-check made 260 files cost ~780 `git` spawns.
+      expect(elapsedMs).toBeLessThan(10_000);
+
+      // Manifest build (`ls-files --cached` + `ls-files --others`) is 2 calls;
+      // the rest are `assertCheckoutIdentity` invocations (3 `rev-parse` calls
+      // each). 260 candidates at a 25-file recheck interval is at most a
+      // handful of rechecks — nowhere near 260 * 3 = 780.
+      expect(recorded.length).toBeLessThan(40);
+      for (const argv of recorded) {
+        expect(ALLOWED_GIT_SUBCOMMANDS.has(argv[0] ?? '')).toBe(true);
+      }
+    });
+
+    it('denies the whole call when the worktree root is replaced before it starts', async () => {
+      const boundary = tools();
+      // Build (and cache) the manifest against the real worktree first —
+      // matching every real Ornith round, where the loop itself already
+      // re-confirms checkout identity before dispatch and a search is never
+      // the very first action against a brand-new tool instance.
+      await boundary.listFiles({ version: 1, action: 'list_files', prefix: '', limit: 20 });
+      const moved = join(root, 'moved-before-search');
+      renameSync(worktree, moved);
+      symlinkSync(moved, worktree, process.platform === 'win32' ? 'junction' : 'dir');
+      try {
+        const result = await boundary.searchText({ version: 1, action: 'search_text', query: 'alpha', caseSensitive: false, limit: 10 });
+        expect(result).toMatchObject({ ok: false, code: 'checkout_identity_changed' });
+      } finally {
+        unlinkSync(worktree);
+        renameSync(moved, worktree);
+      }
+    });
+
+    it('denies a scan and stops, rather than continuing, when the worktree root is replaced mid-scan', async () => {
+      const originalInterval = ORNITH_LIMITS.searchIdentityRecheckFiles;
+      // Shrink the recheck interval so a small, fast fixture still exercises a
+      // real mid-scan recheck rather than needing hundreds of files.
+      (ORNITH_LIMITS as { searchIdentityRecheckFiles: number }).searchIdentityRecheckFiles = 2;
+      try {
+        for (let index = 0; index < 8; index += 1) {
+          writeFileSync(join(worktree, `mid-scan-${index}.txt`), 'needle\n');
+        }
+        let swapped = false;
+        const boundary = new OrnithWorktreeTools({
+          worktreePath: worktree,
+          worktreesRoot,
+          repositoryPath: repository,
+          branchName: 'task',
+          runner,
+          gitExecutablePath: gitPath,
+          testHooks: {
+            beforeIdentityRecheck: () => {
+              if (swapped) return;
+              swapped = true;
+              const moved = join(root, 'moved-mid-scan');
+              renameSync(worktree, moved);
+              symlinkSync(moved, worktree, process.platform === 'win32' ? 'junction' : 'dir');
+            }
+          }
+        });
+
+        try {
+          const result = await boundary.searchText({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 20 });
+          expect(swapped).toBe(true);
+          expect(result).toMatchObject({ ok: false, code: 'checkout_identity_changed' });
+        } finally {
+          if (swapped) {
+            const moved = join(root, 'moved-mid-scan');
+            unlinkSync(worktree);
+            renameSync(moved, worktree);
+          }
+        }
+      } finally {
+        (ORNITH_LIMITS as { searchIdentityRecheckFiles: number }).searchIdentityRecheckFiles = originalInterval;
+      }
+    });
   });
 
   describe('listFiles byte-budget packing', () => {

@@ -35,7 +35,7 @@ import {
   type LocalInferenceMessage,
   type LocalInferenceRequest
 } from '../../shared/domain/local-inference';
-import type { ClaudeRoundAssessmentRecord } from '../../shared/domain/claude-assessment';
+import type { ClaudePublishBlock, ClaudeRoundAssessmentRecord } from '../../shared/domain/claude-assessment';
 import { CLAUDE_ASSESSMENT_VERSION } from '../../shared/domain/claude-assessment';
 import { AgentRelayError } from '../../shared/domain/errors';
 import { containsSecretShape } from '../../shared/util/redact';
@@ -251,6 +251,10 @@ Rules:
   "nextCursor" rule below, not this one.)
 - Never repeat an identical list_files, read_file, search_text, git_status, or git_diff action after it succeeds.
   Use the returned files, cursor, or status to choose a different next action.
+- A "list_files", "read_file", "search_text", "git_status", or "git_diff" action that fails with
+  code "timeout" is recoverable a bounded number of times per run: choose a DIFFERENT, narrower
+  request (fewer "files", a shorter prefix, a smaller byte range) on your next turn — repeating
+  the identical request will be refused outright once, not retried.
 - A "list_files" result's "nextCursor" is the ONLY thing that tells you whether there is more:
   if it is a number, your NEXT "list_files" call for that SAME "prefix" must set "cursor" to
   exactly that number to continue; if it is null, that prefix is fully listed and must not be
@@ -465,6 +469,81 @@ function toMessages(promptText: string): LocalInferenceMessage[] {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Tool-denial classification                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Every `OrnithDenialCode` sorted into the same `publishBlock` buckets
+ * Claude's own `RoundReasonCode` -> bucket mapping uses
+ * (`claude-round-policy.ts`): `'security'` is reserved for a genuine
+ * path/identity/credential-shape refusal; everything else — including a
+ * plain `timeout`, every resource-budget `limit_*` code, and an
+ * infrastructural failure like `lease_busy` or `internal_error` — is
+ * `'configuration'`, matching every other loop-level limit/timeout condition
+ * already classified that way elsewhere in this file (deadline, turns,
+ * prompt size, output tokens). A `Record` over the full `OrnithDenialCode`
+ * union makes this exhaustive at compile time: a new denial code with no
+ * entry here fails to build rather than silently defaulting to one bucket
+ * or the other.
+ */
+const ORNITH_DENIAL_PUBLISH_BLOCK: Record<OrnithDenialCode, ClaudePublishBlock> = {
+  runtime_unavailable: 'configuration',
+  runtime_unhealthy: 'security',
+  runtime_identity_changed: 'configuration',
+  lease_busy: 'configuration',
+  malformed_output: 'configuration',
+  oversized_output: 'configuration',
+  unknown_action: 'configuration',
+  disallowed_action: 'security',
+  invalid_path: 'security',
+  path_outside_worktree: 'security',
+  path_not_regular_file: 'security',
+  path_symlink: 'security',
+  checkout_identity_changed: 'security',
+  stale_hash: 'configuration',
+  replacement_mismatch: 'configuration',
+  file_exists: 'configuration',
+  file_not_found: 'configuration',
+  limit_turns_exceeded: 'configuration',
+  limit_actions_exceeded: 'configuration',
+  limit_context_exceeded: 'configuration',
+  limit_prompt_exceeded: 'configuration',
+  limit_result_exceeded: 'configuration',
+  limit_read_bytes_exceeded: 'configuration',
+  limit_write_bytes_exceeded: 'configuration',
+  limit_changed_files_exceeded: 'configuration',
+  limit_manifest_files_exceeded: 'configuration',
+  limit_verification_calls_exceeded: 'configuration',
+  limit_deadline_exceeded: 'configuration',
+  timeout: 'configuration',
+  blocked: 'configuration',
+  cancelled: 'configuration',
+  internal_error: 'configuration'
+};
+
+/**
+ * Only a plain `timeout` on a read-only action is fed back to the model as
+ * recoverable feedback instead of ending the run — every other denial,
+ * including a resource-budget `limit_*` code, stays terminal-but-explicit.
+ * Read-only actions are the ones a repeat cannot corrupt anything by
+ * retrying; a mutation or `run_verification` denial is never retried here.
+ */
+function isRecoverableToolDenial(action: OrnithAction, code: OrnithDenialCode): boolean {
+  return code === 'timeout' && isNoProgressGuardAction(action);
+}
+
+/** One safe, specific sentence naming the action, its exact denial code, and the tool's own reason. */
+function describeOrnithToolDenial(action: OrnithAction, toolResult: Extract<OrnithToolResult, { ok: false }>): {
+  readonly message: string;
+  readonly publishBlock: ClaudePublishBlock;
+} {
+  return {
+    message: `Agent Relay stopped the Ornith "${action.action}" action (${toolResult.code}): ${toolResult.reason}`,
+    publishBlock: ORNITH_DENIAL_PUBLISH_BLOCK[toolResult.code]
+  };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Assessment mapping                                                         */
 /* -------------------------------------------------------------------------- */
 
@@ -514,7 +593,11 @@ export class OrnithImplementationService {
     let cumulativeReadBytes = 0;
     let cumulativeWriteBytes = 0;
     let previousReadOnlyFingerprint: string | null = null;
+    /** The prior no-progress-guard action's real outcome, so a repeat of a failed
+     *  action is not told it "already succeeded". `null` before any such action. */
+    let previousReadOnlyOutcome: 'succeeded' | OrnithDenialCode | null = null;
     let consecutiveIdenticalReadOnlyActions = 0;
+    let readOnlyRecoveryAttemptsUsed = 0;
     const outcomes: Array<{ sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }> = [];
     const finish = (
       disposition: 'pass' | 'fail', message: string,
@@ -811,12 +894,18 @@ export class OrnithImplementationService {
       }
       if (consecutiveIdenticalReadOnlyActions === 2) {
         outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: false });
+        const priorFailureCode = previousReadOnlyOutcome !== null && previousReadOnlyOutcome !== 'succeeded'
+          ? previousReadOnlyOutcome
+          : null;
         const duplicateFeedback = {
           ok: false,
-          code: 'duplicate_no_progress',
-          reason:
-            `The identical ${action.action} request already succeeded and was not executed again. ` +
-            'Use its prior result and choose a different action; narrow the query or page only if the result was truncated.'
+          code: priorFailureCode ?? 'duplicate_no_progress',
+          reason: priorFailureCode !== null
+            ? `The identical ${action.action} request (${describeActionParams(action)}) already failed ` +
+              `(${priorFailureCode}) and was not retried unchanged. Narrow "files", the query, offset, or limit ` +
+              'before retrying — repeating the exact same request will not succeed.'
+            : `The identical ${action.action} request already succeeded and was not executed again. ` +
+              'Use its prior result and choose a different action; narrow the query or page only if the result was truncated.'
         };
         rolling.push({
           turn: turnsUsed,
@@ -917,6 +1006,9 @@ export class OrnithImplementationService {
       }
 
       const durationMs = Date.now() - operationStarted;
+      if (isNoProgressGuardAction(action)) {
+        previousReadOnlyOutcome = toolResult.ok ? 'succeeded' : toolResult.code;
+      }
       if (!toolResult.ok) {
         outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code });
         request.onProgress({
@@ -924,7 +1016,27 @@ export class OrnithImplementationService {
           text: `Ornith action ${action.action} denied (${toolResult.code}).`,
           data: { sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code, durationMs }
         });
-        return finish('fail', 'Agent Relay refused an unsafe or over-limit Ornith action.', 'security', [toolResult.code]);
+
+        if (
+          isRecoverableToolDenial(action, toolResult.code) &&
+          readOnlyRecoveryAttemptsUsed < ORNITH_LIMITS.maxReadOnlyRecoveryAttempts
+        ) {
+          readOnlyRecoveryAttemptsUsed += 1;
+          const remaining = ORNITH_LIMITS.maxReadOnlyRecoveryAttempts - readOnlyRecoveryAttemptsUsed;
+          const recoveryFeedback = {
+            ok: false,
+            code: toolResult.code,
+            reason:
+              `${toolResult.reason} (${describeActionParams(action)}) ${remaining} read-only recovery ` +
+              `attempt${remaining === 1 ? '' : 's'} remain this run. Narrow "files", the query, offset, or limit ` +
+              'before retrying; repeating this exact request will be refused.'
+          };
+          rolling.push({ turn: turnsUsed, action: action.action, resultText: JSON.stringify(recoveryFeedback) });
+          continue;
+        }
+
+        const { message, publishBlock } = describeOrnithToolDenial(action, toolResult);
+        return finish('fail', message, publishBlock, [toolResult.code]);
       }
 
       if (cumulativeReadBytes + toolResult.readBytes > ORNITH_LIMITS.maxCumulativeReadBytes) {
@@ -997,6 +1109,30 @@ function isNoProgressGuardAction(action: OrnithAction): boolean {
     action.action === 'search_text' ||
     action.action === 'git_status' ||
     action.action === 'git_diff';
+}
+
+/**
+ * A compact, safe rendering of a read-only action's own parameters, for
+ * feedback that names exactly which request timed out or was repeated. Every
+ * field here is the model's own prior input, already bounded and validated
+ * as safe prose/paths by the action schema — never file content or a
+ * denial's internal detail.
+ */
+function describeActionParams(action: OrnithAction): string {
+  switch (action.action) {
+    case 'search_text':
+      return `query=${JSON.stringify(action.query)} caseSensitive=${action.caseSensitive} ` +
+        `files=${action.files ? JSON.stringify(action.files) : '<whole manifest>'} limit=${action.limit}`;
+    case 'read_file':
+      return `path=${JSON.stringify(action.path)} offset=${action.offset} limit=${action.limit}`;
+    case 'list_files':
+      return `prefix=${JSON.stringify(action.prefix)} limit=${action.limit}` +
+        (action.cursor !== undefined ? ` cursor=${action.cursor}` : '');
+    case 'git_diff':
+      return `paths=${action.paths ? JSON.stringify(action.paths) : '<whole manifest>'}`;
+    default:
+      return '(no parameters)';
+  }
 }
 
 function finishedResult(

@@ -16,7 +16,8 @@ import type {
   CodeReviewFinding,
   CodeReviewOccurrence,
   CodeReviewRound,
-  CodeReviewSubject
+  CodeReviewSubject,
+  CodeReviewTriage
 } from '../../../shared/domain/code-review';
 import type {
   Clock,
@@ -27,6 +28,7 @@ import type {
   NewCodeReviewFinding,
   NewCodeReviewRound,
   NewCodeReviewSubject,
+  NewCodeReviewTriage,
   RoundFindingRecord
 } from '../../ports';
 import type { Db } from '../database';
@@ -52,6 +54,9 @@ const FINDING_COLUMNS = `id, task_id, subject_sha256, fingerprint, severity, cat
 
 const DECISION_COLUMNS = `id, finding_id, subject_sha256, action, reason, actor, source,
                           finding_revision, decided_at, created_at`;
+
+const TRIAGE_COLUMNS = `id, task_id, subject_id, subject_sha256, findings_snapshot_json,
+                        triage_json, created_at, updated_at`;
 
 interface SubjectRow {
   id: string;
@@ -149,6 +154,17 @@ interface DecisionRow {
   finding_revision: number;
   decided_at: string;
   created_at: string;
+}
+
+interface TriageRow {
+  id: string;
+  task_id: string;
+  subject_id: string;
+  subject_sha256: string;
+  findings_snapshot_json: string;
+  triage_json: string;
+  created_at: string;
+  updated_at: string;
 }
 
 function toSubject(row: SubjectRow): CodeReviewSubject {
@@ -256,6 +272,19 @@ function toDecision(row: DecisionRow): CodeReviewDecision {
     findingRevision: row.finding_revision,
     decidedAt: row.decided_at,
     createdAt: row.created_at
+  };
+}
+
+function toTriage(row: TriageRow): CodeReviewTriage {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    subjectId: row.subject_id,
+    subjectSha256: row.subject_sha256,
+    findingsSnapshotJson: row.findings_snapshot_json,
+    triageJson: row.triage_json,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
   };
 }
 
@@ -702,5 +731,59 @@ export class SqliteCodeReviewRepository implements CodeReviewRepository {
       )
       .get(findingId) as DecisionRow | undefined;
     return row ? toDecision(row) : null;
+  }
+
+  /* ------------------------------------------------------------------ triage */
+
+  getTriage(taskId: string): CodeReviewTriage | null {
+    const row = this.db
+      .prepare(`SELECT ${TRIAGE_COLUMNS} FROM code_review_triage WHERE task_id = ?`)
+      .get(taskId) as TriageRow | undefined;
+    return row ? toTriage(row) : null;
+  }
+
+  upsertTriage(record: NewCodeReviewTriage): CodeReviewTriage {
+    const now = this.clock.nowIso();
+    // Preserves the row's original id and `createdAt` across a later
+    // overwrite — this is one durable slot per task, not a fresh identity
+    // every time analysis runs.
+    const existing = this.getTriage(record.taskId);
+    const id = existing?.id ?? record.id;
+    const createdAt = existing?.createdAt ?? now;
+    this.db
+      .prepare(
+        `INSERT INTO code_review_triage (
+           id, task_id, subject_id, subject_sha256, findings_snapshot_json,
+           triage_json, created_at, updated_at)
+         VALUES (
+           @id, @taskId, @subjectId, @subjectSha256, @findingsSnapshotJson,
+           @triageJson, @createdAt, @updatedAt)
+         ON CONFLICT(task_id) DO UPDATE SET
+           subject_id = excluded.subject_id,
+           subject_sha256 = excluded.subject_sha256,
+           findings_snapshot_json = excluded.findings_snapshot_json,
+           triage_json = excluded.triage_json,
+           updated_at = excluded.updated_at`
+      )
+      .run({
+        id,
+        taskId: record.taskId,
+        subjectId: record.subjectId,
+        subjectSha256: record.subjectSha256,
+        findingsSnapshotJson: record.findingsSnapshotJson,
+        triageJson: record.triageJson,
+        createdAt,
+        updatedAt: now
+      });
+    return {
+      id,
+      taskId: record.taskId,
+      subjectId: record.subjectId,
+      subjectSha256: record.subjectSha256,
+      findingsSnapshotJson: record.findingsSnapshotJson,
+      triageJson: record.triageJson,
+      createdAt,
+      updatedAt: now
+    };
   }
 }

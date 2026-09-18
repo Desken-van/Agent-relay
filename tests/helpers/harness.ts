@@ -23,7 +23,7 @@ import { InMemoryEventPublisher } from '../../src/main/services/event-bus';
 import { ContinuationService } from '../../src/main/services/continuation-service';
 import { Orchestrator } from '../../src/main/services/orchestrator';
 import type { VerificationExecutor } from '../../src/main/services/worktree-verification';
-import type { WorktreeDependencyPreparer } from '../../src/main/services/worktree-dependencies';
+import type { WorktreeDependencyInstaller, WorktreeDependencyPreparer } from '../../src/main/services/worktree-dependencies';
 import { ProjectService } from '../../src/main/services/project-service';
 import { PublishService } from '../../src/main/services/publish-service';
 import { TaskService } from '../../src/main/services/task-service';
@@ -77,6 +77,7 @@ export function createHarness(
     settings?: Partial<Settings>;
     verification?: VerificationExecutor;
     worktreeDependencies?: WorktreeDependencyPreparer;
+    worktreeDependencyInstaller?: WorktreeDependencyInstaller;
     /** Present only in tests that exercise Ornith routing; absent everywhere else, matching production's optional wiring. */
     ornith?: OrnithImplementationService;
     ornithLease?: OrnithInferenceLeaseService;
@@ -138,6 +139,7 @@ export function createHarness(
   const orchestrator = new Orchestrator({
     verification: options.verification,
     worktreeDependencies: options.worktreeDependencies,
+    worktreeDependencyInstaller: options.worktreeDependencyInstaller,
     projects,
     tasks,
     runs,

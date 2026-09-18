@@ -88,7 +88,8 @@ type Action =
   | { type: 'dismiss-toast'; id: number }
   | { type: 'loading'; value: boolean };
 
-const initialState: State = {
+/** Exported only for focused reducer-level tests. */
+export const initialState: State = {
   section: 'projects',
   projects: [],
   selectedProjectId: null,
@@ -107,7 +108,8 @@ const initialState: State = {
 
 const MAX_LIVE_EVENTS_PER_RUN = 800;
 
-function reducer(state: State, action: Action): State {
+/** Exported only for focused reducer-level tests; the app itself only ever uses it via `useReducer` below. */
+export function reducer(state: State, action: Action): State {
   switch (action.type) {
     case 'section':
       return { ...state, section: action.section };
@@ -218,8 +220,17 @@ function reducer(state: State, action: Action): State {
     case 'busy':
       return { ...state, busy: { ...state.busy, [action.key]: action.value } };
 
-    case 'toast':
+    case 'toast': {
+      // A duplicate of the most recent still-visible toast (same tone, title,
+      // body) is dropped rather than shown twice — a double-submitted action
+      // that failed or succeeded twice in the same tick should not stack two
+      // identical notifications.
+      const last = state.toasts.at(-1);
+      if (last && last.tone === action.toast.tone && last.title === action.toast.title && last.body === action.toast.body) {
+        return state;
+      }
       return { ...state, toasts: [...state.toasts.slice(-4), action.toast] };
+    }
 
     case 'dismiss-toast':
       return { ...state, toasts: state.toasts.filter((t) => t.id !== action.id) };
