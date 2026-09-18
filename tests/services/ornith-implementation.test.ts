@@ -1309,16 +1309,19 @@ describe('OrnithImplementationService limits and cancellation', () => {
     });
 
     /**
-     * Builds a repository of `count` same-size tracked files (each under
-     * `ORNITH_LIMITS.maxReadBytes` so `search_text` reads every byte of every
-     * one of them) sized so that ONE broad search consumes almost the entire
-     * cumulative read budget, leaving less than one file's worth remaining —
-     * reproducing the real observed run (a broad search that ate most of the
-     * budget, followed by a later search this account could no longer fit).
+     * Builds a repository of `count` same-size tracked files (each exactly at
+     * `ORNITH_LIMITS.maxReadBytes`, so `search_text` reads every byte of every
+     * one of them and none is skipped for being individually oversized) whose
+     * total exactly equals the whole cumulative read budget, leaving nothing
+     * remaining — including for the tiny pre-existing `fixture.txt` from
+     * `beforeEach`, which a search_text `continue`-past-oversized-candidates
+     * scan would otherwise still find room for. Reproduces the real observed
+     * run (a broad search that ate the whole budget, followed by a later
+     * search this account could no longer fit at all).
      */
     function writeBudgetExhaustingFiles(): { fileBytes: number; count: number; remainingAfterFirstSearch: number } {
-      const fileBytes = 65_000; // just under ORNITH_LIMITS.maxReadBytes (65_536)
-      const count = Math.floor(ORNITH_LIMITS.maxCumulativeReadBytes / fileBytes); // 64
+      const fileBytes = ORNITH_LIMITS.maxReadBytes; // exactly at the per-file cap, not over it
+      const count = ORNITH_LIMITS.maxCumulativeReadBytes / fileBytes; // exact division: 64
       for (let index = 0; index < count; index += 1) {
         const content = index === 0
           ? `needle\n${'a'.repeat(fileBytes - 7)}`

@@ -1039,7 +1039,13 @@ describe('OrnithWorktreeTools containment and budgets', () => {
     });
   });
 
-  describe('searchText authoritative scope', () => {
+  describe('resolveAuthoritativeScope', () => {
+    // `search_text` deliberately does NOT consume this (a Coai review round found
+    // that narrowing an omitted search to a declared scope could permanently hide
+    // a real match in a file the scope claim omitted, whenever the scope file
+    // itself also happened to contain an incidental match). It exists solely so
+    // `OrnithImplementationService` can confirm a specification's declared scope
+    // against the real manifest before rendering it in the prompt as a hint.
     function toolsWithScope(scopedFilePathCandidates: readonly string[]): OrnithWorktreeTools {
       return new OrnithWorktreeTools({
         worktreePath: worktree,
@@ -1052,136 +1058,36 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       });
     }
 
-    it('scans only the manifest-confirmed authoritative scope when the model omits files, and records it in auditSummary', async () => {
-      writeFileSync(join(worktree, 'scoped.txt'), 'needle here\n', 'utf8');
-      writeFileSync(join(worktree, 'other.txt'), 'needle here too\n', 'utf8');
+    it('resolves to the manifest-confirmed subset of declared candidates', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
       const boundary = toolsWithScope(['scoped.txt']);
 
-      const result = await boundary.searchText(
-        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
-        undefined,
-        { readBytes: 100_000, writeBytes: 0 }
-      );
-
-      expect(result).toMatchObject({ ok: true });
-      if (!result.ok) throw new Error('expected a successful search');
-      const forModel = result.forModel as { matches: { path: string; line: number }[] };
-      expect(forModel.matches).toEqual([{ path: 'scoped.txt', line: 1 }]); // other.txt was never scanned
-      expect(result.auditSummary).toContain('scoped to 1 authoritative file');
+      expect(await boundary.resolveAuthoritativeScope()).toEqual(['scoped.txt']);
     });
 
-    it('falls back to the rest of the manifest when nothing matches within scope, finding a real match elsewhere', async () => {
-      writeFileSync(join(worktree, 'scoped.txt'), 'unrelated content\n', 'utf8');
-      writeFileSync(join(worktree, 'elsewhere.txt'), 'needle is actually here\n', 'utf8');
-      const boundary = toolsWithScope(['scoped.txt']);
+    it('drops a nonexistent declared candidate, resolving to null when nothing survives', async () => {
+      const boundary = toolsWithScope(['docs/does-not-exist.md']);
 
-      const result = await boundary.searchText(
-        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
-        undefined,
-        { readBytes: 100_000, writeBytes: 0 }
-      );
-
-      expect(result).toMatchObject({ ok: true });
-      if (!result.ok) throw new Error('expected a successful search');
-      const forModel = result.forModel as { matches: { path: string; line: number }[] };
-      // The declared scope did not name the file that actually matched — an
-      // incomplete scope claim must never hide it.
-      expect(forModel.matches).toEqual([{ path: 'elsewhere.txt', line: 1 }]);
-      expect(result.auditSummary).toContain('fell back to the full manifest');
+      expect(await boundary.resolveAuthoritativeScope()).toBeNull();
     });
 
-    it('reports zero matches honestly (never as a denial) when nothing matches even after the fallback', async () => {
-      writeFileSync(join(worktree, 'scoped.txt'), 'unrelated content\n', 'utf8');
-      writeFileSync(join(worktree, 'other.txt'), 'also unrelated\n', 'utf8');
-      const boundary = toolsWithScope(['scoped.txt']);
-
-      const result = await boundary.searchText(
-        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
-        undefined,
-        { readBytes: 100_000, writeBytes: 0 }
-      );
-
-      expect(result).toMatchObject({ ok: true });
-      if (!result.ok) throw new Error('expected an honest empty result, not a denial');
-      const forModel = result.forModel as { matches: { path: string; line: number }[] };
-      expect(forModel.matches).toEqual([]);
+    it('resolves to null when no scope was declared at all', async () => {
+      expect(await tools().resolveAuthoritativeScope()).toBeNull();
     });
 
-    it('never revives scope narrowing after eager resolution fails, even once a later manifest build would succeed', async () => {
-      writeFileSync(join(worktree, 'scoped.txt'), 'needle here\n', 'utf8');
+    it('freezes the decision permanently once resolved, even after a failed first attempt followed by a successful retry', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
       const boundary = toolsWithScope(['scoped.txt']);
       const aborted = new AbortController();
       aborted.abort();
 
-      const resolved = await boundary.resolveAuthoritativeScope(aborted.signal);
-      expect(resolved).toBeNull();
+      const first = await boundary.resolveAuthoritativeScope(aborted.signal);
+      expect(first).toBeNull();
 
-      // A later, real (non-aborted) call must not silently re-derive scope.
-      const result = await boundary.searchText(
-        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
-        undefined,
-        { readBytes: 100_000, writeBytes: 0 }
-      );
-
-      expect(result).toMatchObject({ ok: true });
-      if (!result.ok) throw new Error('expected a successful search');
-      expect(result.auditSummary).not.toContain('scoped to');
-    });
-
-    it('an explicit action.files list overrides the authoritative scope entirely', async () => {
-      writeFileSync(join(worktree, 'scoped.txt'), 'needle here\n', 'utf8');
-      writeFileSync(join(worktree, 'other.txt'), 'needle here too\n', 'utf8');
-      const boundary = toolsWithScope(['scoped.txt']);
-
-      const result = await boundary.searchText(
-        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10, files: ['other.txt'] },
-        undefined,
-        { readBytes: 100_000, writeBytes: 0 }
-      );
-
-      expect(result).toMatchObject({ ok: true });
-      if (!result.ok) throw new Error('expected a successful search');
-      const forModel = result.forModel as { matches: { path: string; line: number }[] };
-      expect(forModel.matches).toEqual([{ path: 'other.txt', line: 1 }]);
-    });
-
-    it('a nonexistent declared scope candidate is dropped, falling back to unrestricted discovery', async () => {
-      writeFileSync(join(worktree, 'real.txt'), 'needle here\n', 'utf8');
-      const boundary = toolsWithScope(['docs/does-not-exist.md']);
-
-      const result = await boundary.searchText(
-        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
-        undefined,
-        { readBytes: 100_000, writeBytes: 0 }
-      );
-
-      expect(result).toMatchObject({ ok: true });
-      if (!result.ok) throw new Error('expected a successful search');
-      const forModel = result.forModel as { matches: { path: string; line: number }[] };
-      expect(forModel.matches).toEqual([{ path: 'real.txt', line: 1 }]);
-      expect(result.auditSummary).not.toContain('scoped to');
-    });
-
-    it('unions the authoritative scope with files created this run, so a search never goes blind to its own work', async () => {
-      writeFileSync(join(worktree, 'scoped.txt'), 'plain\n', 'utf8');
-      const boundary = toolsWithScope(['scoped.txt']);
-      const created = await boundary.createFile(
-        { version: 1, action: 'create_file', path: 'notes.txt', content: 'needle appears here\n' },
-        undefined,
-        { readBytes: 0, writeBytes: 1000 }
-      );
-      expect(created).toMatchObject({ ok: true });
-
-      const result = await boundary.searchText(
-        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
-        undefined,
-        { readBytes: 100_000, writeBytes: 0 }
-      );
-
-      expect(result).toMatchObject({ ok: true });
-      if (!result.ok) throw new Error('expected a successful search');
-      const forModel = result.forModel as { matches: { path: string; line: number }[] };
-      expect(forModel.matches).toEqual([{ path: 'notes.txt', line: 1 }]);
+      // A later, real (non-aborted) call must not silently reach a different
+      // answer than the one already decided and reported to the model.
+      const second = await boundary.resolveAuthoritativeScope();
+      expect(second).toBeNull();
     });
   });
 
@@ -1219,6 +1125,30 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       );
 
       expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    });
+
+    it('skips an oversized candidate but keeps scanning smaller ones later in the list that still fit', async () => {
+      const matchBytes = Buffer.byteLength('needle\n', 'utf8');
+      writeFileSync(join(worktree, 'a-toobig.txt'), 'z'.repeat(1000), 'utf8');
+      writeFileSync(join(worktree, 'b-fits.txt'), 'needle\n', 'utf8');
+      const boundary = tools();
+
+      const result = await boundary.searchText(
+        {
+          version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10,
+          files: ['a-toobig.txt', 'b-fits.txt']
+        },
+        undefined,
+        { readBytes: matchBytes, writeBytes: 0 } // fits only the second, smaller candidate
+      );
+
+      // Without skip-and-continue, the oversized first candidate would have
+      // stopped the scan before ever reaching the second, smaller one that fits.
+      expect(result).toMatchObject({ ok: true, readBytes: matchBytes });
+      if (!result.ok) throw new Error('expected a successful, partial search');
+      const forModel = result.forModel as { matches: { path: string; line: number }[]; truncated: boolean };
+      expect(forModel.matches).toEqual([{ path: 'b-fits.txt', line: 1 }]);
+      expect(forModel.truncated).toBe(true);
     });
   });
 });

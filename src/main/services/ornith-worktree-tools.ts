@@ -845,18 +845,19 @@ export class OrnithWorktreeTools {
     const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.searchTimeoutMs, signal);
     try {
       const manifest = await this.ensureManifest(bounded);
-      // A file this run itself created or modified is unioned into the
-      // authoritative scope (not into `manifest`, which already includes it):
-      // Codex's pre-approved scope claim can never have named a path that did
-      // not exist when the specification was written, so a search the model
-      // narrows to "the file(s) I already know about" must not go blind to
-      // its own work-in-progress within the same run.
-      const scopedCandidates = this.authoritativeScope === null
-        ? null
-        : [...new Set([...this.authoritativeScope, ...this.changedFiles])];
-      const explicitFiles = action.files;
-      const candidates = explicitFiles ?? scopedCandidates ?? manifest;
-      const scopedToAuthority = explicitFiles === undefined && scopedCandidates !== null;
+      // Deliberately NOT narrowed to `authoritativeScope`: a Coai review round
+      // found that silently limiting an omitted search to the specification's
+      // declared scope can permanently hide a real match in a file the scope
+      // claim did not name, whenever the scope files themselves also contain
+      // an incidental match for the query (so a "found something" result
+      // looks complete when it is not) — a specification's scope is a
+      // discovery hint, never a proof of completeness, and `search_text` has
+      // no way to safely tell the difference between "nothing else matches"
+      // and "the declared scope wasn't the whole story". Scoped discovery is
+      // instead achieved at the prompt level (the SCOPE section in
+      // `ornith-implementation.ts` tells the model it can `read_file` the
+      // named path directly, without needing to search for it at all).
+      const candidates = action.files ?? manifest;
       for (const path of candidates) {
         if (!this.knownFiles.has(path)) {
           return denied('file_not_found', `"${path}" is not part of the task manifest.`);
@@ -895,112 +896,81 @@ export class OrnithWorktreeTools {
       let anySkippedDueToBudget = false;
       let firstSkipped: { path: string; line: number; requiredBytes: number } | null = null;
       let readBytesTotal = 0;
-      /** Set when a candidate's own size would exceed the remaining cumulative
-       *  read budget, so the outer loop stops before touching it. See the
-       *  zero-progress-vs-partial-progress split below the loop. */
-      let readBudgetExhausted = false;
+      /** Set when at least one candidate's own size exceeded the remaining
+       *  cumulative read budget and was skipped without being opened. Does
+       *  NOT stop the scan — a later, smaller candidate may still fit — so
+       *  this only affects `truncated` and the zero-progress check below. */
+      let anySkippedDueToReadBudget = false;
 
-      // Extracted so a scope-narrowed search that finds nothing can fall
-      // through to a second pass over the rest of the manifest (below) without
-      // duplicating this logic. Returns a denial to propagate immediately, or
-      // `null` to mean "this pass finished; inspect matches/readBudgetExhausted
-      // to decide what happens next" — never a silent, unreported stop.
-      const scanCandidates = async (list: readonly string[]): Promise<OrnithToolResult | null> => {
-        for (const path of list) {
-          if (matches.length >= action.limit) break;
-          // Cheap, synchronous: several of this loop's own calls (`lstat`,
-          // `resolvePathOnly`) take no signal, so without this the loop would
-          // keep doing real filesystem work for the rest of a large candidate
-          // list after the timeout already fired, only stopping once an
-          // abort-aware read eventually throws.
-          if (bounded.aborted) return denied('timeout', 'The repository operation timed out.');
-          if (!(await stillCurrent())) {
-            return denied('checkout_identity_changed', 'The checkout identity changed.');
-          }
-          const resolved = await this.resolvePathOnly(path, { mustExist: true, forWrite: false });
-          if (!resolved.ok) continue;
-          let content: string;
-          try {
-            const stats = await lstat(resolved.absolutePath);
-            if (stats.size > ORNITH_LIMITS.maxReadBytes) continue;
-            if (readBytesTotal + stats.size > budget.readBytes) {
-              // This exact candidate is never opened or read — `readBytesTotal`
-              // below is therefore always exactly the sum of PRIOR, fully and
-              // successfully read candidates, never a partial figure for this
-              // one. Stop scanning; the zero-vs-partial-progress split below
-              // decides whether that is an honest empty denial or an honest
-              // partial success, but either way nothing already accounted for
-              // is discarded.
-              readBudgetExhausted = true;
-              break;
-            }
-            const safeRead = await this.readRegularFileSafely(
-              resolved.absolutePath,
-              Math.min(ORNITH_LIMITS.maxReadBytes, budget.readBytes - readBytesTotal),
-              bounded
-            );
-            if (!safeRead.ok) {
-              if (safeRead.code === 'limit_read_bytes_exceeded' && stats.size > ORNITH_LIMITS.maxReadBytes) continue;
-              return denied(safeRead.code, safeRead.reason);
-            }
-            const raw = safeRead.raw;
-            readBytesTotal += raw.byteLength;
-            content = new TextDecoder('utf-8', { fatal: true }).decode(raw);
-          } catch {
-            continue; // binary or unreadable: silently skipped, matching a literal-text search's scope
-          }
-          const haystack = action.caseSensitive ? content : content.toLowerCase();
-          if (!haystack.includes(needle)) continue;
-          const lines = content.split('\n');
-          for (let index = 0; index < lines.length && matches.length < action.limit; index += 1) {
-            // Named distinctly from `candidate.line` below (a line NUMBER, index+1):
-            // this is the line's TEXT, used only for the needle check on this line and
-            // never itself serialized — the two "line"s sharing a name previously read
-            // as if a matched line's text became part of the returned entry, when it
-            // never does.
-            const lineText = action.caseSensitive ? lines[index] : lines[index]?.toLowerCase();
-            if (lineText === undefined || !lineText.includes(needle)) continue;
-            const candidate = { path, line: index + 1 };
-            // Exact per-candidate size: path content varies, so unlike the skeleton this
-            // cannot be hoisted, but it is computed only once per real candidate match,
-            // not per budget check.
-            const entryBytes = Buffer.byteLength(JSON.stringify(candidate), 'utf8') + (matches.length > 0 ? 1 : 0);
-            if (skeletonBytes + matchesArrayContentBytes + entryBytes > maxResultBytes) {
-              anySkippedDueToBudget = true;
-              firstSkipped ??= { path, line: index + 1, requiredBytes: skeletonBytes + entryBytes };
-              // Not `continue`: `path` is fixed for the rest of this file and line
-              // numbers only increase, so every later line's entry in THIS file is at
-              // least as large as this one's — none of them could fit either. Move on
-              // to the next candidate file instead of checking each remaining line.
-              break;
-            }
-            matches.push(candidate);
-            matchesArrayContentBytes += entryBytes;
-          }
+      for (const path of candidates) {
+        if (matches.length >= action.limit) break;
+        // Cheap, synchronous: several of this loop's own calls (`lstat`,
+        // `resolvePathOnly`) take no signal, so without this the loop would
+        // keep doing real filesystem work for the rest of a large candidate
+        // list after the timeout already fired, only stopping once an
+        // abort-aware read eventually throws.
+        if (bounded.aborted) return denied('timeout', 'The repository operation timed out.');
+        if (!(await stillCurrent())) {
+          return denied('checkout_identity_changed', 'The checkout identity changed.');
         }
-        return null;
-      };
-
-      const primaryDenial = await scanCandidates(candidates);
-      if (primaryDenial !== null) return primaryDenial;
-
-      // A scope-narrowed search that found NOTHING may mean the declared scope
-      // was incomplete (it is a discovery hint from the specification, never a
-      // guarantee) rather than that nothing matches anywhere. Fall back to the
-      // rest of the manifest so a real match elsewhere in the repository is
-      // never silently hidden just because the specification named a
-      // different file — this can only ever match today's pre-scoping cost
-      // (a full manifest scan) in the worst case, never exceed it, and the
-      // common, correctly-scoped case never reaches this branch at all
-      // because it already found its match in the first, cheap pass.
-      let usedFallbackToFullManifest = false;
-      if (scopedToAuthority && matches.length === 0 && !readBudgetExhausted) {
-        const scannedAlready = new Set(candidates);
-        const restOfManifest = manifest.filter((path) => !scannedAlready.has(path));
-        if (restOfManifest.length > 0) {
-          usedFallbackToFullManifest = true;
-          const fallbackDenial = await scanCandidates(restOfManifest);
-          if (fallbackDenial !== null) return fallbackDenial;
+        const resolved = await this.resolvePathOnly(path, { mustExist: true, forWrite: false });
+        if (!resolved.ok) continue;
+        let content: string;
+        try {
+          const stats = await lstat(resolved.absolutePath);
+          if (stats.size > ORNITH_LIMITS.maxReadBytes) continue;
+          if (readBytesTotal + stats.size > budget.readBytes) {
+            // This exact candidate is never opened or read — every byte
+            // charged below still comes from a fully, successfully read
+            // candidate. A later, SMALLER candidate may still fit the
+            // remaining budget, so this skips just this one file rather than
+            // stopping the whole scan (a large file early in manifest order
+            // must not block smaller ones later in it).
+            anySkippedDueToReadBudget = true;
+            continue;
+          }
+          const safeRead = await this.readRegularFileSafely(
+            resolved.absolutePath,
+            Math.min(ORNITH_LIMITS.maxReadBytes, budget.readBytes - readBytesTotal),
+            bounded
+          );
+          if (!safeRead.ok) {
+            if (safeRead.code === 'limit_read_bytes_exceeded' && stats.size > ORNITH_LIMITS.maxReadBytes) continue;
+            return denied(safeRead.code, safeRead.reason);
+          }
+          const raw = safeRead.raw;
+          readBytesTotal += raw.byteLength;
+          content = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+        } catch {
+          continue; // binary or unreadable: silently skipped, matching a literal-text search's scope
+        }
+        const haystack = action.caseSensitive ? content : content.toLowerCase();
+        if (!haystack.includes(needle)) continue;
+        const lines = content.split('\n');
+        for (let index = 0; index < lines.length && matches.length < action.limit; index += 1) {
+          // Named distinctly from `candidate.line` below (a line NUMBER, index+1):
+          // this is the line's TEXT, used only for the needle check on this line and
+          // never itself serialized — the two "line"s sharing a name previously read
+          // as if a matched line's text became part of the returned entry, when it
+          // never does.
+          const lineText = action.caseSensitive ? lines[index] : lines[index]?.toLowerCase();
+          if (lineText === undefined || !lineText.includes(needle)) continue;
+          const candidate = { path, line: index + 1 };
+          // Exact per-candidate size: path content varies, so unlike the skeleton this
+          // cannot be hoisted, but it is computed only once per real candidate match,
+          // not per budget check.
+          const entryBytes = Buffer.byteLength(JSON.stringify(candidate), 'utf8') + (matches.length > 0 ? 1 : 0);
+          if (skeletonBytes + matchesArrayContentBytes + entryBytes > maxResultBytes) {
+            anySkippedDueToBudget = true;
+            firstSkipped ??= { path, line: index + 1, requiredBytes: skeletonBytes + entryBytes };
+            // Not `continue`: `path` is fixed for the rest of this file and line
+            // numbers only increase, so every later line's entry in THIS file is at
+            // least as large as this one's — none of them could fit either. Move on
+            // to the next candidate file instead of checking each remaining line.
+            break;
+          }
+          matches.push(candidate);
+          matchesArrayContentBytes += entryBytes;
         }
       }
 
@@ -1024,31 +994,29 @@ export class OrnithWorktreeTools {
         );
       }
 
-      // Zero progress (nothing read, nothing found) before the cumulative read
-      // budget stopped the scan: an honest, explicit denial — this is a real
-      // "this request cannot proceed" fact, eligible for the caller's bounded
-      // one-shot read-budget recovery. `readBytesTotal === 0` is sufficient to
-      // detect this: a match can only be recorded after a successful read,
-      // which always adds to `readBytesTotal` first.
-      if (readBudgetExhausted && readBytesTotal === 0) {
+      // Zero progress (nothing read, nothing found) despite at least one
+      // candidate being skipped for exceeding the remaining read budget: an
+      // honest, explicit denial — this is a real "this request cannot
+      // proceed" fact, eligible for the caller's bounded one-shot read-budget
+      // recovery. `readBytesTotal === 0` is sufficient to detect this: a
+      // match can only be recorded after a successful read, which always
+      // adds to `readBytesTotal` first — so if it is still 0, every examined
+      // candidate was either skipped for budget or otherwise unreadable, and
+      // nothing was genuinely searched.
+      if (anySkippedDueToReadBudget && readBytesTotal === 0) {
         return denied(
           'limit_read_bytes_exceeded',
-          `The remaining repository read budget (${budget.readBytes} byte(s)) could not fit even the smallest ` +
-            'unscanned candidate file. search_text made no progress.'
+          `No candidate file could be read within the remaining repository read budget (${budget.readBytes} ` +
+            'byte(s)); search_text made no progress.'
         );
       }
 
       return {
         ok: true,
-        forModel: { matches, truncated: matches.length >= action.limit || anySkippedDueToBudget || readBudgetExhausted },
+        forModel: { matches, truncated: matches.length >= action.limit || anySkippedDueToBudget || anySkippedDueToReadBudget },
         readBytes: readBytesTotal,
         writeBytes: 0,
-        auditSummary: scopedToAuthority
-          ? usedFallbackToFullManifest
-            ? `search_text (scoped to ${candidates.length} file(s) first, found nothing, fell back to the full ` +
-              `manifest) -> ${matches.length} match(es)`
-            : `search_text (scoped to ${candidates.length} authoritative file(s)) -> ${matches.length} match(es)`
-          : `search_text -> ${matches.length} match(es) across ${candidates.length} file(s)`
+        auditSummary: `search_text -> ${matches.length} match(es) across ${candidates.length} file(s)`
       };
     } catch (error) {
       return operationFailure(error, signal, bounded);
