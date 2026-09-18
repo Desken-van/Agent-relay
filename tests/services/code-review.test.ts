@@ -2907,6 +2907,22 @@ describe('code-review automatic finding triage', () => {
     expect(task.status).toBe('READY_FOR_IMPLEMENTATION');
   });
 
+  it('releases the exclusivity claim when Codex itself fails, so a retry is never blocked by a stale claim', async () => {
+    const { value, codex, triageService } = await withTwoLiveFindings();
+    codex.triageError = new Error('Codex timed out.');
+
+    await expect(triageService.triage(value.task.id)).rejects.toThrow(/timed out/i);
+
+    // The claim is released in a `finally`, unconditionally — a failed
+    // attempt (a Codex timeout, in this case) must not leave the task
+    // exclusivity claim held, which would otherwise make every later
+    // review/reconcile/triage call for this task fail with BUSY forever.
+    // No queued response is pushed: the fake defaults to one recommendation
+    // per requested finding, satisfying full coverage on its own.
+    codex.triageError = null;
+    await expect(triageService.triage(value.task.id)).resolves.toBeDefined();
+  });
+
   it('refuses when Codex is not configured for this build', async () => {
     const { value } = await withTwoLiveFindings();
     await expect(value.service.triage(value.task.id)).rejects.toMatchObject({ code: 'TOOL_MISSING' });

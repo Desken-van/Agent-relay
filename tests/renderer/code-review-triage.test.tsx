@@ -271,6 +271,10 @@ describe('the external code-review panel — automatic finding triage', () => {
     expect(inputs).toContainEqual({ taskId: 'task-1', findingId: 'f-2', expectedRevision: 0, action: 'reject', reason: 'r2' });
 
     expect(await screen.findByText(/1 of 2 recommendations could not be applied/i)).toBeTruthy();
+    // The aggregate error is thrown AFTER the loop, inside act()'s try —
+    // its catch does not return early, so the unconditional codeReview:get
+    // re-read below it still runs: one on mount, one after this batch.
+    expect(bridge.callsTo('codeReview:get').length).toBeGreaterThanOrEqual(2);
   });
 
   it('never shows a stored recommendation once the reviewed subject has changed', async () => {
@@ -351,6 +355,50 @@ describe('the external code-review panel — automatic finding triage', () => {
     // happened to its sibling and remains applicable.
     expect(screen.getByText(/Recommended: reject/)).toBeTruthy();
     expect(await screen.findByRole('button', { name: /^Apply recommendation$/ })).toBeTruthy();
+  });
+
+  it('end to end: after finding A is decided elsewhere, B still applies through the UI, and exactly one decision is submitted for B alone', async () => {
+    const f1 = finding({ id: 'f-1', revision: 1 }); // A: already decided elsewhere
+    const f2 = finding({ id: 'f-2', revision: 0, title: 'Second finding' }); // B: untouched
+    const triage = triageRecord(
+      [['f-1', 0], ['f-2', 0]],
+      [
+        { findingId: 'f-1', recommendation: 'accept', reason: 'r1', evidenceRef: 'e', confidence: 'high' },
+        { findingId: 'f-2', recommendation: 'reject', reason: 'r2', evidenceRef: 'e', confidence: 'high' }
+      ]
+    );
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
+      detail({
+        subject: subject(),
+        subjectIdentity: 'current',
+        findings: [f1, f2],
+        latestDecisions: {
+          'f-1': {
+            id: 'd-1', findingId: 'f-1', subjectSha256: SUBJECT_SHA, action: 'accept',
+            reason: 'Decided already.', actor: 'operator', source: 'test', findingRevision: 0,
+            decidedAt: '2026-09-06T00:00:00.000Z', createdAt: '2026-09-06T00:00:00.000Z'
+          }
+        },
+        triage
+      })
+    ));
+    bridge.set('codeReview:decide', () => ok<'codeReview:decide'>(
+      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2] })
+    ));
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+
+    // B's apply affordance is present and B alone gets submitted.
+    const apply = await screen.findByRole('button', { name: /^Apply recommendation$/ });
+    fireEvent.click(apply);
+
+    await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(1));
+    expect(bridge.callsTo('codeReview:decide')[0]?.input).toEqual({
+      taskId: 'task-1',
+      findingId: 'f-2',
+      expectedRevision: 0,
+      action: 'reject',
+      reason: 'r2'
+    });
   });
 
   it('resets the busy guard and shows an error when Analyze itself fails, leaving no control stuck disabled', async () => {
