@@ -1620,12 +1620,15 @@ export function CodeReviewPanel({
   }, [task.id]);
 
   const findings = detail?.findings ?? NO_CODE_FINDINGS;
-  // Keyed on the subject and the exact live findings (id + revision), not on
-  // any single mutable counter: a decision on ONE finding must not discard a
-  // draft in progress for another, but a new subject or a finding actually
-  // moving (the only things that change this key) should.
+  // Keyed on the subject and the SET of live finding ids, deliberately not
+  // on their revisions: a decided finding stays in `findings` (it just also
+  // gains a `latestDecisions` entry and stops rendering its own draft
+  // controls), so its id never leaves this set and deciding it must not
+  // discard a draft in progress for an untouched sibling. Only a genuinely
+  // different set of live findings — a new subject, or a finding newly
+  // appearing or disappearing — invalidates a stale draft.
   const roundKey = detail?.subject
-    ? `${detail.subject.subjectSha256}:${JSON.stringify(findings.map((f) => [f.id, f.revision]))}`
+    ? `${detail.subject.subjectSha256}:${findings.map((f) => f.id).sort().join(',')}`
     : null;
   const decisions = draftState.roundKey === roundKey ? draftState.drafts : NO_CODE_DECISIONS;
   const setDecisions = useCallback(
@@ -1678,11 +1681,20 @@ export function CodeReviewPanel({
     } catch (caught) {
       opError = caught instanceof Error ? caught.message : String(caught);
     }
-    const result = await call('codeReview:get', { taskId: task.id });
-    if (result.ok) setDetail(result.data);
-    setError(opError ?? (result.ok ? null : result.error.message));
-    inFlightRef.current = false;
-    setBusy(null);
+    // The single-flight guard is released in `finally` below regardless of
+    // what happens here: `call` (unlike `expect`) is documented to resolve
+    // rather than reject, but a reread that somehow threw anyway must not
+    // leave every control on this panel permanently disabled.
+    try {
+      const result = await call('codeReview:get', { taskId: task.id });
+      if (result.ok) setDetail(result.data);
+      setError(opError ?? (result.ok ? null : result.error.message));
+    } catch (caught) {
+      setError(opError ?? (caught instanceof Error ? caught.message : String(caught)));
+    } finally {
+      inFlightRef.current = false;
+      setBusy(null);
+    }
   }, [task.id]);
 
   if (task.worktreePath === null) return null;
@@ -1719,31 +1731,35 @@ export function CodeReviewPanel({
   const applyAllRecommendations = (): void => {
     if (applicableUndecided.length === 0) return;
     void act('apply-all', async () => {
-      // Every item is attempted regardless of an earlier one failing — a
-      // successful decide() call already durably committed before the next
-      // iteration starts, and one failed or stale item (e.g. decided by
-      // someone else moments ago) must not discard the rest of an otherwise
-      // valid batch. Failures are collected and reported together at the
-      // end, after every attempt has been made.
-      const failures: string[] = [];
+      const targets: { finding: CodeReviewFinding; action: CodeReviewDecisionAction; reason: string }[] = [];
       for (const finding of applicableUndecided) {
         const recommendation = triageByFinding.get(finding.id);
         if (!recommendation || recommendation.recommendation === 'needs_user') continue;
-        try {
-          await expect('codeReview:decide', {
-            taskId: task.id,
-            findingId: finding.id,
-            expectedRevision: finding.revision,
-            action: recommendation.recommendation,
-            reason: recommendation.reason
-          });
-        } catch (caught) {
-          failures.push(`${finding.title}: ${caught instanceof Error ? caught.message : String(caught)}`);
-        }
+        targets.push({ finding, action: recommendation.recommendation, reason: recommendation.reason });
       }
+      // Fired concurrently, not one at a time: each targets a different
+      // finding with its own expectedRevision, so there is no ordering
+      // dependency between them, and every item is attempted regardless of
+      // whether another fails — one stale or failed item (e.g. decided by
+      // someone else moments ago) must not discard the rest of an
+      // otherwise valid batch. Failures are collected and reported
+      // together, after every attempt has settled.
+      const settled = await Promise.allSettled(
+        targets.map((target) => expect('codeReview:decide', {
+          taskId: task.id,
+          findingId: target.finding.id,
+          expectedRevision: target.finding.revision,
+          action: target.action,
+          reason: target.reason
+        }))
+      );
+      const failures = settled
+        .map((outcome, index) => ({ outcome, finding: targets[index]!.finding }))
+        .filter((entry): entry is { outcome: PromiseRejectedResult; finding: CodeReviewFinding } => entry.outcome.status === 'rejected')
+        .map(({ outcome, finding }) => `${finding.title}: ${outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)}`);
       if (failures.length > 0) {
         throw new Error(
-          `${failures.length} of ${applicableUndecided.length} recommendations could not be applied: ${failures.join('; ')}`
+          `${failures.length} of ${targets.length} recommendations could not be applied: ${failures.join('; ')}`
         );
       }
     });

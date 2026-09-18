@@ -594,8 +594,16 @@ export interface IpcResponseMap {
   'codeReview:review': CodeReviewDetail;
   'codeReview:reconcile': CodeReviewDetail;
   'codeReview:decide': CodeReviewDetail;
-  /** Not persisted — a fresh analysis every call — so the recommendations
-   *  ride alongside the detail rather than inside it. */
+  /**
+   * Every call runs a fresh, independent Codex analysis (never reused or
+   * cached), but its result IS persisted — see `CodeReviewRepository.
+   * upsertTriage` and `CodeReviewDetail.triage`. `recommendations` here is
+   * this exact call's answer, returned directly so a caller need not wait
+   * for a second round trip; `detail` is included alongside it (rather than
+   * folding `recommendations` into `detail` itself) because the two answer
+   * different questions — this call's own fresh output, versus the durable
+   * state a later, unrelated `codeReview:get` would read back.
+   */
   'codeReview:triage': { readonly recommendations: readonly FindingTriageRecommendation[]; readonly detail: CodeReviewDetail };
 
   'git:changes': GitChangeSet;

@@ -401,6 +401,62 @@ describe('the external code-review panel — automatic finding triage', () => {
     });
   });
 
+  it('preserves an in-progress manual draft for an untouched finding after a sibling finding is decided', async () => {
+    const f1 = finding({ id: 'f-1', revision: 0, title: 'First finding' });
+    const f2 = finding({ id: 'f-2', revision: 0, title: 'Second finding' });
+    // Stateful: `act()`'s post-mutation reread is a SEPARATE codeReview:get
+    // call, not the codeReview:decide response — the mock must reflect the
+    // decision on its NEXT read, or this test cannot tell the fix from a
+    // mock that never actually re-rendered anything.
+    let f1Decided = false;
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
+      detail({
+        subject: subject(),
+        subjectIdentity: 'current',
+        findings: [finding({ id: 'f-1', revision: f1Decided ? 1 : 0, title: 'First finding' }), f2],
+        latestDecisions: f1Decided ? {
+          'f-1': {
+            id: 'd-1', findingId: 'f-1', subjectSha256: SUBJECT_SHA, action: 'accept',
+            reason: 'Handled.', actor: 'operator', source: 'test', findingRevision: 0,
+            decidedAt: '2026-09-06T00:00:00.000Z', createdAt: '2026-09-06T00:00:00.000Z'
+          }
+        } : {}
+      })
+    ));
+    bridge.set('codeReview:decide', () => {
+      f1Decided = true;
+      return ok<'codeReview:decide'>(detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2] }));
+    });
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+
+    await screen.findByText('Second finding');
+    const decisionSelects = screen.getAllByLabelText('Decision');
+    // Not `getAllByLabelText('Reason')`: the Reason field's label also wraps
+    // a hint span ("Required for every decision"), so its accessible name is
+    // "ReasonRequired for every decision", not "Reason" alone.
+    const reasonInputs = screen.getAllByRole('textbox');
+    expect(decisionSelects).toHaveLength(2);
+
+    // A draft in progress for f-2 — never submitted.
+    fireEvent.change(decisionSelects[1]!, { target: { value: 'reject' } });
+    fireEvent.change(reasonInputs[1]!, { target: { value: 'Draft reason for the second finding.' } });
+
+    // f-1 is decided through the UI.
+    fireEvent.change(decisionSelects[0]!, { target: { value: 'accept' } });
+    fireEvent.change(reasonInputs[0]!, { target: { value: 'Handled.' } });
+    const submitButtons = screen.getAllByRole('button', { name: /^Submit decision$/ });
+    fireEvent.click(submitButtons[0]!);
+
+    await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(1));
+    // f-1 now shows its decision instead of controls; f-2's draft, entered
+    // before f-1 was decided, must still be there — not wiped by the
+    // unconditional reread that followed deciding an unrelated sibling.
+    await screen.findByText(/Decided: accept/);
+    const remainingReasonInputs = screen.getAllByRole('textbox');
+    expect(remainingReasonInputs).toHaveLength(1);
+    expect((remainingReasonInputs[0] as HTMLInputElement).value).toBe('Draft reason for the second finding.');
+  });
+
   it('resets the busy guard and shows an error when Analyze itself fails, leaving no control stuck disabled', async () => {
     const f1 = finding({ id: 'f-1' });
     bridge.set('codeReview:get', () => ok<'codeReview:get'>(
