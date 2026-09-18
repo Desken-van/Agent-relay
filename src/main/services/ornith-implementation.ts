@@ -205,7 +205,9 @@ function renderSpecification(specification: TaskSpecification): string {
 The approved specification confidently limits this task to the following existing repository
 file(s). Read them directly with "read_file" — you do not need "list_files" or "search_text" to
 find them; a search does NOT automatically narrow itself to this list, so calling one anyway to
-"double check" costs the same as any other repository-wide search.
+"double check" costs the same as any other repository-wide search. The list can be incomplete: if
+the work turns out to need other files, or a new one, discover them normally with "list_files"
+and "search_text".
 ${scope.map((path) => `  - ${path}`).join('\n')}
 `
     : '';

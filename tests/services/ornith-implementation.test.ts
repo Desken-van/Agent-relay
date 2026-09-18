@@ -1385,7 +1385,65 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(events.some((event) => event.text.includes('Confirming specification scope'))).toBe(true);
       const firstPrompt = requests[0]!.messages.map((message) => message.content).join('\n');
       expect(firstPrompt).toContain('=== SCOPE ===');
-      expect(firstPrompt).toContain('docs/manual-test.md');
+      expect(firstPrompt).toContain('  - docs/manual-test.md');
+      // The claims the SCOPE section makes must be true of the implementation:
+      // search_text is never narrowed for the model, and the list is not a wall.
+      expect(firstPrompt).toContain('a search does NOT automatically narrow itself to this list');
+      expect(firstPrompt).toContain('The list can be incomplete');
+    });
+
+    it('renders every confirmed scoped path once, in order, and drops the ones the manifest does not confirm', async () => {
+      mkdirSync(join(worktree, 'docs'), { recursive: true });
+      writeFileSync(join(worktree, 'docs', 'manual-test.md'), 'a\n', 'utf8');
+      writeFileSync(join(worktree, 'scoped.txt'), 'b\n', 'utf8');
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Inspected only.' }));
+        }
+      };
+
+      await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        specification: {
+          ...specification,
+          scopedFilePaths: ['scoped.txt', 'docs/not-tracked.md', 'docs/manual-test.md', 'scoped.txt']
+        }
+      });
+
+      const scopeSection = requests[0]!.messages.map((message) => message.content).join('\n')
+        .split('=== SCOPE ===')[1]!.split('\n=== ')[0]!;
+      const listed = scopeSection.split('\n').filter((line) => line.startsWith('  - '));
+      expect(listed).toEqual(['  - scoped.txt', '  - docs/manual-test.md']);
+    });
+
+    it('preflight already charges the largest possible SCOPE section, so resolving the scope can only make the prompt smaller', () => {
+      const fullScope = Array.from({ length: ORNITH_LIMITS.maxScopedFilePaths }, (_, index) =>
+        `docs/${'d'.repeat(180)}-${String(index).padStart(2, '0')}.md`
+      );
+      const budgetFor = (scopedFilePaths: readonly string[]): number => {
+        const checked = preflightOrnithPrompt({
+          specification: { ...specification, scopedFilePaths: [...scopedFilePaths] },
+          ruleEvidence: null,
+          acceptedPlanReviewAddenda: null,
+          correctionFindings: null,
+          round: 1,
+          maxRounds: 3,
+          lease: lease({ contextLimitTokens: 16_384, maxOutputTokens: 1_024 })
+        });
+        expect(checked.ok).toBe(true);
+        if (!checked.ok) throw new Error('preflight unexpectedly refused');
+        return checked.budget.maxToolResultBytes;
+      };
+
+      // Every subset resolution can produce (including "unconfirmed" = none) leaves
+      // at least as much tool-result room as the full declared list preflight used.
+      const full = budgetFor(fullScope);
+      expect(budgetFor(fullScope.slice(0, 10))).toBeGreaterThanOrEqual(full);
+      expect(budgetFor([])).toBeGreaterThan(full);
     });
 
     it('bounds eager scope confirmation by the whole-loop deadline: it fails with limit_deadline_exceeded before any inference and the deadline reaches the git layer', async () => {
