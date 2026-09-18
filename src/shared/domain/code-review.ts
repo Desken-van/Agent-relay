@@ -577,7 +577,7 @@ export function parseCodeReviewTriage(json: string | null): CodeReviewTriageResu
  * it was computed against, so a later read can tell — without trusting
  * anything about elapsed time or a bumped counter unrelated to triage itself
  * — whether the stored recommendations still speak for what is on screen.
- * See {@link codeReviewTriageIsCurrent}.
+ * See {@link codeReviewCurrentTriageRecommendations}.
  */
 export const codeReviewTriageSchema = z
   .object({
@@ -619,37 +619,71 @@ export function codeReviewTriageFindingsSnapshot(
 }
 
 /**
- * Whether a stored triage result still speaks for the task's current state.
- *
- * Both dimensions the task requires are checked together, and either one
- * failing discards the WHOLE result rather than the one finding it names:
- * the subject must be the CURRENT one (never a newer capture's predecessor),
- * and every finding the result covers must still be live at the exact
- * revision it was analyzed at (a decision recorded on any one of them — the
- * only thing that bumps a finding's revision — invalidates the set, not just
- * that entry, since the recommendations were computed together against one
- * coherent view). Only the findings the stored result actually names are
- * compared — an unrelated live finding appearing or disappearing says
- * nothing about whether THIS analysis still applies.
+ * Parse a {@link codeReviewTriageFindingsSnapshot} string back into a lookup
+ * of the revision each finding was analyzed at. `null` on anything that does
+ * not match the exact shape the function above produces — never trusted as
+ * partial data.
  */
-export function codeReviewTriageIsCurrent(
+function parseTriageFindingsSnapshot(json: string): ReadonlyMap<string, number> | null {
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (!Array.isArray(parsed)) return null;
+    const entries = new Map<string, number>();
+    for (const entry of parsed) {
+      if (
+        !Array.isArray(entry) || entry.length !== 2 ||
+        typeof entry[0] !== 'string' || typeof entry[1] !== 'number'
+      ) {
+        return null;
+      }
+      entries.set(entry[0], entry[1]);
+    }
+    return entries;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The recommendations from a stored triage result that still speak for the
+ * task's current state — filtered per finding, not gated as one all-or-
+ * nothing block.
+ *
+ * The subject is still an all-or-nothing gate: if it no longer matches the
+ * current one, nothing from the stored result applies (every finding it
+ * named belongs to code that is no longer current). But within a matching
+ * subject, each recommendation is independent of its siblings — Codex
+ * evaluates one finding's own text and evidence, not anything about the
+ * OTHER findings it was asked about in the same call — so a decision
+ * recorded on finding A (the only thing that bumps a finding's revision)
+ * has nothing to say about whether the recommendation for finding B is
+ * still accurate. Discarding the whole result the moment any ONE covered
+ * finding moves would silently hide B's still-valid recommendation too,
+ * which is exactly the wrong direction for a feature meant to let an
+ * operator apply some recommendations and leave others (in particular
+ * `needs_user` ones) for a human to read while deciding — including right
+ * after using "apply all", which is the case this design fixes: applying
+ * an accept/reject recommendation for one finding no longer erases the
+ * still-open recommendation shown for another.
+ */
+export function codeReviewCurrentTriageRecommendations(
   triage: Pick<CodeReviewTriage, 'subjectSha256' | 'findingsSnapshotJson' | 'triageJson'> | null,
   currentSubjectSha256: string | null,
   liveFindings: readonly { readonly id: string; readonly revision: number }[]
-): boolean {
-  if (triage === null || currentSubjectSha256 === null) return false;
-  if (triage.subjectSha256 !== currentSubjectSha256) return false;
+): readonly CodeReviewTriageRecommendation[] {
+  if (triage === null || currentSubjectSha256 === null) return [];
+  if (triage.subjectSha256 !== currentSubjectSha256) return [];
   const parsed = parseCodeReviewTriage(triage.triageJson);
-  if (parsed === null) return false;
+  if (parsed === null) return [];
+  const analyzedRevisionById = parseTriageFindingsSnapshot(triage.findingsSnapshotJson);
+  if (analyzedRevisionById === null) return [];
 
-  const revisionById = new Map(liveFindings.map((f) => [f.id, f.revision] as const));
-  const coveredIds = new Set(parsed.recommendations.map((r) => r.findingId));
-  const current: { id: string; revision: number }[] = [];
-  for (const id of coveredIds) {
-    const revision = revisionById.get(id);
-    // Not live anymore — decided, or from a subject this one superseded.
-    if (revision === undefined) return false;
-    current.push({ id, revision });
-  }
-  return codeReviewTriageFindingsSnapshot(current) === triage.findingsSnapshotJson;
+  const liveRevisionById = new Map(liveFindings.map((f) => [f.id, f.revision] as const));
+  return parsed.recommendations.filter((recommendation) => {
+    const analyzedAt = analyzedRevisionById.get(recommendation.findingId);
+    const liveNow = liveRevisionById.get(recommendation.findingId);
+    // Undefined on either side means: not part of what this result actually
+    // analyzed, or not live anymore (decided, or from a superseded subject).
+    return analyzedAt !== undefined && liveNow !== undefined && analyzedAt === liveNow;
+  });
 }

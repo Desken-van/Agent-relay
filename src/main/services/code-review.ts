@@ -1580,8 +1580,9 @@ export class CodeReviewService {
    * access is reused or granted. The result is persisted (one durable row
    * per task, wholesale-replaced — see `CodeReviewRepository.upsertTriage`)
    * bound to the exact subject and the exact finding identities/revisions it
-   * was computed against, so it survives a restart and a later read can tell
-   * whether it still applies via `codeReviewTriageIsCurrent`.
+   * was computed against, so it survives a restart and a later read can tell,
+   * per finding, whether it still applies via
+   * `codeReviewCurrentTriageRecommendations`.
    */
   async triage(
     taskId: string,

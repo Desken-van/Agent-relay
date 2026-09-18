@@ -193,10 +193,10 @@ export interface CodeReviewDetail {
    *
    * Deliberately NOT pre-filtered to "still current" here, mirroring how
    * `PlanReviewGate.triageForFindings` is exposed raw and compared against
-   * `findingsJson` by the reader: whether it still applies is a comparison
-   * against `findings`/`subject` the caller already has, computed once via
-   * `codeReviewTriageIsCurrent` rather than duplicated as a second boolean
-   * that could disagree with it.
+   * `findingsJson` by the reader: which of its recommendations still apply
+   * is a per-finding comparison against `findings`/`subject` the caller
+   * already has, computed once via `codeReviewCurrentTriageRecommendations`
+   * rather than duplicated as a second, potentially disagreeing filter.
    */
   readonly triage: CodeReviewTriage | null;
 }

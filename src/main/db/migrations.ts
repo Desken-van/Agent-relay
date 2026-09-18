@@ -1058,12 +1058,13 @@ export const MIGRATIONS: readonly Migration[] = [
       // same reason the plan gate's own triage columns are not one: a
       // finding's revision is meaningful (it bumps on a real decision), but
       // nothing here predicts what it will become next. A read instead
-      // recomputes the same snapshot from the CURRENT live findings the
-      // stored result names and compares it byte-for-byte
-      // (`codeReviewTriageIsCurrent`): only a subject change or a decision on
-      // one of the analyzed findings invalidates the stored result, and a
-      // newer subject's row starts this table's per-task slot over from
-      // nothing, so a stale result is never carried forward onto it.
+      // filters the stored recommendations per finding against the CURRENT
+      // live findings the result names
+      // (`codeReviewCurrentTriageRecommendations`): a subject change drops
+      // the whole result, but a decision on ONE covered finding only drops
+      // that finding's own recommendation, not its siblings'. A newer
+      // subject's row starts this table's per-task slot over from nothing,
+      // so a stale result is never carried forward onto it.
       db.exec(`
         CREATE TABLE code_review_triage (
           id                       TEXT PRIMARY KEY,

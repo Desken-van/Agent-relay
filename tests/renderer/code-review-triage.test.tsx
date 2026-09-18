@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { Task } from '../../src/shared/domain/models';
 import type { CodeReviewDetail } from '../../src/shared/ipc';
 import type { CodeReviewFinding, CodeReviewSubject, CodeReviewTriage } from '../../src/shared/domain/code-review';
@@ -306,6 +306,68 @@ describe('the external code-review panel — automatic finding triage', () => {
     await screen.findByText(/The retry is ambiguous/);
     expect(screen.queryByText(/Recommended: accept/)).toBeNull();
     expect(screen.queryByText(/Stale recommendation\./)).toBeNull();
+  });
+
+  it('keeps a sibling finding\'s recommendation visible after another finding from the same analysis is decided', async () => {
+    // f-1 was decided (its live revision moved from the analyzed 0 to 1);
+    // f-2 is untouched and still at the revision it was analyzed at.
+    const f1 = finding({ id: 'f-1', revision: 1 });
+    const f2 = finding({ id: 'f-2', revision: 0, title: 'Second finding' });
+    const triage = triageRecord(
+      [['f-1', 0], ['f-2', 0]],
+      [
+        { findingId: 'f-1', recommendation: 'accept', reason: 'r1', evidenceRef: 'e', confidence: 'high' },
+        { findingId: 'f-2', recommendation: 'reject', reason: 'r2', evidenceRef: 'e', confidence: 'high' }
+      ]
+    );
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
+      detail({
+        subject: subject(),
+        subjectIdentity: 'current',
+        findings: [f1, f2],
+        latestDecisions: {
+          'f-1': {
+            id: 'd-1',
+            findingId: 'f-1',
+            subjectSha256: SUBJECT_SHA,
+            action: 'accept',
+            reason: 'Decided already.',
+            actor: 'operator',
+            source: 'test',
+            findingRevision: 0,
+            decidedAt: '2026-09-06T00:00:00.000Z',
+            createdAt: '2026-09-06T00:00:00.000Z'
+          }
+        },
+        triage
+      })
+    ));
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+
+    // f-1 shows its decision, not a stale recommendation for itself.
+    await screen.findByText(/Decided: accept/);
+    expect(screen.queryByText(/^r1$/)).toBeNull();
+    // f-2's recommendation, from the SAME analysis, is unaffected by what
+    // happened to its sibling and remains applicable.
+    expect(screen.getByText(/Recommended: reject/)).toBeTruthy();
+    expect(await screen.findByRole('button', { name: /^Apply recommendation$/ })).toBeTruthy();
+  });
+
+  it('resets the busy guard and shows an error when Analyze itself fails, leaving no control stuck disabled', async () => {
+    const f1 = finding({ id: 'f-1' });
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
+      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1] })
+    ));
+    bridge.set('codeReview:triage', () => fail('Codex did not respond in time.', 'TIMEOUT'));
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+
+    const button = await screen.findByRole('button', { name: /Analyze undecided findings/i });
+    fireEvent.click(button);
+
+    expect(await screen.findByText(/Codex did not respond in time\./)).toBeTruthy();
+    // The single-flight guard was released — the button is enabled again,
+    // not left stuck disabled by a failure that never called release().
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
   });
 
   it('offers no Analyze button, and shows no code-review panel content, when there is nothing captured and the integration is off', async () => {

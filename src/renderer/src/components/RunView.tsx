@@ -10,8 +10,7 @@ import type { GitChangeSet } from '@shared/domain/git';
 import { APPROVAL_ACTIONS, type ApprovalAction, type Run, type Task } from '@shared/domain/models';
 import { parsePlanReviewTriage, type PlanReviewDecision } from '@shared/domain/plan-review';
 import {
-  codeReviewTriageIsCurrent,
-  parseCodeReviewTriage,
+  codeReviewCurrentTriageRecommendations,
   type CodeReviewDecisionAction,
   type CodeReviewFinding
 } from '@shared/domain/code-review';
@@ -1643,22 +1642,19 @@ export function CodeReviewPanel({
   const undecidedFindings = findings.filter((f) => !latestDecisions[f.id]);
   const undecidedIds = undecidedFindings.map((f) => f.id);
 
-  // Discards the WHOLE stored result together — never just the one finding
-  // it names — the moment the subject or any finding it covers has moved.
-  // See `codeReviewTriageIsCurrent`.
-  const currentTriage = detail && codeReviewTriageIsCurrent(
-    detail.triage,
-    detail.subject?.subjectSha256 ?? null,
-    findings
-  )
-    ? parseCodeReviewTriage(detail.triage!.triageJson)
-    : null;
-  const triageByFinding = new Map(currentTriage?.recommendations.map((r) => [r.findingId, r] as const) ?? []);
-  const triageSummary = currentTriage
+  // Filtered per finding, not gated as one all-or-nothing block: a decision
+  // on one covered finding must not hide a still-accurate recommendation for
+  // another. A subject change is still all-or-nothing (nothing it covers is
+  // current code anymore). See `codeReviewCurrentTriageRecommendations`.
+  const currentRecommendations = detail
+    ? codeReviewCurrentTriageRecommendations(detail.triage, detail.subject?.subjectSha256 ?? null, findings)
+    : [];
+  const triageByFinding = new Map(currentRecommendations.map((r) => [r.findingId, r] as const));
+  const triageSummary = currentRecommendations.length > 0
     ? {
-        accept: currentTriage.recommendations.filter((r) => r.recommendation === 'accept').length,
-        reject: currentTriage.recommendations.filter((r) => r.recommendation === 'reject').length,
-        needsUser: currentTriage.recommendations.filter((r) => r.recommendation === 'needs_user').length
+        accept: currentRecommendations.filter((r) => r.recommendation === 'accept').length,
+        reject: currentRecommendations.filter((r) => r.recommendation === 'reject').length,
+        needsUser: currentRecommendations.filter((r) => r.recommendation === 'needs_user').length
       }
     : null;
   const applicableUndecided = undecidedFindings.filter((f) => {

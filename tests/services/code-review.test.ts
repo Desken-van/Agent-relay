@@ -48,7 +48,7 @@ import {
   type SnapshotFileOps
 } from '../../src/main/adapters/git/git-code-snapshot';
 import {
-  codeReviewTriageIsCurrent,
+  codeReviewCurrentTriageRecommendations,
   parseCodeReviewTriage,
   type ProviderCodeFinding
 } from '../../src/shared/domain/code-review';
@@ -2950,9 +2950,10 @@ describe('code-review automatic finding triage', () => {
     const independentReviews = new SqliteCodeReviewRepository(value.harness.db, value.harness.clock);
     expect(independentReviews.getTriage(value.task.id)).toEqual(stored);
 
-    // The positive case `codeReviewTriageIsCurrent` exists to recognize:
-    // freshly written, against the live subject and its live findings.
-    expect(codeReviewTriageIsCurrent(stored, identity.currentSha256, findings)).toBe(true);
+    // The positive case `codeReviewCurrentTriageRecommendations` exists to
+    // recognize: freshly written, against the live subject and its live
+    // findings, both recommendations are still current.
+    expect(codeReviewCurrentTriageRecommendations(stored, identity.currentSha256, findings)).toHaveLength(2);
   });
 
   it('never shows a stored recommendation for a `needs_user` finding as something to apply', async () => {
@@ -2993,11 +2994,12 @@ describe('code-review automatic finding triage', () => {
     // per task, wholesale-replaced only by the NEXT triage run, not by a
     // capture.
     expect(value.reviews.getTriage(value.task.id)).toEqual(stored);
-    // But it must never be shown as speaking for the new subject.
-    expect(codeReviewTriageIsCurrent(stored, newSubject.subjectSha256, findings)).toBe(false);
+    // But it must never be shown as speaking for the new subject — a
+    // subject mismatch is still an all-or-nothing gate.
+    expect(codeReviewCurrentTriageRecommendations(stored, newSubject.subjectSha256, findings)).toEqual([]);
   });
 
-  it('rejects a stored triage result once one of its analyzed findings is decided, even though the subject is unchanged', async () => {
+  it('drops only the decided finding\'s own recommendation, keeping its sibling\'s recommendation current', async () => {
     const { value, triageService, findings } = await withTwoLiveFindings();
     await triageService.triage(value.task.id);
     const stored = value.reviews.getTriage(value.task.id)!;
@@ -3015,10 +3017,11 @@ describe('code-review automatic finding triage', () => {
     const liveNow = value.reviews
       .listFindings(value.task.id)
       .filter((f) => f.subjectSha256 === identity.stored!.subjectSha256);
-    // The subject itself never moved — only proof that a decision on ANY one
-    // of the analyzed findings invalidates the WHOLE stored result, not only
-    // the one finding it named.
+    // The subject itself never moved. Deciding finding 0 must drop ONLY its
+    // own recommendation — finding 1's is untouched by anything that
+    // happened to a sibling in the same analysis, and stays current.
     expect(identity.currentSha256).toBe(stored.subjectSha256);
-    expect(codeReviewTriageIsCurrent(stored, identity.currentSha256, liveNow)).toBe(false);
+    const current = codeReviewCurrentTriageRecommendations(stored, identity.currentSha256, liveNow);
+    expect(current.map((r) => r.findingId)).toEqual([findings[1]!.id]);
   });
 });
