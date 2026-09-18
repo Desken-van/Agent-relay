@@ -287,6 +287,14 @@ Rules:
   a few KB before "totalBytes"), or, when a SCOPE section names the file(s), run "search_text"
   with "files" set to exactly those file(s) (it reports line numbers, not byte offsets). A chunk
   may be shorter than your "limit" so the result fits; "bytesRead" says how much you got.
+- A "read_file" result also reports "lineEnding" for the WHOLE file: "lf", "crlf", "mixed" or "none".
+  In your JSON reply, "\\r\\n" (one backslash before each letter) decodes to the real CR and LF
+  characters, but "\\\\r\\\\n" (doubled backslashes) decodes to four literal characters (backslash, r,
+  backslash, n) that will NOT match a line break. Write each real line break in "oldText" and
+  "newText" as the single-backslash escape that fits lineEnding (crlf: "\\r\\n", lf: "\\n"), and never
+  copy a JSON escape from a result as literal text. Agent Relay converts neither form for you. A
+  "replace_text" refused with code "replacement_escape_suspected" changed nothing and allows exactly
+  ONE retry, which must differ from the refused request.
 - A "list_files" result's "nextCursor" is the ONLY thing that tells you whether there is more:
   if it is a number, your NEXT "list_files" call for that SAME "prefix" must set "cursor" to
   exactly that number to continue; if it is null, that prefix is fully listed and must not be
@@ -534,6 +542,7 @@ const ORNITH_DENIAL_PUBLISH_BLOCK: Record<OrnithDenialCode, ClaudePublishBlock> 
   checkout_identity_changed: 'security',
   stale_hash: 'configuration',
   replacement_mismatch: 'configuration',
+  replacement_escape_suspected: 'configuration',
   file_exists: 'configuration',
   file_not_found: 'configuration',
   limit_turns_exceeded: 'configuration',
@@ -565,6 +574,10 @@ const ORNITH_DENIAL_PUBLISH_BLOCK: Record<OrnithDenialCode, ClaudePublishBlock> 
  * budget — and a read-budget denial gets exactly one chance, not three.
  */
 function isRecoverableToolDenial(action: OrnithAction, code: OrnithDenialCode): boolean {
+  // The one mutation denial that is recoverable: `replace_text` refused with
+  // `replacement_escape_suspected` provably wrote nothing (the refusal precedes
+  // every mutation step), so a DIFFERENT retry cannot corrupt anything.
+  if (code === 'replacement_escape_suspected') return action.action === 'replace_text';
   return (code === 'timeout' || code === 'limit_read_bytes_exceeded') && isNoProgressGuardAction(action);
 }
 
@@ -636,6 +649,10 @@ export class OrnithImplementationService {
     let consecutiveIdenticalReadOnlyActions = 0;
     let readOnlyRecoveryAttemptsUsed = 0;
     let readBudgetRecoveryAttemptsUsed = 0;
+    let replacementEscapeRecoveryAttemptsUsed = 0;
+    /** The exact `replace_text` action refused with `replacement_escape_suspected`, so an
+     *  identical repeat is refused before dispatch. `null` until such a denial. */
+    let escapeDeniedFingerprint: string | null = null;
     const outcomes: Array<{ sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }> = [];
     const finish = (
       disposition: 'pass' | 'fail', message: string,
@@ -1014,8 +1031,19 @@ export class OrnithImplementationService {
       }
 
       let toolResult: OrnithToolResult;
+      let identicalEscapeRetryRefused = false;
       const operationStarted = Date.now();
-      if (action.action === 'run_verification') {
+      if (action.action === 'replace_text' && escapeDeniedFingerprint !== null && JSON.stringify(action) === escapeDeniedFingerprint) {
+        // Never dispatched: it would fail exactly as before. The single retry was
+        // supposed to CHANGE the escaping, so this ends the run.
+        identicalEscapeRetryRefused = true;
+        toolResult = {
+          ok: false,
+          code: 'replacement_escape_suspected',
+          reason: 'The identical replace_text request already failed with replacement_escape_suspected and was ' +
+            'not dispatched again. The file is unchanged.'
+        };
+      } else if (action.action === 'run_verification') {
         if (verificationsUsed >= ORNITH_LIMITS.maxVerificationCalls) {
           return finish('fail', 'The verification-call budget for this run is exhausted.', 'configuration', ['limit_verification_calls_exceeded']);
         } else {
@@ -1095,11 +1123,17 @@ export class OrnithImplementationService {
         outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code });
 
         const isBudgetDenial = toolResult.code === 'limit_read_bytes_exceeded';
-        const recoveryAttemptsUsed = isBudgetDenial ? readBudgetRecoveryAttemptsUsed : readOnlyRecoveryAttemptsUsed;
+        const isEscapeDenial = toolResult.code === 'replacement_escape_suspected';
+        const recoveryAttemptsUsed = isBudgetDenial
+          ? readBudgetRecoveryAttemptsUsed
+          : isEscapeDenial ? replacementEscapeRecoveryAttemptsUsed : readOnlyRecoveryAttemptsUsed;
         const recoveryAttemptsMax = isBudgetDenial
           ? ORNITH_LIMITS.maxReadBudgetRecoveryAttempts
-          : ORNITH_LIMITS.maxReadOnlyRecoveryAttempts;
-        const willRecover = isRecoverableToolDenial(action, toolResult.code) && recoveryAttemptsUsed < recoveryAttemptsMax;
+          : isEscapeDenial
+            ? ORNITH_LIMITS.maxReplacementEscapeRecoveryAttempts
+            : ORNITH_LIMITS.maxReadOnlyRecoveryAttempts;
+        const willRecover = !identicalEscapeRetryRefused &&
+          isRecoverableToolDenial(action, toolResult.code) && recoveryAttemptsUsed < recoveryAttemptsMax;
 
         // One event covers both facts (denied, and whether it will recover)
         // so there is exactly one notification for this operation — never a
@@ -1124,12 +1158,21 @@ export class OrnithImplementationService {
         });
 
         if (willRecover) {
-          if (isBudgetDenial) readBudgetRecoveryAttemptsUsed += 1; else readOnlyRecoveryAttemptsUsed += 1;
+          if (isBudgetDenial) readBudgetRecoveryAttemptsUsed += 1;
+          else if (isEscapeDenial) {
+            replacementEscapeRecoveryAttemptsUsed += 1;
+            escapeDeniedFingerprint = JSON.stringify(action);
+          } else readOnlyRecoveryAttemptsUsed += 1;
           const remaining = recoveryAttemptsMax - (recoveryAttemptsUsed + 1);
           const recoveryFeedback = {
             ok: false,
             code: toolResult.code,
-            reason: isBudgetDenial
+            reason: isEscapeDenial
+              ? `${toolResult.reason} The file is unchanged and still has the sha256 you supplied. You have one ` +
+                'retry: send a DIFFERENT replace_text (or read_file again first), writing every real line break in ' +
+                'oldText and newText as the single-backslash JSON escape that matches the lineEnding read_file ' +
+                'reported. The identical request will not be dispatched again.'
+              : isBudgetDenial
               ? `${toolResult.reason} (${describeActionParams(action)}) No further reads or searches are ` +
                 'available for this request; the repository read budget for this run cannot fit it. Use the ' +
                 'verified context you already have to make the scoped edit now, or call "blocked" if you cannot ' +

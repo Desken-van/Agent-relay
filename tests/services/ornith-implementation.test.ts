@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import { ExecaProcessRunner, type ProcessResult, type ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
 import {
@@ -10,6 +10,7 @@ import {
   OrnithImplementationService,
   preflightOrnithPrompt
 } from '../../src/main/services/ornith-implementation';
+import { OrnithWorktreeTools } from '../../src/main/services/ornith-worktree-tools';
 import type { AgentProgressEvent, OrnithHealthyLease, OrnithInferenceLeaseService } from '../../src/main/ports';
 import { AgentRelayError } from '../../src/shared/domain/errors';
 import {
@@ -503,10 +504,10 @@ describe('OrnithImplementationService limits and cancellation', () => {
     // `preflightOrnithPrompt` for the `chars` that yields each target budget)
     // rather than hand-deriving the offset.
     const budgetCases: { label: string; chars: number; expectedBudget: number }[] = [
-      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 122_834, expectedBudget: 384 },
-      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 122_788, expectedBudget: 407 },
-      { label: '408 bytes (right at the old fallback stub size)', chars: 122_786, expectedBudget: 408 },
-      { label: '471 bytes ("408+": comfortably normal)', chars: 122_660, expectedBudget: 471 }
+      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 122_090, expectedBudget: 384 },
+      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 122_044, expectedBudget: 407 },
+      { label: '408 bytes (right at the old fallback stub size)', chars: 122_042, expectedBudget: 408 },
+      { label: '471 bytes ("408+": comfortably normal)', chars: 121_916, expectedBudget: 471 }
     ];
 
     for (const { label, chars, expectedBudget } of budgetCases) {
@@ -586,7 +587,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_834)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_090)}` // -> 384-byte budget
       };
       const preflight = preflightOrnithPrompt({
         specification: oversizedSpecification,
@@ -638,7 +639,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_834)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_090)}` // -> 384-byte budget
       };
       for (let index = 0; index < 40; index += 1) {
         writeFileSync(join(worktree, `s${String(index).padStart(3, '0')}.txt`), 'needle appears here\n', 'utf8');
@@ -680,7 +681,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_834)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_090)}` // -> 384-byte budget
       };
       // Multi-byte (3 UTF-8 bytes each) names: short enough in UTF-16 code units to
       // stay well under Windows' MAX_PATH, long enough in UTF-8 bytes that every
@@ -1636,6 +1637,174 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(result.assessment.publishBlock).toBe('configuration');
       expect(result.assessment.reasonCodes).toContain('blocked');
       expect(result.ornithAudit.changedFiles).toBe(0);
+    });
+  });
+
+  describe('replace_text JSON-escape diagnosis and its single recovery', () => {
+    const original = 'Title\r\nKeep this line\r\nTail\r\n';
+    const hash = createHash('sha256').update(original, 'utf8').digest('hex');
+    const readAction = JSON.stringify({ version: 1, action: 'read_file', path: 'crlf.md', offset: 0, limit: 4096 });
+    const finishAction = JSON.stringify({ version: 1, action: 'finish', summary: 'Updated the file.' });
+    /** The completion a model sends when `oldText`/`newText` decode to exactly these strings. */
+    const replace = (oldText: string, newText: string): string => JSON.stringify({
+      version: 1, action: 'replace_text', path: 'crlf.md', sha256: hash, replacements: [{ oldText, newText }]
+    });
+    /** What the real model sent: doubled backslashes, which decode to literal backslash characters. */
+    const wrongOldText = 'Keep this line\\r\\nTail';
+    /** What a correct single-backslash escape decodes to: real CR and LF. */
+    const rightOldText = 'Keep this line\r\nTail';
+
+    let replaceTextCalls: MockInstance;
+
+    beforeEach(() => {
+      writeFileSync(join(worktree, 'crlf.md'), original, 'utf8');
+      replaceTextCalls = vi.spyOn(OrnithWorktreeTools.prototype, 'replaceText');
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    async function run(completions: readonly string[]) {
+      const requests: LocalInferenceRequest[] = [];
+      const events: AgentProgressEvent[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          const next = completions[requests.length - 1];
+          if (next === undefined) throw new Error(`the model was asked for turn ${requests.length} beyond the script`);
+          return completed(request, next);
+        }
+      };
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        onProgress: (event) => events.push(event)
+      });
+      const promptOf = (index: number): string => requests[index]!.messages.map((message) => message.content).join('\n');
+      const denials = events.filter((event) => (event.data as { ok?: boolean } | undefined)?.ok === false);
+      return { result, requests, events, denials, promptOf };
+    }
+
+    const onDisk = (): string => readFileSync(join(worktree, 'crlf.md'), 'utf8');
+
+    it('tells the model the file is CRLF and applies a replacement whose JSON escape is correct', async () => {
+      const { result, promptOf } = await run([
+        readAction,
+        replace(rightOldText, 'Kept this line\r\nTail'),
+        finishAction
+      ]);
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(promptOf(1)).toContain('"lineEnding":"crlf"');
+      expect(onDisk()).toBe('Title\r\nKept this line\r\nTail\r\n');
+      expect(replaceTextCalls).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses a doubled-backslash oldText with the exact diagnosis, writes nothing, and lets the model fix the escaping once', async () => {
+      const { result, denials, promptOf } = await run([
+        readAction,
+        replace(wrongOldText, 'Kept this line\r\nTail'), // refused
+        replace(rightOldText, 'Kept this line\r\nTail'), // the corrected, different retry
+        finishAction
+      ]);
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(result.ornithAudit.outcomes).toEqual([
+        { sequence: 1, action: 'read_file', ok: true },
+        { sequence: 2, action: 'replace_text', ok: false, code: 'replacement_escape_suspected' },
+        { sequence: 3, action: 'replace_text', ok: true }
+      ]);
+      // One denial event only, and it says the run will recover (no duplicate notification).
+      expect(denials).toHaveLength(1);
+      expect(denials[0]!.text).toContain('replacement_escape_suspected');
+      expect(denials[0]!.text).toContain('recovering with feedback');
+      expect(denials[0]!.data).toMatchObject({ code: 'replacement_escape_suspected', recoverable: true });
+      // The feedback the model sees names the style and the mistake and demands a DIFFERENT retry ...
+      const feedbackPrompt = promptOf(2);
+      expect(feedbackPrompt).toContain('"code":"replacement_escape_suspected"');
+      expect(feedbackPrompt).toContain('CRLF line endings');
+      expect(feedbackPrompt).toContain('JSON escaping');
+      expect(feedbackPrompt).toContain('DIFFERENT replace_text');
+      // ... and does not repeat the refused oldText back.
+      expect(feedbackPrompt.split('"code":"replacement_escape_suspected"')[1]).not.toContain('Keep this line');
+      expect(onDisk()).toBe('Title\r\nKept this line\r\nTail\r\n');
+      expect(replaceTextCalls).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not dispatch an identical retry: the run ends with the bounded escape failure and the file is unchanged', async () => {
+      const { result, requests, denials } = await run([
+        readAction,
+        replace(wrongOldText, 'x'),
+        replace(wrongOldText, 'x') // byte-identical to the refused request
+      ]);
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.publishBlock).toBe('configuration');
+      expect(result.assessment.reasonCodes).toEqual(['replacement_escape_suspected']);
+      expect(result.finalMessage).toContain('replacement_escape_suspected');
+      expect(result.ornithAudit.changedFiles).toBe(0);
+      expect(replaceTextCalls).toHaveBeenCalledTimes(1); // the second one never reached the tool
+      expect(requests).toHaveLength(3); // no further inference after the terminal failure
+      expect(denials.map((event) => (event.data as { recoverable: boolean }).recoverable)).toEqual([true, false]);
+      expect(onDisk()).toBe(original);
+    });
+
+    it('ends with a bounded terminal failure when the one retry is different but still wrongly escaped', async () => {
+      const { result, requests, denials } = await run([
+        readAction,
+        replace(wrongOldText, 'x'),
+        replace(wrongOldText, 'a different newText'), // different action, same escaping mistake
+        finishAction // never reached
+      ]);
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.reasonCodes).toEqual(['replacement_escape_suspected']);
+      expect(replaceTextCalls).toHaveBeenCalledTimes(2); // dispatched, refused again, and only then terminal
+      expect(requests).toHaveLength(3);
+      expect(denials.map((event) => (event.data as { recoverable: boolean }).recoverable)).toEqual([true, false]);
+      expect(onDisk()).toBe(original);
+    });
+
+    it('allows a read_file between the refusal and the corrected retry, and still succeeds', async () => {
+      const { result } = await run([
+        readAction,
+        replace(wrongOldText, 'Kept this line\r\nTail'),
+        readAction, // looking at the file again is a different action and is allowed
+        replace(rightOldText, 'Kept this line\r\nTail'),
+        finishAction
+      ]);
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(onDisk()).toBe('Title\r\nKept this line\r\nTail\r\n');
+    });
+
+    it('keeps the stale-hash check ahead of the diagnosis: a wrong sha256 is terminal stale_hash, not a recoverable escape hint', async () => {
+      const wrongHash = 'f'.repeat(64);
+      const { result } = await run([
+        readAction,
+        JSON.stringify({
+          version: 1, action: 'replace_text', path: 'crlf.md', sha256: wrongHash,
+          replacements: [{ oldText: wrongOldText, newText: 'x' }]
+        })
+      ]);
+
+      expect(result.assessment.reasonCodes).toEqual(['stale_hash']);
+      expect(onDisk()).toBe(original);
+    });
+
+    it('explains JSON escaping and lineEnding in the protocol, with the exact single- and doubled-backslash forms', async () => {
+      const { promptOf } = await run([JSON.stringify({ version: 1, action: 'blocked', reason: 'Only reading the protocol.' })]);
+      const prompt = promptOf(0);
+
+      expect(prompt).toContain('"lineEnding" for the WHOLE file: "lf", "crlf", "mixed" or "none"');
+      expect(prompt).toContain('"\\r\\n" (one backslash before each letter) decodes to the real CR and LF');
+      expect(prompt).toContain('"\\\\r\\\\n" (doubled backslashes) decodes to four literal characters');
+      expect(prompt).toContain('(crlf: "\\r\\n", lf: "\\n")');
+      expect(prompt).toContain('never\n  copy a JSON escape from a result as literal text');
+      expect(prompt).toContain('Agent Relay converts neither form for you');
+      expect(prompt).toContain('code "replacement_escape_suspected" changed nothing and allows exactly\n  ONE retry');
     });
   });
 });

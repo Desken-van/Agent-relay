@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ExecaProcessRunner, type ProcessResult, type ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
 import { OrnithWorktreeTools } from '../../src/main/services/ornith-worktree-tools';
-import { ORNITH_LIMITS } from '../../src/shared/domain/ornith';
+import { ORNITH_LIMITS, containsAbsoluteMachinePath } from '../../src/shared/domain/ornith';
 
 const runner = new ExecaProcessRunner();
 const locatedGit = locateExecutable('git');
@@ -1500,6 +1500,147 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       const forModel = result.forModel as { matches: { path: string; line: number }[]; truncated: boolean };
       expect(forModel.matches).toEqual([{ path: 'b-fits.txt', line: 1 }]);
       expect(forModel.truncated).toBe(true);
+    });
+  });
+
+  describe('line endings and the replace_text JSON-escape diagnosis', () => {
+    const budget = { readBytes: 1_000_000, writeBytes: 1_000_000 };
+    const sha = (value: Buffer | string): string => createHash('sha256').update(value).digest('hex');
+    /** What a doubled-backslash JSON escape of CRLF decodes to: four literal characters. */
+    const literalCrlf = '\\r\\n';
+
+    type ReadForModel = { lineEnding: string; content: string; bytesRead: number; totalBytes: number };
+
+    async function readBack(name: string, content: string, limit = 65_536, maxResultBytes?: number): Promise<ReadForModel> {
+      writeFileSync(join(worktree, name), content);
+      const result = await tools().readFile(
+        { version: 1, action: 'read_file', path: name, offset: 0, limit },
+        undefined,
+        budget,
+        maxResultBytes
+      );
+      if (!result.ok) throw new Error(`expected a successful read, got ${result.code}`);
+      return result.forModel as ReadForModel;
+    }
+
+    async function replaceIn(name: string, content: string, oldText: string, newText: string, hash = sha(content)) {
+      writeFileSync(join(worktree, name), content);
+      const boundary = tools();
+      const result = await boundary.replaceText(
+        { version: 1, action: 'replace_text', path: name, sha256: hash, replacements: [{ oldText, newText }] },
+        undefined,
+        budget
+      );
+      return { result, boundary, bytes: readFileSync(join(worktree, name)) };
+    }
+
+    it.each([
+      ['lf', 'one\ntwo\nthree\n'],
+      ['crlf', 'one\r\ntwo\r\nthree\r\n'],
+      ['mixed', 'one\r\ntwo\nthree\r\n'],
+      ['mixed', 'one\rtwo'],
+      ['none', 'a single line with no break at all']
+    ])('read_file classifies the whole file as %s (%j)', async (expected, content) => {
+      const forModel = await readBack('endings.txt', content);
+      expect(forModel.lineEnding).toBe(expected);
+      expect(forModel.content).toBe(content); // classification never changes what is returned
+    });
+
+    it('classifies from the complete file, not from the returned slice', async () => {
+      const content = `${'x'.repeat(300)}\r\nsecond line\r\n`;
+      const forModel = await readBack('window.txt', content, 50);
+
+      expect(forModel.content).toBe('x'.repeat(50)); // this window holds no line break at all
+      expect(forModel.lineEnding).toBe('crlf');
+    });
+
+    it('still packs a line-ending-bearing, escape-heavy result inside the serialized budget', async () => {
+      const line = '1. Open the "Settings" page, choose `Local inference`\\and press "Start"; expect "Healthy".\r\n';
+      const forModel = await readBack('heavy.txt', line.repeat(420), 65_536, 1_500);
+
+      expect(forModel.lineEnding).toBe('crlf');
+      expect(forModel.bytesRead).toBeGreaterThan(0);
+      expect(Buffer.byteLength(JSON.stringify(forModel), 'utf8')).toBeLessThanOrEqual(1_500);
+    });
+
+    it('replaces text in a CRLF file when oldText carries real CR and LF characters (what a single-backslash JSON escape decodes to)', async () => {
+      const original = 'title\r\nkeep this line\r\ntail\r\n';
+      const decoded = (JSON.parse('{"oldText":"keep this line\\r\\ntail"}') as { oldText: string }).oldText;
+      expect(decoded).toBe('keep this line\r\ntail');
+
+      const { result, bytes } = await replaceIn('crlf.txt', original, decoded, 'kept\r\ntail');
+
+      expect(result).toMatchObject({ ok: true });
+      expect(bytes.toString('utf8')).toBe('title\r\nkept\r\ntail\r\n');
+    });
+
+    it.each([
+      ['crlf', 'CRLF', 'first line\r\nsecond line\r\n', `first line${literalCrlf}second line`],
+      ['lf', 'LF', 'first line\nsecond line\n', 'first line\\nsecond line']
+    ])('refuses a literal backslash escape in oldText on a %s file with a precise diagnosis and writes nothing', async (_style, label, content, oldText) => {
+      const { result, boundary, bytes } = await replaceIn('escaped.txt', content, oldText, 'replacement');
+
+      expect(result).toMatchObject({ ok: false, code: 'replacement_escape_suspected' });
+      if (result.ok) throw new Error('expected a refusal');
+      expect(result.reason).toContain(`${label} line endings`);
+      expect(result.reason).toContain('JSON escaping');
+      expect(result.reason.length).toBeLessThanOrEqual(ORNITH_LIMITS.maxErrorChars);
+      // Neither oldText nor any file content is echoed, and the text cannot be mistaken for a UNC path.
+      expect(result.reason).not.toContain('first line');
+      expect(result.reason).not.toContain('second line');
+      expect(containsAbsoluteMachinePath(result.reason)).toBe(false);
+      expect(bytes.toString('utf8')).toBe(content);
+      expect(boundary.changedFileCount()).toBe(0);
+    });
+
+    it.each([
+      ['mixed', 'first line\r\nsecond line\nthird'],
+      ['none', 'first line second line']
+    ])('keeps the plain replacement_mismatch for a %s file (no known LF/CRLF style to diagnose)', async (_style, content) => {
+      const { result, bytes } = await replaceIn('unknown-style.txt', content, `first line${literalCrlf}second line`, 'x');
+
+      expect(result).toMatchObject({ ok: false, code: 'replacement_mismatch' });
+      expect(bytes.toString('utf8')).toBe(content);
+    });
+
+    it('keeps the plain replacement_mismatch when oldText has no literal backslash escape', async () => {
+      const { result } = await replaceIn('plain.txt', 'a\r\nb\r\n', 'not present', 'x');
+
+      expect(result).toMatchObject({ ok: false, code: 'replacement_mismatch' });
+    });
+
+    it('does not diagnose text that really occurs in the file more than once: that is an ambiguous match, not an escaping mistake', async () => {
+      const content = `a${literalCrlf}b\r\nc${literalCrlf}d\r\n`;
+      const { result } = await replaceIn('twice.txt', content, literalCrlf, 'x');
+
+      expect(result).toMatchObject({ ok: false, code: 'replacement_mismatch' });
+    });
+
+    it('checks the file hash first: a stale sha256 is still stale_hash, never the escape diagnosis', async () => {
+      const { result, bytes } = await replaceIn(
+        'stale.txt', 'first line\r\nsecond line\r\n', `first line${literalCrlf}second line`, 'x', sha('some other content')
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'stale_hash' });
+      expect(bytes.toString('utf8')).toBe('first line\r\nsecond line\r\n');
+    });
+
+    it('never decodes or normalizes literal backslash sequences that really are the file text', async () => {
+      // A CRLF documentation file whose text legitimately contains the four-character sequence.
+      const original =
+        `Escapes\r\nUse ${literalCrlf} in a JSON string.\r\nAlso keep ${literalCrlf} and \\n here.\r\nend\r\n`;
+      const { result, bytes } = await replaceIn(
+        'doc.md', original, `Use ${literalCrlf} in a JSON string.`, `Use ${literalCrlf} or \\r in a JSON string.`
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      // Only the addressed literal text changed; every other literal sequence and every real CRLF is byte-identical.
+      expect(bytes.toString('utf8')).toBe(
+        `Escapes\r\nUse ${literalCrlf} or \\r in a JSON string.\r\nAlso keep ${literalCrlf} and \\n here.\r\nend\r\n`
+      );
+      const forModel = await readBack('doc-after.txt', bytes.toString('utf8'));
+      expect(forModel.content).toBe(bytes.toString('utf8'));
+      expect(forModel.lineEnding).toBe('crlf');
     });
   });
 });

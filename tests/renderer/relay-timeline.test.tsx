@@ -256,6 +256,44 @@ describe('Relay timeline — Ornith read-budget denial events', () => {
     expect(text).not.toContain('recovering with feedback');
   });
 
+  it('renders a recoverable replacement_escape_suspected denial once, with its code and the unchanged-file state', async () => {
+    installBridge({
+      'runs:events': () =>
+        ok<'runs:events'>([
+          {
+            id: 'e1',
+            runId: 'ornith-run',
+            timestamp: '2026-09-10T10:00:01.000Z',
+            type: 'tool_use',
+            payload: JSON.stringify({
+              text: 'Ornith action replace_text denied (replacement_escape_suspected); recovering with feedback.',
+              data: {
+                sequence: 3,
+                action: 'replace_text',
+                ok: false,
+                code: 'replacement_escape_suspected',
+                recoverable: true,
+                readBytesUsed: 82_664,
+                readBytesConfigured: 4_194_304,
+                changedFiles: 0
+              }
+            })
+          }
+        ])
+    });
+    const run = makeRun({ id: 'ornith-run', agent: 'ornith' });
+    renderApp(<RelayTimeline runs={[run]} />);
+
+    await screen.findByText('tool use');
+    const lines = document.querySelectorAll('.logs__text');
+    expect(lines).toHaveLength(1);
+    const text = lines[0]!.textContent ?? '';
+    expect(text).toContain('replace_text');
+    expect(text).toContain('replacement_escape_suspected');
+    expect(text).toContain('recovering with feedback');
+    expect(text).toContain('no files changed yet');
+  });
+
   it('leaves an ordinary tool_use event (no enriched denial data) rendered as plain text, unaffected', async () => {
     installBridge({
       'runs:events': () =>

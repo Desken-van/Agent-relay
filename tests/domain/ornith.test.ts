@@ -7,10 +7,14 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  classifyLineEnding,
   containsAbsoluteMachinePath,
+  containsLiteralLineBreakEscape,
   isOrnithTerminalAction,
   ORNITH_ACTION_KINDS,
+  ORNITH_DENIAL_CODES,
   ORNITH_LIMITS,
+  ORNITH_LINE_ENDINGS,
   ORNITH_NONTERMINAL_ACTION_KINDS,
   ORNITH_PROTOCOL_VERSION,
   ornithActionSchema,
@@ -489,5 +493,55 @@ describe('parseOrnithCompletion', () => {
     const result = parseOrnithCompletion('not json at all');
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.code).toBe('malformed_output');
+  });
+});
+
+describe('line-ending classification and literal escape detection', () => {
+  const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+  it.each([
+    ['lf', 'a\nb\nc'],
+    ['lf', '\n'],
+    ['crlf', 'a\r\nb\r\n'],
+    ['crlf', 'a\r\nb'],
+    ['mixed', 'a\r\nb\nc'],
+    ['mixed', 'a\nb\r\nc'],
+    ['mixed', 'a\rb'],
+    ['mixed', 'a\r\nb\rc'],
+    ['none', ''],
+    ['none', 'no break at all']
+  ])('classifies as %s: %j', (expected, text) => {
+    expect(classifyLineEnding(bytes(text))).toBe(expected);
+  });
+
+  it('is exact for multi-byte UTF-8 text, whose continuation bytes never look like CR or LF', () => {
+    expect(classifyLineEnding(bytes('π ω 日本語 🎉\r\nsecond π\r\n'))).toBe('crlf');
+    expect(classifyLineEnding(bytes('π ω 日本語 🎉 no break'))).toBe('none');
+  });
+
+  it('treats a literal backslash sequence in the text as ordinary characters, never as a line break', () => {
+    expect(classifyLineEnding(bytes('a\\r\\nb\\n'))).toBe('none');
+    expect(classifyLineEnding(bytes('a\\r\\nb\r\n'))).toBe('crlf');
+  });
+
+  it('lists exactly the four styles', () => {
+    expect([...ORNITH_LINE_ENDINGS]).toEqual(['lf', 'crlf', 'mixed', 'none']);
+  });
+
+  it.each([
+    ['a\\nb', true],
+    ['a\\r\\nb', true],
+    ['a\\rb', true],
+    ['a\r\nb', false],
+    ['a\nb', false],
+    ['C:\\path only', false],
+    ['no backslash n or r follows: \\t \\\\', false]
+  ])('reports whether %j contains a literal backslash followed by n or r: %s', (text, expected) => {
+    expect(containsLiteralLineBreakEscape(text)).toBe(expected);
+  });
+
+  it('gives the escape diagnosis its own denial code and exactly one retry', () => {
+    expect(ORNITH_DENIAL_CODES).toContain('replacement_escape_suspected');
+    expect(ORNITH_LIMITS.maxReplacementEscapeRecoveryAttempts).toBe(1);
   });
 });

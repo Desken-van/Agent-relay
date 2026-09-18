@@ -23,6 +23,8 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { AgentRelayError } from '../../shared/domain/errors';
 import {
   ORNITH_LIMITS,
+  classifyLineEnding,
+  containsLiteralLineBreakEscape,
   type OrnithAction,
   type OrnithDenialCode
 } from '../../shared/domain/ornith';
@@ -822,6 +824,10 @@ export class OrnithWorktreeTools {
         }
         const sha256 = createHash('sha256').update(raw).digest('hex');
         const totalBytes = raw.byteLength;
+        // Derived from the complete bytes already read and hashed above, never from
+        // the returned slice: a window that happens to hold no line break must not
+        // report "none" for a CRLF file.
+        const lineEnding = classifyLineEnding(raw);
         const packed = packReadSlice(
           raw,
           action.offset,
@@ -833,6 +839,7 @@ export class OrnithWorktreeTools {
               offset: slice.offset,
               bytesRead: slice.bytesRead,
               totalBytes,
+              lineEnding,
               // The offset a following chunk starts at; `null` once the end of
               // the file has been returned, so "is there more" never has to be
               // inferred from `eof` alone.
@@ -1239,6 +1246,21 @@ export class OrnithWorktreeTools {
       let next = text;
       for (const replacement of action.replacements) {
         const occurrences = countOccurrences(next, replacement.oldText);
+        if (occurrences === 0 && containsLiteralLineBreakEscape(replacement.oldText)) {
+          // Diagnostic only: nothing is decoded, rewritten or applied. `raw` is the
+          // hash-verified current content, so the style is the file's real one. The
+          // reason names the style and the mistake, never file content or oldText.
+          const lineEnding = classifyLineEnding(raw);
+          if (lineEnding === 'lf' || lineEnding === 'crlf') {
+            return denied(
+              'replacement_escape_suspected',
+              `oldText matched nothing and contains a backslash followed by "n" or "r", while this file uses ` +
+                `${lineEnding.toUpperCase()} line endings. Probable JSON escaping mistake: a single-backslash JSON ` +
+                'escape decodes to a real line break, but a doubled backslash decodes to a literal backslash plus a ' +
+                'letter that cannot match a line break. Nothing was written or converted.'
+            );
+          }
+        }
         if (occurrences !== 1) {
           return denied(
             'replacement_mismatch',
