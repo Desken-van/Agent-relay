@@ -540,6 +540,20 @@ describe('line-ending classification and literal escape detection', () => {
     expect(containsLiteralLineBreakEscape(text)).toBe(expected);
   });
 
+  it('parses reordered JSON keys, at every nesting level, to an identical serialization (the basis of duplicate-action detection)', () => {
+    const hash = 'a'.repeat(64);
+    const ordered = parseOrnithCompletion(
+      `{"version":1,"action":"replace_text","path":"a.md","sha256":"${hash}","replacements":[{"oldText":"x","newText":"y"}]}`
+    );
+    const reordered = parseOrnithCompletion(
+      `{"replacements":[{"newText":"y","oldText":"x"}],"sha256":"${hash}","path":"a.md","action":"replace_text","version":1}`
+    );
+
+    expect(ordered.ok && reordered.ok).toBe(true);
+    if (!ordered.ok || !reordered.ok) return;
+    expect(JSON.stringify(reordered.action)).toBe(JSON.stringify(ordered.action));
+  });
+
   it('gives the escape diagnosis its own denial code and exactly one retry', () => {
     expect(ORNITH_DENIAL_CODES).toContain('replacement_escape_suspected');
     expect(ORNITH_LIMITS.maxReplacementEscapeRecoveryAttempts).toBe(1);

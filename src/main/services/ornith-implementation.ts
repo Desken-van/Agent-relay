@@ -651,7 +651,11 @@ export class OrnithImplementationService {
     let readBudgetRecoveryAttemptsUsed = 0;
     let replacementEscapeRecoveryAttemptsUsed = 0;
     /** The exact `replace_text` action refused with `replacement_escape_suspected`, so an
-     *  identical repeat is refused before dispatch. `null` until such a denial. */
+     *  identical repeat is refused before dispatch. `null` until such a denial.
+     *  Sound to keep for the whole run: the action carries `path` and the expected
+     *  `sha256`, so an identical later action addresses byte-identical content (the tool
+     *  would fail the same way) or a changed file (it would be `stale_hash`). Key order
+     *  cannot defeat it: the schema-parsed action has a canonical key order. */
     let escapeDeniedFingerprint: string | null = null;
     const outcomes: Array<{ sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }> = [];
     const finish = (

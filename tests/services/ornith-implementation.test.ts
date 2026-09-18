@@ -1665,7 +1665,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       vi.restoreAllMocks();
     });
 
-    async function run(completions: readonly string[]) {
+    async function run(completions: readonly string[], beforeTurn?: (turn: number) => void) {
       const requests: LocalInferenceRequest[] = [];
       const events: AgentProgressEvent[] = [];
       const leaseService: OrnithInferenceLeaseService = {
@@ -1673,6 +1673,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
         recheckOrnithLease: async () => true,
         inferForOrnith: async (_lease, request) => {
           requests.push(request);
+          beforeTurn?.(requests.length);
           const next = completions[requests.length - 1];
           if (next === undefined) throw new Error(`the model was asked for turn ${requests.length} beyond the script`);
           return completed(request, next);
@@ -1778,6 +1779,34 @@ describe('OrnithImplementationService limits and cancellation', () => {
 
       expect(result.assessment.disposition).toBe('pass');
       expect(onDisk()).toBe('Title\r\nKept this line\r\nTail\r\n');
+    });
+
+    it('does not dispatch an identical retry even when the model reorders the JSON keys (the parsed action is canonical)', async () => {
+      // Same fields and values as replace(wrongOldText, 'x'), serialized in a different key order at both levels.
+      const reordered = '{"replacements":[{"newText":"x","oldText":' + JSON.stringify(wrongOldText) + '}],' +
+        '"sha256":"' + hash + '","path":"crlf.md","action":"replace_text","version":1}';
+      const { result, requests } = await run([readAction, replace(wrongOldText, 'x'), reordered]);
+
+      expect(result.assessment.reasonCodes).toEqual(['replacement_escape_suspected']);
+      expect(replaceTextCalls).toHaveBeenCalledTimes(1); // the reordered repeat never reached the tool
+      expect(requests).toHaveLength(3);
+      expect(onDisk()).toBe(original);
+    });
+
+    it('a corrected retry that still carries the OLD hash after the file was modified externally is a terminal stale_hash, with the external bytes intact', async () => {
+      const external = 'Title\r\nKeep this line\r\nTail\r\nadded by someone else\r\n';
+      const { result } = await run(
+        [readAction, replace(wrongOldText, 'x'), replace(rightOldText, 'Kept this line\r\nTail')],
+        (turn) => {
+          if (turn === 3) writeFileSync(join(worktree, 'crlf.md'), external, 'utf8'); // between the refusal and the retry
+        }
+      );
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.reasonCodes).toEqual(['stale_hash']);
+      expect(result.ornithAudit.changedFiles).toBe(0);
+      expect(replaceTextCalls).toHaveBeenCalledTimes(2); // dispatched, and refused by the unchanged hash check
+      expect(onDisk()).toBe(external);
     });
 
     it('keeps the stale-hash check ahead of the diagnosis: a wrong sha256 is terminal stale_hash, not a recoverable escape hint', async () => {

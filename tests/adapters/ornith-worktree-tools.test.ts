@@ -1625,6 +1625,31 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(bytes.toString('utf8')).toBe('first line\r\nsecond line\r\n');
     });
 
+    it('never classifies or diagnoses input that is not valid UTF-8, even when it holds CR/LF bytes: both tools refuse it as non-text first', async () => {
+      // CR LF, then bytes that are not UTF-8, then the four literal characters an escaped CRLF decodes to.
+      const raw = Buffer.concat([Buffer.from('line\r\n'), Buffer.from([0xff, 0xfe]), Buffer.from(literalCrlf), Buffer.from('\r\n')]);
+      writeFileSync(join(worktree, 'binary.dat'), raw);
+
+      const read = await tools().readFile(
+        { version: 1, action: 'read_file', path: 'binary.dat', offset: 0, limit: 100 }, undefined, budget
+      );
+      expect(read).toMatchObject({ ok: false, code: 'path_not_regular_file' });
+      expect(JSON.stringify(read)).not.toContain('lineEnding');
+
+      const boundary = tools();
+      const replaced = await boundary.replaceText(
+        {
+          version: 1, action: 'replace_text', path: 'binary.dat', sha256: sha(raw),
+          replacements: [{ oldText: literalCrlf, newText: 'x' }]
+        },
+        undefined,
+        budget
+      );
+      expect(replaced).toMatchObject({ ok: false, code: 'path_not_regular_file' });
+      expect(readFileSync(join(worktree, 'binary.dat')).equals(raw)).toBe(true);
+      expect(boundary.changedFileCount()).toBe(0);
+    });
+
     it('never decodes or normalizes literal backslash sequences that really are the file text', async () => {
       // A CRLF documentation file whose text legitimately contains the four-character sequence.
       const original =
