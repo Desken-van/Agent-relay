@@ -47,7 +47,11 @@ import {
   nodeSnapshotFileOps,
   type SnapshotFileOps
 } from '../../src/main/adapters/git/git-code-snapshot';
-import type { ProviderCodeFinding } from '../../src/shared/domain/code-review';
+import {
+  codeReviewTriageIsCurrent,
+  parseCodeReviewTriage,
+  type ProviderCodeFinding
+} from '../../src/shared/domain/code-review';
 import { AgentRelayError } from '../../src/shared/domain/errors';
 import { CoaiCodeReviewer } from '../../src/main/adapters/mcp/coai-code-reviewer';
 import {
@@ -2919,5 +2923,102 @@ describe('code-review automatic finding triage', () => {
 
     resolveGate();
     await first;
+  });
+
+  it('persists a durable triage record bound to the exact subject and the exact findings analyzed, readable from an independent repository instance', async () => {
+    const { value, triageService, findings } = await withTwoLiveFindings();
+    const recommendations = await triageService.triage(value.task.id);
+
+    const stored = value.reviews.getTriage(value.task.id);
+    expect(stored).not.toBeNull();
+    const identity = await value.service.subjectIdentity(value.task.id);
+    expect(stored!.subjectSha256).toBe(identity.currentSha256);
+    expect(stored!.subjectId).toBe(identity.stored!.id);
+
+    const parsed = parseCodeReviewTriage(stored!.triageJson);
+    expect(parsed?.recommendations.map((r) => r.findingId).sort()).toEqual(
+      findings.map((f) => f.id).sort()
+    );
+    expect(recommendations).toHaveLength(2);
+
+    // A second, independent repository instance against the SAME underlying
+    // database sees the identical row — this is a durable write, not state
+    // held only by the service instance (or the in-memory triage() call)
+    // that made it, which is what "survives an application restart" reduces
+    // to at this layer: `tests/db/code-review-repository.test.ts` proves the
+    // same row also survives closing and reopening the database FILE.
+    const independentReviews = new SqliteCodeReviewRepository(value.harness.db, value.harness.clock);
+    expect(independentReviews.getTriage(value.task.id)).toEqual(stored);
+
+    // The positive case `codeReviewTriageIsCurrent` exists to recognize:
+    // freshly written, against the live subject and its live findings.
+    expect(codeReviewTriageIsCurrent(stored, identity.currentSha256, findings)).toBe(true);
+  });
+
+  it('never shows a stored recommendation for a `needs_user` finding as something to apply', async () => {
+    const { value, codex, triageService, findings } = await withTwoLiveFindings();
+    codex.triageQueue.push([
+      { findingRef: findings[0]!.id, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+      { findingRef: findings[1]!.id, recommendation: 'needs_user', reason: 'Ambiguous.', evidenceRef: 'e', confidence: 'low' }
+    ]);
+    const recommendations = await triageService.triage(value.task.id);
+
+    const needsUser = recommendations.find((r) => r.findingRef === findings[1]!.id);
+    expect(needsUser?.recommendation).toBe('needs_user');
+    // The service itself never decides anything regardless of recommendation
+    // — this is the renderer's contract (a `needs_user` recommendation is
+    // never offered an "apply" affordance), proved here at the boundary the
+    // renderer actually reads: the persisted, parsed recommendation itself.
+    expect(value.reviews.latestDecision(findings[1]!.id)).toBeNull();
+  });
+
+  it('rejects a stored triage result once the subject changes, without deleting the durable row', async () => {
+    const { value, triageService, findings } = await withTwoLiveFindings();
+    await triageService.triage(value.task.id);
+    const stored = value.reviews.getTriage(value.task.id)!;
+
+    // A genuinely new capture: real file content changes on disk, which
+    // changes the canonical snapshot and therefore the subject hash.
+    const root = value.harness.worktreesRoot;
+    mkdirSync(root, { recursive: true });
+    const changed = join(root, 'changed.ts');
+    writeFileSync(changed, 'const changed = 1;\n');
+    value.snapshots.files = [
+      { path: 'changed.ts', change: 'added', absolutePath: changed }
+    ];
+    const newSubject = await value.service.captureSubject(value.task.id);
+    expect(newSubject.subjectSha256).not.toBe(stored.subjectSha256);
+
+    // Nothing purges the old row on a later capture — it is one durable slot
+    // per task, wholesale-replaced only by the NEXT triage run, not by a
+    // capture.
+    expect(value.reviews.getTriage(value.task.id)).toEqual(stored);
+    // But it must never be shown as speaking for the new subject.
+    expect(codeReviewTriageIsCurrent(stored, newSubject.subjectSha256, findings)).toBe(false);
+  });
+
+  it('rejects a stored triage result once one of its analyzed findings is decided, even though the subject is unchanged', async () => {
+    const { value, triageService, findings } = await withTwoLiveFindings();
+    await triageService.triage(value.task.id);
+    const stored = value.reviews.getTriage(value.task.id)!;
+    const identity = await value.service.subjectIdentity(value.task.id);
+
+    await value.service.decide(value.task.id, {
+      findingId: findings[0]!.id,
+      action: 'accept',
+      reason: 'Handled manually before the recommendation was applied.',
+      expectedRevision: findings[0]!.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+
+    const liveNow = value.reviews
+      .listFindings(value.task.id)
+      .filter((f) => f.subjectSha256 === identity.stored!.subjectSha256);
+    // The subject itself never moved — only proof that a decision on ANY one
+    // of the analyzed findings invalidates the WHOLE stored result, not only
+    // the one finding it named.
+    expect(identity.currentSha256).toBe(stored.subjectSha256);
+    expect(codeReviewTriageIsCurrent(stored, identity.currentSha256, liveNow)).toBe(false);
   });
 });

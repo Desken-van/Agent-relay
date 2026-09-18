@@ -379,6 +379,230 @@ describe('the durable code-review store', () => {
   });
 });
 
+describe('the code-review triage store', () => {
+  it('returns null before any automatic analysis has ever run', () => {
+    expect(reviews.getTriage(taskId)).toBeNull();
+  });
+
+  it('round-trips a fresh triage record', () => {
+    const s = subject();
+    const stored = reviews.upsertTriage({
+      id: ids.next(),
+      taskId,
+      subjectId: s.id,
+      subjectSha256: s.subjectSha256,
+      findingsSnapshotJson: JSON.stringify([['f-1', 0]]),
+      triageJson: JSON.stringify({
+        recommendations: [
+          { findingId: 'f-1', recommendation: 'accept', reason: 'Legitimate.', evidenceRef: 'src/x.ts:1', confidence: 'high' }
+        ]
+      })
+    });
+
+    expect(stored.subjectId).toBe(s.id);
+    expect(stored.subjectSha256).toBe(s.subjectSha256);
+    expect(reviews.getTriage(taskId)).toEqual(stored);
+  });
+
+  it('wholesale-replaces the row on a later analysis, keeping its original id and createdAt stable', () => {
+    const s = subject();
+    const first = reviews.upsertTriage({
+      id: ids.next(),
+      taskId,
+      subjectId: s.id,
+      subjectSha256: s.subjectSha256,
+      findingsSnapshotJson: JSON.stringify([['f-1', 0]]),
+      triageJson: JSON.stringify({
+        recommendations: [
+          { findingId: 'f-1', recommendation: 'accept', reason: 'First pass.', evidenceRef: 'src/x.ts:1', confidence: 'high' }
+        ]
+      })
+    });
+
+    clock.advance(1_000);
+
+    // A caller re-analyzing (a decision moved a finding's revision) supplies
+    // a fresh `id` too — proof the store, not the caller, decides identity
+    // is stable across an upsert.
+    const second = reviews.upsertTriage({
+      id: ids.next(),
+      taskId,
+      subjectId: s.id,
+      subjectSha256: s.subjectSha256,
+      findingsSnapshotJson: JSON.stringify([['f-1', 1]]),
+      triageJson: JSON.stringify({
+        recommendations: [
+          { findingId: 'f-1', recommendation: 'reject', reason: 'Superseded.', evidenceRef: 'src/x.ts:2', confidence: 'medium' }
+        ]
+      })
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(second.createdAt).toBe(first.createdAt);
+    expect(second.updatedAt).not.toBe(first.updatedAt);
+    expect(second.triageJson).not.toBe(first.triageJson);
+    expect(reviews.getTriage(taskId)).toEqual(second);
+  });
+
+  it('keeps two tasks\' triage records independent', () => {
+    const projects = new SqliteProjectRepository(db, clock);
+    const tasks = new SqliteTaskRepository(db, clock);
+    const project = projects.create({
+      id: 'p-triage-2',
+      name: 'other',
+      localPath: 'C:\\other-repo',
+      projectType: 'existing',
+      defaultBranch: 'main',
+      githubOwner: null,
+      githubRepo: null,
+      githubVisibility: 'private'
+    });
+    const otherTaskId = tasks.create({
+      id: 't-triage-2',
+      projectId: project.id,
+      title: 'Another task',
+      originalRequest: 'Another.',
+      status: 'READY_FOR_IMPLEMENTATION',
+      currentRound: 0,
+      maxRounds: 3,
+      codexThreadId: null,
+      claudeSessionId: null,
+      worktreePath: null,
+      branchName: null,
+      baseBranch: null,
+      specificationJson: null,
+      specificationApprovedAt: null,
+      lastReviewJson: null,
+      lastError: null,
+      codexModel: null,
+      claudeModel: null
+    }).id;
+    const otherReviews = new SqliteCodeReviewRepository(db, clock);
+    const otherSubject = otherReviews.createSubject({
+      id: ids.next(),
+      taskId: otherTaskId,
+      baseCommit: COMMIT_A,
+      headCommit: COMMIT_B,
+      branch: 'agent/other',
+      snapshotJson: JSON.stringify(['other']),
+      subjectSha256: SUBJECT_B,
+      fileCount: 1,
+      totalBytes: 10,
+      truncated: false,
+      complete: true,
+      hasUncommittedState: false,
+      capturedAt: clock.nowIso()
+    });
+
+    const mine = subject();
+    reviews.upsertTriage({
+      id: ids.next(),
+      taskId,
+      subjectId: mine.id,
+      subjectSha256: mine.subjectSha256,
+      findingsSnapshotJson: JSON.stringify([['f-1', 0]]),
+      triageJson: JSON.stringify({ recommendations: [] })
+    });
+    otherReviews.upsertTriage({
+      id: ids.next(),
+      taskId: otherTaskId,
+      subjectId: otherSubject.id,
+      subjectSha256: otherSubject.subjectSha256,
+      findingsSnapshotJson: JSON.stringify([['f-2', 0]]),
+      triageJson: JSON.stringify({ recommendations: [] })
+    });
+
+    expect(reviews.getTriage(taskId)?.taskId).toBe(taskId);
+    expect(reviews.getTriage(otherTaskId)?.taskId).toBe(otherTaskId);
+  });
+
+  it('survives closing and reopening the database file — a real restart, not an in-memory connection kept alive', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'agent-relay-code-review-triage-'));
+    const file = join(directory, 'agent-relay.sqlite');
+
+    try {
+      const before = openDatabase({ file });
+      const beforeClock = new FixedClock();
+      const beforeIds = new SequentialIdGenerator('r');
+      const beforeReviews = new SqliteCodeReviewRepository(before, beforeClock);
+      const beforeProjects = new SqliteProjectRepository(before, beforeClock);
+      const beforeTasks = new SqliteTaskRepository(before, beforeClock);
+
+      const project = beforeProjects.create({
+        id: 'p-restart',
+        name: 'demo',
+        localPath: 'C:\\repo',
+        projectType: 'existing',
+        defaultBranch: 'main',
+        githubOwner: null,
+        githubRepo: null,
+        githubVisibility: 'private'
+      });
+      const restartTaskId = beforeTasks.create({
+        id: 't-restart',
+        projectId: project.id,
+        title: 'Survives a restart',
+        originalRequest: 'Survive a restart.',
+        status: 'READY_FOR_IMPLEMENTATION',
+        currentRound: 0,
+        maxRounds: 3,
+        codexThreadId: null,
+        claudeSessionId: null,
+        worktreePath: null,
+        branchName: null,
+        baseBranch: null,
+        specificationJson: null,
+        specificationApprovedAt: null,
+        lastReviewJson: null,
+        lastError: null,
+        codexModel: null,
+        claudeModel: null
+      }).id;
+      const restartSubject = beforeReviews.createSubject({
+        id: beforeIds.next(),
+        taskId: restartTaskId,
+        baseCommit: COMMIT_A,
+        headCommit: COMMIT_B,
+        branch: 'agent/restart',
+        snapshotJson: JSON.stringify(['restart']),
+        subjectSha256: SUBJECT_A,
+        fileCount: 1,
+        totalBytes: 10,
+        truncated: false,
+        complete: true,
+        hasUncommittedState: false,
+        capturedAt: beforeClock.nowIso()
+      });
+      const written = beforeReviews.upsertTriage({
+        id: beforeIds.next(),
+        taskId: restartTaskId,
+        subjectId: restartSubject.id,
+        subjectSha256: restartSubject.subjectSha256,
+        findingsSnapshotJson: JSON.stringify([['f-1', 0]]),
+        triageJson: JSON.stringify({
+          recommendations: [
+            { findingId: 'f-1', recommendation: 'accept', reason: 'Legitimate.', evidenceRef: 'src/x.ts:1', confidence: 'high' }
+          ]
+        })
+      });
+      // Simulates the application quitting: the connection is closed, and
+      // nothing about the row's durability may depend on this process, this
+      // repository instance, or this connection staying alive.
+      closeDatabase(before);
+
+      const after = openDatabase({ file });
+      try {
+        const afterReviews = new SqliteCodeReviewRepository(after, new FixedClock());
+        expect(afterReviews.getTriage(restartTaskId)).toEqual(written);
+      } finally {
+        closeDatabase(after);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
 /**
  * The constraints, attacked directly.
  *
@@ -461,6 +685,35 @@ describe('code-review relational integrity', () => {
              created_at, updated_at)
            VALUES ('r-hash', ?, ?, ?, 'requested', NULL, NULL, NULL, NULL, NULL,
                    NULL, NULL, NULL, NULL, NULL, 0, 't', NULL, 't', 't')`
+        )
+        .run(taskId, mine.id, SUBJECT_B)
+    ).toThrow(/FOREIGN KEY/i);
+  });
+
+  it('refuses a triage row that points at another task\'s subject', () => {
+    const mine = subject();
+    const theirs = otherTask();
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO code_review_triage (
+             id, task_id, subject_id, subject_sha256, findings_snapshot_json,
+             triage_json, created_at, updated_at)
+           VALUES ('tri-cross', ?, ?, ?, '[]', '{"recommendations":[]}', 't', 't')`
+        )
+        .run(theirs, mine.id, mine.subjectSha256)
+    ).toThrow(/FOREIGN KEY/i);
+  });
+
+  it('refuses a triage row whose hash disagrees with the subject it names', () => {
+    const mine = subject();
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO code_review_triage (
+             id, task_id, subject_id, subject_sha256, findings_snapshot_json,
+             triage_json, created_at, updated_at)
+           VALUES ('tri-hash', ?, ?, ?, '[]', '{"recommendations":[]}', 't', 't')`
         )
         .run(taskId, mine.id, SUBJECT_B)
     ).toThrow(/FOREIGN KEY/i);
@@ -629,7 +882,7 @@ describe('code-review relational integrity', () => {
 
 describe('the code-review migration', () => {
   it('keeps code review at version 7 in the forward-only migration sequence', () => {
-    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+    expect(MIGRATIONS.map((migration) => migration.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
     expect(MIGRATIONS[6]?.name).toBe('code-review-evidence');
     expect(MIGRATIONS[7]?.name).toBe('task-provider-routing');
     expect(MIGRATIONS[8]?.name).toBe('local-inference-settings');
@@ -641,6 +894,7 @@ describe('the code-review migration', () => {
     expect(MIGRATIONS[14]?.name).toBe('ornith-provider-version-collision-repair');
     expect(MIGRATIONS[15]?.name).toBe('coai-contract-fingerprint');
     expect(MIGRATIONS[16]?.name).toBe('plan-review-triage');
+    expect(MIGRATIONS[17]?.name).toBe('code-review-triage');
   });
 
   it('upgrades a real database file that stops at version 6, keeping its rows', () => {
@@ -678,7 +932,7 @@ describe('the code-review migration', () => {
             version: number;
           }[]
         ).map((row) => row.version);
-        expect(applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+        expect(applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
 
         // The pre-existing row survived the upgrade untouched.
         expect(upgraded.prepare('SELECT name FROM projects WHERE id = ?').get('p1')).toEqual({

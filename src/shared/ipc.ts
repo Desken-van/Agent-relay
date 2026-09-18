@@ -57,7 +57,8 @@ import {
   type CodeReviewFinding,
   type CodeReviewRound,
   type CodeReviewSubject,
-  type CodeReviewSubjectIdentity
+  type CodeReviewSubjectIdentity,
+  type CodeReviewTriage
 } from './domain/code-review';
 import {
   planReviewDecisionSchema,
@@ -185,6 +186,19 @@ export interface CodeReviewDetail {
    * operator without a checkout path or a credential travelling with it.
    */
   readonly identityProblem: string | null;
+  /**
+   * The task's durable automatic-triage record, whatever subject it was
+   * computed against — raw, exactly as stored. Present across a restart and
+   * across every `codeReview:*` read, not only the one that requested it.
+   *
+   * Deliberately NOT pre-filtered to "still current" here, mirroring how
+   * `PlanReviewGate.triageForFindings` is exposed raw and compared against
+   * `findingsJson` by the reader: whether it still applies is a comparison
+   * against `findings`/`subject` the caller already has, computed once via
+   * `codeReviewTriageIsCurrent` rather than duplicated as a second boolean
+   * that could disagree with it.
+   */
+  readonly triage: CodeReviewTriage | null;
 }
 
 export interface PlanReviewDetail {

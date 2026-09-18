@@ -1,9 +1,9 @@
 /**
  * What the code-review channels will and will not accept.
  *
- * The renderer does not exist yet, which is exactly why this is worth pinning
- * now: the shape a future screen is allowed to send is a security boundary, and
- * it is far easier to keep narrow than to narrow later.
+ * Pinned independently of `CodeReviewPanel`: the shape a screen is allowed to
+ * send is a security boundary, and it is far easier to keep narrow than to
+ * narrow later once a caller has come to depend on a wider one.
  */
 
 import { describe, expect, it } from 'vitest';

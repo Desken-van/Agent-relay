@@ -10,6 +10,12 @@ import type { GitChangeSet } from '@shared/domain/git';
 import { APPROVAL_ACTIONS, type ApprovalAction, type Run, type Task } from '@shared/domain/models';
 import { parsePlanReviewTriage, type PlanReviewDecision } from '@shared/domain/plan-review';
 import {
+  codeReviewTriageIsCurrent,
+  parseCodeReviewTriage,
+  type CodeReviewDecisionAction,
+  type CodeReviewFinding
+} from '@shared/domain/code-review';
+import {
   runGuidance,
   type PlanReviewPreparation,
   type RunActionKey,
@@ -21,7 +27,7 @@ import {
   WORKTREE_DEPENDENCY_INSTALLABLE_BLOCKER_STATES,
   type WorktreeDependencyStatus
 } from '@shared/domain/worktree-dependencies';
-import type { PlanReviewDetail, PublishConfirmation, PublishOutcome, TaskDetail } from '@shared/ipc';
+import type { CodeReviewDetail, PlanReviewDetail, PublishConfirmation, PublishOutcome, TaskDetail } from '@shared/ipc';
 import type { CodexReviewResult, FindingSeverity, TaskSpecification } from '@shared/schemas/codex';
 import { ApiError, call, describeError, expect } from '../lib/api';
 import { formatDateTime, pluralize } from '../lib/format';
@@ -392,6 +398,7 @@ export function RunView(): React.JSX.Element {
 
   const { task, project, specification, lastReview } = detail;
   const planReviewEnabled = settings?.externalPlanReviewEnabled ?? false;
+  const codeReviewEnabled = settings?.externalCodeReviewEnabled ?? false;
   const planReviewMayControlNextAction =
     task.status === 'DRAFT' ||
     (task.status === 'READY_FOR_IMPLEMENTATION' && !task.specificationApprovedAt);
@@ -625,6 +632,12 @@ export function RunView(): React.JSX.Element {
             onGuidanceStateChanged={updatePlanReviewPreparation}
             renderPrimary={false}
             onDispatchReady={registerPlanDispatcher}
+          />
+
+          <CodeReviewPanel
+            key={`code-review-${task.id}`}
+            task={task}
+            integrationEnabled={codeReviewEnabled}
           />
 
           {dirtyPrompt ? (
@@ -1539,6 +1552,376 @@ export function PlanReviewPanel({
       {gate?.status === 'proceeded' && identity === 'current' ? (
         <Notice tone="info">The exact specification and rule snapshot passed resolution. You may now approve the specification.</Notice>
       ) : null}
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+
+type CodeDecisionDraft = { action: '' | CodeReviewDecisionAction; reason: string };
+const NO_CODE_DECISIONS: Record<string, CodeDecisionDraft> = {};
+const NO_CODE_FINDINGS: readonly CodeReviewFinding[] = [];
+
+function subjectIdentityLabel(identity: CodeReviewDetail['subjectIdentity']): string {
+  switch (identity) {
+    case 'no_subject': return 'no subject captured';
+    case 'current': return 'current';
+    case 'stale': return 'stale — code has changed';
+    case 'unknown': return 'unknown — could not be read';
+    case 'incomplete': return 'incomplete capture';
+  }
+}
+
+/**
+ * External code review, folded into Run → Actions, alongside
+ * {@link PlanReviewPanel}.
+ *
+ * Unlike the plan gate, code review has no single row that answers "resolve
+ * everything at once": each finding is decided independently via
+ * `codeReview:decide`, so this panel has no batch resolve button — only a
+ * per-finding decision, and (from automatic triage) a per-finding or
+ * apply-all-applicable shortcut that fills in and submits that same decision
+ * from Codex's recommendation. Every mutation ends with an unconditional
+ * re-read of `codeReview:get`, whether it fully succeeded, partially
+ * succeeded (an apply-all batch), or failed outright — never a locally
+ * guessed state.
+ */
+export function CodeReviewPanel({
+  task,
+  integrationEnabled
+}: {
+  task: Task;
+  integrationEnabled: boolean;
+}): React.JSX.Element | null {
+  const [detail, setDetail] = useState<CodeReviewDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
+  const [error, setError] = useState<string | null>(null);
+  const [draftState, setDraftState] = useState<{
+    readonly roundKey: string | null;
+    readonly drafts: Record<string, CodeDecisionDraft>;
+  }>({ roundKey: null, drafts: {} });
+
+  useEffect(() => {
+    let active = true;
+    void call('codeReview:get', { taskId: task.id }).then((result) => {
+      if (!active) return;
+      if (result.ok) {
+        setDetail(result.data);
+        setError(null);
+      } else {
+        setError(result.error.message);
+      }
+      setLoading(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, [task.id]);
+
+  const findings = detail?.findings ?? NO_CODE_FINDINGS;
+  // Keyed on the subject and the exact live findings (id + revision), not on
+  // any single mutable counter: a decision on ONE finding must not discard a
+  // draft in progress for another, but a new subject or a finding actually
+  // moving (the only things that change this key) should.
+  const roundKey = detail?.subject
+    ? `${detail.subject.subjectSha256}:${JSON.stringify(findings.map((f) => [f.id, f.revision]))}`
+    : null;
+  const decisions = draftState.roundKey === roundKey ? draftState.drafts : NO_CODE_DECISIONS;
+  const setDecisions = useCallback(
+    (update: (current: Record<string, CodeDecisionDraft>) => Record<string, CodeDecisionDraft>): void => {
+      setDraftState((current) => ({
+        roundKey,
+        drafts: update(current.roundKey === roundKey ? current.drafts : {})
+      }));
+    },
+    [roundKey]
+  );
+
+  const latestDecisions = detail?.latestDecisions ?? {};
+  const undecidedFindings = findings.filter((f) => !latestDecisions[f.id]);
+  const undecidedIds = undecidedFindings.map((f) => f.id);
+
+  // Discards the WHOLE stored result together — never just the one finding
+  // it names — the moment the subject or any finding it covers has moved.
+  // See `codeReviewTriageIsCurrent`.
+  const currentTriage = detail && codeReviewTriageIsCurrent(
+    detail.triage,
+    detail.subject?.subjectSha256 ?? null,
+    findings
+  )
+    ? parseCodeReviewTriage(detail.triage!.triageJson)
+    : null;
+  const triageByFinding = new Map(currentTriage?.recommendations.map((r) => [r.findingId, r] as const) ?? []);
+  const triageSummary = currentTriage
+    ? {
+        accept: currentTriage.recommendations.filter((r) => r.recommendation === 'accept').length,
+        reject: currentTriage.recommendations.filter((r) => r.recommendation === 'reject').length,
+        needsUser: currentTriage.recommendations.filter((r) => r.recommendation === 'needs_user').length
+      }
+    : null;
+  const applicableUndecided = undecidedFindings.filter((f) => {
+    const r = triageByFinding.get(f.id);
+    return r !== undefined && r.recommendation !== 'needs_user';
+  });
+
+  /**
+   * Every mutation goes through here. `operation` performs exactly one
+   * durable write (or, for "apply all", several in sequence) and then this
+   * ALWAYS re-reads `codeReview:get` — even when `operation` threw partway
+   * through a batch — so `detail` never reflects a locally guessed outcome.
+   */
+  const act = useCallback(async (key: string, operation: () => Promise<void>): Promise<void> => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    setBusy(key);
+    let opError: string | null = null;
+    try {
+      await operation();
+    } catch (caught) {
+      opError = caught instanceof Error ? caught.message : String(caught);
+    }
+    const result = await call('codeReview:get', { taskId: task.id });
+    if (result.ok) setDetail(result.data);
+    setError(opError ?? (result.ok ? null : result.error.message));
+    inFlightRef.current = false;
+    setBusy(null);
+  }, [task.id]);
+
+  if (task.worktreePath === null) return null;
+  if (!integrationEnabled && detail?.subject == null) return null;
+
+  const subject = detail?.subject ?? null;
+  const identity = detail?.subjectIdentity ?? 'no_subject';
+  const canCapture = integrationEnabled && busy === null;
+  const canReview = integrationEnabled && busy === null && identity === 'current';
+  // `rounds` is oldest-first (see `CodeReviewRepository.listRounds`); the
+  // latest is the last entry, not the first.
+  const latestRound = detail?.rounds.at(-1) ?? null;
+  const canReconcile = integrationEnabled && busy === null && latestRound !== null &&
+    ['requested', 'reviewing', 'interrupted'].includes(latestRound.status);
+
+  const decide = (finding: CodeReviewFinding, action: CodeReviewDecisionAction, reason: string): void => {
+    const trimmed = reason.trim();
+    if (trimmed.length === 0) return;
+    void act(`decide:${finding.id}`, () => expect('codeReview:decide', {
+      taskId: task.id,
+      findingId: finding.id,
+      expectedRevision: finding.revision,
+      action,
+      reason: trimmed
+    }).then(() => undefined));
+  };
+
+  const applyRecommendation = (finding: CodeReviewFinding): void => {
+    const recommendation = triageByFinding.get(finding.id);
+    if (!recommendation || recommendation.recommendation === 'needs_user') return;
+    decide(finding, recommendation.recommendation, recommendation.reason);
+  };
+
+  const applyAllRecommendations = (): void => {
+    if (applicableUndecided.length === 0) return;
+    void act('apply-all', async () => {
+      for (const finding of applicableUndecided) {
+        const recommendation = triageByFinding.get(finding.id);
+        if (!recommendation || recommendation.recommendation === 'needs_user') continue;
+        await expect('codeReview:decide', {
+          taskId: task.id,
+          findingId: finding.id,
+          expectedRevision: finding.revision,
+          action: recommendation.recommendation,
+          reason: recommendation.reason
+        });
+      }
+    });
+  };
+
+  return (
+    <div className="stack" aria-label="External code review">
+      <div className="row" style={{ justifyContent: 'space-between' }}>
+        <div className="section-title">External code review</div>
+        {subject ? <span className={`tag ${identity === 'current' ? 'tag--ok' : 'tag--warn'}`}>{subjectIdentityLabel(identity)}</span> : null}
+      </div>
+      {loading ? <div className="muted">Loading code-review evidence…</div> : null}
+      {!integrationEnabled ? (
+        <Notice tone="warn">This task is bound to external code-review evidence. Re-enable the integration in Settings to continue it.</Notice>
+      ) : null}
+      {error ? <Notice tone="error">{error}</Notice> : null}
+      {detail?.identityProblem ? <Notice tone="warn">{detail.identityProblem}</Notice> : null}
+
+      {subject ? (
+        <div className="kv">
+          <span className="kv__k">Subject</span><span className="kv__v mono selectable">{subject.subjectSha256}</span>
+          <span className="kv__k">Files</span><span className="kv__v">{subject.fileCount}</span>
+          <span className="kv__k">Bytes</span><span className="kv__v">{subject.totalBytes.toLocaleString()}</span>
+        </div>
+      ) : (
+        <div className="muted">Capture the current code as this task&apos;s review subject before running an external review.</div>
+      )}
+
+      <div className="row">
+        <button
+          type="button"
+          className="btn btn--sm"
+          disabled={!canCapture}
+          onClick={() => void act('capture', () => expect('codeReview:capture', { taskId: task.id }).then(() => undefined))}
+        >
+          {busy === 'capture' ? <Spinner /> : null} {subject ? 'Capture subject again' : 'Capture code-review subject'}
+        </button>
+        {latestRound && canReconcile ? (
+          <button
+            type="button"
+            className="btn btn--sm"
+            disabled={busy !== null}
+            onClick={() => void act('reconcile', () => expect('codeReview:reconcile', { taskId: task.id }).then(() => undefined))}
+          >
+            {busy === 'reconcile' ? <Spinner /> : null} Reconcile outstanding round
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="btn btn--sm btn--primary"
+            disabled={!canReview}
+            onClick={() => void act('review', () => expect('codeReview:review', { taskId: task.id }).then(() => undefined))}
+          >
+            {busy === 'review' ? <Spinner /> : null} Run external code review
+          </button>
+        )}
+        {integrationEnabled && undecidedIds.length > 0 ? (
+          <button
+            type="button"
+            className="btn btn--sm"
+            disabled={busy !== null}
+            title="Independent Codex analysis: recommends accept/reject/needs a human for each undecided finding, with reasons. Never resolves anything on its own."
+            onClick={() => void act('triage', async () => {
+              await expect('codeReview:triage', { taskId: task.id, findingIds: undecidedIds });
+            })}
+          >
+            {busy === 'triage' ? <Spinner /> : null} Analyze undecided findings
+          </button>
+        ) : null}
+      </div>
+
+      {latestRound ? (
+        <div className="kv">
+          <span className="kv__k">Round status</span><span className="kv__v">{latestRound.status.replace(/_/g, ' ')}</span>
+          <span className="kv__k">Verdict</span><span className="kv__v">{latestRound.verdict ?? 'No verdict recorded'}</span>
+          <span className="kv__k">Reviewers</span><span className="kv__v selectable">{latestRound.reviewers ?? '—'}</span>
+        </div>
+      ) : null}
+
+      {triageSummary ? (
+        <div className="row muted" style={{ marginTop: 4 }}>
+          Analysis: {triageSummary.accept} recommended accept · {triageSummary.reject} recommended reject ·
+          {' '}{triageSummary.needsUser} need a human
+          {applicableUndecided.length > 0 ? (
+            <button
+              type="button"
+              className="btn btn--sm btn--ghost"
+              style={{ marginLeft: 8 }}
+              disabled={busy !== null}
+              onClick={applyAllRecommendations}
+            >
+              Apply all recommendations to undecided findings
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {findings.length === 0 ? (
+        <div className="muted">No live findings for the current subject.</div>
+      ) : (
+        <div className="stack stack--tight">
+          {findings.map((finding) => {
+            const decided = latestDecisions[finding.id] ?? null;
+            const draft = decisions[finding.id] ?? { action: '', reason: '' };
+            const recommendation = triageByFinding.get(finding.id);
+            return (
+              <div className="finding" key={finding.id}>
+                <div className="finding__head">
+                  <span className={`tag ${finding.severity === 'blocking' || finding.severity === 'major' ? 'tag--danger' : 'tag--warn'}`}>{finding.severity}</span>
+                  <span className="finding__title selectable">{finding.title}</span>
+                  <span className="finding__where selectable">{finding.category}{finding.file ? ` · ${finding.file}${finding.line ? `:${finding.line}` : ''}` : ''}</span>
+                </div>
+                <div className="finding__desc selectable">{finding.body}</div>
+                {finding.fix ? <div className="muted selectable" style={{ marginTop: 6 }}>Suggested: {finding.fix}</div> : null}
+
+                {decided ? (
+                  <div className="muted selectable" style={{ marginTop: 6 }}>
+                    <strong>Decided: {decided.action}</strong> — {decided.reason}
+                  </div>
+                ) : (
+                  <>
+                    {recommendation ? (
+                      <div
+                        className={`muted selectable ${recommendation.recommendation === 'needs_user' ? 'tag--warn' : ''}`}
+                        style={{ marginTop: 6, padding: 6, border: '1px solid var(--border, #444)', borderRadius: 4 }}
+                      >
+                        <strong>
+                          {recommendation.recommendation === 'accept' ? 'Recommended: accept'
+                            : recommendation.recommendation === 'reject' ? 'Recommended: reject'
+                            : 'Needs a human decision'}
+                        </strong>{' '}
+                        ({recommendation.confidence} confidence) — {recommendation.reason}
+                        <div>Evidence: {recommendation.evidenceRef}</div>
+                        {recommendation.recommendation !== 'needs_user' ? (
+                          <button
+                            type="button"
+                            className="btn btn--sm btn--ghost"
+                            style={{ marginTop: 4 }}
+                            disabled={busy !== null}
+                            onClick={() => applyRecommendation(finding)}
+                          >
+                            Apply recommendation
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    <div className="grid-2" style={{ marginTop: 10 }}>
+                      <Field label="Decision">
+                        <select
+                          className="select"
+                          value={draft.action}
+                          onChange={(event) => setDecisions((current) => ({
+                            ...current,
+                            [finding.id]: { ...draft, action: event.target.value as CodeDecisionDraft['action'] }
+                          }))}
+                        >
+                          <option value="">Choose…</option>
+                          <option value="accept">Accept and address</option>
+                          <option value="reject">Reject with reason</option>
+                          <option value="resolved">Mark resolved (code has moved on)</option>
+                        </select>
+                      </Field>
+                      <Field label="Reason" hint="Required for every decision">
+                        <input
+                          className="input"
+                          value={draft.reason}
+                          onChange={(event) => setDecisions((current) => ({
+                            ...current,
+                            [finding.id]: { ...draft, reason: event.target.value }
+                          }))}
+                        />
+                      </Field>
+                    </div>
+                    <div className="row" style={{ marginTop: 6 }}>
+                      <button
+                        type="button"
+                        className="btn btn--sm"
+                        disabled={!integrationEnabled || busy !== null || !draft.action || draft.reason.trim().length === 0}
+                        onClick={() => decide(finding, draft.action as CodeReviewDecisionAction, draft.reason)}
+                      >
+                        {busy === `decide:${finding.id}` ? <Spinner /> : null} Submit decision
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

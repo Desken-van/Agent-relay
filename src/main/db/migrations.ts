@@ -1035,6 +1035,50 @@ export const MIGRATIONS: readonly Migration[] = [
         ALTER TABLE plan_review_gates ADD COLUMN triage_for_findings TEXT;
       `);
     }
+  },
+  {
+    version: 18,
+    name: 'code-review-triage',
+    up(db) {
+      // Codex-assisted automatic triage recommendations for code-review
+      // findings — see `CodeReviewService.triage()`. One row per task,
+      // wholesale-replaced on every analysis, unlike the plan gate's own
+      // triage columns: a code-review subject is captured as an immutable
+      // identity row (`code_review_subjects`), not a mutable review-lifecycle
+      // row, so triage state — which DOES change independently of the
+      // subject — gets its own table rather than mutating that one.
+      //
+      // `subject_id`/`subject_sha256` name the EXACT subject this result was
+      // computed against; the composite foreign key (mirroring
+      // `code_review_rounds`' own) refuses a row that names a subject
+      // belonging to a different task or a different hash than it claims.
+      // `findings_snapshot_json` is the canonical, sorted `[[id, revision],
+      // ...]` of the EXACT findings analyzed (see
+      // `codeReviewTriageFindingsSnapshot`) — not a revision number, for the
+      // same reason the plan gate's own triage columns are not one: a
+      // finding's revision is meaningful (it bumps on a real decision), but
+      // nothing here predicts what it will become next. A read instead
+      // recomputes the same snapshot from the CURRENT live findings the
+      // stored result names and compares it byte-for-byte
+      // (`codeReviewTriageIsCurrent`): only a subject change or a decision on
+      // one of the analyzed findings invalidates the stored result, and a
+      // newer subject's row starts this table's per-task slot over from
+      // nothing, so a stale result is never carried forward onto it.
+      db.exec(`
+        CREATE TABLE code_review_triage (
+          id                       TEXT PRIMARY KEY,
+          task_id                  TEXT NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
+          subject_id               TEXT NOT NULL,
+          subject_sha256           TEXT NOT NULL CHECK (length(subject_sha256) = 64),
+          findings_snapshot_json   TEXT NOT NULL,
+          triage_json              TEXT NOT NULL,
+          created_at               TEXT NOT NULL,
+          updated_at               TEXT NOT NULL,
+          FOREIGN KEY (subject_id, task_id, subject_sha256)
+            REFERENCES code_review_subjects(id, task_id, subject_sha256) ON DELETE CASCADE
+        );
+      `);
+    }
   }
 ];
 

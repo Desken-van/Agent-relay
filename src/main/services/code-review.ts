@@ -23,6 +23,7 @@ import {
   canonicalCodeSnapshot,
   codeFindingFingerprintInput,
   codeReviewSnapshotSchema,
+  codeReviewTriageFindingsSnapshot,
   CODE_REVIEW_UNRESOLVED_STATUSES,
   CODE_SNAPSHOT_VERSION,
   providerCodeFindingSchema,
@@ -33,6 +34,7 @@ import {
   type CodeReviewSnapshot,
   type CodeReviewSubject,
   type CodeReviewSubjectIdentity,
+  type CodeReviewTriageResult,
   type CodeReviewVerdict,
   type CodeSnapshotEntry,
   type CodeSnapshotOmissionEntry,
@@ -1575,10 +1577,11 @@ export class CodeReviewService {
    * Codex-assisted, independent recommendations for a bounded set of
    * undecided, live findings — never a decision, never a resolve. A fresh,
    * read-only Codex call every time: no implementation session or tool
-   * access is reused or granted. Nothing is persisted: there is no durable
-   * "triage" record for code review (unlike the plan-review gate), so this
-   * always computes a fresh answer and staleness is checked immediately
-   * before returning rather than via a conditional write.
+   * access is reused or granted. The result is persisted (one durable row
+   * per task, wholesale-replaced — see `CodeReviewRepository.upsertTriage`)
+   * bound to the exact subject and the exact finding identities/revisions it
+   * was computed against, so it survives a restart and a later read can tell
+   * whether it still applies via `codeReviewTriageIsCurrent`.
    */
   async triage(
     taskId: string,
@@ -1714,6 +1717,28 @@ export class CodeReviewService {
         );
       }
     }
+
+    const triageResult: CodeReviewTriageResult = {
+      recommendations: validated.map((r) => ({
+        // Guaranteed a string by `validateTriageCoverage` above (only a
+        // string ref can be in `requestedIds`, which holds only finding ids).
+        findingId: String(r.findingRef),
+        recommendation: r.recommendation,
+        reason: r.reason,
+        evidenceRef: r.evidenceRef,
+        confidence: r.confidence
+      }))
+    };
+    this.deps.reviews.upsertTriage({
+      id: this.deps.ids.next(),
+      taskId,
+      subjectId: after.stored.id,
+      subjectSha256,
+      findingsSnapshotJson: codeReviewTriageFindingsSnapshot(
+        targets.map((f) => ({ id: f.id, revision: f.revision }))
+      ),
+      triageJson: JSON.stringify(triageResult)
+    });
 
     return validated;
   }

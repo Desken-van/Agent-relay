@@ -124,8 +124,9 @@ describe('migrations', () => {
 
       // Migrations 12 (Ornith), 13 (this test's review-limit subject),
       // 14 (review-blocked-status), 15 (compatibility repair), 16
-      // (Coai contract fingerprint), and 17 (plan-review triage) are pending.
-      expect(runMigrations(legacy)).toBe(6);
+      // (Coai contract fingerprint), 17 (plan-review triage), and 18
+      // (code-review triage) are pending.
+      expect(runMigrations(legacy)).toBe(7);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_LIMIT_REACHED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');
       expect(() => tasks.create({
@@ -196,8 +197,9 @@ describe('migrations', () => {
 
       // Migrations 13 (review-limit-status), 14 (this test's review-blocked
       // subject), 15 (compatibility repair), 16 (Coai contract
-      // fingerprint), and 17 (plan-review triage) are still pending.
-      expect(runMigrations(legacy)).toBe(5);
+      // fingerprint), 17 (plan-review triage), and 18 (code-review triage)
+      // are still pending.
+      expect(runMigrations(legacy)).toBe(6);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_BLOCKED');
       expect(tasks.findById(staleEvidence.id)?.status).toBe('FAILED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');

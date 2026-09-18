@@ -62,6 +62,7 @@ import type {
   CodeReviewOccurrence,
   CodeReviewRound,
   CodeReviewSubject,
+  CodeReviewTriage,
   CodeSnapshotChange,
   ProviderCodeFinding
 } from '../shared/domain/code-review';
@@ -730,6 +731,8 @@ export interface CodeSnapshotLimits {
 }
 
 export type NewCodeReviewSubject = Omit<CodeReviewSubject, 'createdAt'>;
+/** `id`, if it names an existing row's task, is not honored — the row's original id is kept across an upsert; only its content and `updatedAt` change. */
+export type NewCodeReviewTriage = Omit<CodeReviewTriage, 'createdAt' | 'updatedAt'>;
 export type NewCodeReviewRound = Omit<
   CodeReviewRound,
   'createdAt' | 'updatedAt' | 'revision'
@@ -829,6 +832,16 @@ export interface CodeReviewRepository {
   ): { decision: CodeReviewDecision; finding: CodeReviewFinding } | null;
   listDecisions(findingId: string): CodeReviewDecision[];
   latestDecision(findingId: string): CodeReviewDecision | null;
+
+  /** The task's one durable triage record, if automatic analysis has ever run. */
+  getTriage(taskId: string): CodeReviewTriage | null;
+  /**
+   * Wholesale replace the task's triage record — one row per task, never a
+   * history. The row's original `id` is kept across a later call even though
+   * its content and `updatedAt` are fully overwritten; the `id` on `record`
+   * is used only the first time a row is created for this task.
+   */
+  upsertTriage(record: NewCodeReviewTriage): CodeReviewTriage;
 }
 
 /**

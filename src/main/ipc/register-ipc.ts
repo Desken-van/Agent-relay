@@ -129,7 +129,8 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       historicalFindings: all,
       latestDecisions,
       totalFindingsEverRecorded: all.length,
-      identityProblem: identityProblem ?? identity.problem
+      identityProblem: identityProblem ?? identity.problem,
+      triage: app.codeReviews.getTriage(taskId)
     };
   };
   const planReviewDetail = (taskId: string): IpcResponseMap['planReview:get'] => {
