@@ -122,14 +122,21 @@ const completed = {
   usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0, cache_write_input_tokens: 0, reasoning_output_tokens: 0 }
 };
 
-async function failure(events: AgentProgressEvent[], options?: Parameters<typeof context>[1]): Promise<Error & { code?: string }> {
+/** The fields of an AgentRelayError these tests read. */
+interface RelayFailure extends Error {
+  code?: string;
+  details?: string;
+  remediation?: string;
+}
+
+async function failure(events: AgentProgressEvent[], options?: Parameters<typeof context>[1]): Promise<RelayFailure> {
   return new CodexSdkAdapter(runner)
     .createSpecification(request, context(events, options))
     .then(
       () => {
         throw new Error('expected createSpecification to reject');
       },
-      (error: Error & { code?: string }) => error
+      (error: RelayFailure) => error
     );
 }
 
