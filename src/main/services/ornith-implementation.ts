@@ -272,7 +272,8 @@ Rules:
   such recovery chance per run: on your next turn, either make the scoped edit now using context you
   already have, or call "blocked" — repeating the identical request will be refused outright.
 - "search_text" reads the FULL content of every candidate file toward the same cumulative read
-  budget as "read_file" — a repository-wide search (no "files" given) is the most expensive
+  budget as "read_file" (files over 64 KB and binary files are skipped, never searched: use
+  "read_file" on those) — a repository-wide search (no "files" given) is the most expensive
   possible request, and is NEVER automatically narrowed for you, including by a SCOPE section
   above. If you already know which file matters, pass it in "files" explicitly, or better, skip
   the search entirely and use "read_file" directly.

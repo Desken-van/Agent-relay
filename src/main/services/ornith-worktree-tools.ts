@@ -116,8 +116,8 @@ export interface OrnithWorktreeToolsOptions {
   /**
    * A specification's raw `scopedFilePaths` claim, already syntax-sanitized
    * by `sanitizeScopedFilePaths` (main/services/ornith-implementation.ts).
-   * Intersected against the real manifest once, inside `ensureManifest()`, to
-   * become `authoritativeScope` — a candidate that does not exist in this
+   * Intersected against the real manifest once, by `resolveAuthoritativeScope()`,
+   * to become `authoritativeScope` — a candidate that does not exist in this
    * worktree is silently dropped, never treated as an error. Absent or fully
    * unmatched means "no trustworthy scope": every existing code path then
    * behaves exactly as it does without this option.
@@ -193,15 +193,15 @@ export class OrnithWorktreeTools {
   private readonly rootInode: bigint | number;
   private readonly fsGuard: WindowsFsGuard;
   private nativeRootIdentity: WindowsFsRootIdentity | null = null;
-  /** Manifest-confirmed subset of `scopedFilePathCandidates`, resolved once inside `ensureManifest()`. */
+  /** Manifest-confirmed subset of `scopedFilePathCandidates`; computed only by `resolveAuthoritativeScope()`. */
   private authoritativeScope: readonly string[] | null = null;
   /**
-   * Set once `resolveAuthoritativeScope()` has returned, success or failure,
-   * so a LATER `ensureManifest()` retry (e.g. the manifest build failed
-   * transiently during the eager pre-loop call, then succeeds on the first
-   * real tool dispatch) never silently re-derives a different scope answer
-   * than the one already reported to the model. Once decided, `authoritativeScope`
-   * is frozen for the rest of this instance's life.
+   * Set once `resolveAuthoritativeScope()` has decided, success or failure, so
+   * every later call returns the SAME answer that was already reported to the
+   * model (e.g. a manifest build that failed transiently during the eager
+   * pre-loop call is never quietly retried into a different scope). Nothing
+   * else derives or touches `authoritativeScope`: it is not part of the
+   * manifest's own lifecycle.
    */
   private authoritativeScopeDecided = false;
 
@@ -406,11 +406,6 @@ export class OrnithWorktreeTools {
       const sorted = [...names].sort();
       this.manifest = sorted;
       for (const name of sorted) this.knownFiles.add(name);
-      if (!this.authoritativeScopeDecided) {
-        const scopeCandidates = this.deps.scopedFilePathCandidates ?? [];
-        const validatedScope = [...new Set(scopeCandidates)].filter((path) => this.knownFiles.has(path));
-        this.authoritativeScope = validatedScope.length > 0 ? validatedScope : null;
-      }
       return sorted;
     } finally {
       dispose();
@@ -434,25 +429,31 @@ export class OrnithWorktreeTools {
    * re-detected by the loop's own per-iteration `assertCheckoutIdentity`
    * regardless, so nothing is masked either way — only a truly transient
    * failure benefits from the second try. Whatever the outcome, this remains
-   * the one and only authoritative decision for this run instance, frozen so
-   * a LATER retry (e.g. from the loop's own subsequent tool dispatches) can
-   * never quietly reach a different answer than what was already reported.
+   * the one and only authoritative decision for this run instance: the scope
+   * is computed here and nowhere else (it is not part of the manifest's own
+   * lifecycle), and every later call returns the same answer that was
+   * already reported to the model.
    */
   async resolveAuthoritativeScope(signal?: AbortSignal): Promise<readonly string[] | null> {
+    if (this.authoritativeScopeDecided) return this.authoritativeScope;
     const maxAttempts = 2;
+    let manifestBuilt = false;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       // An aborted signal (task cancelled, or the caller's whole-loop deadline
       // reached) is not a transient failure: retrying it only spends more time.
       if (signal?.aborted) break;
       try {
         await this.ensureManifest(signal);
+        manifestBuilt = true;
         break;
       } catch {
-        // Fall through to the next attempt (if any); `authoritativeScope`
-        // stays at whatever it already was (still `null` on a first-ever
-        // attempt, since a failed manifest build never reaches the
-        // scope-computation block below it).
+        // Fall through to the next attempt (if any).
       }
+    }
+    if (manifestBuilt) {
+      const candidates = this.deps.scopedFilePathCandidates ?? [];
+      const confirmed = [...new Set(candidates)].filter((path) => this.knownFiles.has(path));
+      this.authoritativeScope = confirmed.length > 0 ? confirmed : null;
     }
     this.authoritativeScopeDecided = true;
     return this.authoritativeScope;
@@ -1599,7 +1600,10 @@ function packReadSlice<T>(
   let best: T = build(safeUtf8Slice(raw, requestedOffset, 0));
   if (measure(best) > maxResultBytes) return null;
   let low = 1;
-  let high = requestedLimit - 1;
+  // JSON escaping can only ever INFLATE a slice, so a slice of more than
+  // `maxResultBytes` raw bytes can never serialize to within it: nothing above
+  // that is worth measuring.
+  let high = Math.min(requestedLimit - 1, maxResultBytes);
   while (low <= high) {
     const mid = Math.floor((low + high) / 2);
     const candidate = build(safeUtf8Slice(raw, requestedOffset, mid));

@@ -503,10 +503,10 @@ describe('OrnithImplementationService limits and cancellation', () => {
     // `preflightOrnithPrompt` for the `chars` that yields each target budget)
     // rather than hand-deriving the offset.
     const budgetCases: { label: string; chars: number; expectedBudget: number }[] = [
-      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 122_925, expectedBudget: 384 },
-      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 122_879, expectedBudget: 407 },
-      { label: '408 bytes (right at the old fallback stub size)', chars: 122_877, expectedBudget: 408 },
-      { label: '471 bytes ("408+": comfortably normal)', chars: 122_751, expectedBudget: 471 }
+      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 122_834, expectedBudget: 384 },
+      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 122_788, expectedBudget: 407 },
+      { label: '408 bytes (right at the old fallback stub size)', chars: 122_786, expectedBudget: 408 },
+      { label: '471 bytes ("408+": comfortably normal)', chars: 122_660, expectedBudget: 471 }
     ];
 
     for (const { label, chars, expectedBudget } of budgetCases) {
@@ -586,7 +586,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_925)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_834)}` // -> 384-byte budget
       };
       const preflight = preflightOrnithPrompt({
         specification: oversizedSpecification,
@@ -638,7 +638,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_925)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_834)}` // -> 384-byte budget
       };
       for (let index = 0; index < 40; index += 1) {
         writeFileSync(join(worktree, `s${String(index).padStart(3, '0')}.txt`), 'needle appears here\n', 'utf8');
@@ -680,7 +680,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_925)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_834)}` // -> 384-byte budget
       };
       // Multi-byte (3 UTF-8 bytes each) names: short enough in UTF-16 code units to
       // stay well under Windows' MAX_PATH, long enough in UTF-8 bytes that every
@@ -1332,6 +1332,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(prompts[0]).toContain('"totalBytes"');
       expect(prompts[0]).toContain('"nextOffset"');
       expect(prompts[0]).toContain('NEVER page through a large file in small');
+      expect(prompts[0]).toContain('files over 64 KB and binary files are skipped');
       expect(prompts[0]).toMatch(/FULL size\s+against the/);
       // The fields the protocol promises are present, with the values the tool really computed.
       expect(prompts[1]).toContain(`"totalBytes":${bytes}`);

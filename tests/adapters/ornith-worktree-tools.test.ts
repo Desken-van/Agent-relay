@@ -1333,6 +1333,22 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(calls).toBeGreaterThan(1);
     });
 
+    it('does not depend on call order: the answer is the same when another tool built the manifest first', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
+      const boundary = toolsWithScope(['scoped.txt']);
+
+      // A tool dispatch builds the manifest before scope is ever resolved.
+      const read = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'scoped.txt', offset: 0, limit: 10 },
+        undefined,
+        { readBytes: 1_000, writeBytes: 0 }
+      );
+      expect(read).toMatchObject({ ok: true });
+
+      expect(await boundary.resolveAuthoritativeScope()).toEqual(['scoped.txt']);
+      expect(await boundary.resolveAuthoritativeScope()).toEqual(['scoped.txt']); // frozen, idempotent
+    });
+
     it('freezes the decision permanently once resolved, even after a failed first attempt followed by a successful retry', async () => {
       writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
       const boundary = toolsWithScope(['scoped.txt']);
@@ -1442,6 +1458,24 @@ describe('OrnithWorktreeTools containment and budgets', () => {
         { readBytes: matchBytes, writeBytes: 0 }
       );
       expect(exhausted.gitCalls).toBe(single.gitCalls);
+    });
+
+    it('does not search files over the per-file read cap or binary files, exactly as the protocol tells the model', async () => {
+      writeFileSync(join(worktree, 'a-big.txt'), `needle\n${'z'.repeat(ORNITH_LIMITS.maxReadBytes)}`, 'utf8'); // one byte over the cap
+      writeFileSync(join(worktree, 'b-binary.dat'), Buffer.concat([Buffer.from('needle '), Buffer.from([0xff, 0xfe, 0x00, 0xc3, 0x28])]));
+      writeFileSync(join(worktree, 'c-ok.txt'), 'needle\n', 'utf8');
+
+      const result = await tools().searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
+        undefined,
+        { readBytes: 10_000_000, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('expected a successful search');
+      const forModel = result.forModel as { matches: { path: string; line: number }[] };
+      // Only the small text file is searched; a match in the two skipped files is invisible to search_text.
+      expect(forModel.matches).toEqual([{ path: 'c-ok.txt', line: 1 }]);
     });
 
     it('skips an oversized candidate but keeps scanning smaller ones later in the list that still fit', async () => {
