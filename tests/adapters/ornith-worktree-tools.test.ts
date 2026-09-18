@@ -1385,6 +1385,65 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
     });
 
+    function countingTools(counter: { gitCalls: number }): OrnithWorktreeTools {
+      const countingRunner: ProcessRunner = {
+        run: (file, args, options) => {
+          if (file === gitPath) counter.gitCalls += 1;
+          return runner.run(file, args, options);
+        }
+      };
+      return new OrnithWorktreeTools({
+        worktreePath: worktree,
+        worktreesRoot,
+        repositoryPath: repository,
+        branchName: 'task',
+        runner: countingRunner,
+        gitExecutablePath: gitPath
+      });
+    }
+
+    it('fails before any manifest, identity or per-file work when the read budget is already zero', async () => {
+      writeFileSync(join(worktree, 'a.txt'), 'needle\n', 'utf8');
+      const counter = { gitCalls: 0 };
+
+      const result = await countingTools(counter).searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
+        undefined,
+        { readBytes: 0, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+      expect(counter.gitCalls).toBe(0); // decided by arithmetic alone: nothing was touched
+    });
+
+    it('stops scanning the moment the budget is spent exactly, instead of probing every remaining candidate', async () => {
+      const matchBytes = Buffer.byteLength('needle\n', 'utf8');
+      writeFileSync(join(worktree, 'f000.txt'), 'needle\n', 'utf8');
+      for (let index = 1; index < 300; index += 1) {
+        writeFileSync(join(worktree, `f${String(index).padStart(3, '0')}.txt`), 'x\n', 'utf8');
+      }
+      const action = { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 } as const;
+
+      const exhausted = { gitCalls: 0 };
+      const stopped = await countingTools(exhausted).searchText(action, undefined, { readBytes: matchBytes, writeBytes: 0 });
+      expect(stopped).toMatchObject({ ok: true, readBytes: matchBytes });
+      if (!stopped.ok) throw new Error('expected a partial success');
+      expect((stopped.forModel as { matches: unknown[] }).matches).toEqual([{ path: 'f000.txt', line: 1 }]);
+      expect((stopped.forModel as { truncated: boolean }).truncated).toBe(true);
+
+      // Baseline: the identical search over ONE candidate. Its git cost is the fixed
+      // cost of a search (manifest + identity checks). Probing the other 299
+      // candidates would add a checkout-identity re-check (several git spawns)
+      // every 25 of them, so an exact match proves none of them were probed.
+      const single = { gitCalls: 0 };
+      await countingTools(single).searchText(
+        { ...action, files: ['f000.txt'] },
+        undefined,
+        { readBytes: matchBytes, writeBytes: 0 }
+      );
+      expect(exhausted.gitCalls).toBe(single.gitCalls);
+    });
+
     it('skips an oversized candidate but keeps scanning smaller ones later in the list that still fit', async () => {
       const matchBytes = Buffer.byteLength('needle\n', 'utf8');
       writeFileSync(join(worktree, 'a-toobig.txt'), 'z'.repeat(1000), 'utf8');

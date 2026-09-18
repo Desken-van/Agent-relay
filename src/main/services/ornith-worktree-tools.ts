@@ -441,6 +441,9 @@ export class OrnithWorktreeTools {
   async resolveAuthoritativeScope(signal?: AbortSignal): Promise<readonly string[] | null> {
     const maxAttempts = 2;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      // An aborted signal (task cancelled, or the caller's whole-loop deadline
+      // reached) is not a transient failure: retrying it only spends more time.
+      if (signal?.aborted) break;
       try {
         await this.ensureManifest(signal);
         break;
@@ -896,6 +899,17 @@ export class OrnithWorktreeTools {
   ): Promise<OrnithToolResult> {
     const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.searchTimeoutMs, signal);
     try {
+      // Nothing left to spend: no non-empty candidate can fit, so this is the one
+      // case that can be decided exactly - and therefore must fail BEFORE any
+      // manifest, identity or per-file work, not after walking every candidate.
+      // (With a small but non-zero remainder a later, smaller file may still fit,
+      // which cannot be known without looking at sizes, so that case scans.)
+      if (budget.readBytes <= 0) {
+        return denied(
+          'limit_read_bytes_exceeded',
+          'No repository read budget remains for this run; search_text made no progress.'
+        );
+      }
       const manifest = await this.ensureManifest(bounded);
       // Deliberately NOT narrowed to `authoritativeScope`: a Coai review round
       // found that silently limiting an omitted search to the specification's
@@ -956,6 +970,13 @@ export class OrnithWorktreeTools {
 
       for (const path of candidates) {
         if (matches.length >= action.limit) break;
+        // The budget is spent exactly: no further non-empty candidate can fit, so
+        // stop instead of probing every remaining file just to skip each one. A
+        // candidate is still pending here, so the result is honestly truncated.
+        if (readBytesTotal >= budget.readBytes) {
+          anySkippedDueToReadBudget = true;
+          break;
+        }
         // Cheap, synchronous: several of this loop's own calls (`lstat`,
         // `resolvePathOnly`) take no signal, so without this the loop would
         // keep doing real filesystem work for the rest of a large candidate

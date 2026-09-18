@@ -693,8 +693,28 @@ export class OrnithImplementationService {
     // never a precondition for the run to proceed.
     const declaredScopeCandidates = promptInput.specification.scopedFilePaths ?? [];
     if (declaredScopeCandidates.length > 0) {
+      // Bounded by the SAME whole-loop deadline as every other await in this
+      // method: without it a slow or hung manifest build (two attempts, each
+      // with its own git timeouts) could keep implement() running past the
+      // caller's deadline before the loop ever got to check it.
+      const scopeRemainingMs = deadline - Date.now();
+      if (scopeRemainingMs <= 0) {
+        return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+      }
       request.onProgress({ type: 'progress', text: 'Confirming specification scope against the worktree manifest…' });
-      const resolvedScope = await tools.resolveAuthoritativeScope(request.signal);
+      const scopeSignal = deadlineSignal(request.signal, scopeRemainingMs);
+      let resolvedScope: readonly string[] | null;
+      try {
+        resolvedScope = await tools.resolveAuthoritativeScope(scopeSignal.signal);
+      } finally {
+        scopeSignal.dispose();
+      }
+      if (request.signal.aborted) {
+        throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+      }
+      if (scopeSignal.timedOut() || Date.now() >= deadline) {
+        return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+      }
       if (resolvedScope === null) {
         request.onProgress({
           type: 'progress',

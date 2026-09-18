@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ExecaProcessRunner } from '../../src/main/adapters/process/process-runner';
+import { ExecaProcessRunner, type ProcessResult, type ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
 import {
   normalizeOrnithPromptInput,
@@ -1386,6 +1386,54 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(firstPrompt).toContain('=== SCOPE ===');
       expect(firstPrompt).toContain('docs/manual-test.md');
     });
+
+    it('bounds eager scope confirmation by the whole-loop deadline: it fails with limit_deadline_exceeded before any inference and the deadline reaches the git layer', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
+      let abortSeenByGit = false;
+      // Every git call takes 1.5s unless the caller's signal aborts it first, so a
+      // manifest build (several calls, up to two attempts) would run far past a
+      // 400ms loop deadline if the deadline never reached this layer.
+      const slowRunner: ProcessRunner = {
+        run: (file, args, options) => new Promise<ProcessResult>((resolve) => {
+          const signal = options?.signal;
+          const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            void runner.run(file, args, options).then(resolve);
+          }, 1_500);
+          function onAbort(): void {
+            abortSeenByGit = true;
+            clearTimeout(timer);
+            resolve({
+              command: file, exitCode: null, stdout: '', stderr: '', timedOut: false, cancelled: true, durationMs: 1, failed: true
+            });
+          }
+          if (signal?.aborted) onAbort();
+          else signal?.addEventListener('abort', onAbort, { once: true });
+        })
+      };
+      let inferenceCalls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          inferenceCalls += 1;
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'not reached' }));
+        }
+      };
+
+      const startedAt = Date.now();
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal, 400),
+        runner: slowRunner,
+        specification: { ...specification, scopedFilePaths: ['scoped.txt'] }
+      });
+
+      expect(result.assessment.reasonCodes).toContain('limit_deadline_exceeded');
+      expect(result.assessment.publishBlock).toBe('configuration');
+      expect(inferenceCalls).toBe(0);
+      expect(abortSeenByGit).toBe(true); // the deadline signal itself, not just a later check
+      expect(Date.now() - startedAt).toBeLessThan(1_400); // far below one un-aborted git call (1.5s), let alone a whole manifest build
+    }, 30_000);
 
     it('emits a diagnostic note and falls back to unrestricted discovery when declared scope does not exist', async () => {
       writeFileSync(join(worktree, 'real.txt'), 'needle here\n', 'utf8');
