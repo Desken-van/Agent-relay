@@ -684,6 +684,7 @@ export class OrnithImplementationService {
     // never a precondition for the run to proceed.
     const declaredScopeCandidates = promptInput.specification.scopedFilePaths ?? [];
     if (declaredScopeCandidates.length > 0) {
+      request.onProgress({ type: 'progress', text: 'Confirming specification scope against the worktree manifest…' });
       const resolvedScope = await tools.resolveAuthoritativeScope(request.signal);
       if (resolvedScope === null) {
         request.onProgress({

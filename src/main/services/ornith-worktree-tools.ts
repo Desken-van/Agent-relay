@@ -195,6 +195,15 @@ export class OrnithWorktreeTools {
   private nativeRootIdentity: WindowsFsRootIdentity | null = null;
   /** Manifest-confirmed subset of `scopedFilePathCandidates`, resolved once inside `ensureManifest()`. */
   private authoritativeScope: readonly string[] | null = null;
+  /**
+   * Set once `resolveAuthoritativeScope()` has returned, success or failure,
+   * so a LATER `ensureManifest()` retry (e.g. the manifest build failed
+   * transiently during the eager pre-loop call, then succeeds on the first
+   * real tool dispatch) never silently re-derives a different scope answer
+   * than the one already reported to the model. Once decided, `authoritativeScope`
+   * is frozen for the rest of this instance's life.
+   */
+  private authoritativeScopeDecided = false;
 
   constructor(private readonly deps: OrnithWorktreeToolsOptions) {
     this.fsGuard = deps.fsGuard ?? new ExecaWindowsFsGuard(deps.runner);
@@ -397,9 +406,11 @@ export class OrnithWorktreeTools {
       const sorted = [...names].sort();
       this.manifest = sorted;
       for (const name of sorted) this.knownFiles.add(name);
-      const scopeCandidates = this.deps.scopedFilePathCandidates ?? [];
-      const validatedScope = [...new Set(scopeCandidates)].filter((path) => this.knownFiles.has(path));
-      this.authoritativeScope = validatedScope.length > 0 ? validatedScope : null;
+      if (!this.authoritativeScopeDecided) {
+        const scopeCandidates = this.deps.scopedFilePathCandidates ?? [];
+        const validatedScope = [...new Set(scopeCandidates)].filter((path) => this.knownFiles.has(path));
+        this.authoritativeScope = validatedScope.length > 0 ? validatedScope : null;
+      }
       return sorted;
     } finally {
       dispose();
@@ -422,8 +433,14 @@ export class OrnithWorktreeTools {
     try {
       await this.ensureManifest(signal);
     } catch {
-      return null;
+      // Fall through: `authoritativeScope` stays at whatever it already was
+      // (still `null` on a first-ever attempt, since the manifest build
+      // failing means the scope-computation block below it never ran).
     }
+    // Whatever the outcome, this is the one and only authoritative decision
+    // for this run instance — freeze it so a later, possibly successful
+    // `ensureManifest()` retry cannot quietly reach a different answer.
+    this.authoritativeScopeDecided = true;
     return this.authoritativeScope;
   }
 
@@ -883,76 +900,107 @@ export class OrnithWorktreeTools {
        *  zero-progress-vs-partial-progress split below the loop. */
       let readBudgetExhausted = false;
 
-      for (const path of candidates) {
-        if (matches.length >= action.limit) break;
-        // Cheap, synchronous: several of this loop's own calls (`lstat`,
-        // `resolvePathOnly`) take no signal, so without this the loop would
-        // keep doing real filesystem work for the rest of a large candidate
-        // list after the timeout already fired, only stopping once an
-        // abort-aware read eventually throws.
-        if (bounded.aborted) return denied('timeout', 'The repository operation timed out.');
-        if (!(await stillCurrent())) {
-          return denied('checkout_identity_changed', 'The checkout identity changed.');
+      // Extracted so a scope-narrowed search that finds nothing can fall
+      // through to a second pass over the rest of the manifest (below) without
+      // duplicating this logic. Returns a denial to propagate immediately, or
+      // `null` to mean "this pass finished; inspect matches/readBudgetExhausted
+      // to decide what happens next" — never a silent, unreported stop.
+      const scanCandidates = async (list: readonly string[]): Promise<OrnithToolResult | null> => {
+        for (const path of list) {
+          if (matches.length >= action.limit) break;
+          // Cheap, synchronous: several of this loop's own calls (`lstat`,
+          // `resolvePathOnly`) take no signal, so without this the loop would
+          // keep doing real filesystem work for the rest of a large candidate
+          // list after the timeout already fired, only stopping once an
+          // abort-aware read eventually throws.
+          if (bounded.aborted) return denied('timeout', 'The repository operation timed out.');
+          if (!(await stillCurrent())) {
+            return denied('checkout_identity_changed', 'The checkout identity changed.');
+          }
+          const resolved = await this.resolvePathOnly(path, { mustExist: true, forWrite: false });
+          if (!resolved.ok) continue;
+          let content: string;
+          try {
+            const stats = await lstat(resolved.absolutePath);
+            if (stats.size > ORNITH_LIMITS.maxReadBytes) continue;
+            if (readBytesTotal + stats.size > budget.readBytes) {
+              // This exact candidate is never opened or read — `readBytesTotal`
+              // below is therefore always exactly the sum of PRIOR, fully and
+              // successfully read candidates, never a partial figure for this
+              // one. Stop scanning; the zero-vs-partial-progress split below
+              // decides whether that is an honest empty denial or an honest
+              // partial success, but either way nothing already accounted for
+              // is discarded.
+              readBudgetExhausted = true;
+              break;
+            }
+            const safeRead = await this.readRegularFileSafely(
+              resolved.absolutePath,
+              Math.min(ORNITH_LIMITS.maxReadBytes, budget.readBytes - readBytesTotal),
+              bounded
+            );
+            if (!safeRead.ok) {
+              if (safeRead.code === 'limit_read_bytes_exceeded' && stats.size > ORNITH_LIMITS.maxReadBytes) continue;
+              return denied(safeRead.code, safeRead.reason);
+            }
+            const raw = safeRead.raw;
+            readBytesTotal += raw.byteLength;
+            content = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+          } catch {
+            continue; // binary or unreadable: silently skipped, matching a literal-text search's scope
+          }
+          const haystack = action.caseSensitive ? content : content.toLowerCase();
+          if (!haystack.includes(needle)) continue;
+          const lines = content.split('\n');
+          for (let index = 0; index < lines.length && matches.length < action.limit; index += 1) {
+            // Named distinctly from `candidate.line` below (a line NUMBER, index+1):
+            // this is the line's TEXT, used only for the needle check on this line and
+            // never itself serialized — the two "line"s sharing a name previously read
+            // as if a matched line's text became part of the returned entry, when it
+            // never does.
+            const lineText = action.caseSensitive ? lines[index] : lines[index]?.toLowerCase();
+            if (lineText === undefined || !lineText.includes(needle)) continue;
+            const candidate = { path, line: index + 1 };
+            // Exact per-candidate size: path content varies, so unlike the skeleton this
+            // cannot be hoisted, but it is computed only once per real candidate match,
+            // not per budget check.
+            const entryBytes = Buffer.byteLength(JSON.stringify(candidate), 'utf8') + (matches.length > 0 ? 1 : 0);
+            if (skeletonBytes + matchesArrayContentBytes + entryBytes > maxResultBytes) {
+              anySkippedDueToBudget = true;
+              firstSkipped ??= { path, line: index + 1, requiredBytes: skeletonBytes + entryBytes };
+              // Not `continue`: `path` is fixed for the rest of this file and line
+              // numbers only increase, so every later line's entry in THIS file is at
+              // least as large as this one's — none of them could fit either. Move on
+              // to the next candidate file instead of checking each remaining line.
+              break;
+            }
+            matches.push(candidate);
+            matchesArrayContentBytes += entryBytes;
+          }
         }
-        const resolved = await this.resolvePathOnly(path, { mustExist: true, forWrite: false });
-        if (!resolved.ok) continue;
-        let content: string;
-        try {
-          const stats = await lstat(resolved.absolutePath);
-          if (stats.size > ORNITH_LIMITS.maxReadBytes) continue;
-          if (readBytesTotal + stats.size > budget.readBytes) {
-            // This exact candidate is never opened or read — `readBytesTotal`
-            // below is therefore always exactly the sum of PRIOR, fully and
-            // successfully read candidates, never a partial figure for this
-            // one. Stop scanning; the zero-vs-partial-progress split below
-            // decides whether that is an honest empty denial or an honest
-            // partial success, but either way nothing already accounted for
-            // is discarded.
-            readBudgetExhausted = true;
-            break;
-          }
-          const safeRead = await this.readRegularFileSafely(
-            resolved.absolutePath,
-            Math.min(ORNITH_LIMITS.maxReadBytes, budget.readBytes - readBytesTotal),
-            bounded
-          );
-          if (!safeRead.ok) {
-            if (safeRead.code === 'limit_read_bytes_exceeded' && stats.size > ORNITH_LIMITS.maxReadBytes) continue;
-            return denied(safeRead.code, safeRead.reason);
-          }
-          const raw = safeRead.raw;
-          readBytesTotal += raw.byteLength;
-          content = new TextDecoder('utf-8', { fatal: true }).decode(raw);
-        } catch {
-          continue; // binary or unreadable: silently skipped, matching a literal-text search's scope
-        }
-        const haystack = action.caseSensitive ? content : content.toLowerCase();
-        if (!haystack.includes(needle)) continue;
-        const lines = content.split('\n');
-        for (let index = 0; index < lines.length && matches.length < action.limit; index += 1) {
-          // Named distinctly from `candidate.line` below (a line NUMBER, index+1):
-          // this is the line's TEXT, used only for the needle check on this line and
-          // never itself serialized — the two "line"s sharing a name previously read
-          // as if a matched line's text became part of the returned entry, when it
-          // never does.
-          const lineText = action.caseSensitive ? lines[index] : lines[index]?.toLowerCase();
-          if (lineText === undefined || !lineText.includes(needle)) continue;
-          const candidate = { path, line: index + 1 };
-          // Exact per-candidate size: path content varies, so unlike the skeleton this
-          // cannot be hoisted, but it is computed only once per real candidate match,
-          // not per budget check.
-          const entryBytes = Buffer.byteLength(JSON.stringify(candidate), 'utf8') + (matches.length > 0 ? 1 : 0);
-          if (skeletonBytes + matchesArrayContentBytes + entryBytes > maxResultBytes) {
-            anySkippedDueToBudget = true;
-            firstSkipped ??= { path, line: index + 1, requiredBytes: skeletonBytes + entryBytes };
-            // Not `continue`: `path` is fixed for the rest of this file and line
-            // numbers only increase, so every later line's entry in THIS file is at
-            // least as large as this one's — none of them could fit either. Move on
-            // to the next candidate file instead of checking each remaining line.
-            break;
-          }
-          matches.push(candidate);
-          matchesArrayContentBytes += entryBytes;
+        return null;
+      };
+
+      const primaryDenial = await scanCandidates(candidates);
+      if (primaryDenial !== null) return primaryDenial;
+
+      // A scope-narrowed search that found NOTHING may mean the declared scope
+      // was incomplete (it is a discovery hint from the specification, never a
+      // guarantee) rather than that nothing matches anywhere. Fall back to the
+      // rest of the manifest so a real match elsewhere in the repository is
+      // never silently hidden just because the specification named a
+      // different file — this can only ever match today's pre-scoping cost
+      // (a full manifest scan) in the worst case, never exceed it, and the
+      // common, correctly-scoped case never reaches this branch at all
+      // because it already found its match in the first, cheap pass.
+      let usedFallbackToFullManifest = false;
+      if (scopedToAuthority && matches.length === 0 && !readBudgetExhausted) {
+        const scannedAlready = new Set(candidates);
+        const restOfManifest = manifest.filter((path) => !scannedAlready.has(path));
+        if (restOfManifest.length > 0) {
+          usedFallbackToFullManifest = true;
+          const fallbackDenial = await scanCandidates(restOfManifest);
+          if (fallbackDenial !== null) return fallbackDenial;
         }
       }
 
@@ -996,7 +1044,10 @@ export class OrnithWorktreeTools {
         readBytes: readBytesTotal,
         writeBytes: 0,
         auditSummary: scopedToAuthority
-          ? `search_text (scoped to ${candidates.length} authoritative file(s)) -> ${matches.length} match(es)`
+          ? usedFallbackToFullManifest
+            ? `search_text (scoped to ${candidates.length} file(s) first, found nothing, fell back to the full ` +
+              `manifest) -> ${matches.length} match(es)`
+            : `search_text (scoped to ${candidates.length} authoritative file(s)) -> ${matches.length} match(es)`
           : `search_text -> ${matches.length} match(es) across ${candidates.length} file(s)`
       };
     } catch (error) {

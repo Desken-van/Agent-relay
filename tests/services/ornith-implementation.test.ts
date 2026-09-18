@@ -1269,15 +1269,19 @@ describe('OrnithImplementationService limits and cancellation', () => {
         }
       };
 
+      const events: AgentProgressEvent[] = [];
       const result = await new OrnithImplementationService().implement({
         ...baseRequest(leaseService, new AbortController().signal),
-        specification: { ...specification, scopedFilePaths: ['docs/manual-test.md'] }
+        specification: { ...specification, scopedFilePaths: ['docs/manual-test.md'] },
+        onProgress: (event) => events.push(event)
       });
 
       expect(result.assessment.disposition).toBe('pass');
       expect(result.ornithAudit.changedFiles).toBe(1);
       expect(result.ornithAudit.outcomes.map((o) => o.action)).toEqual(['read_file', 'replace_text']);
       expect(readFileSync(join(worktree, 'docs', 'manual-test.md'), 'utf8')).toContain('checklist (updated)');
+      // Confirming scope is visible progress, not a silent stall before the first turn.
+      expect(events.some((event) => event.text.includes('Confirming specification scope'))).toBe(true);
       const firstPrompt = requests[0]!.messages.map((message) => message.content).join('\n');
       expect(firstPrompt).toContain('=== SCOPE ===');
       expect(firstPrompt).toContain('docs/manual-test.md');

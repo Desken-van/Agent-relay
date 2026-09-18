@@ -1070,6 +1070,64 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(result.auditSummary).toContain('scoped to 1 authoritative file');
     });
 
+    it('falls back to the rest of the manifest when nothing matches within scope, finding a real match elsewhere', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'unrelated content\n', 'utf8');
+      writeFileSync(join(worktree, 'elsewhere.txt'), 'needle is actually here\n', 'utf8');
+      const boundary = toolsWithScope(['scoped.txt']);
+
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
+        undefined,
+        { readBytes: 100_000, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('expected a successful search');
+      const forModel = result.forModel as { matches: { path: string; line: number }[] };
+      // The declared scope did not name the file that actually matched — an
+      // incomplete scope claim must never hide it.
+      expect(forModel.matches).toEqual([{ path: 'elsewhere.txt', line: 1 }]);
+      expect(result.auditSummary).toContain('fell back to the full manifest');
+    });
+
+    it('reports zero matches honestly (never as a denial) when nothing matches even after the fallback', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'unrelated content\n', 'utf8');
+      writeFileSync(join(worktree, 'other.txt'), 'also unrelated\n', 'utf8');
+      const boundary = toolsWithScope(['scoped.txt']);
+
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
+        undefined,
+        { readBytes: 100_000, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('expected an honest empty result, not a denial');
+      const forModel = result.forModel as { matches: { path: string; line: number }[] };
+      expect(forModel.matches).toEqual([]);
+    });
+
+    it('never revives scope narrowing after eager resolution fails, even once a later manifest build would succeed', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'needle here\n', 'utf8');
+      const boundary = toolsWithScope(['scoped.txt']);
+      const aborted = new AbortController();
+      aborted.abort();
+
+      const resolved = await boundary.resolveAuthoritativeScope(aborted.signal);
+      expect(resolved).toBeNull();
+
+      // A later, real (non-aborted) call must not silently re-derive scope.
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
+        undefined,
+        { readBytes: 100_000, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('expected a successful search');
+      expect(result.auditSummary).not.toContain('scoped to');
+    });
+
     it('an explicit action.files list overrides the authoritative scope entirely', async () => {
       writeFileSync(join(worktree, 'scoped.txt'), 'needle here\n', 'utf8');
       writeFileSync(join(worktree, 'other.txt'), 'needle here too\n', 'utf8');
