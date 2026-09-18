@@ -1723,16 +1723,32 @@ export function CodeReviewPanel({
   const applyAllRecommendations = (): void => {
     if (applicableUndecided.length === 0) return;
     void act('apply-all', async () => {
+      // Every item is attempted regardless of an earlier one failing — a
+      // successful decide() call already durably committed before the next
+      // iteration starts, and one failed or stale item (e.g. decided by
+      // someone else moments ago) must not discard the rest of an otherwise
+      // valid batch. Failures are collected and reported together at the
+      // end, after every attempt has been made.
+      const failures: string[] = [];
       for (const finding of applicableUndecided) {
         const recommendation = triageByFinding.get(finding.id);
         if (!recommendation || recommendation.recommendation === 'needs_user') continue;
-        await expect('codeReview:decide', {
-          taskId: task.id,
-          findingId: finding.id,
-          expectedRevision: finding.revision,
-          action: recommendation.recommendation,
-          reason: recommendation.reason
-        });
+        try {
+          await expect('codeReview:decide', {
+            taskId: task.id,
+            findingId: finding.id,
+            expectedRevision: finding.revision,
+            action: recommendation.recommendation,
+            reason: recommendation.reason
+          });
+        } catch (caught) {
+          failures.push(`${finding.title}: ${caught instanceof Error ? caught.message : String(caught)}`);
+        }
+      }
+      if (failures.length > 0) {
+        throw new Error(
+          `${failures.length} of ${applicableUndecided.length} recommendations could not be applied: ${failures.join('; ')}`
+        );
       }
     });
   };

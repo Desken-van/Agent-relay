@@ -6,7 +6,7 @@ import type { Task } from '../../src/shared/domain/models';
 import type { CodeReviewDetail } from '../../src/shared/ipc';
 import type { CodeReviewFinding, CodeReviewSubject, CodeReviewTriage } from '../../src/shared/domain/code-review';
 import { CodeReviewPanel } from '../../src/renderer/src/components/RunView';
-import { burstClick, installBridge, ok, type Bridge } from './harness';
+import { burstClick, fail, installBridge, ok, type Bridge } from './harness';
 
 const SUBJECT_SHA = 'a'.repeat(64);
 const OTHER_SUBJECT_SHA = 'b'.repeat(64);
@@ -236,6 +236,41 @@ describe('the external code-review panel — automatic finding triage', () => {
     const inputs = bridge.callsTo('codeReview:decide').map((call) => call.input);
     expect(inputs).toContainEqual({ taskId: 'task-1', findingId: 'f-1', expectedRevision: 0, action: 'accept', reason: 'r1' });
     expect(inputs).toContainEqual({ taskId: 'task-1', findingId: 'f-2', expectedRevision: 0, action: 'reject', reason: 'r2' });
+  });
+
+  it('continues applying the rest of an apply-all batch after one item fails, and reports the failure', async () => {
+    const f1 = finding({ id: 'f-1', revision: 0 });
+    const f2 = finding({ id: 'f-2', revision: 0, title: 'Second' });
+    const triage = triageRecord(
+      [['f-1', 0], ['f-2', 0]],
+      [
+        { findingId: 'f-1', recommendation: 'accept', reason: 'r1', evidenceRef: 'e', confidence: 'high' },
+        { findingId: 'f-2', recommendation: 'reject', reason: 'r2', evidenceRef: 'e', confidence: 'high' }
+      ]
+    );
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
+      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2], triage })
+    ));
+    // f-1 was decided by someone else moments ago; f-2 is still fully valid.
+    bridge.set('codeReview:decide', (input) => {
+      const { findingId } = input as { findingId: string };
+      return findingId === 'f-1'
+        ? fail('This finding was decided by someone else while you were looking at it, so nothing was written.')
+        : ok<'codeReview:decide'>(detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2] }));
+    });
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+
+    const applyAll = await screen.findByRole('button', { name: /Apply all recommendations to undecided findings/i });
+    await burstClick(applyAll, 1);
+
+    // Both items were attempted — the failure on f-1 did not stop f-2 from
+    // being submitted.
+    await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(2));
+    const inputs = bridge.callsTo('codeReview:decide').map((call) => call.input);
+    expect(inputs).toContainEqual({ taskId: 'task-1', findingId: 'f-1', expectedRevision: 0, action: 'accept', reason: 'r1' });
+    expect(inputs).toContainEqual({ taskId: 'task-1', findingId: 'f-2', expectedRevision: 0, action: 'reject', reason: 'r2' });
+
+    expect(await screen.findByText(/1 of 2 recommendations could not be applied/i)).toBeTruthy();
   });
 
   it('never shows a stored recommendation once the reviewed subject has changed', async () => {
