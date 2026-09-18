@@ -1856,6 +1856,10 @@ export function CodeReviewPanel({
         </div>
       ) : null}
 
+      {findings.length > 0 && undecidedIds.length === 0 ? (
+        <div className="muted">All live findings have decisions recorded.</div>
+      ) : null}
+
       {findings.length === 0 ? (
         <div className="muted">No live findings for the current subject.</div>
       ) : (

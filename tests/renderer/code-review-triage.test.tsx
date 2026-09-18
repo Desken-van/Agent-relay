@@ -512,6 +512,30 @@ describe('the external code-review panel — automatic finding triage', () => {
     await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
   });
 
+  it('shows an explanatory status, not just the button disappearing, once every live finding has a decision', async () => {
+    const f1 = finding({ id: 'f-1' });
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
+      detail({
+        subject: subject(),
+        subjectIdentity: 'current',
+        findings: [f1],
+        latestDecisions: {
+          'f-1': {
+            id: 'd-1', findingId: 'f-1', subjectSha256: SUBJECT_SHA, action: 'accept',
+            reason: 'Handled.', actor: 'operator', source: 'test', findingRevision: 0,
+            decidedAt: '2026-09-06T00:00:00.000Z', createdAt: '2026-09-06T00:00:00.000Z'
+          }
+        }
+      })
+    ));
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+
+    expect(await screen.findByText('All live findings have decisions recorded.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Analyze undecided findings/i })).toBeNull();
+    // The decided finding itself is still shown, not replaced by the notice.
+    expect(screen.getByText(/Decided: accept/)).toBeTruthy();
+  });
+
   it('offers no Analyze button, and shows no code-review panel content, when there is nothing captured and the integration is off', async () => {
     render(<CodeReviewPanel task={task()} integrationEnabled={false} />);
     await waitFor(() => expect(bridge.callsTo('codeReview:get')).toHaveLength(1));
