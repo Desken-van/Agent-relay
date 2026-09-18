@@ -607,6 +607,47 @@ export function isOrnithTerminalAction(kind: OrnithActionKind): boolean {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Denied-action progress-event contract                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The exact `data` shape `OrnithImplementationService` attaches to a denied
+ * nonterminal action's `tool_use` progress event
+ * (`src/main/services/ornith-implementation.ts`). Shared with the renderer
+ * (`RelayTimeline.tsx`) so the two sides cannot silently drift apart — a
+ * service-side field rename or addition fails this type at compile time on
+ * both ends instead of only showing up as a renderer fallback to plain text.
+ */
+export interface OrnithToolDenialEventData {
+  readonly sequence: number;
+  readonly action: OrnithActionKind;
+  readonly ok: false;
+  readonly code: OrnithDenialCode;
+  readonly durationMs: number;
+  /** Whether this exact denial will be fed back for one more turn rather than ending the run. */
+  readonly recoverable: boolean;
+  readonly readBytesUsed: number;
+  readonly readBytesConfigured: number;
+  readonly changedFiles: number;
+}
+
+/** Narrows an already-JSON-decoded, untyped event `data` payload to {@link OrnithToolDenialEventData}. */
+export function isOrnithToolDenialEventData(
+  data: Record<string, unknown> | null
+): data is Record<string, unknown> & OrnithToolDenialEventData {
+  return (
+    data !== null &&
+    data['ok'] === false &&
+    typeof data['action'] === 'string' &&
+    typeof data['code'] === 'string' &&
+    typeof data['recoverable'] === 'boolean' &&
+    typeof data['readBytesUsed'] === 'number' &&
+    typeof data['readBytesConfigured'] === 'number' &&
+    typeof data['changedFiles'] === 'number'
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 /* Completion parsing                                                         */
 /* -------------------------------------------------------------------------- */
 

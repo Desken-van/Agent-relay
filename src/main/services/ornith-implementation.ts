@@ -29,7 +29,8 @@ import {
   sanitizeScopedFilePaths,
   type OrnithAction,
   type OrnithActionKind,
-  type OrnithDenialCode
+  type OrnithDenialCode,
+  type OrnithToolDenialEventData
 } from '../../shared/domain/ornith';
 import {
   LOCAL_INFERENCE_CONTRACT_VERSION,
@@ -1072,18 +1073,23 @@ export class OrnithImplementationService {
         // One event covers both facts (denied, and whether it will recover)
         // so there is exactly one notification for this operation — never a
         // second one moments later when the recovery branch below runs.
+        // Typed against the shared OrnithToolDenialEventData contract (see
+        // shared/domain/ornith.ts) so a field rename/removal here fails this
+        // build instead of only showing up as RelayTimeline silently falling
+        // back to plain text.
+        const denialEventData: Record<string, unknown> & OrnithToolDenialEventData = {
+          sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code, durationMs,
+          recoverable: willRecover,
+          readBytesUsed: cumulativeReadBytes,
+          readBytesConfigured: ORNITH_LIMITS.maxCumulativeReadBytes,
+          changedFiles: tools.changedFileCount()
+        };
         request.onProgress({
           type: 'tool_use',
           text: willRecover
             ? `Ornith action ${action.action} denied (${toolResult.code}); recovering with feedback.`
             : `Ornith action ${action.action} denied (${toolResult.code}); the run stopped.`,
-          data: {
-            sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code, durationMs,
-            recoverable: willRecover,
-            readBytesUsed: cumulativeReadBytes,
-            readBytesConfigured: ORNITH_LIMITS.maxCumulativeReadBytes,
-            changedFiles: tools.changedFileCount()
-          }
+          data: denialEventData
         });
 
         if (willRecover) {
