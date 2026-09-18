@@ -102,6 +102,30 @@ describe('specification parsing', () => {
     expect(outcome.ok).toBe(false);
     expect(outcome.error).toContain('assumptions');
   });
+
+  it('accepts a specification with scopedFilePaths', () => {
+    const outcome = parseTaskSpecification(
+      JSON.stringify({ ...makeSpecification(), scopedFilePaths: ['docs/manual-test.md'] })
+    );
+    expect(outcome.ok).toBe(true);
+    expect(outcome.value?.scopedFilePaths).toEqual(['docs/manual-test.md']);
+  });
+
+  it('accepts a specification with no scopedFilePaths at all', () => {
+    const { scopedFilePaths: _dropped, ...rest } = { ...makeSpecification(), scopedFilePaths: undefined };
+    const outcome = parseTaskSpecification(JSON.stringify(rest));
+    expect(outcome.ok).toBe(true);
+    expect(outcome.value?.scopedFilePaths).toBeUndefined();
+  });
+
+  it('rejects scopedFilePaths beyond the count limit, without rejecting the rest of the specification unnecessarily', () => {
+    const tooMany = Array.from({ length: 21 }, (_unused, i) => `f${i}.ts`);
+    const outcome = parseTaskSpecification(
+      JSON.stringify({ ...makeSpecification(), scopedFilePaths: tooMany })
+    );
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toContain('scopedFilePaths');
+  });
 });
 
 describe('review parsing', () => {

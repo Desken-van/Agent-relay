@@ -26,9 +26,11 @@ import {
   ORNITH_LIMITS,
   containsAbsoluteMachinePath,
   parseOrnithCompletion,
+  sanitizeScopedFilePaths,
   type OrnithAction,
   type OrnithActionKind,
-  type OrnithDenialCode
+  type OrnithDenialCode,
+  type OrnithToolDenialEventData
 } from '../../shared/domain/ornith';
 import {
   LOCAL_INFERENCE_CONTRACT_VERSION,
@@ -183,7 +185,8 @@ export function normalizeOrnithPromptInput(
       constraints: request.specification.constraints.map(safe),
       assumptions: request.specification.assumptions.map(safe),
       suggestedTests: request.specification.suggestedTests.map(safe),
-      implementationPrompt: safe(request.specification.implementationPrompt)
+      implementationPrompt: safe(request.specification.implementationPrompt),
+      scopedFilePaths: sanitizeScopedFilePaths(request.specification.scopedFilePaths?.map(safe))
     },
     ruleEvidence: request.ruleEvidence === null ? null : safe(request.ruleEvidence),
     acceptedPlanReviewAddenda:
@@ -196,6 +199,18 @@ export function normalizeOrnithPromptInput(
 }
 
 function renderSpecification(specification: TaskSpecification): string {
+  const scope = specification.scopedFilePaths ?? [];
+  const scopeSection = scope.length > 0
+    ? `\n=== SCOPE ===
+The approved specification confidently limits this task to the following existing repository
+file(s). Read them directly with "read_file" — you do not need "list_files" or "search_text" to
+find them; a search does NOT automatically narrow itself to this list, so calling one anyway to
+"double check" costs the same as any other repository-wide search. The list can be incomplete: if
+the work turns out to need other files, or a new one, discover them normally with "list_files"
+and "search_text".
+${scope.map((path) => `  - ${path}`).join('\n')}
+`
+    : '';
   return `=== THE APPROVED SPECIFICATION ===
 Title: ${specification.title}
 
@@ -213,7 +228,7 @@ ${specification.assumptions.length > 0 ? specification.assumptions.map((a) => ` 
 
 Tests to add or run:
 ${specification.suggestedTests.length > 0 ? specification.suggestedTests.map((t) => `  - ${t}`).join('\n') : '  (none suggested)'}
-
+${scopeSection}
 === DETAILED INSTRUCTION ===
 ${specification.implementationPrompt}`;
 }
@@ -255,6 +270,32 @@ Rules:
   code "timeout" is recoverable a bounded number of times per run: choose a DIFFERENT, narrower
   request (fewer "files", a shorter prefix, a smaller byte range) on your next turn — repeating
   the identical request will be refused outright once, not retried.
+- A "search_text" or "read_file" that fails with code "limit_read_bytes_exceeded" gets exactly ONE
+  such recovery chance per run: on your next turn, either make the scoped edit now using context you
+  already have, or call "blocked" — repeating the identical request will be refused outright.
+- "search_text" reads the FULL content of every candidate file toward the same cumulative read
+  budget as "read_file" (files over 64 KB and binary files are skipped, never searched: use
+  "read_file" on those) — a repository-wide search (no "files" given) is the most expensive
+  possible request, and is NEVER automatically narrowed for you, including by a SCOPE section
+  above. If you already know which file matters, pass it in "files" explicitly, or better, skip
+  the search entirely and use "read_file" directly.
+- A "read_file" result reports "totalBytes" (the file's size) and "nextOffset" (where the next
+  chunk starts; null at the end of the file). Every "read_file" is charged the file's FULL size
+  against the read budget however small the chunk, so NEVER page through a large file in small
+  consecutive chunks. If the part you need is not in the chunk you received, jump straight to the
+  relevant offset computed from "totalBytes" (to add something after the last section, read from
+  a few KB before "totalBytes"), or, when a SCOPE section names the file(s), run "search_text"
+  with "files" set to exactly those file(s) (it reports line numbers, not byte offsets). A chunk
+  may be shorter than your "limit" so the result fits; "bytesRead" says how much you got.
+- A "read_file" result also reports "lineEnding" for the WHOLE file: "lf", "crlf", "mixed" or "none".
+  In your JSON reply, "\\r\\n" (one backslash before each letter) decodes to the real CR and LF
+  characters, but "\\\\r\\\\n" (doubled backslashes) decodes to four literal characters (backslash, r,
+  backslash, n) that will NOT match a line break. Write each real line break in "oldText" and
+  "newText" as the single-backslash escape that fits lineEnding (crlf: "\\r\\n", lf: "\\n"; mixed:
+  reproduce each break exactly as the content shows it), and never copy a JSON escape from a result
+  as literal text. Agent Relay converts neither form for you. A
+  "replace_text" refused with code "replacement_escape_suspected" changed nothing and allows exactly
+  ONE retry, which must differ from the refused request.
 - A "list_files" result's "nextCursor" is the ONLY thing that tells you whether there is more:
   if it is a number, your NEXT "list_files" call for that SAME "prefix" must set "cursor" to
   exactly that number to continue; if it is null, that prefix is fully listed and must not be
@@ -502,6 +543,7 @@ const ORNITH_DENIAL_PUBLISH_BLOCK: Record<OrnithDenialCode, ClaudePublishBlock> 
   checkout_identity_changed: 'security',
   stale_hash: 'configuration',
   replacement_mismatch: 'configuration',
+  replacement_escape_suspected: 'configuration',
   file_exists: 'configuration',
   file_not_found: 'configuration',
   limit_turns_exceeded: 'configuration',
@@ -522,14 +564,22 @@ const ORNITH_DENIAL_PUBLISH_BLOCK: Record<OrnithDenialCode, ClaudePublishBlock> 
 };
 
 /**
- * Only a plain `timeout` on a read-only action is fed back to the model as
- * recoverable feedback instead of ending the run — every other denial,
- * including a resource-budget `limit_*` code, stays terminal-but-explicit.
- * Read-only actions are the ones a repeat cannot corrupt anything by
- * retrying; a mutation or `run_verification` denial is never retried here.
+ * A plain `timeout`, or a `limit_read_bytes_exceeded`, on a read-only action
+ * is fed back to the model as recoverable feedback instead of ending the run
+ * outright — every other denial, including every other resource-budget
+ * `limit_*` code, stays terminal-but-explicit. Read-only actions are the ones
+ * a repeat cannot corrupt anything by retrying; a mutation or
+ * `run_verification` denial is never retried here. The two recoverable codes
+ * are tracked against SEPARATE bounded counters (see the loop) because they
+ * have different causes — a transient timeout vs. an exhausted resource
+ * budget — and a read-budget denial gets exactly one chance, not three.
  */
 function isRecoverableToolDenial(action: OrnithAction, code: OrnithDenialCode): boolean {
-  return code === 'timeout' && isNoProgressGuardAction(action);
+  // The one mutation denial that is recoverable: `replace_text` refused with
+  // `replacement_escape_suspected` provably wrote nothing (the refusal precedes
+  // every mutation step), so a DIFFERENT retry cannot corrupt anything.
+  if (code === 'replacement_escape_suspected') return action.action === 'replace_text';
+  return (code === 'timeout' || code === 'limit_read_bytes_exceeded') && isNoProgressGuardAction(action);
 }
 
 /** One safe, specific sentence naming the action, its exact denial code, and the tool's own reason. */
@@ -572,20 +622,21 @@ function assessmentFor(input: {
 
 export class OrnithImplementationService {
   async implement(request: OrnithImplementationRequest): Promise<OrnithImplementationResult> {
+    const deadline = Date.now() + request.loopDeadlineMs;
+    let promptInput = normalizeOrnithPromptInput(
+      request,
+      [request.worktreePath, request.repositoryPath]
+    );
     const tools = new OrnithWorktreeTools({
       worktreePath: request.worktreePath,
       worktreesRoot: request.worktreesRoot,
       repositoryPath: request.repositoryPath,
       branchName: request.branchName,
       runner: request.runner,
-      gitExecutablePath: request.gitExecutablePath ?? null
+      gitExecutablePath: request.gitExecutablePath ?? null,
+      scopedFilePathCandidates: promptInput.specification.scopedFilePaths
     });
 
-    const deadline = Date.now() + request.loopDeadlineMs;
-    const promptInput = normalizeOrnithPromptInput(
-      request,
-      [request.worktreePath, request.repositoryPath]
-    );
     const rolling: RollingResult[] = [];
     let turnsUsed = 0;
     let nonterminalActionsUsed = 0;
@@ -598,6 +649,15 @@ export class OrnithImplementationService {
     let previousReadOnlyOutcome: 'succeeded' | OrnithDenialCode | null = null;
     let consecutiveIdenticalReadOnlyActions = 0;
     let readOnlyRecoveryAttemptsUsed = 0;
+    let readBudgetRecoveryAttemptsUsed = 0;
+    let replacementEscapeRecoveryAttemptsUsed = 0;
+    /** The exact `replace_text` action refused with `replacement_escape_suspected`, so an
+     *  identical repeat is refused before dispatch. `null` until such a denial.
+     *  Sound to keep for the whole run: the action carries `path` and the expected
+     *  `sha256`, so an identical later action addresses byte-identical content (the tool
+     *  would fail the same way) or a changed file (it would be `stale_hash`). Key order
+     *  cannot defeat it: the schema-parsed action has a canonical key order. */
+    let escapeDeniedFingerprint: string | null = null;
     const outcomes: Array<{ sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }> = [];
     const finish = (
       disposition: 'pass' | 'fail', message: string,
@@ -647,6 +707,50 @@ export class OrnithImplementationService {
       );
     }
     const promptBudget = promptPreflight.budget;
+
+    // Resolve the specification's declared scope against the real manifest
+    // once, eagerly, so even the very first prompt can name the confirmed
+    // file(s) instead of the model discovering them lazily on first tool
+    // dispatch. A candidate the manifest does not confirm is dropped; if
+    // nothing survives (including a resolution failure, which `tools` itself
+    // already treats as "no scope" rather than throwing), fall back to the
+    // unmodified, unrestricted discovery behavior — scope is an optimization,
+    // never a precondition for the run to proceed.
+    const declaredScopeCandidates = promptInput.specification.scopedFilePaths ?? [];
+    if (declaredScopeCandidates.length > 0) {
+      // Bounded by the SAME whole-loop deadline as every other await in this
+      // method: without it a slow or hung manifest build (two attempts, each
+      // with its own git timeouts) could keep implement() running past the
+      // caller's deadline before the loop ever got to check it.
+      const scopeRemainingMs = deadline - Date.now();
+      if (scopeRemainingMs <= 0) {
+        return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+      }
+      request.onProgress({ type: 'progress', text: 'Confirming specification scope against the worktree manifest…' });
+      const scopeSignal = deadlineSignal(request.signal, scopeRemainingMs);
+      let resolvedScope: readonly string[] | null;
+      try {
+        resolvedScope = await tools.resolveAuthoritativeScope(scopeSignal.signal);
+      } finally {
+        scopeSignal.dispose();
+      }
+      if (request.signal.aborted) {
+        throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+      }
+      if (scopeSignal.timedOut() || Date.now() >= deadline) {
+        return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+      }
+      if (resolvedScope === null) {
+        request.onProgress({
+          type: 'progress',
+          text: 'Specification scope could not be confirmed against this worktree; using unrestricted discovery.'
+        });
+      }
+      promptInput = {
+        ...promptInput,
+        specification: { ...promptInput.specification, scopedFilePaths: resolvedScope !== null ? [...resolvedScope] : [] }
+      };
+    }
 
     for (;;) {
       if (request.signal.aborted) {
@@ -932,8 +1036,19 @@ export class OrnithImplementationService {
       }
 
       let toolResult: OrnithToolResult;
+      let identicalEscapeRetryRefused = false;
       const operationStarted = Date.now();
-      if (action.action === 'run_verification') {
+      if (action.action === 'replace_text' && escapeDeniedFingerprint !== null && JSON.stringify(action) === escapeDeniedFingerprint) {
+        // Never dispatched: it would fail exactly as before. The single retry was
+        // supposed to CHANGE the escaping, so this ends the run.
+        identicalEscapeRetryRefused = true;
+        toolResult = {
+          ok: false,
+          code: 'replacement_escape_suspected',
+          reason: 'The identical replace_text request already failed with replacement_escape_suspected and was ' +
+            'not dispatched again. The file is unchanged.'
+        };
+      } else if (action.action === 'run_verification') {
         if (verificationsUsed >= ORNITH_LIMITS.maxVerificationCalls) {
           return finish('fail', 'The verification-call budget for this run is exhausted.', 'configuration', ['limit_verification_calls_exceeded']);
         } else {
@@ -1011,25 +1126,65 @@ export class OrnithImplementationService {
       }
       if (!toolResult.ok) {
         outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code });
+
+        const isBudgetDenial = toolResult.code === 'limit_read_bytes_exceeded';
+        const isEscapeDenial = toolResult.code === 'replacement_escape_suspected';
+        const recoveryAttemptsUsed = isBudgetDenial
+          ? readBudgetRecoveryAttemptsUsed
+          : isEscapeDenial ? replacementEscapeRecoveryAttemptsUsed : readOnlyRecoveryAttemptsUsed;
+        const recoveryAttemptsMax = isBudgetDenial
+          ? ORNITH_LIMITS.maxReadBudgetRecoveryAttempts
+          : isEscapeDenial
+            ? ORNITH_LIMITS.maxReplacementEscapeRecoveryAttempts
+            : ORNITH_LIMITS.maxReadOnlyRecoveryAttempts;
+        const willRecover = !identicalEscapeRetryRefused &&
+          isRecoverableToolDenial(action, toolResult.code) && recoveryAttemptsUsed < recoveryAttemptsMax;
+
+        // One event covers both facts (denied, and whether it will recover)
+        // so there is exactly one notification for this operation — never a
+        // second one moments later when the recovery branch below runs.
+        // Typed against the shared OrnithToolDenialEventData contract (see
+        // shared/domain/ornith.ts) so a field rename/removal here fails this
+        // build instead of only showing up as RelayTimeline silently falling
+        // back to plain text.
+        const denialEventData: Record<string, unknown> & OrnithToolDenialEventData = {
+          sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code, durationMs,
+          recoverable: willRecover,
+          readBytesUsed: cumulativeReadBytes,
+          readBytesConfigured: ORNITH_LIMITS.maxCumulativeReadBytes,
+          changedFiles: tools.changedFileCount()
+        };
         request.onProgress({
           type: 'tool_use',
-          text: `Ornith action ${action.action} denied (${toolResult.code}).`,
-          data: { sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code, durationMs }
+          text: willRecover
+            ? `Ornith action ${action.action} denied (${toolResult.code}); recovering with feedback.`
+            : `Ornith action ${action.action} denied (${toolResult.code}); the run stopped.`,
+          data: denialEventData
         });
 
-        if (
-          isRecoverableToolDenial(action, toolResult.code) &&
-          readOnlyRecoveryAttemptsUsed < ORNITH_LIMITS.maxReadOnlyRecoveryAttempts
-        ) {
-          readOnlyRecoveryAttemptsUsed += 1;
-          const remaining = ORNITH_LIMITS.maxReadOnlyRecoveryAttempts - readOnlyRecoveryAttemptsUsed;
+        if (willRecover) {
+          if (isBudgetDenial) readBudgetRecoveryAttemptsUsed += 1;
+          else if (isEscapeDenial) {
+            replacementEscapeRecoveryAttemptsUsed += 1;
+            escapeDeniedFingerprint = JSON.stringify(action);
+          } else readOnlyRecoveryAttemptsUsed += 1;
+          const remaining = recoveryAttemptsMax - (recoveryAttemptsUsed + 1);
           const recoveryFeedback = {
             ok: false,
             code: toolResult.code,
-            reason:
-              `${toolResult.reason} (${describeActionParams(action)}) ${remaining} read-only recovery ` +
-              `attempt${remaining === 1 ? '' : 's'} remain this run. Narrow "files", the query, offset, or limit ` +
-              'before retrying; repeating this exact request will be refused.'
+            reason: isEscapeDenial
+              ? `${toolResult.reason} The file is unchanged and still has the sha256 you supplied. You have one ` +
+                'retry: send a DIFFERENT replace_text (or read_file again first), writing every real line break in ' +
+                'oldText and newText as the single-backslash JSON escape that matches the lineEnding read_file ' +
+                'reported. The identical request will not be dispatched again.'
+              : isBudgetDenial
+              ? `${toolResult.reason} (${describeActionParams(action)}) No further reads or searches are ` +
+                'available for this request; the repository read budget for this run cannot fit it. Use the ' +
+                'verified context you already have to make the scoped edit now, or call "blocked" if you cannot ' +
+                'safely continue without it. This exact request will not be retried.'
+              : `${toolResult.reason} (${describeActionParams(action)}) ${remaining} read-only recovery ` +
+                `attempt${remaining === 1 ? '' : 's'} remain this run. Narrow "files", the query, offset, or limit ` +
+                'before retrying; repeating this exact request will be refused.'
           };
           rolling.push({ turn: turnsUsed, action: action.action, resultText: JSON.stringify(recoveryFeedback) });
           continue;
@@ -1078,11 +1233,11 @@ export class OrnithImplementationService {
       case 'list_files':
         return tools.listFiles(action, signal, maxToolResultBytes);
       case 'read_file':
-        return tools.readFile(
-          { ...action, limit: Math.min(action.limit, Math.max(1, maxToolResultBytes - 512)) },
-          signal,
-          budget
-        );
+        // Packed against the exact serialized budget inside `readFile` (see its
+        // doc comment) instead of pre-clamping the raw byte limit: a raw-byte
+        // clamp cannot know how much JSON escaping will inflate the slice, and
+        // an over-budget result used to be replaced by a content-free stub.
+        return tools.readFile(action, signal, budget, maxToolResultBytes);
       case 'search_text':
         return tools.searchText(action, signal, budget, maxToolResultBytes);
       case 'create_file':
@@ -1167,9 +1322,10 @@ function boundedJson(value: unknown, maxBytes: number): string {
 
 /** Actions whose `OrnithWorktreeTools` method packs its own result to already fit the
  *  budget it is given (`nextCursor`/`total` for list_files, `truncated` for
- *  search_text), so falling through to the generic byte-cap-and-replace stub would
- *  erase continuation-bearing fields these actions specifically rely on. */
-const SELF_PACKED_ACTIONS: ReadonlySet<OrnithAction['action']> = new Set(['list_files', 'search_text']);
+ *  search_text, `totalBytes`/`nextOffset`/`sha256` for read_file), so falling through
+ *  to the generic byte-cap-and-replace stub would erase continuation-bearing fields
+ *  these actions specifically rely on. */
+const SELF_PACKED_ACTIONS: ReadonlySet<OrnithAction['action']> = new Set(['list_files', 'search_text', 'read_file']);
 
 /**
  * See `SELF_PACKED_ACTIONS`. For those actions this does not degrade a budget-fit

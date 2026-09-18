@@ -180,6 +180,140 @@ describe('Relay timeline — full run detail', () => {
   });
 });
 
+describe('Relay timeline — Ornith read-budget denial events', () => {
+  it('renders the precise budget/recoverable state instead of the plain generic denial text, for a recoverable denial', async () => {
+    installBridge({
+      'runs:events': () =>
+        ok<'runs:events'>([
+          {
+            id: 'e1',
+            runId: 'ornith-run',
+            timestamp: '2026-09-10T10:00:01.000Z',
+            type: 'tool_use',
+            payload: JSON.stringify({
+              text: 'Ornith action search_text denied (limit_read_bytes_exceeded); recovering with feedback.',
+              data: {
+                sequence: 3,
+                action: 'search_text',
+                ok: false,
+                code: 'limit_read_bytes_exceeded',
+                recoverable: true,
+                readBytesUsed: 4_160_000,
+                readBytesConfigured: 4_194_304,
+                changedFiles: 0
+              }
+            })
+          }
+        ])
+    });
+    const run = makeRun({ id: 'ornith-run', agent: 'ornith' });
+    renderApp(<RelayTimeline runs={[run]} />);
+
+    await screen.findByText('tool use');
+    const lines = document.querySelectorAll('.logs__text');
+    expect(lines).toHaveLength(1); // exactly one rendered line for this one recorded event
+    const text = lines[0]!.textContent ?? '';
+    expect(text).toContain('search_text');
+    expect(text).toContain('limit_read_bytes_exceeded');
+    expect(text).toContain('4160000 / 4194304 bytes');
+    expect(text).toContain('recovering with feedback');
+    expect(text).toContain('no files changed yet');
+    expect(text).not.toContain('unsafe or over-limit');
+  });
+
+  it('renders the stopped state, distinctly, once the recovery budget is exhausted', async () => {
+    installBridge({
+      'runs:events': () =>
+        ok<'runs:events'>([
+          {
+            id: 'e1',
+            runId: 'ornith-run',
+            timestamp: '2026-09-10T10:00:01.000Z',
+            type: 'tool_use',
+            payload: JSON.stringify({
+              text: 'Ornith action search_text denied (limit_read_bytes_exceeded); the run stopped.',
+              data: {
+                sequence: 4,
+                action: 'search_text',
+                ok: false,
+                code: 'limit_read_bytes_exceeded',
+                recoverable: false,
+                readBytesUsed: 4_194_000,
+                readBytesConfigured: 4_194_304,
+                changedFiles: 1
+              }
+            })
+          }
+        ])
+    });
+    const run = makeRun({ id: 'ornith-run', agent: 'ornith', status: 'failed' });
+    renderApp(<RelayTimeline runs={[run]} />);
+
+    await screen.findByText('tool use');
+    const text = document.querySelector('.logs__text')?.textContent ?? '';
+    expect(text).toContain('the run stopped');
+    expect(text).toContain('1 file(s) changed');
+    expect(text).not.toContain('recovering with feedback');
+  });
+
+  it('renders a recoverable replacement_escape_suspected denial once, with its code and the unchanged-file state', async () => {
+    installBridge({
+      'runs:events': () =>
+        ok<'runs:events'>([
+          {
+            id: 'e1',
+            runId: 'ornith-run',
+            timestamp: '2026-09-10T10:00:01.000Z',
+            type: 'tool_use',
+            payload: JSON.stringify({
+              text: 'Ornith action replace_text denied (replacement_escape_suspected); recovering with feedback.',
+              data: {
+                sequence: 3,
+                action: 'replace_text',
+                ok: false,
+                code: 'replacement_escape_suspected',
+                recoverable: true,
+                readBytesUsed: 82_664,
+                readBytesConfigured: 4_194_304,
+                changedFiles: 0
+              }
+            })
+          }
+        ])
+    });
+    const run = makeRun({ id: 'ornith-run', agent: 'ornith' });
+    renderApp(<RelayTimeline runs={[run]} />);
+
+    await screen.findByText('tool use');
+    const lines = document.querySelectorAll('.logs__text');
+    expect(lines).toHaveLength(1);
+    const text = lines[0]!.textContent ?? '';
+    expect(text).toContain('replace_text');
+    expect(text).toContain('replacement_escape_suspected');
+    expect(text).toContain('recovering with feedback');
+    expect(text).toContain('no files changed yet');
+  });
+
+  it('leaves an ordinary tool_use event (no enriched denial data) rendered as plain text, unaffected', async () => {
+    installBridge({
+      'runs:events': () =>
+        ok<'runs:events'>([
+          {
+            id: 'e1',
+            runId: 'ornith-run',
+            timestamp: '2026-09-10T10:00:01.000Z',
+            type: 'tool_use',
+            payload: JSON.stringify({ text: 'read_file path="docs/manual-test.md" offset=0 bytes=120', data: { ok: true } })
+          }
+        ])
+    });
+    const run = makeRun({ id: 'ornith-run', agent: 'ornith' });
+    renderApp(<RelayTimeline runs={[run]} />);
+
+    expect(await screen.findByText('read_file path="docs/manual-test.md" offset=0 bytes=120')).toBeTruthy();
+  });
+});
+
 describe('Relay timeline — provider vs snapshot verification stay distinct', () => {
   it('renders a diagnostic provider-side assessment as a warning, never as a failed run, even when the provider check itself failed', async () => {
     installBridge();

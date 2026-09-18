@@ -7,10 +7,14 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  classifyLineEnding,
   containsAbsoluteMachinePath,
+  containsLiteralLineBreakEscape,
   isOrnithTerminalAction,
   ORNITH_ACTION_KINDS,
+  ORNITH_DENIAL_CODES,
   ORNITH_LIMITS,
+  ORNITH_LINE_ENDINGS,
   ORNITH_NONTERMINAL_ACTION_KINDS,
   ORNITH_PROTOCOL_VERSION,
   ornithActionSchema,
@@ -18,7 +22,8 @@ import {
   ornithRelativePrefixSchema,
   ornithSha256Schema,
   parseOrnithCompletion,
-  redactAbsoluteMachinePaths
+  redactAbsoluteMachinePaths,
+  sanitizeScopedFilePaths
 } from '../../src/shared/domain/ornith';
 import {
   implementationProviderSchema,
@@ -151,6 +156,41 @@ describe('ornithRelativePrefixSchema', () => {
   it('applies the same rules as the path schema when non-empty', () => {
     expect(ornithRelativePrefixSchema.safeParse('../escape').success).toBe(false);
     expect(ornithRelativePrefixSchema.safeParse('src').success).toBe(true);
+  });
+});
+
+describe('sanitizeScopedFilePaths', () => {
+  it('returns an empty array for undefined or empty input', () => {
+    expect(sanitizeScopedFilePaths(undefined)).toEqual([]);
+    expect(sanitizeScopedFilePaths([])).toEqual([]);
+  });
+
+  it('keeps every syntactically valid, distinct candidate', () => {
+    expect(sanitizeScopedFilePaths(['docs/manual-test.md', 'src/index.ts'])).toEqual([
+      'docs/manual-test.md',
+      'src/index.ts'
+    ]);
+  });
+
+  it('drops a syntactically invalid candidate without failing the rest', () => {
+    expect(sanitizeScopedFilePaths(['docs/manual-test.md', '../escape', 'C:/Windows', 'src/index.ts'])).toEqual([
+      'docs/manual-test.md',
+      'src/index.ts'
+    ]);
+  });
+
+  it('deduplicates repeated candidates', () => {
+    expect(sanitizeScopedFilePaths(['a.ts', 'a.ts', 'b.ts'])).toEqual(['a.ts', 'b.ts']);
+  });
+
+  it('caps the result at ORNITH_LIMITS.maxScopedFilePaths', () => {
+    const many = Array.from({ length: ORNITH_LIMITS.maxScopedFilePaths + 10 }, (_unused, i) => `f${i}.ts`);
+    expect(sanitizeScopedFilePaths(many)).toHaveLength(ORNITH_LIMITS.maxScopedFilePaths);
+  });
+
+  it('never throws on malformed input', () => {
+    expect(() => sanitizeScopedFilePaths(['\u0000bad', ''])).not.toThrow();
+    expect(sanitizeScopedFilePaths(['\u0000bad', ''])).toEqual([]);
   });
 });
 
@@ -453,5 +493,69 @@ describe('parseOrnithCompletion', () => {
     const result = parseOrnithCompletion('not json at all');
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.code).toBe('malformed_output');
+  });
+});
+
+describe('line-ending classification and literal escape detection', () => {
+  const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+  it.each([
+    ['lf', 'a\nb\nc'],
+    ['lf', '\n'],
+    ['crlf', 'a\r\nb\r\n'],
+    ['crlf', 'a\r\nb'],
+    ['mixed', 'a\r\nb\nc'],
+    ['mixed', 'a\nb\r\nc'],
+    ['mixed', 'a\rb'],
+    ['mixed', 'a\r\nb\rc'],
+    ['none', ''],
+    ['none', 'no break at all']
+  ])('classifies as %s: %j', (expected, text) => {
+    expect(classifyLineEnding(bytes(text))).toBe(expected);
+  });
+
+  it('is exact for multi-byte UTF-8 text, whose continuation bytes never look like CR or LF', () => {
+    expect(classifyLineEnding(bytes('π ω 日本語 🎉\r\nsecond π\r\n'))).toBe('crlf');
+    expect(classifyLineEnding(bytes('π ω 日本語 🎉 no break'))).toBe('none');
+  });
+
+  it('treats a literal backslash sequence in the text as ordinary characters, never as a line break', () => {
+    expect(classifyLineEnding(bytes('a\\r\\nb\\n'))).toBe('none');
+    expect(classifyLineEnding(bytes('a\\r\\nb\r\n'))).toBe('crlf');
+  });
+
+  it('lists exactly the four styles', () => {
+    expect([...ORNITH_LINE_ENDINGS]).toEqual(['lf', 'crlf', 'mixed', 'none']);
+  });
+
+  it.each([
+    ['a\\nb', true],
+    ['a\\r\\nb', true],
+    ['a\\rb', true],
+    ['a\r\nb', false],
+    ['a\nb', false],
+    ['C:\\path only', false],
+    ['no backslash n or r follows: \\t \\\\', false]
+  ])('reports whether %j contains a literal backslash followed by n or r: %s', (text, expected) => {
+    expect(containsLiteralLineBreakEscape(text)).toBe(expected);
+  });
+
+  it('parses reordered JSON keys, at every nesting level, to an identical serialization (the basis of duplicate-action detection)', () => {
+    const hash = 'a'.repeat(64);
+    const ordered = parseOrnithCompletion(
+      `{"version":1,"action":"replace_text","path":"a.md","sha256":"${hash}","replacements":[{"oldText":"x","newText":"y"}]}`
+    );
+    const reordered = parseOrnithCompletion(
+      `{"replacements":[{"newText":"y","oldText":"x"}],"sha256":"${hash}","path":"a.md","action":"replace_text","version":1}`
+    );
+
+    expect(ordered.ok && reordered.ok).toBe(true);
+    if (!ordered.ok || !reordered.ok) return;
+    expect(JSON.stringify(reordered.action)).toBe(JSON.stringify(ordered.action));
+  });
+
+  it('gives the escape diagnosis its own denial code and exactly one retry', () => {
+    expect(ORNITH_DENIAL_CODES).toContain('replacement_escape_suspected');
+    expect(ORNITH_LIMITS.maxReplacementEscapeRecoveryAttempts).toBe(1);
   });
 });

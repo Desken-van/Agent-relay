@@ -109,8 +109,11 @@ async function startLocalInference(page: Page, runtimePath: string, port: number
   await settingsCard.getByLabel(/^Port/).fill(String(port));
   // The production Ornith path now reserves context for both the chat
   // template and one bounded JSON action. Keep this fixture explicit rather
-  // than relying on the generic 4096/4096 manual-inference defaults.
-  await settingsCard.getByLabel('Context size (tokens)').fill('8192');
+  // than relying on the generic 4096/4096 manual-inference defaults. 12288,
+  // not 8192: the protocol's read_file paging guidance raised the smallest
+  // context the immutable prompt fits in from ~7.5K to ~8.3K tokens (the real
+  // configuration uses 32768), and this fixture is not a minimal-window test.
+  await settingsCard.getByLabel('Context size (tokens)').fill('12288');
   await settingsCard.getByLabel('Default max output tokens').fill('1024');
   await saveButton.click();
   await page.getByText('Settings saved').waitFor();

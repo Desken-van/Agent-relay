@@ -14,10 +14,10 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ExecaProcessRunner } from '../../src/main/adapters/process/process-runner';
+import { ExecaProcessRunner, type ProcessResult, type ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
 import { OrnithWorktreeTools } from '../../src/main/services/ornith-worktree-tools';
-import { ORNITH_LIMITS } from '../../src/shared/domain/ornith';
+import { ORNITH_LIMITS, containsAbsoluteMachinePath } from '../../src/shared/domain/ornith';
 
 const runner = new ExecaProcessRunner();
 const locatedGit = locateExecutable('git');
@@ -991,6 +991,713 @@ describe('OrnithWorktreeTools containment and budgets', () => {
         expect(shortNames).toContain(match.path); // never a long (skipped) entry
       }
       expect(forModel.truncated).toBe(true);
+    });
+  });
+
+  describe('read_file accounting and identity-reuse policy', () => {
+    it('charges the full file size for a small offset/limit slice, because identity/security verification requires the whole file', async () => {
+      const content = 'y'.repeat(50_000);
+      writeFileSync(join(worktree, 'large.txt'), content, 'utf8');
+      const boundary = tools();
+
+      const result = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'large.txt', offset: 10, limit: 5 },
+        undefined,
+        { readBytes: 50_000, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: true, readBytes: 50_000 });
+      if (!result.ok) throw new Error('expected a successful read');
+      expect((result.forModel as { bytesRead: number }).bytesRead).toBe(5);
+    });
+
+    it('independently re-verifies a second read of the same path at a different offset, never reusing stale content', async () => {
+      writeFileSync(join(worktree, 'mutable.txt'), 'AAAAAAAAAA', 'utf8');
+      const boundary = tools();
+
+      const first = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'mutable.txt', offset: 0, limit: 5 },
+        undefined,
+        { readBytes: 1000, writeBytes: 0 }
+      );
+      expect(first).toMatchObject({ ok: true, readBytes: 10 });
+
+      // Replaced out from under the tool between two calls of the SAME run: a
+      // cache keyed only on path (no design this repository adopted) would
+      // still serve the stale content here; this tool has none, so the
+      // second call must independently re-verify and see the new bytes.
+      writeFileSync(join(worktree, 'mutable.txt'), 'BBBBBBBBBB', 'utf8');
+      const second = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'mutable.txt', offset: 5, limit: 5 },
+        undefined,
+        { readBytes: 1000, writeBytes: 0 }
+      );
+
+      expect(second).toMatchObject({ ok: true, readBytes: 10 });
+      if (!second.ok) throw new Error('expected a successful read');
+      expect((second.forModel as { content: string }).content).toBe('BBBBB');
+    });
+  });
+
+  describe('read_file totalBytes / nextOffset and result packing', () => {
+    /** JSON-escape-heavy text: quotes, backticks, backslashes and newlines all inflate when serialized. */
+    const escapeHeavyLine = '1. Open the "Settings" page, choose `Local inference`\\and press "Start"; expect "Healthy".\n';
+    const escapeHeavy = escapeHeavyLine.repeat(420); // ~41 KB, like docs/manual-test.md in the real run
+
+    function serializedBytes(value: unknown): number {
+      return Buffer.byteLength(JSON.stringify(value), 'utf8');
+    }
+
+    type ReadResult = {
+      path: string; offset: number; bytesRead: number; totalBytes: number;
+      nextOffset: number | null; eof: boolean; content: string; sha256: string;
+    };
+
+    it('reports the file size and the offset a following chunk starts at, and null at the end of the file', async () => {
+      writeFileSync(join(worktree, 'paged.txt'), 'y'.repeat(50_000), 'utf8');
+      const boundary = tools();
+
+      const first = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'paged.txt', offset: 10, limit: 5 },
+        undefined,
+        { readBytes: 50_000, writeBytes: 0 }
+      );
+      expect(first).toMatchObject({ ok: true, readBytes: 50_000 }); // accounting unchanged: the whole file
+      if (!first.ok) throw new Error('expected a successful read');
+      expect(first.forModel).toMatchObject({ offset: 10, bytesRead: 5, totalBytes: 50_000, nextOffset: 15, eof: false });
+
+      const last = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'paged.txt', offset: 49_995, limit: 100 },
+        undefined,
+        { readBytes: 50_000, writeBytes: 0 }
+      );
+      if (!last.ok) throw new Error('expected a successful read');
+      expect(last.forModel).toMatchObject({ bytesRead: 5, totalBytes: 50_000, nextOffset: null, eof: true });
+    });
+
+    it('follows nextOffset across multi-byte characters with no gaps and no duplicated bytes', async () => {
+      const original = 'é€😀 mixed width text\n'.repeat(400);
+      writeFileSync(join(worktree, 'wide.txt'), original, 'utf8');
+      const boundary = tools();
+
+      let offset = 0;
+      let rebuilt = '';
+      let pages = 0;
+      for (;;) {
+        const page = await boundary.readFile(
+          { version: 1, action: 'read_file', path: 'wide.txt', offset, limit: 1001 }, // deliberately mid-character
+          undefined,
+          { readBytes: 1_000_000, writeBytes: 0 }
+        );
+        if (!page.ok) throw new Error('expected a successful read');
+        const forModel = page.forModel as ReadResult;
+        expect(forModel.bytesRead).toBeLessThanOrEqual(1001);
+        rebuilt += forModel.content;
+        pages += 1;
+        if (forModel.nextOffset === null) break;
+        expect(forModel.nextOffset).toBe(forModel.offset + forModel.bytesRead);
+        offset = forModel.nextOffset;
+        expect(pages).toBeLessThan(200);
+      }
+      expect(rebuilt).toBe(original);
+    });
+
+    it('packs the returned slice to the exact serialized result budget while still charging the whole file', async () => {
+      writeFileSync(join(worktree, 'escape.md'), escapeHeavy, 'utf8');
+      const raw = readFileSync(join(worktree, 'escape.md'));
+      const sha256 = createHash('sha256').update(raw).digest('hex');
+      const boundary = tools();
+
+      const result = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'escape.md', offset: 0, limit: 65_536 },
+        undefined,
+        { readBytes: 1_000_000, writeBytes: 0 },
+        2_000
+      );
+
+      expect(result).toMatchObject({ ok: true, readBytes: raw.byteLength }); // honest: the full file was read
+      if (!result.ok) throw new Error('expected a successful, packed read');
+      expect(serializedBytes(result.forModel)).toBeLessThanOrEqual(2_000);
+      const forModel = result.forModel as ReadResult;
+      expect(forModel.bytesRead).toBeGreaterThan(0);
+      expect(forModel.bytesRead).toBeLessThan(raw.byteLength);
+      expect(forModel.totalBytes).toBe(raw.byteLength);
+      expect(forModel.nextOffset).toBe(forModel.bytesRead);
+      expect(forModel.eof).toBe(false);
+      expect(forModel.sha256).toBe(sha256); // still over the COMPLETE file, not the slice
+      expect(escapeHeavy.startsWith(forModel.content)).toBe(true);
+    });
+
+    it('pages a large escape-heavy file to completion under a tight budget: every page fits, none is a stub, none overlaps', async () => {
+      writeFileSync(join(worktree, 'escape.md'), escapeHeavy, 'utf8');
+      const boundary = tools();
+
+      let offset = 0;
+      let rebuilt = '';
+      let pages = 0;
+      for (;;) {
+        const page = await boundary.readFile(
+          { version: 1, action: 'read_file', path: 'escape.md', offset, limit: 65_536 },
+          undefined,
+          { readBytes: 1_000_000, writeBytes: 0 },
+          1_500
+        );
+        if (!page.ok) throw new Error('expected a successful, packed read');
+        expect(serializedBytes(page.forModel)).toBeLessThanOrEqual(1_500);
+        const forModel = page.forModel as ReadResult;
+        expect(forModel.bytesRead).toBeGreaterThan(0);
+        expect(forModel.offset).toBe(offset);
+        rebuilt += forModel.content;
+        pages += 1;
+        if (forModel.nextOffset === null) break;
+        offset = forModel.nextOffset;
+        expect(pages).toBeLessThan(200);
+      }
+      expect(rebuilt).toBe(escapeHeavy);
+      expect(pages).toBeGreaterThan(1);
+    });
+
+    it('never splits a UTF-8 code point when packing: multi-byte text under a tight budget pages to exactly the original, every page valid', async () => {
+      // 2-, 3- and 4-byte code points mixed with characters that JSON-escape, so the
+      // packing binary search lands on many different byte limits, including
+      // ones that fall inside a code point.
+      const original = 'é€😀 "q" \\ end\n'.repeat(700);
+      writeFileSync(join(worktree, 'wide-escape.md'), original, 'utf8');
+      const boundary = tools();
+
+      let offset = 0;
+      let rebuilt = '';
+      let pages = 0;
+      for (;;) {
+        const page = await boundary.readFile(
+          { version: 1, action: 'read_file', path: 'wide-escape.md', offset, limit: 65_536 },
+          undefined,
+          { readBytes: 10_000_000, writeBytes: 0 },
+          700
+        );
+        if (!page.ok) throw new Error('expected a successful, packed read');
+        expect(serializedBytes(page.forModel)).toBeLessThanOrEqual(700);
+        const forModel = page.forModel as ReadResult;
+        expect(forModel.content).not.toContain('�'); // no replacement character: no split code point
+        expect(Buffer.byteLength(forModel.content, 'utf8')).toBe(forModel.bytesRead); // the text IS the bytes
+        expect(forModel.offset).toBe(offset);
+        expect(forModel.bytesRead).toBeGreaterThan(0);
+        rebuilt += forModel.content;
+        pages += 1;
+        if (forModel.nextOffset === null) break;
+        expect(forModel.nextOffset).toBe(forModel.offset + forModel.bytesRead);
+        offset = forModel.nextOffset;
+        expect(pages).toBeLessThan(2_000);
+      }
+      expect(rebuilt).toBe(original);
+      expect(pages).toBeGreaterThan(20);
+    });
+
+    it('reproduces the real defect: a chunk that fit the raw-byte clamp but not the serialized budget now returns content instead of a stub', async () => {
+      writeFileSync(join(worktree, 'escape.md'), escapeHeavy, 'utf8');
+      const raw = readFileSync(join(worktree, 'escape.md'));
+      const budget = 10_890; // the real run's maxToolResultBytes
+      const rawClamp = budget - 512; // what the dispatcher used to pass as the byte limit
+      const naive = {
+        path: 'escape.md', offset: 0, bytesRead: rawClamp, eof: false,
+        content: raw.subarray(0, rawClamp).toString('utf8'), sha256: 'a'.repeat(64)
+      };
+      // Guard: this fixture really is one the old clamp got wrong (otherwise the test proves nothing).
+      expect(serializedBytes(naive)).toBeGreaterThan(budget);
+
+      const result = await tools().readFile(
+        { version: 1, action: 'read_file', path: 'escape.md', offset: 0, limit: rawClamp },
+        undefined,
+        { readBytes: 1_000_000, writeBytes: 0 },
+        budget
+      );
+
+      if (!result.ok) throw new Error('expected content, not a denial');
+      expect(serializedBytes(result.forModel)).toBeLessThanOrEqual(budget);
+      const forModel = result.forModel as ReadResult;
+      expect(forModel.content.length).toBeGreaterThan(0);
+      expect(forModel.sha256).toHaveLength(64);
+      expect(forModel.nextOffset).not.toBeNull();
+    });
+
+    it('fails closed rather than returning a result over budget when not even an empty result fits', async () => {
+      writeFileSync(join(worktree, 'tiny.txt'), 'hello\n', 'utf8');
+
+      const result = await tools().readFile(
+        { version: 1, action: 'read_file', path: 'tiny.txt', offset: 0, limit: 100 },
+        undefined,
+        { readBytes: 1_000, writeBytes: 0 },
+        40
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'limit_result_exceeded' });
+    });
+
+    it('still refuses a credential-shaped file when the secret lies beyond the slice being returned', async () => {
+      writeFileSync(
+        join(worktree, 'later-secret.txt'),
+        `safe start\n${'x'.repeat(200)}\ntoken=ghp_abcdefghijklmnopqrstuvwxyz1234567890\n`,
+        'utf8'
+      );
+
+      const result = await tools().readFile(
+        { version: 1, action: 'read_file', path: 'later-secret.txt', offset: 0, limit: 5 },
+        undefined,
+        { readBytes: 10_000, writeBytes: 0 },
+        1_000
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'disallowed_action' });
+      expect(JSON.stringify(result)).not.toContain('ghp_');
+    });
+
+    it('still denies a read that would exceed the remaining read budget, independent of the result budget', async () => {
+      writeFileSync(join(worktree, 'big.txt'), 'z'.repeat(5_000), 'utf8');
+
+      const result = await tools().readFile(
+        { version: 1, action: 'read_file', path: 'big.txt', offset: 0, limit: 10 },
+        undefined,
+        { readBytes: 4_999, writeBytes: 0 },
+        10_000
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    });
+  });
+
+  describe('resolveAuthoritativeScope', () => {
+    // `search_text` deliberately does NOT consume this (a Coai review round found
+    // that narrowing an omitted search to a declared scope could permanently hide
+    // a real match in a file the scope claim omitted, whenever the scope file
+    // itself also happened to contain an incidental match). It exists solely so
+    // `OrnithImplementationService` can confirm a specification's declared scope
+    // against the real manifest before rendering it in the prompt as a hint.
+    function toolsWithScope(scopedFilePathCandidates: readonly string[]): OrnithWorktreeTools {
+      return new OrnithWorktreeTools({
+        worktreePath: worktree,
+        worktreesRoot,
+        repositoryPath: repository,
+        branchName: 'task',
+        runner,
+        gitExecutablePath: gitPath,
+        scopedFilePathCandidates
+      });
+    }
+
+    it('resolves to the manifest-confirmed subset of declared candidates', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
+      const boundary = toolsWithScope(['scoped.txt']);
+
+      expect(await boundary.resolveAuthoritativeScope()).toEqual(['scoped.txt']);
+    });
+
+    it('drops a nonexistent declared candidate, resolving to null when nothing survives', async () => {
+      const boundary = toolsWithScope(['docs/does-not-exist.md']);
+
+      expect(await boundary.resolveAuthoritativeScope()).toBeNull();
+    });
+
+    it('resolves to null when no scope was declared at all', async () => {
+      expect(await tools().resolveAuthoritativeScope()).toBeNull();
+    });
+
+    it('recovers from one transient manifest-build failure via its own bounded retry', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
+      let calls = 0;
+      const flakyRunner: ProcessRunner = {
+        run: (file, args, options) => {
+          calls += 1;
+          if (calls === 1) {
+            const failure: ProcessResult = {
+              command: file, exitCode: 1, stdout: '', stderr: 'transient failure',
+              timedOut: false, cancelled: false, durationMs: 1, failed: true
+            };
+            return Promise.resolve(failure);
+          }
+          return runner.run(file, args, options);
+        }
+      };
+      const boundary = new OrnithWorktreeTools({
+        worktreePath: worktree,
+        worktreesRoot,
+        repositoryPath: repository,
+        branchName: 'task',
+        runner: flakyRunner,
+        gitExecutablePath: gitPath,
+        scopedFilePathCandidates: ['scoped.txt']
+      });
+
+      // The first git call (inside the first ensureManifest attempt) fails;
+      // the retry's calls all go through to the real runner and succeed.
+      expect(await boundary.resolveAuthoritativeScope()).toEqual(['scoped.txt']);
+      expect(calls).toBeGreaterThan(1);
+    });
+
+    it('does not depend on call order: the answer is the same when another tool built the manifest first', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
+      const boundary = toolsWithScope(['scoped.txt']);
+
+      // A tool dispatch builds the manifest before scope is ever resolved.
+      const read = await boundary.readFile(
+        { version: 1, action: 'read_file', path: 'scoped.txt', offset: 0, limit: 10 },
+        undefined,
+        { readBytes: 1_000, writeBytes: 0 }
+      );
+      expect(read).toMatchObject({ ok: true });
+
+      expect(await boundary.resolveAuthoritativeScope()).toEqual(['scoped.txt']);
+      expect(await boundary.resolveAuthoritativeScope()).toEqual(['scoped.txt']); // frozen, idempotent
+    });
+
+    it('freezes the decision permanently once resolved, even after a failed first attempt followed by a successful retry', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
+      const boundary = toolsWithScope(['scoped.txt']);
+      const aborted = new AbortController();
+      aborted.abort();
+
+      const first = await boundary.resolveAuthoritativeScope(aborted.signal);
+      expect(first).toBeNull();
+
+      // A later, real (non-aborted) call must not silently reach a different
+      // answer than the one already decided and reported to the model.
+      const second = await boundary.resolveAuthoritativeScope();
+      expect(second).toBeNull();
+    });
+  });
+
+  describe('searchText mid-scan cumulative read-budget handling', () => {
+    it('returns honest partial matches and the true bytes read when the cumulative budget runs out mid-scan, never discarding progress', async () => {
+      const matchBytes = Buffer.byteLength('needle\n', 'utf8');
+      writeFileSync(join(worktree, 'a-match.txt'), 'needle\n', 'utf8');
+      writeFileSync(join(worktree, 'b-toobig.txt'), 'z'.repeat(1000), 'utf8');
+      const boundary = tools();
+
+      const result = await boundary.searchText(
+        {
+          version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10,
+          files: ['a-match.txt', 'b-toobig.txt']
+        },
+        undefined,
+        { readBytes: matchBytes, writeBytes: 0 } // fits exactly the first candidate, never the second
+      );
+
+      expect(result).toMatchObject({ ok: true, readBytes: matchBytes });
+      if (!result.ok) throw new Error('expected a partial success, not a denial');
+      const forModel = result.forModel as { matches: { path: string; line: number }[]; truncated: boolean };
+      expect(forModel.matches).toEqual([{ path: 'a-match.txt', line: 1 }]);
+      expect(forModel.truncated).toBe(true);
+    });
+
+    it('denies with limit_read_bytes_exceeded and zero progress when even the first candidate cannot fit the remaining budget', async () => {
+      writeFileSync(join(worktree, 'toobig.txt'), 'needle '.repeat(200), 'utf8');
+      const boundary = tools();
+
+      const result = await boundary.searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10, files: ['toobig.txt'] },
+        undefined,
+        { readBytes: 5, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    });
+
+    function countingTools(counter: { gitCalls: number }): OrnithWorktreeTools {
+      const countingRunner: ProcessRunner = {
+        run: (file, args, options) => {
+          if (file === gitPath) counter.gitCalls += 1;
+          return runner.run(file, args, options);
+        }
+      };
+      return new OrnithWorktreeTools({
+        worktreePath: worktree,
+        worktreesRoot,
+        repositoryPath: repository,
+        branchName: 'task',
+        runner: countingRunner,
+        gitExecutablePath: gitPath
+      });
+    }
+
+    it('fails before any manifest, identity or per-file work when the read budget is already zero', async () => {
+      writeFileSync(join(worktree, 'a.txt'), 'needle\n', 'utf8');
+      const counter = { gitCalls: 0 };
+
+      const result = await countingTools(counter).searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
+        undefined,
+        { readBytes: 0, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+      expect(counter.gitCalls).toBe(0); // decided by arithmetic alone: nothing was touched
+    });
+
+    it('stops scanning the moment the budget is spent exactly, instead of probing every remaining candidate', async () => {
+      const matchBytes = Buffer.byteLength('needle\n', 'utf8');
+      writeFileSync(join(worktree, 'f000.txt'), 'needle\n', 'utf8');
+      for (let index = 1; index < 300; index += 1) {
+        writeFileSync(join(worktree, `f${String(index).padStart(3, '0')}.txt`), 'x\n', 'utf8');
+      }
+      const action = { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 } as const;
+
+      const exhausted = { gitCalls: 0 };
+      const stopped = await countingTools(exhausted).searchText(action, undefined, { readBytes: matchBytes, writeBytes: 0 });
+      expect(stopped).toMatchObject({ ok: true, readBytes: matchBytes });
+      if (!stopped.ok) throw new Error('expected a partial success');
+      expect((stopped.forModel as { matches: unknown[] }).matches).toEqual([{ path: 'f000.txt', line: 1 }]);
+      expect((stopped.forModel as { truncated: boolean }).truncated).toBe(true);
+
+      // Baseline: the identical search over ONE candidate. Its git cost is the fixed
+      // cost of a search (manifest + identity checks). Probing the other 299
+      // candidates would add a checkout-identity re-check (several git spawns)
+      // every 25 of them, so an exact match proves none of them were probed.
+      const single = { gitCalls: 0 };
+      await countingTools(single).searchText(
+        { ...action, files: ['f000.txt'] },
+        undefined,
+        { readBytes: matchBytes, writeBytes: 0 }
+      );
+      expect(exhausted.gitCalls).toBe(single.gitCalls);
+    });
+
+    it('does not search files over the per-file read cap or binary files, exactly as the protocol tells the model', async () => {
+      writeFileSync(join(worktree, 'a-big.txt'), `needle\n${'z'.repeat(ORNITH_LIMITS.maxReadBytes)}`, 'utf8'); // one byte over the cap
+      writeFileSync(join(worktree, 'b-binary.dat'), Buffer.concat([Buffer.from('needle '), Buffer.from([0xff, 0xfe, 0x00, 0xc3, 0x28])]));
+      writeFileSync(join(worktree, 'c-ok.txt'), 'needle\n', 'utf8');
+
+      const result = await tools().searchText(
+        { version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 },
+        undefined,
+        { readBytes: 10_000_000, writeBytes: 0 }
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      if (!result.ok) throw new Error('expected a successful search');
+      const forModel = result.forModel as { matches: { path: string; line: number }[] };
+      // Only the small text file is searched; a match in the two skipped files is invisible to search_text.
+      expect(forModel.matches).toEqual([{ path: 'c-ok.txt', line: 1 }]);
+    });
+
+    it('skips an oversized candidate but keeps scanning smaller ones later in the list that still fit', async () => {
+      const matchBytes = Buffer.byteLength('needle\n', 'utf8');
+      writeFileSync(join(worktree, 'a-toobig.txt'), 'z'.repeat(1000), 'utf8');
+      writeFileSync(join(worktree, 'b-fits.txt'), 'needle\n', 'utf8');
+      const boundary = tools();
+
+      const result = await boundary.searchText(
+        {
+          version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10,
+          files: ['a-toobig.txt', 'b-fits.txt']
+        },
+        undefined,
+        { readBytes: matchBytes, writeBytes: 0 } // fits only the second, smaller candidate
+      );
+
+      // Without skip-and-continue, the oversized first candidate would have
+      // stopped the scan before ever reaching the second, smaller one that fits.
+      expect(result).toMatchObject({ ok: true, readBytes: matchBytes });
+      if (!result.ok) throw new Error('expected a successful, partial search');
+      const forModel = result.forModel as { matches: { path: string; line: number }[]; truncated: boolean };
+      expect(forModel.matches).toEqual([{ path: 'b-fits.txt', line: 1 }]);
+      expect(forModel.truncated).toBe(true);
+    });
+  });
+
+  describe('line endings and the replace_text JSON-escape diagnosis', () => {
+    const budget = { readBytes: 1_000_000, writeBytes: 1_000_000 };
+    const sha = (value: Buffer | string): string => createHash('sha256').update(value).digest('hex');
+    /** What a doubled-backslash JSON escape of CRLF decodes to: four literal characters. */
+    const literalCrlf = '\\r\\n';
+
+    type ReadForModel = { lineEnding: string; content: string; bytesRead: number; totalBytes: number };
+
+    async function readBack(name: string, content: string, limit = 65_536, maxResultBytes?: number): Promise<ReadForModel> {
+      writeFileSync(join(worktree, name), content);
+      const result = await tools().readFile(
+        { version: 1, action: 'read_file', path: name, offset: 0, limit },
+        undefined,
+        budget,
+        maxResultBytes
+      );
+      if (!result.ok) throw new Error(`expected a successful read, got ${result.code}`);
+      return result.forModel as ReadForModel;
+    }
+
+    async function replaceIn(name: string, content: string, oldText: string, newText: string, hash = sha(content)) {
+      writeFileSync(join(worktree, name), content);
+      const boundary = tools();
+      const result = await boundary.replaceText(
+        { version: 1, action: 'replace_text', path: name, sha256: hash, replacements: [{ oldText, newText }] },
+        undefined,
+        budget
+      );
+      return { result, boundary, bytes: readFileSync(join(worktree, name)) };
+    }
+
+    it.each([
+      ['lf', 'one\ntwo\nthree\n'],
+      ['crlf', 'one\r\ntwo\r\nthree\r\n'],
+      ['mixed', 'one\r\ntwo\nthree\r\n'],
+      ['mixed', 'one\rtwo'],
+      ['none', 'a single line with no break at all']
+    ])('read_file classifies the whole file as %s (%j)', async (expected, content) => {
+      const forModel = await readBack('endings.txt', content);
+      expect(forModel.lineEnding).toBe(expected);
+      expect(forModel.content).toBe(content); // classification never changes what is returned
+    });
+
+    it('classifies from the complete file, not from the returned slice', async () => {
+      const content = `${'x'.repeat(300)}\r\nsecond line\r\n`;
+      const forModel = await readBack('window.txt', content, 50);
+
+      expect(forModel.content).toBe('x'.repeat(50)); // this window holds no line break at all
+      expect(forModel.lineEnding).toBe('crlf');
+    });
+
+    it('still packs a line-ending-bearing, escape-heavy result inside the serialized budget', async () => {
+      const line = '1. Open the "Settings" page, choose `Local inference`\\and press "Start"; expect "Healthy".\r\n';
+      const forModel = await readBack('heavy.txt', line.repeat(420), 65_536, 1_500);
+
+      expect(forModel.lineEnding).toBe('crlf');
+      expect(forModel.bytesRead).toBeGreaterThan(0);
+      expect(Buffer.byteLength(JSON.stringify(forModel), 'utf8')).toBeLessThanOrEqual(1_500);
+    });
+
+    it('replaces text in a CRLF file when oldText carries real CR and LF characters (what a single-backslash JSON escape decodes to)', async () => {
+      const original = 'title\r\nkeep this line\r\ntail\r\n';
+      const decoded = (JSON.parse('{"oldText":"keep this line\\r\\ntail"}') as { oldText: string }).oldText;
+      expect(decoded).toBe('keep this line\r\ntail');
+
+      const { result, bytes } = await replaceIn('crlf.txt', original, decoded, 'kept\r\ntail');
+
+      expect(result).toMatchObject({ ok: true });
+      expect(bytes.toString('utf8')).toBe('title\r\nkept\r\ntail\r\n');
+    });
+
+    it.each([
+      ['crlf', 'CRLF', 'first line\r\nsecond line\r\n', `first line${literalCrlf}second line`],
+      ['lf', 'LF', 'first line\nsecond line\n', 'first line\\nsecond line']
+    ])('refuses a literal backslash escape in oldText on a %s file with a precise diagnosis and writes nothing', async (_style, label, content, oldText) => {
+      const { result, boundary, bytes } = await replaceIn('escaped.txt', content, oldText, 'replacement');
+
+      expect(result).toMatchObject({ ok: false, code: 'replacement_escape_suspected' });
+      if (result.ok) throw new Error('expected a refusal');
+      expect(result.reason).toContain(`${label} line endings`);
+      expect(result.reason).toContain('JSON escaping');
+      expect(result.reason.length).toBeLessThanOrEqual(ORNITH_LIMITS.maxErrorChars);
+      // Neither oldText nor any file content is echoed, and the text cannot be mistaken for a UNC path.
+      expect(result.reason).not.toContain('first line');
+      expect(result.reason).not.toContain('second line');
+      expect(containsAbsoluteMachinePath(result.reason)).toBe(false);
+      expect(bytes.toString('utf8')).toBe(content);
+      expect(boundary.changedFileCount()).toBe(0);
+    });
+
+    it.each([
+      ['mixed', 'first line\r\nsecond line\nthird'],
+      ['none', 'first line second line']
+    ])('keeps the plain replacement_mismatch for a %s file (no known LF/CRLF style to diagnose)', async (_style, content) => {
+      const { result, bytes } = await replaceIn('unknown-style.txt', content, `first line${literalCrlf}second line`, 'x');
+
+      expect(result).toMatchObject({ ok: false, code: 'replacement_mismatch' });
+      expect(bytes.toString('utf8')).toBe(content);
+    });
+
+    it('keeps the plain replacement_mismatch when oldText has no literal backslash escape', async () => {
+      const { result } = await replaceIn('plain.txt', 'a\r\nb\r\n', 'not present', 'x');
+
+      expect(result).toMatchObject({ ok: false, code: 'replacement_mismatch' });
+    });
+
+    it('does not diagnose text that really occurs in the file more than once: that is an ambiguous match, not an escaping mistake', async () => {
+      const content = `a${literalCrlf}b\r\nc${literalCrlf}d\r\n`;
+      const { result } = await replaceIn('twice.txt', content, literalCrlf, 'x');
+
+      expect(result).toMatchObject({ ok: false, code: 'replacement_mismatch' });
+    });
+
+    it('checks the file hash first: a stale sha256 is still stale_hash, never the escape diagnosis', async () => {
+      const { result, bytes } = await replaceIn(
+        'stale.txt', 'first line\r\nsecond line\r\n', `first line${literalCrlf}second line`, 'x', sha('some other content')
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'stale_hash' });
+      expect(bytes.toString('utf8')).toBe('first line\r\nsecond line\r\n');
+    });
+
+    it('never classifies or diagnoses input that is not valid UTF-8, even when it holds CR/LF bytes: both tools refuse it as non-text first', async () => {
+      // CR LF, then bytes that are not UTF-8, then the four literal characters an escaped CRLF decodes to.
+      const raw = Buffer.concat([Buffer.from('line\r\n'), Buffer.from([0xff, 0xfe]), Buffer.from(literalCrlf), Buffer.from('\r\n')]);
+      writeFileSync(join(worktree, 'binary.dat'), raw);
+
+      const read = await tools().readFile(
+        { version: 1, action: 'read_file', path: 'binary.dat', offset: 0, limit: 100 }, undefined, budget
+      );
+      expect(read).toMatchObject({ ok: false, code: 'path_not_regular_file' });
+      expect(JSON.stringify(read)).not.toContain('lineEnding');
+
+      const boundary = tools();
+      const replaced = await boundary.replaceText(
+        {
+          version: 1, action: 'replace_text', path: 'binary.dat', sha256: sha(raw),
+          replacements: [{ oldText: literalCrlf, newText: 'x' }]
+        },
+        undefined,
+        budget
+      );
+      expect(replaced).toMatchObject({ ok: false, code: 'path_not_regular_file' });
+      expect(readFileSync(join(worktree, 'binary.dat')).equals(raw)).toBe(true);
+      expect(boundary.changedFileCount()).toBe(0);
+    });
+
+    it('is all-or-nothing across several replacements: a valid first one followed by an escape-suspected second one writes nothing', async () => {
+      const content = 'alpha\r\nbeta line\r\ngamma\r\n';
+      writeFileSync(join(worktree, 'multi.txt'), content);
+      const boundary = tools();
+
+      const result = await boundary.replaceText(
+        {
+          version: 1, action: 'replace_text', path: 'multi.txt', sha256: sha(content),
+          replacements: [
+            { oldText: 'alpha', newText: 'ALPHA' }, // valid, would apply in memory first
+            { oldText: `beta line${literalCrlf}gamma`, newText: 'x' } // escape-suspected
+          ]
+        },
+        undefined,
+        budget
+      );
+
+      expect(result).toMatchObject({ ok: false, code: 'replacement_escape_suspected' });
+      expect(readFileSync(join(worktree, 'multi.txt'), 'utf8')).toBe(content); // not even the first replacement landed
+      expect(boundary.changedFileCount()).toBe(0);
+    });
+
+    it('replaces a block that spans a CRLF and a bare LF in a mixed file byte-exactly, converting nothing', async () => {
+      const content = 'one\r\ntwo\nthree\r\nfour\n';
+      const spanning = 'two\nthree\r\nfour'; // what single-backslash JSON escapes for LF and CRLF decode to
+
+      const { result, bytes } = await replaceIn('mixed.txt', content, spanning, 'TWO\nTHREE\r\nFOUR');
+
+      expect(result).toMatchObject({ ok: true });
+      expect(bytes.toString('utf8')).toBe('one\r\nTWO\nTHREE\r\nFOUR\n');
+    });
+
+    it('never decodes or normalizes literal backslash sequences that really are the file text', async () => {
+      // A CRLF documentation file whose text legitimately contains the four-character sequence.
+      const original =
+        `Escapes\r\nUse ${literalCrlf} in a JSON string.\r\nAlso keep ${literalCrlf} and \\n here.\r\nend\r\n`;
+      const { result, bytes } = await replaceIn(
+        'doc.md', original, `Use ${literalCrlf} in a JSON string.`, `Use ${literalCrlf} or \\r in a JSON string.`
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      // Only the addressed literal text changed; every other literal sequence and every real CRLF is byte-identical.
+      expect(bytes.toString('utf8')).toBe(
+        `Escapes\r\nUse ${literalCrlf} or \\r in a JSON string.\r\nAlso keep ${literalCrlf} and \\n here.\r\nend\r\n`
+      );
+      const forModel = await readBack('doc-after.txt', bytes.toString('utf8'));
+      expect(forModel.content).toBe(bytes.toString('utf8'));
+      expect(forModel.lineEnding).toBe('crlf');
     });
   });
 });

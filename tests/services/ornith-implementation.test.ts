@@ -2,14 +2,15 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ExecaProcessRunner } from '../../src/main/adapters/process/process-runner';
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
+import { ExecaProcessRunner, type ProcessResult, type ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
 import {
   normalizeOrnithPromptInput,
   OrnithImplementationService,
   preflightOrnithPrompt
 } from '../../src/main/services/ornith-implementation';
+import { OrnithWorktreeTools } from '../../src/main/services/ornith-worktree-tools';
 import type { AgentProgressEvent, OrnithHealthyLease, OrnithInferenceLeaseService } from '../../src/main/ports';
 import { AgentRelayError } from '../../src/shared/domain/errors';
 import {
@@ -503,10 +504,10 @@ describe('OrnithImplementationService limits and cancellation', () => {
     // `preflightOrnithPrompt` for the `chars` that yields each target budget)
     // rather than hand-deriving the offset.
     const budgetCases: { label: string; chars: number; expectedBudget: number }[] = [
-      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 124_415, expectedBudget: 384 },
-      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 124_369, expectedBudget: 407 },
-      { label: '408 bytes (right at the old fallback stub size)', chars: 124_367, expectedBudget: 408 },
-      { label: '471 bytes ("408+": comfortably normal)', chars: 124_241, expectedBudget: 471 }
+      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 122_027, expectedBudget: 384 },
+      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 121_981, expectedBudget: 407 },
+      { label: '408 bytes (right at the old fallback stub size)', chars: 121_979, expectedBudget: 408 },
+      { label: '471 bytes ("408+": comfortably normal)', chars: 121_853, expectedBudget: 471 }
     ];
 
     for (const { label, chars, expectedBudget } of budgetCases) {
@@ -586,7 +587,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_415)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_027)}` // -> 384-byte budget
       };
       const preflight = preflightOrnithPrompt({
         specification: oversizedSpecification,
@@ -638,7 +639,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_415)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_027)}` // -> 384-byte budget
       };
       for (let index = 0; index < 40; index += 1) {
         writeFileSync(join(worktree, `s${String(index).padStart(3, '0')}.txt`), 'needle appears here\n', 'utf8');
@@ -680,7 +681,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(124_415)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_027)}` // -> 384-byte budget
       };
       // Multi-byte (3 UTF-8 bytes each) names: short enough in UTF-16 code units to
       // stay well under Windows' MAX_PATH, long enough in UTF-8 bytes that every
@@ -817,11 +818,15 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(() => readFileSync(join(worktree, 'large.ts'), 'utf8')).toThrow();
   });
 
-  it('terminates immediately when the cumulative read budget is exhausted', async () => {
+  it('terminates once the cumulative read budget is exhausted and its one recovery attempt is also denied', async () => {
     const content = 'x'.repeat(ORNITH_LIMITS.maxFileBytes);
     writeFileSync(join(worktree, 'large.txt'), content, 'utf8');
     let calls = 0;
-    const actions = Array.from({ length: 5 }, (_unused, offset) => JSON.stringify({
+    // 4 reads exhaust the 4MB cumulative budget exactly. The 5th is denied and
+    // gets the one bounded `limit_read_bytes_exceeded` recovery attempt; the
+    // 6th (a distinct offset, so not caught by the identical-action guard) is
+    // denied again with none left, ending the run.
+    const actions = Array.from({ length: 6 }, (_unused, offset) => JSON.stringify({
       version: 1,
       action: 'read_file',
       path: 'large.txt',
@@ -841,7 +846,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
 
     expect(result.assessment.reasonCodes).toContain('limit_read_bytes_exceeded');
     expect(result.ornithAudit.readBytes).toBe(ORNITH_LIMITS.maxCumulativeReadBytes);
-    expect(calls).toBe(5);
+    expect(calls).toBe(6);
   }, 60_000);
 
   it('maps the whole-loop deadline during inference to limit_deadline_exceeded', async () => {
@@ -1232,6 +1237,603 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(result.assessment.reasonCodes).toContain('disallowed_action');
       expect(result.finalMessage).toContain('read_file');
       expect(result.finalMessage).toContain('disallowed_action');
+    });
+  });
+
+  describe('read_file totalBytes / nextOffset through the full implement() loop', () => {
+    const manualLine = '1. Open the "Settings" page, choose `Local inference`\\and press "Start"; expect "Healthy".\n';
+    const endMarker = 'END-OF-MANUAL-TEST-MARKER\n';
+
+    function writeManualTest(): { bytes: number } {
+      mkdirSync(join(worktree, 'docs'), { recursive: true });
+      const content = `${manualLine.repeat(420)}${endMarker}`;
+      writeFileSync(join(worktree, 'docs', 'manual-test.md'), content, 'utf8');
+      return { bytes: Buffer.byteLength(content, 'utf8') };
+    }
+
+    it('jumps to the tail using totalBytes and edits it, with no content-free stub and no page-by-page crawl', async () => {
+      const { bytes } = writeManualTest();
+      // The real run's limits: 32K context, 4096 output tokens => ~10.9 KB tool-result budget.
+      const realLease = lease({ contextLimitTokens: 32_768, maxOutputTokens: 4_096 });
+      const prompts: string[] = [];
+      let calls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => realLease,
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          calls += 1;
+          const promptText = request.messages.map((message) => message.content).join('\n');
+          prompts.push(promptText);
+          if (calls === 1) {
+            // Exactly the request that used to come back as a content-free stub.
+            return completed(request, JSON.stringify({ version: 1, action: 'read_file', path: 'docs/manual-test.md', offset: 0, limit: 65_536 }));
+          }
+          if (calls === 2) {
+            const total = Number([...promptText.matchAll(/"totalBytes":(\d+)/g)].at(-1)?.[1]);
+            return completed(request, JSON.stringify({ version: 1, action: 'read_file', path: 'docs/manual-test.md', offset: total - 1_500, limit: 65_536 }));
+          }
+          if (calls === 3) {
+            const sha256 = [...promptText.matchAll(/"sha256":"([0-9a-f]{64})"/g)].at(-1)![1]!;
+            return completed(request, JSON.stringify({
+              version: 1, action: 'replace_text', path: 'docs/manual-test.md', sha256,
+              replacements: [{
+                oldText: 'END-OF-MANUAL-TEST-MARKER',
+                newText: 'END-OF-MANUAL-TEST-MARKER\n\n## Configured provider smoke-test checklist\n- [ ] Claude Code\n- [ ] Codex\n- [ ] Ornith'
+              }]
+            }));
+          }
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Appended the checklist.' }));
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        lease: realLease,
+        specification: { ...specification, scopedFilePaths: ['docs/manual-test.md'] }
+      });
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(result.ornithAudit.outcomes.map((o) => o.action)).toEqual(['read_file', 'read_file', 'replace_text']);
+      expect(result.ornithAudit.changedFiles).toBe(1);
+      expect(readFileSync(join(worktree, 'docs', 'manual-test.md'), 'utf8')).toContain('## Configured provider smoke-test checklist');
+      // Never the generic, content-free stub - the defect that made the real model crawl.
+      for (const prompt of prompts) {
+        expect(prompt).not.toContain('request a smaller page or read chunk');
+        expect(prompt).not.toContain('exceeded this runtime context budget');
+      }
+      // The first (large) read really returned content plus a continuation offset.
+      expect(prompts[1]).toContain('Local inference');
+      expect(prompts[1]).toMatch(/"nextOffset":\d+/);
+      expect(prompts[1]).toContain(`"totalBytes":${bytes}`);
+      // Honest accounting is unchanged: read + read + replace_text (which reads twice) each charge the whole file.
+      expect(result.ornithAudit.readBytes).toBe(bytes * 4);
+    }, 120_000);
+
+    it('tells the model about the new fields and the no-crawl rule, and every field it names really exists in a result', async () => {
+      const { bytes } = writeManualTest();
+      const prompts: string[] = [];
+      let calls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          calls += 1;
+          prompts.push(request.messages.map((message) => message.content).join('\n'));
+          return completed(
+            request,
+            calls === 1
+              ? JSON.stringify({ version: 1, action: 'read_file', path: 'docs/manual-test.md', offset: 0, limit: 200 })
+              : JSON.stringify({ version: 1, action: 'finish', summary: 'Looked.' })
+          );
+        }
+      };
+
+      await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
+
+      expect(prompts[0]).toContain('"totalBytes"');
+      expect(prompts[0]).toContain('"nextOffset"');
+      expect(prompts[0]).toContain('NEVER page through a large file in small');
+      expect(prompts[0]).toContain('files over 64 KB and binary files are skipped');
+      expect(prompts[0]).toMatch(/FULL size\s+against the/);
+      // The fields the protocol promises are present, with the values the tool really computed.
+      expect(prompts[1]).toContain(`"totalBytes":${bytes}`);
+      expect(prompts[1]).toMatch(/"nextOffset":\d+/);
+    }, 120_000);
+  });
+
+  describe('specification scope and read-budget recovery', () => {
+    it('reads and edits the one file the specification scoped, with zero list_files/search_text calls', async () => {
+      mkdirSync(join(worktree, 'docs'), { recursive: true });
+      const scopedContent = 'Manual test checklist\n';
+      writeFileSync(join(worktree, 'docs', 'manual-test.md'), scopedContent, 'utf8');
+      // Plenty of other repository files a repo-wide search/list would otherwise touch.
+      for (let index = 0; index < 30; index += 1) {
+        writeFileSync(join(worktree, `unrelated-${String(index).padStart(2, '0')}.ts`), 'export {};\n', 'utf8');
+      }
+      const sha256 = createHash('sha256').update(scopedContent, 'utf8').digest('hex');
+
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          if (requests.length === 1) {
+            return completed(request, JSON.stringify({ version: 1, action: 'read_file', path: 'docs/manual-test.md', offset: 0, limit: 4096 }));
+          }
+          if (requests.length === 2) {
+            return completed(request, JSON.stringify({
+              version: 1, action: 'replace_text', path: 'docs/manual-test.md', sha256,
+              replacements: [{ oldText: 'checklist', newText: 'checklist (updated)' }]
+            }));
+          }
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Updated the scoped checklist.' }));
+        }
+      };
+
+      const events: AgentProgressEvent[] = [];
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        specification: { ...specification, scopedFilePaths: ['docs/manual-test.md'] },
+        onProgress: (event) => events.push(event)
+      });
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(result.ornithAudit.changedFiles).toBe(1);
+      expect(result.ornithAudit.outcomes.map((o) => o.action)).toEqual(['read_file', 'replace_text']);
+      expect(readFileSync(join(worktree, 'docs', 'manual-test.md'), 'utf8')).toContain('checklist (updated)');
+      // Confirming scope is visible progress, not a silent stall before the first turn.
+      expect(events.some((event) => event.text.includes('Confirming specification scope'))).toBe(true);
+      const firstPrompt = requests[0]!.messages.map((message) => message.content).join('\n');
+      expect(firstPrompt).toContain('=== SCOPE ===');
+      expect(firstPrompt).toContain('  - docs/manual-test.md');
+      // The claims the SCOPE section makes must be true of the implementation:
+      // search_text is never narrowed for the model, and the list is not a wall.
+      expect(firstPrompt).toContain('a search does NOT automatically narrow itself to this list');
+      expect(firstPrompt).toContain('The list can be incomplete');
+    });
+
+    it('renders every confirmed scoped path once, in order, and drops the ones the manifest does not confirm', async () => {
+      mkdirSync(join(worktree, 'docs'), { recursive: true });
+      writeFileSync(join(worktree, 'docs', 'manual-test.md'), 'a\n', 'utf8');
+      writeFileSync(join(worktree, 'scoped.txt'), 'b\n', 'utf8');
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Inspected only.' }));
+        }
+      };
+
+      await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        specification: {
+          ...specification,
+          scopedFilePaths: ['scoped.txt', 'docs/not-tracked.md', 'docs/manual-test.md', 'scoped.txt']
+        }
+      });
+
+      const scopeSection = requests[0]!.messages.map((message) => message.content).join('\n')
+        .split('=== SCOPE ===')[1]!.split('\n=== ')[0]!;
+      const listed = scopeSection.split('\n').filter((line) => line.startsWith('  - '));
+      expect(listed).toEqual(['  - scoped.txt', '  - docs/manual-test.md']);
+    });
+
+    it('preflight already charges the largest possible SCOPE section, so resolving the scope can only make the prompt smaller', () => {
+      const fullScope = Array.from({ length: ORNITH_LIMITS.maxScopedFilePaths }, (_, index) =>
+        `docs/${'d'.repeat(180)}-${String(index).padStart(2, '0')}.md`
+      );
+      const budgetFor = (scopedFilePaths: readonly string[]): number => {
+        const checked = preflightOrnithPrompt({
+          specification: { ...specification, scopedFilePaths: [...scopedFilePaths] },
+          ruleEvidence: null,
+          acceptedPlanReviewAddenda: null,
+          correctionFindings: null,
+          round: 1,
+          maxRounds: 3,
+          lease: lease({ contextLimitTokens: 16_384, maxOutputTokens: 1_024 })
+        });
+        expect(checked.ok).toBe(true);
+        if (!checked.ok) throw new Error('preflight unexpectedly refused');
+        return checked.budget.maxToolResultBytes;
+      };
+
+      // Every subset resolution can produce (including "unconfirmed" = none) leaves
+      // at least as much tool-result room as the full declared list preflight used.
+      const full = budgetFor(fullScope);
+      expect(budgetFor(fullScope.slice(0, 10))).toBeGreaterThanOrEqual(full);
+      expect(budgetFor([])).toBeGreaterThan(full);
+    });
+
+    it('bounds eager scope confirmation by the whole-loop deadline: it fails with limit_deadline_exceeded before any inference and the deadline reaches the git layer', async () => {
+      writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
+      let abortSeenByGit = false;
+      // Every git call takes 1.5s unless the caller's signal aborts it first, so a
+      // manifest build (several calls, up to two attempts) would run far past a
+      // 400ms loop deadline if the deadline never reached this layer.
+      const slowRunner: ProcessRunner = {
+        run: (file, args, options) => new Promise<ProcessResult>((resolve) => {
+          const signal = options?.signal;
+          const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            void runner.run(file, args, options).then(resolve);
+          }, 1_500);
+          function onAbort(): void {
+            abortSeenByGit = true;
+            clearTimeout(timer);
+            resolve({
+              command: file, exitCode: null, stdout: '', stderr: '', timedOut: false, cancelled: true, durationMs: 1, failed: true
+            });
+          }
+          if (signal?.aborted) onAbort();
+          else signal?.addEventListener('abort', onAbort, { once: true });
+        })
+      };
+      let inferenceCalls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          inferenceCalls += 1;
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'not reached' }));
+        }
+      };
+
+      const startedAt = Date.now();
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal, 400),
+        runner: slowRunner,
+        specification: { ...specification, scopedFilePaths: ['scoped.txt'] }
+      });
+
+      expect(result.assessment.reasonCodes).toContain('limit_deadline_exceeded');
+      expect(result.assessment.publishBlock).toBe('configuration');
+      expect(inferenceCalls).toBe(0);
+      expect(abortSeenByGit).toBe(true); // the deadline signal itself, not just a later check
+      expect(Date.now() - startedAt).toBeLessThan(1_400); // far below one un-aborted git call (1.5s), let alone a whole manifest build
+    }, 30_000);
+
+    it('emits a diagnostic note and falls back to unrestricted discovery when declared scope does not exist', async () => {
+      writeFileSync(join(worktree, 'real.txt'), 'needle here\n', 'utf8');
+      const events: AgentProgressEvent[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) =>
+          completed(request, JSON.stringify({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 }))
+      };
+
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        specification: { ...specification, scopedFilePaths: ['docs/does-not-exist.md'] },
+        onProgress: (event) => events.push(event)
+      });
+
+      expect(events.some((event) => event.text.includes('could not be confirmed'))).toBe(true);
+      // Falls back to unrestricted: the search still finds the real file.
+      expect(result.ornithAudit.outcomes[0]).toMatchObject({ action: 'search_text', ok: true });
+    });
+
+    /**
+     * Builds a repository of `count` same-size tracked files (each exactly at
+     * `ORNITH_LIMITS.maxReadBytes`, so `search_text` reads every byte of every
+     * one of them and none is skipped for being individually oversized) whose
+     * total exactly equals the whole cumulative read budget, leaving nothing
+     * remaining — including for the tiny pre-existing `fixture.txt` from
+     * `beforeEach`, which a search_text `continue`-past-oversized-candidates
+     * scan would otherwise still find room for. Reproduces the real observed
+     * run (a broad search that ate the whole budget, followed by a later
+     * search this account could no longer fit at all).
+     */
+    function writeBudgetExhaustingFiles(): { fileBytes: number; count: number; remainingAfterFirstSearch: number } {
+      const fileBytes = ORNITH_LIMITS.maxReadBytes; // exactly at the per-file cap, not over it
+      const count = ORNITH_LIMITS.maxCumulativeReadBytes / fileBytes; // exact division: 64
+      for (let index = 0; index < count; index += 1) {
+        const content = index === 0
+          ? `needle\n${'a'.repeat(fileBytes - 7)}`
+          : 'a'.repeat(fileBytes);
+        writeFileSync(join(worktree, `f${String(index).padStart(3, '0')}.txt`), content, 'utf8');
+      }
+      return {
+        fileBytes,
+        count,
+        remainingAfterFirstSearch: ORNITH_LIMITS.maxCumulativeReadBytes - count * fileBytes
+      };
+    }
+
+    it('feeds a real read-budget denial back once, then completes once the model pivots to a valid mutation', async () => {
+      const { fileBytes, remainingAfterFirstSearch } = writeBudgetExhaustingFiles();
+      expect(remainingAfterFirstSearch).toBeLessThan(fileBytes); // a further broad search cannot fit even one file
+      const broadSearch = JSON.stringify({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 });
+      const differentSearch = JSON.stringify({ version: 1, action: 'search_text', query: 'other-term', caseSensitive: false, limit: 10 });
+      let calls = 0;
+      const events: AgentProgressEvent[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          calls += 1;
+          if (calls === 1) return completed(request, broadSearch); // consumes almost the whole budget
+          if (calls === 2) return completed(request, broadSearch); // identical repeat: rejected, not dispatched
+          if (calls === 3) return completed(request, differentSearch); // over budget: denied, zero progress
+          if (calls === 4) return completed(request, JSON.stringify({ version: 1, action: 'create_file', path: 'result.md', content: 'Found it.' }));
+          if (calls === 5) return completed(request, JSON.stringify({ version: 1, action: 'run_verification' }));
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Pivoted after the read-budget denial.' }));
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        runVerification: async () => ({ passed: true, summary: 'passed' }),
+        onProgress: (event) => events.push(event)
+      });
+
+      expect(calls).toBe(6);
+      expect(result.assessment.disposition).toBe('pass');
+      expect(result.ornithAudit.changedFiles).toBe(1);
+      expect(readFileSync(join(worktree, 'result.md'), 'utf8')).toBe('Found it.');
+      // The denial was fed back as recoverable, not as a terminal stop.
+      expect(events.some((event) => event.text.includes('recovering with feedback'))).toBe(true);
+      expect(events.some((event) => event.text.includes('the run stopped'))).toBe(false);
+    });
+
+    it('does not redispatch a repeated read-budget denial and ends in a bounded terminal failure with zero mutation', async () => {
+      writeBudgetExhaustingFiles();
+      const broadSearch = JSON.stringify({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 });
+      const differentSearch = JSON.stringify({ version: 1, action: 'search_text', query: 'other-term', caseSensitive: false, limit: 10 });
+      let dispatchedDifferentSearch = 0;
+      let calls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          calls += 1;
+          if (calls === 1) return completed(request, broadSearch);
+          if (calls === 2) return completed(request, broadSearch); // duplicate: not dispatched
+          // Every remaining turn repeats the SAME over-budget request: the
+          // identical-action guard must intercept every one after the first.
+          return completed(request, differentSearch);
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement(
+        baseRequest(leaseService, new AbortController().signal)
+      );
+
+      dispatchedDifferentSearch = result.ornithAudit.outcomes.filter(
+        (o) => o.action === 'search_text' && o.code === 'limit_read_bytes_exceeded'
+      ).length;
+      expect(dispatchedDifferentSearch).toBe(1); // denied exactly once for real; every repeat after was intercepted
+      expect(calls).toBe(5); // 1 real + 1 duplicate + 1 real denial + 1 duplicate + 1 no-progress terminal
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.reasonCodes).toContain('no_progress_loop');
+      expect(result.ornithAudit.changedFiles).toBe(0);
+    });
+
+    it('fails closed as configuration, not security, when the model cannot safely continue after its one recovery attempt', async () => {
+      writeBudgetExhaustingFiles();
+      const broadSearch = JSON.stringify({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 });
+      const differentSearch = JSON.stringify({ version: 1, action: 'search_text', query: 'other-term', caseSensitive: false, limit: 10 });
+      let calls = 0;
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          calls += 1;
+          if (calls === 1) return completed(request, broadSearch);
+          if (calls === 2) return completed(request, broadSearch);
+          if (calls === 3) return completed(request, differentSearch); // denied, recovered once
+          return completed(request, JSON.stringify({ version: 1, action: 'blocked', reason: 'Cannot safely proceed without more context.' }));
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement(
+        baseRequest(leaseService, new AbortController().signal)
+      );
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.publishBlock).toBe('configuration');
+      expect(result.assessment.reasonCodes).toContain('blocked');
+      expect(result.ornithAudit.changedFiles).toBe(0);
+    });
+  });
+
+  describe('replace_text JSON-escape diagnosis and its single recovery', () => {
+    const original = 'Title\r\nKeep this line\r\nTail\r\n';
+    const hash = createHash('sha256').update(original, 'utf8').digest('hex');
+    const readAction = JSON.stringify({ version: 1, action: 'read_file', path: 'crlf.md', offset: 0, limit: 4096 });
+    const finishAction = JSON.stringify({ version: 1, action: 'finish', summary: 'Updated the file.' });
+    /** The completion a model sends when `oldText`/`newText` decode to exactly these strings. */
+    const replace = (oldText: string, newText: string): string => JSON.stringify({
+      version: 1, action: 'replace_text', path: 'crlf.md', sha256: hash, replacements: [{ oldText, newText }]
+    });
+    /** What the real model sent: doubled backslashes, which decode to literal backslash characters. */
+    const wrongOldText = 'Keep this line\\r\\nTail';
+    /** What a correct single-backslash escape decodes to: real CR and LF. */
+    const rightOldText = 'Keep this line\r\nTail';
+
+    let replaceTextCalls: MockInstance;
+
+    beforeEach(() => {
+      writeFileSync(join(worktree, 'crlf.md'), original, 'utf8');
+      replaceTextCalls = vi.spyOn(OrnithWorktreeTools.prototype, 'replaceText');
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    async function run(completions: readonly string[], beforeTurn?: (turn: number) => void) {
+      const requests: LocalInferenceRequest[] = [];
+      const events: AgentProgressEvent[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          beforeTurn?.(requests.length);
+          const next = completions[requests.length - 1];
+          if (next === undefined) throw new Error(`the model was asked for turn ${requests.length} beyond the script`);
+          return completed(request, next);
+        }
+      };
+      const result = await new OrnithImplementationService().implement({
+        ...baseRequest(leaseService, new AbortController().signal),
+        onProgress: (event) => events.push(event)
+      });
+      const promptOf = (index: number): string => requests[index]!.messages.map((message) => message.content).join('\n');
+      const denials = events.filter((event) => (event.data as { ok?: boolean } | undefined)?.ok === false);
+      return { result, requests, events, denials, promptOf };
+    }
+
+    const onDisk = (): string => readFileSync(join(worktree, 'crlf.md'), 'utf8');
+
+    it('tells the model the file is CRLF and applies a replacement whose JSON escape is correct', async () => {
+      const { result, promptOf } = await run([
+        readAction,
+        replace(rightOldText, 'Kept this line\r\nTail'),
+        finishAction
+      ]);
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(promptOf(1)).toContain('"lineEnding":"crlf"');
+      expect(onDisk()).toBe('Title\r\nKept this line\r\nTail\r\n');
+      expect(replaceTextCalls).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses a doubled-backslash oldText with the exact diagnosis, writes nothing, and lets the model fix the escaping once', async () => {
+      const { result, denials, promptOf } = await run([
+        readAction,
+        replace(wrongOldText, 'Kept this line\r\nTail'), // refused
+        replace(rightOldText, 'Kept this line\r\nTail'), // the corrected, different retry
+        finishAction
+      ]);
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(result.ornithAudit.outcomes).toEqual([
+        { sequence: 1, action: 'read_file', ok: true },
+        { sequence: 2, action: 'replace_text', ok: false, code: 'replacement_escape_suspected' },
+        { sequence: 3, action: 'replace_text', ok: true }
+      ]);
+      // One denial event only, and it says the run will recover (no duplicate notification).
+      expect(denials).toHaveLength(1);
+      expect(denials[0]!.text).toContain('replacement_escape_suspected');
+      expect(denials[0]!.text).toContain('recovering with feedback');
+      expect(denials[0]!.data).toMatchObject({ code: 'replacement_escape_suspected', recoverable: true });
+      // The feedback the model sees names the style and the mistake and demands a DIFFERENT retry ...
+      const feedbackPrompt = promptOf(2);
+      expect(feedbackPrompt).toContain('"code":"replacement_escape_suspected"');
+      expect(feedbackPrompt).toContain('CRLF line endings');
+      expect(feedbackPrompt).toContain('JSON escaping');
+      expect(feedbackPrompt).toContain('DIFFERENT replace_text');
+      // ... and does not repeat the refused oldText back.
+      expect(feedbackPrompt.split('"code":"replacement_escape_suspected"')[1]).not.toContain('Keep this line');
+      expect(onDisk()).toBe('Title\r\nKept this line\r\nTail\r\n');
+      expect(replaceTextCalls).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not dispatch an identical retry: the run ends with the bounded escape failure and the file is unchanged', async () => {
+      const { result, requests, denials } = await run([
+        readAction,
+        replace(wrongOldText, 'x'),
+        replace(wrongOldText, 'x') // byte-identical to the refused request
+      ]);
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.publishBlock).toBe('configuration');
+      expect(result.assessment.reasonCodes).toEqual(['replacement_escape_suspected']);
+      expect(result.finalMessage).toContain('replacement_escape_suspected');
+      expect(result.ornithAudit.changedFiles).toBe(0);
+      expect(replaceTextCalls).toHaveBeenCalledTimes(1); // the second one never reached the tool
+      expect(requests).toHaveLength(3); // no further inference after the terminal failure
+      expect(denials.map((event) => (event.data as { recoverable: boolean }).recoverable)).toEqual([true, false]);
+      expect(onDisk()).toBe(original);
+    });
+
+    it('ends with a bounded terminal failure when the one retry is different but still wrongly escaped', async () => {
+      const { result, requests, denials } = await run([
+        readAction,
+        replace(wrongOldText, 'x'),
+        replace(wrongOldText, 'a different newText'), // different action, same escaping mistake
+        finishAction // never reached
+      ]);
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.reasonCodes).toEqual(['replacement_escape_suspected']);
+      expect(replaceTextCalls).toHaveBeenCalledTimes(2); // dispatched, refused again, and only then terminal
+      expect(requests).toHaveLength(3);
+      expect(denials.map((event) => (event.data as { recoverable: boolean }).recoverable)).toEqual([true, false]);
+      expect(onDisk()).toBe(original);
+    });
+
+    it('allows a read_file between the refusal and the corrected retry, and still succeeds', async () => {
+      const { result } = await run([
+        readAction,
+        replace(wrongOldText, 'Kept this line\r\nTail'),
+        readAction, // looking at the file again is a different action and is allowed
+        replace(rightOldText, 'Kept this line\r\nTail'),
+        finishAction
+      ]);
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(onDisk()).toBe('Title\r\nKept this line\r\nTail\r\n');
+    });
+
+    it('does not dispatch an identical retry even when the model reorders the JSON keys (the parsed action is canonical)', async () => {
+      // Same fields and values as replace(wrongOldText, 'x'), serialized in a different key order at both levels.
+      const reordered = '{"replacements":[{"newText":"x","oldText":' + JSON.stringify(wrongOldText) + '}],' +
+        '"sha256":"' + hash + '","path":"crlf.md","action":"replace_text","version":1}';
+      const { result, requests } = await run([readAction, replace(wrongOldText, 'x'), reordered]);
+
+      expect(result.assessment.reasonCodes).toEqual(['replacement_escape_suspected']);
+      expect(replaceTextCalls).toHaveBeenCalledTimes(1); // the reordered repeat never reached the tool
+      expect(requests).toHaveLength(3);
+      expect(onDisk()).toBe(original);
+    });
+
+    it('a corrected retry that still carries the OLD hash after the file was modified externally is a terminal stale_hash, with the external bytes intact', async () => {
+      const external = 'Title\r\nKeep this line\r\nTail\r\nadded by someone else\r\n';
+      const { result } = await run(
+        [readAction, replace(wrongOldText, 'x'), replace(rightOldText, 'Kept this line\r\nTail')],
+        (turn) => {
+          if (turn === 3) writeFileSync(join(worktree, 'crlf.md'), external, 'utf8'); // between the refusal and the retry
+        }
+      );
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.reasonCodes).toEqual(['stale_hash']);
+      expect(result.ornithAudit.changedFiles).toBe(0);
+      expect(replaceTextCalls).toHaveBeenCalledTimes(2); // dispatched, and refused by the unchanged hash check
+      expect(onDisk()).toBe(external);
+    });
+
+    it('keeps the stale-hash check ahead of the diagnosis: a wrong sha256 is terminal stale_hash, not a recoverable escape hint', async () => {
+      const wrongHash = 'f'.repeat(64);
+      const { result } = await run([
+        readAction,
+        JSON.stringify({
+          version: 1, action: 'replace_text', path: 'crlf.md', sha256: wrongHash,
+          replacements: [{ oldText: wrongOldText, newText: 'x' }]
+        })
+      ]);
+
+      expect(result.assessment.reasonCodes).toEqual(['stale_hash']);
+      expect(onDisk()).toBe(original);
+    });
+
+    it('explains JSON escaping and lineEnding in the protocol, with the exact single- and doubled-backslash forms', async () => {
+      const { promptOf } = await run([JSON.stringify({ version: 1, action: 'blocked', reason: 'Only reading the protocol.' })]);
+      const prompt = promptOf(0);
+
+      expect(prompt).toContain('"lineEnding" for the WHOLE file: "lf", "crlf", "mixed" or "none"');
+      expect(prompt).toContain('"\\r\\n" (one backslash before each letter) decodes to the real CR and LF');
+      expect(prompt).toContain('"\\\\r\\\\n" (doubled backslashes) decodes to four literal characters');
+      expect(prompt).toContain('(crlf: "\\r\\n", lf: "\\n"; mixed:\n  reproduce each break exactly as the content shows it)');
+      expect(prompt).toContain('never copy a JSON escape from a result\n  as literal text');
+      expect(prompt).toContain('Agent Relay converts neither form for you');
+      expect(prompt).toContain('code "replacement_escape_suspected" changed nothing and allows exactly\n  ONE retry');
     });
   });
 });

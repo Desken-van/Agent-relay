@@ -23,6 +23,8 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { AgentRelayError } from '../../shared/domain/errors';
 import {
   ORNITH_LIMITS,
+  classifyLineEnding,
+  containsLiteralLineBreakEscape,
   type OrnithAction,
   type OrnithDenialCode
 } from '../../shared/domain/ornith';
@@ -113,6 +115,16 @@ export interface OrnithWorktreeToolsOptions {
   readonly branchName: string;
   readonly runner: ProcessRunner;
   readonly gitExecutablePath?: string | null;
+  /**
+   * A specification's raw `scopedFilePaths` claim, already syntax-sanitized
+   * by `sanitizeScopedFilePaths` (main/services/ornith-implementation.ts).
+   * Intersected against the real manifest once, by `resolveAuthoritativeScope()`,
+   * to become `authoritativeScope` — a candidate that does not exist in this
+   * worktree is silently dropped, never treated as an error. Absent or fully
+   * unmatched means "no trustworthy scope": every existing code path then
+   * behaves exactly as it does without this option.
+   */
+  readonly scopedFilePathCandidates?: readonly string[];
   /** Deterministic race injection for security tests; never wired from IPC or model output. */
   readonly testHooks?: {
     readonly beforeMutation?: (
@@ -183,6 +195,17 @@ export class OrnithWorktreeTools {
   private readonly rootInode: bigint | number;
   private readonly fsGuard: WindowsFsGuard;
   private nativeRootIdentity: WindowsFsRootIdentity | null = null;
+  /** Manifest-confirmed subset of `scopedFilePathCandidates`; computed only by `resolveAuthoritativeScope()`. */
+  private authoritativeScope: readonly string[] | null = null;
+  /**
+   * Set once `resolveAuthoritativeScope()` has decided, success or failure, so
+   * every later call returns the SAME answer that was already reported to the
+   * model (e.g. a manifest build that failed transiently during the eager
+   * pre-loop call is never quietly retried into a different scope). Nothing
+   * else derives or touches `authoritativeScope`: it is not part of the
+   * manifest's own lifecycle.
+   */
+  private authoritativeScopeDecided = false;
 
   constructor(private readonly deps: OrnithWorktreeToolsOptions) {
     this.fsGuard = deps.fsGuard ?? new ExecaWindowsFsGuard(deps.runner);
@@ -389,6 +412,53 @@ export class OrnithWorktreeTools {
     } finally {
       dispose();
     }
+  }
+
+  /**
+   * Resolve and cache `authoritativeScope` against the real manifest, building
+   * the manifest if needed. Read-only, never mutates. Intended to be called
+   * once, eagerly, before the first prompt is built, so a scoped run's very
+   * first turn can already name the confirmed file(s) instead of discovering
+   * them lazily on first tool dispatch.
+   *
+   * Retries `ensureManifest()` up to twice before giving up: a review round
+   * found that freezing the decision after a single failure could permanently
+   * lose the scope hint for the rest of the run over a one-off transient
+   * hiccup (e.g. a momentary git-spawn delay under load), reproducing the
+   * unscoped-discovery cost this feature exists to avoid for the ENTIRE run
+   * rather than just this one check. Two attempts bounds that cost: a
+   * genuinely broken worktree fails both quickly and is then independently
+   * re-detected by the loop's own per-iteration `assertCheckoutIdentity`
+   * regardless, so nothing is masked either way — only a truly transient
+   * failure benefits from the second try. Whatever the outcome, this remains
+   * the one and only authoritative decision for this run instance: the scope
+   * is computed here and nowhere else (it is not part of the manifest's own
+   * lifecycle), and every later call returns the same answer that was
+   * already reported to the model.
+   */
+  async resolveAuthoritativeScope(signal?: AbortSignal): Promise<readonly string[] | null> {
+    if (this.authoritativeScopeDecided) return this.authoritativeScope;
+    const maxAttempts = 2;
+    let manifestBuilt = false;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      // An aborted signal (task cancelled, or the caller's whole-loop deadline
+      // reached) is not a transient failure: retrying it only spends more time.
+      if (signal?.aborted) break;
+      try {
+        await this.ensureManifest(signal);
+        manifestBuilt = true;
+        break;
+      } catch {
+        // Fall through to the next attempt (if any).
+      }
+    }
+    if (manifestBuilt) {
+      const candidates = this.deps.scopedFilePathCandidates ?? [];
+      const confirmed = [...new Set(candidates)].filter((path) => this.knownFiles.has(path));
+      this.authoritativeScope = confirmed.length > 0 ? confirmed : null;
+    }
+    this.authoritativeScopeDecided = true;
+    return this.authoritativeScope;
   }
 
   /* ------------------------------------------------------------------ */
@@ -678,7 +748,38 @@ export class OrnithWorktreeTools {
     }
   }
 
-  async readFile(action: Extract<OrnithAction, { action: 'read_file' }>, signal?: AbortSignal, budget = DEFAULT_OPERATION_BUDGET): Promise<OrnithToolResult> {
+  /**
+   * Charges the WHOLE file's size against the read budget even when `action`
+   * only requests a small offset/limit slice, and even on a repeat read of a
+   * path already read this run. This is intentional, not an oversight: the
+   * whole file must be opened, read once, decoded, hashed (the returned
+   * `sha256` is over the complete content) and scanned for credential-shaped
+   * text before any slice of it can be safely returned, and the post-read
+   * identity re-verification below only makes sense against that same
+   * complete read. A per-run cache to avoid re-paying this on a later slice
+   * of an unchanged file was considered and rejected: this run's cumulative
+   * budget is meant to mean exactly "bytes actually read this run", and an
+   * existing, deliberately-designed test exercises the cumulative cap via
+   * repeated full-price reads of one large file at different offsets.
+   *
+   * `maxResultBytes` bounds the SERIALIZED result the same way `listFiles`'s and
+   * `searchText`'s do: the slice is packed against the exact serialized size
+   * (JSON escaping of quotes, backslashes and newlines can make a slice of
+   * N raw bytes serialize to well over N), so the result — including
+   * `totalBytes` and `nextOffset` — fits by construction instead of being
+   * replaced afterward by the generic "exceeded this runtime context budget"
+   * stub, which carries no content, no `sha256` and no way to continue. That
+   * defect made a weak model that asked for a large chunk receive nothing and
+   * fall back to paging through the file in tiny consecutive reads. Packing
+   * changes only how much of the already fully-read, fully-hashed,
+   * fully-scanned file is RETURNED; the byte charge above is unchanged.
+   */
+  async readFile(
+    action: Extract<OrnithAction, { action: 'read_file' }>,
+    signal?: AbortSignal,
+    budget = DEFAULT_OPERATION_BUDGET,
+    maxResultBytes = Number.POSITIVE_INFINITY
+  ): Promise<OrnithToolResult> {
     const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.filesystemTimeoutMs, signal);
     try {
       await this.ensureManifest(bounded);
@@ -721,22 +822,51 @@ export class OrnithWorktreeTools {
         if (containsSecretShape(completeText)) {
           return denied('disallowed_action', 'The file content looks credential-shaped and was not returned.');
         }
-        const sliced = safeUtf8Slice(raw, action.offset, action.limit);
         const sha256 = createHash('sha256').update(raw).digest('hex');
+        const totalBytes = raw.byteLength;
+        // Derived from the complete bytes already read and hashed above, never from
+        // the returned slice: a window that happens to hold no line break must not
+        // report "none" for a CRLF file.
+        const lineEnding = classifyLineEnding(raw);
+        const packed = packReadSlice(
+          raw,
+          action.offset,
+          action.limit,
+          (slice) => {
+            const end = slice.offset + slice.bytesRead;
+            return {
+              path: action.path,
+              offset: slice.offset,
+              bytesRead: slice.bytesRead,
+              totalBytes,
+              lineEnding,
+              // The offset a following chunk starts at; `null` once the end of
+              // the file has been returned, so "is there more" never has to be
+              // inferred from `eof` alone.
+              nextOffset: end >= totalBytes ? null : end,
+              eof: end >= totalBytes,
+              content: slice.text,
+              sha256
+            };
+          },
+          maxResultBytes
+        );
+        if (packed === null) {
+          return denied(
+            'limit_result_exceeded',
+            `Even an empty read_file result for this path needs more than the ${maxResultBytes} bytes that remain for ` +
+              'this tool result. No part of the file can be reported within the current budget.'
+          );
+        }
 
         return {
           ok: true,
-          forModel: {
-            path: action.path,
-            offset: sliced.offset,
-            bytesRead: sliced.bytesRead,
-            eof: sliced.offset + sliced.bytesRead >= fileStats.size,
-            content: sliced.text,
-            sha256
-          },
+          forModel: packed,
           readBytes: raw.byteLength,
           writeBytes: 0,
-          auditSummary: `read_file path="${action.path}" offset=${sliced.offset} bytes=${sliced.bytesRead} sha256=${sha256}`
+          auditSummary:
+            `read_file path="${action.path}" offset=${packed.offset} bytes=${packed.bytesRead} ` +
+            `of ${totalBytes} sha256=${sha256}`
         };
       } finally {
         await handle.close();
@@ -777,7 +907,30 @@ export class OrnithWorktreeTools {
   ): Promise<OrnithToolResult> {
     const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.searchTimeoutMs, signal);
     try {
+      // Nothing left to spend: no non-empty candidate can fit, so this is the one
+      // case that can be decided exactly - and therefore must fail BEFORE any
+      // manifest, identity or per-file work, not after walking every candidate.
+      // (With a small but non-zero remainder a later, smaller file may still fit,
+      // which cannot be known without looking at sizes, so that case scans.)
+      if (budget.readBytes <= 0) {
+        return denied(
+          'limit_read_bytes_exceeded',
+          'No repository read budget remains for this run; search_text made no progress.'
+        );
+      }
       const manifest = await this.ensureManifest(bounded);
+      // Deliberately NOT narrowed to `authoritativeScope`: a Coai review round
+      // found that silently limiting an omitted search to the specification's
+      // declared scope can permanently hide a real match in a file the scope
+      // claim did not name, whenever the scope files themselves also contain
+      // an incidental match for the query (so a "found something" result
+      // looks complete when it is not) — a specification's scope is a
+      // discovery hint, never a proof of completeness, and `search_text` has
+      // no way to safely tell the difference between "nothing else matches"
+      // and "the declared scope wasn't the whole story". Scoped discovery is
+      // instead achieved at the prompt level (the SCOPE section in
+      // `ornith-implementation.ts` tells the model it can `read_file` the
+      // named path directly, without needing to search for it at all).
       const candidates = action.files ?? manifest;
       for (const path of candidates) {
         if (!this.knownFiles.has(path)) {
@@ -817,9 +970,21 @@ export class OrnithWorktreeTools {
       let anySkippedDueToBudget = false;
       let firstSkipped: { path: string; line: number; requiredBytes: number } | null = null;
       let readBytesTotal = 0;
+      /** Set when at least one candidate's own size exceeded the remaining
+       *  cumulative read budget and was skipped without being opened. Does
+       *  NOT stop the scan — a later, smaller candidate may still fit — so
+       *  this only affects `truncated` and the zero-progress check below. */
+      let anySkippedDueToReadBudget = false;
 
       for (const path of candidates) {
         if (matches.length >= action.limit) break;
+        // The budget is spent exactly: no further non-empty candidate can fit, so
+        // stop instead of probing every remaining file just to skip each one. A
+        // candidate is still pending here, so the result is honestly truncated.
+        if (readBytesTotal >= budget.readBytes) {
+          anySkippedDueToReadBudget = true;
+          break;
+        }
         // Cheap, synchronous: several of this loop's own calls (`lstat`,
         // `resolvePathOnly`) take no signal, so without this the loop would
         // keep doing real filesystem work for the rest of a large candidate
@@ -836,7 +1001,14 @@ export class OrnithWorktreeTools {
           const stats = await lstat(resolved.absolutePath);
           if (stats.size > ORNITH_LIMITS.maxReadBytes) continue;
           if (readBytesTotal + stats.size > budget.readBytes) {
-            return denied('limit_read_bytes_exceeded', 'Search would exceed the remaining repository byte budget.');
+            // This exact candidate is never opened or read — every byte
+            // charged below still comes from a fully, successfully read
+            // candidate. A later, SMALLER candidate may still fit the
+            // remaining budget, so this skips just this one file rather than
+            // stopping the whole scan (a large file early in manifest order
+            // must not block smaller ones later in it).
+            anySkippedDueToReadBudget = true;
+            continue;
           }
           const safeRead = await this.readRegularFileSafely(
             resolved.absolutePath,
@@ -903,9 +1075,26 @@ export class OrnithWorktreeTools {
         );
       }
 
+      // Zero progress (nothing read, nothing found) despite at least one
+      // candidate being skipped for exceeding the remaining read budget: an
+      // honest, explicit denial — this is a real "this request cannot
+      // proceed" fact, eligible for the caller's bounded one-shot read-budget
+      // recovery. `readBytesTotal === 0` is sufficient to detect this: a
+      // match can only be recorded after a successful read, which always
+      // adds to `readBytesTotal` first — so if it is still 0, every examined
+      // candidate was either skipped for budget or otherwise unreadable, and
+      // nothing was genuinely searched.
+      if (anySkippedDueToReadBudget && readBytesTotal === 0) {
+        return denied(
+          'limit_read_bytes_exceeded',
+          `No candidate file could be read within the remaining repository read budget (${budget.readBytes} ` +
+            'byte(s)); search_text made no progress.'
+        );
+      }
+
       return {
         ok: true,
-        forModel: { matches, truncated: matches.length >= action.limit || anySkippedDueToBudget },
+        forModel: { matches, truncated: matches.length >= action.limit || anySkippedDueToBudget || anySkippedDueToReadBudget },
         readBytes: readBytesTotal,
         writeBytes: 0,
         auditSummary: `search_text -> ${matches.length} match(es) across ${candidates.length} file(s)`
@@ -1057,6 +1246,21 @@ export class OrnithWorktreeTools {
       let next = text;
       for (const replacement of action.replacements) {
         const occurrences = countOccurrences(next, replacement.oldText);
+        if (occurrences === 0 && containsLiteralLineBreakEscape(replacement.oldText)) {
+          // Diagnostic only: nothing is decoded, rewritten or applied. `raw` is the
+          // hash-verified current content, so the style is the file's real one. The
+          // reason names the style and the mistake, never file content or oldText.
+          const lineEnding = classifyLineEnding(raw);
+          if (lineEnding === 'lf' || lineEnding === 'crlf') {
+            return denied(
+              'replacement_escape_suspected',
+              `oldText matched nothing and contains a backslash followed by "n" or "r", while this file uses ` +
+                `${lineEnding.toUpperCase()} line endings. Probable JSON escaping mistake: a single-backslash JSON ` +
+                'escape decodes to a real line break, but a doubled backslash decodes to a literal backslash plus a ' +
+                'letter that cannot match a line break. Nothing was written or converted.'
+            );
+          }
+        }
         if (occurrences !== 1) {
           return denied(
             'replacement_mismatch',
@@ -1392,6 +1596,47 @@ function safeUtf8Slice(raw: Buffer, requestedOffset: number, limit: number): {
     bytesRead: bytes.byteLength,
     text: new TextDecoder('utf-8', { fatal: true }).decode(bytes)
   };
+}
+
+/**
+ * Return the largest UTF-8-safe slice of `raw` whose SERIALIZED result (as built
+ * by `build`) is at most `maxResultBytes`, or `null` when not even an empty
+ * slice fits. A binary search over the byte limit is enough: serialized size
+ * grows with the limit apart from a few bytes of noise (`eof`'s `true` versus
+ * `false`, `nextOffset`'s `null` versus a number), and the search only ever
+ * returns a candidate it has actually measured as fitting, so the guarantee
+ * is exact even where that noise makes the answer one or two bytes short of
+ * the true maximum.
+ */
+function packReadSlice<T>(
+  raw: Buffer,
+  requestedOffset: number,
+  requestedLimit: number,
+  build: (slice: { offset: number; bytesRead: number; text: string }) => T,
+  maxResultBytes: number
+): T | null {
+  const measure = (value: T): number => Buffer.byteLength(JSON.stringify(value), 'utf8');
+  const whole = build(safeUtf8Slice(raw, requestedOffset, requestedLimit));
+  if (measure(whole) <= maxResultBytes) return whole;
+
+  let best: T = build(safeUtf8Slice(raw, requestedOffset, 0));
+  if (measure(best) > maxResultBytes) return null;
+  let low = 1;
+  // JSON escaping can only ever INFLATE a slice, so a slice of more than
+  // `maxResultBytes` raw bytes can never serialize to within it: nothing above
+  // that is worth measuring.
+  let high = Math.min(requestedLimit - 1, maxResultBytes);
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = build(safeUtf8Slice(raw, requestedOffset, mid));
+    if (measure(candidate) <= maxResultBytes) {
+      best = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return best;
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {

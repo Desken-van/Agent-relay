@@ -89,6 +89,23 @@ export const ORNITH_LIMITS = {
    *  read-only action is recoverable this way; every other denial code
    *  remains terminal. */
   maxReadOnlyRecoveryAttempts: 3,
+  /** Separate, single-shot recovery budget for a read-only action denied by
+   *  `limit_read_bytes_exceeded`: one bounded chance to pivot to a mutation
+   *  using already-verified context before the run ends. Kept independent of
+   *  `maxReadOnlyRecoveryAttempts` because the two denials have different
+   *  causes (transient timeout vs. exhausted resource budget). */
+  maxReadBudgetRecoveryAttempts: 1,
+  /** Single-shot recovery for a `replace_text` refused with
+   *  `replacement_escape_suspected`. The refused call wrote nothing; the model
+   *  gets exactly one DIFFERENT retry, and an identical repeat is never
+   *  dispatched. */
+  maxReplacementEscapeRecoveryAttempts: 1,
+
+  /** Discovery-scope hint: how many of a specification's declared
+   *  `scopedFilePaths` entries are honored after syntax sanitization. Matches
+   *  `taskSpecificationSchema`'s own array cap; re-checked here because the
+   *  sanitizer is reused independently of that schema. */
+  maxScopedFilePaths: 20,
 
   /** Repository manifest. */
   maxManifestFiles: 20_000,
@@ -139,6 +156,7 @@ export const ORNITH_DENIAL_CODES = [
   'checkout_identity_changed',
   'stale_hash',
   'replacement_mismatch',
+  'replacement_escape_suspected',
   'file_exists',
   'file_not_found',
   'limit_turns_exceeded',
@@ -158,6 +176,55 @@ export const ORNITH_DENIAL_CODES = [
   'internal_error'
 ] as const;
 export type OrnithDenialCode = (typeof ORNITH_DENIAL_CODES)[number];
+
+/* -------------------------------------------------------------------------- */
+/* Line endings                                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The line-ending style of a whole file: `lf` and `crlf` mean every line break
+ * uses that one style; `mixed` means both styles occur or a lone CR is
+ * present; `none` means the file has no line break at all.
+ */
+export const ORNITH_LINE_ENDINGS = ['lf', 'crlf', 'mixed', 'none'] as const;
+export type OrnithLineEnding = (typeof ORNITH_LINE_ENDINGS)[number];
+
+/**
+ * Classify the line endings of an already-read, complete file. Works on bytes:
+ * 0x0A and 0x0D never occur inside a multi-byte UTF-8 sequence, so no decoding
+ * is needed and the result is exact for any valid UTF-8 text.
+ */
+export function classifyLineEnding(raw: Uint8Array): OrnithLineEnding {
+  let lf = 0;
+  let crlf = 0;
+  let cr = 0;
+  for (let index = 0; index < raw.length; index += 1) {
+    const byte = raw[index];
+    if (byte === 0x0d) {
+      if (raw[index + 1] === 0x0a) {
+        crlf += 1;
+        index += 1;
+      } else {
+        cr += 1;
+      }
+    } else if (byte === 0x0a) {
+      lf += 1;
+    }
+  }
+  if (lf + crlf + cr === 0) return 'none';
+  if (cr > 0 || (lf > 0 && crlf > 0)) return 'mixed';
+  return crlf > 0 ? 'crlf' : 'lf';
+}
+
+/**
+ * True when `value` contains a backslash immediately followed by `n` or `r`
+ * (which also covers the four-character text a doubled-backslash JSON escape
+ * of CRLF decodes to). Only a DIAGNOSTIC signal for a probable JSON-escaping
+ * mistake: it never rewrites, decodes or normalizes anything.
+ */
+export function containsLiteralLineBreakEscape(value: string): boolean {
+  return /\\[nr]/.test(value);
+}
 
 /* -------------------------------------------------------------------------- */
 /* Path & primitive schemas                                                   */
@@ -214,6 +281,30 @@ function isValidOrnithRelativePath(value: string): boolean {
 export const ornithRelativePathSchema = z
   .string()
   .refine(isValidOrnithRelativePath, 'Not a normalized repository-relative POSIX path.');
+
+/**
+ * Reduce a specification's raw, model-authored `scopedFilePaths` claim to a
+ * safe, deduplicated, bounded candidate list, using the exact same strict
+ * syntax check a live action's `path` field must pass. This is intentionally
+ * permissive at the schema layer (`taskSpecificationSchema` only bounds count
+ * and length) and strict here: a malformed or oversized entry is dropped
+ * individually rather than failing specification parsing outright, and later,
+ * manifest-membership filtering (in `OrnithWorktreeTools`) further narrows the
+ * result to paths that actually exist. Never throws.
+ */
+export function sanitizeScopedFilePaths(candidates: readonly string[] | undefined): string[] {
+  if (!candidates || candidates.length === 0) return [];
+  const seen = new Set<string>();
+  const sanitized: string[] = [];
+  for (const candidate of candidates) {
+    if (sanitized.length >= ORNITH_LIMITS.maxScopedFilePaths) break;
+    if (seen.has(candidate)) continue;
+    if (!ornithRelativePathSchema.safeParse(candidate).success) continue;
+    seen.add(candidate);
+    sanitized.push(candidate);
+  }
+  return sanitized;
+}
 
 /** Same rule, but an empty string is accepted to mean "the worktree root". */
 export const ornithRelativePrefixSchema = z
@@ -568,6 +659,47 @@ export const ORNITH_NONTERMINAL_ACTION_KINDS: readonly OrnithActionKind[] = [
 
 export function isOrnithTerminalAction(kind: OrnithActionKind): boolean {
   return kind === 'finish' || kind === 'blocked';
+}
+
+/* -------------------------------------------------------------------------- */
+/* Denied-action progress-event contract                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The exact `data` shape `OrnithImplementationService` attaches to a denied
+ * nonterminal action's `tool_use` progress event
+ * (`src/main/services/ornith-implementation.ts`). Shared with the renderer
+ * (`RelayTimeline.tsx`) so the two sides cannot silently drift apart — a
+ * service-side field rename or addition fails this type at compile time on
+ * both ends instead of only showing up as a renderer fallback to plain text.
+ */
+export interface OrnithToolDenialEventData {
+  readonly sequence: number;
+  readonly action: OrnithActionKind;
+  readonly ok: false;
+  readonly code: OrnithDenialCode;
+  readonly durationMs: number;
+  /** Whether this exact denial will be fed back for one more turn rather than ending the run. */
+  readonly recoverable: boolean;
+  readonly readBytesUsed: number;
+  readonly readBytesConfigured: number;
+  readonly changedFiles: number;
+}
+
+/** Narrows an already-JSON-decoded, untyped event `data` payload to {@link OrnithToolDenialEventData}. */
+export function isOrnithToolDenialEventData(
+  data: Record<string, unknown> | null
+): data is Record<string, unknown> & OrnithToolDenialEventData {
+  return (
+    data !== null &&
+    data['ok'] === false &&
+    typeof data['action'] === 'string' &&
+    typeof data['code'] === 'string' &&
+    typeof data['recoverable'] === 'boolean' &&
+    typeof data['readBytesUsed'] === 'number' &&
+    typeof data['readBytesConfigured'] === 'number' &&
+    typeof data['changedFiles'] === 'number'
+  );
 }
 
 /* -------------------------------------------------------------------------- */
