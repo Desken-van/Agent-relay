@@ -1157,6 +1157,42 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(pages).toBeGreaterThan(1);
     });
 
+    it('never splits a UTF-8 code point when packing: multi-byte text under a tight budget pages to exactly the original, every page valid', async () => {
+      // 2-, 3- and 4-byte code points mixed with characters that JSON-escape, so the
+      // packing binary search lands on many different byte limits, including
+      // ones that fall inside a code point.
+      const original = 'é€😀 "q" \\ end\n'.repeat(700);
+      writeFileSync(join(worktree, 'wide-escape.md'), original, 'utf8');
+      const boundary = tools();
+
+      let offset = 0;
+      let rebuilt = '';
+      let pages = 0;
+      for (;;) {
+        const page = await boundary.readFile(
+          { version: 1, action: 'read_file', path: 'wide-escape.md', offset, limit: 65_536 },
+          undefined,
+          { readBytes: 10_000_000, writeBytes: 0 },
+          700
+        );
+        if (!page.ok) throw new Error('expected a successful, packed read');
+        expect(serializedBytes(page.forModel)).toBeLessThanOrEqual(700);
+        const forModel = page.forModel as ReadResult;
+        expect(forModel.content).not.toContain('�'); // no replacement character: no split code point
+        expect(Buffer.byteLength(forModel.content, 'utf8')).toBe(forModel.bytesRead); // the text IS the bytes
+        expect(forModel.offset).toBe(offset);
+        expect(forModel.bytesRead).toBeGreaterThan(0);
+        rebuilt += forModel.content;
+        pages += 1;
+        if (forModel.nextOffset === null) break;
+        expect(forModel.nextOffset).toBe(forModel.offset + forModel.bytesRead);
+        offset = forModel.nextOffset;
+        expect(pages).toBeLessThan(2_000);
+      }
+      expect(rebuilt).toBe(original);
+      expect(pages).toBeGreaterThan(20);
+    });
+
     it('reproduces the real defect: a chunk that fit the raw-byte clamp but not the serialized budget now returns content instead of a stub', async () => {
       writeFileSync(join(worktree, 'escape.md'), escapeHeavy, 'utf8');
       const raw = readFileSync(join(worktree, 'escape.md'));
