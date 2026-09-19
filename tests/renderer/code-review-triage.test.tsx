@@ -913,6 +913,10 @@ describe('code review: panel visibility', () => {
     await screen.findByText('Finding A');
     expect(screen.queryByRole('button', { name: /Auto decide all undecided/ })).toBeNull();
     expect(autoButton('Finding A')).toHaveProperty('disabled', true);
+    // The operator is told why, and how to fix it, in the tooltip and as the accessible description.
+    const described = document.getElementById(autoButton('Finding A').getAttribute('aria-describedby') as string);
+    expect(described?.textContent).toMatch(/turned off in Settings/i);
+    expect(autoButton('Finding A').getAttribute('title')).toMatch(/turned off in Settings/i);
   });
 
   it('shows the real error when reading the evidence fails', async () => {

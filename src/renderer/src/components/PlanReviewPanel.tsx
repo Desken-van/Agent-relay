@@ -969,7 +969,9 @@ export function PlanReviewPanel({
                     findingLabel={finding.title}
                     disabled={!integrationEnabled || busy !== null}
                     blockedReason={
-                      hasDraft(index)
+                      !integrationEnabled
+                        ? 'External plan review is turned off in Settings. Turn it back on to use Auto decide.'
+                        : hasDraft(index)
                         ? 'You have already chosen a decision for this finding. Clear it first if you want Auto decide to decide instead.'
                         : needsUserByFinding.has(index)
                           ? 'Auto decide stopped on this finding on purpose. It needs your decision.'

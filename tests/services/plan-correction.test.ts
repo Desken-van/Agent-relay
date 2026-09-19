@@ -744,6 +744,67 @@ describe('plan correction loop: the Codex revision', () => {
   });
 });
 
+describe('plan correction loop: the crash window between the commit and the next review', () => {
+  it('resumes a committed correction by creating exactly one gate for the revised text, without asking Codex again', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change']), roundWith(value, [], 'proceed')];
+    value.reviewer.resolutionQueue = [revise(value), proceed(value)];
+    await value.gateService.review(task.id);
+    const source = currentGate(value, task.id);
+    await value.gateService.runResolve(task.id, {
+      gateId: source.id,
+      expectedRevision: source.revision,
+      decisions: decide([0, 'accept', 'Yes.']),
+      allowAccepted: true
+    });
+    // The process dies right after the atomic commit: the revised version and the completed
+    // correction are durable, but no gate exists for the revised specification yet.
+    const original = specOf(value, task.id);
+    const revised = JSON.stringify(makeSpecification({ summary: 'Revised before the crash' }));
+    const opened = value.corrections.begin({
+      id: 'correction-crashed',
+      versionId: 'version-generated',
+      taskId: task.id,
+      sourceGateId: source.id,
+      fromSpecificationSha256: specificationIdentity(original).sha256,
+      currentSpecificationJson: original,
+      acceptedJson: JSON.stringify([
+        { finding: 0, severity: 'major', category: 'reliability', file: 'src/a.ts', line: 1, title: 'Needs a change', why: 'w', fix: 'f', operatorNote: 'Yes.' }
+      ])
+    });
+    value.corrections.complete({
+      correctionId: opened.id,
+      versionId: 'version-revised',
+      expectedSpecificationJson: original,
+      newSpecificationJson: revised,
+      newSpecificationSha256: specificationIdentity(revised).sha256,
+      addressedJson: JSON.stringify([{ finding: 0, field: 'summary', change: 'Revised.' }])
+    });
+    expect(value.harness.planReviewGates.listByTask(task.id)).toHaveLength(1);
+    expect(value.loop.detail(task.id).nextStep).toBe('run_review');
+
+    // After the restart: a fresh service, exactly as a restarted process would build it.
+    const outcome = await value.loop.continueCorrection(task.id, { autoContinue: true });
+
+    expect(outcome.stopped).toBe('clean');
+    expect(outcome).toMatchObject({ correctionsRun: 0, roundsReviewed: 1 });
+    // One new gate, bound to the revised text; the old one is untouched history.
+    const gates = value.harness.planReviewGates.listByTask(task.id);
+    expect(gates).toHaveLength(2);
+    expect(gates[0]).toMatchObject({ specificationSha256: specificationIdentity(revised).sha256, status: 'proceeded' });
+    expect(gates[1]).toMatchObject({ id: source.id, specificationSha256: specificationIdentity(original).sha256 });
+    // Nothing was repeated: no second revision, no second correction, no second version.
+    expect(value.harness.codex.revisionCalls).toHaveLength(0);
+    expect(value.corrections.listByTask(task.id)).toHaveLength(1);
+    expect(value.corrections.listVersions(task.id)).toHaveLength(2);
+    // Resuming AGAIN is inert: it does not review the same text twice.
+    const again = await value.loop.continueCorrection(task.id, { autoContinue: true });
+    expect(again.stopped).toBe('clean');
+    expect(value.reviewer.reviewCalls).toHaveLength(2);
+  });
+});
+
 describe('plan correction loop: exclusion and reporting', () => {
   it('holds the task for its whole run: nothing else touches the plan review, and the phase is visible', async () => {
     const value = setup();

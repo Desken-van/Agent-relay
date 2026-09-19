@@ -478,7 +478,9 @@ export function CodeReviewPanel({
                         findingLabel={finding.title}
                         disabled={!integrationEnabled || busy !== null}
                         blockedReason={
-                          draft.action !== '' || draft.reason.trim().length > 0
+                          !integrationEnabled
+                            ? 'External code review is turned off in Settings. Turn it back on to use Auto decide.'
+                            : draft.action !== '' || draft.reason.trim().length > 0
                             ? 'You have already chosen a decision for this finding. Clear it first if you want Auto decide to decide instead.'
                             : stop
                               ? 'Auto decide stopped on this finding on purpose. It needs your decision.'

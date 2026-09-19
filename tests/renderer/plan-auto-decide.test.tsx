@@ -422,6 +422,21 @@ describe('plan review: Auto decide beside every Decision', () => {
     expect(autoCalls().map((call) => call.findingIndex)).toEqual([1]);
   });
 
+  it('with the integration off, says why Auto decide is unavailable and sends nothing', async () => {
+    serve(awaiting(1), (index, s) => s.decided(index, 'accept'));
+    render(<PlanReviewPanel task={task()} integrationEnabled={false} onChanged={async () => undefined} />);
+
+    await screen.findByText('Finding A');
+    const button = autoButton('Finding A');
+    expect(button).toHaveProperty('disabled', true);
+    expect(button.getAttribute('title')).toMatch(/turned off in Settings/i);
+    expect(document.getElementById(button.getAttribute('aria-describedby') as string)?.textContent).toMatch(
+      /turned off in Settings/i
+    );
+    fireEvent.click(button);
+    expect(autoCalls()).toHaveLength(0);
+  });
+
   it('will not analyze a finding the operator has already chosen or typed for, so a draft can never be discarded', async () => {
     serve(awaiting(2), (index, s) => s.decided(index, 'accept'));
     renderPanel();
