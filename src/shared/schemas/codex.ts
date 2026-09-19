@@ -71,9 +71,11 @@ export const taskSpecificationResponseSchema = z.object({
  * A specification stored before the field existed must stay readable, and
  * every consumer of a stored specification uses this schema, so the fallback
  * is defined once here. The factory gives each parse its own array.
+ *
+ * Derived from the response schema, overriding only that one field, so a field
+ * added to the contract reaches both the model and every reader.
  */
-export const taskSpecificationSchema = z.object({
-  ...specificationFields,
+export const taskSpecificationSchema = taskSpecificationResponseSchema.extend({
   scopedFilePaths: scopedFilePathsField.default(() => [])
 });
 

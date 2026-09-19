@@ -159,6 +159,18 @@ describe('specification parsing', () => {
     expect(taskSpecificationResponseSchema.safeParse(makeSpecification()).success).toBe(true);
   });
 
+  it('keeps the reading schema and the response schema on exactly the same fields, in the same order', () => {
+    // Order matters: the reader's key order is what specification identities hash.
+    expect(Object.keys(taskSpecificationSchema.shape)).toEqual(Object.keys(taskSpecificationResponseSchema.shape));
+    expect(Object.keys(taskSpecificationSchema.shape).at(-1)).toBe('scopedFilePaths');
+    // Every field except the one with a legacy default is the very same definition.
+    for (const [key, field] of Object.entries(taskSpecificationResponseSchema.shape)) {
+      if (key !== 'scopedFilePaths') {
+        expect(taskSpecificationSchema.shape[key as keyof typeof taskSpecificationSchema.shape]).toBe(field);
+      }
+    }
+  });
+
   it('reads any valid response identically through the strict and the reading schema', () => {
     const value = makeSpecification({ scopedFilePaths: ['docs/manual-test.md'] });
     expect(taskSpecificationSchema.parse(value)).toEqual(taskSpecificationResponseSchema.parse(value));
