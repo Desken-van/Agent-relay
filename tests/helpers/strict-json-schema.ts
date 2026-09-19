@@ -22,8 +22,12 @@ export function strictSchemaViolations(schema: unknown, path = '#'): string[] {
   if (!isRecord(schema)) return [];
   const violations: string[] = [];
 
-  if (isRecord(schema.properties)) {
-    const declared = Object.keys(schema.properties).sort();
+  // An object node is one that says so, or that declares properties: a bare
+  // `{ type: 'object' }` (what a free-form record becomes) breaks the rules too.
+  const isObject =
+    schema.type === 'object' || (Array.isArray(schema.type) && schema.type.includes('object')) || isRecord(schema.properties);
+  if (isObject) {
+    const declared = Object.keys(isRecord(schema.properties) ? schema.properties : {}).sort();
     const required = Array.isArray(schema.required) ? schema.required.map(String).sort() : [];
     const missing = declared.filter((key) => !required.includes(key));
     const unknown = required.filter((key) => !declared.includes(key));

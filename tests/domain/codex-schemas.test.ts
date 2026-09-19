@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 import { IMPLEMENTATION_REPORT_SCHEMA } from '../../src/main/adapters/codex/codex-adapter';
 import {
   codexReviewResultJsonSchema,
@@ -304,6 +305,23 @@ describe('JSON Schema projection handed to Codex', () => {
       '#/properties/list/items: properties not listed in required: x',
       '#/properties/maybe/anyOf/1: additionalProperties must be false'
     ]);
+  });
+
+  it('the strict-schema check also rejects an object that declares no properties, such as a free-form record', () => {
+    const record = z.toJSONSchema(z.object({ notes: z.record(z.string(), z.string()) }), {
+      target: 'draft-7',
+      io: 'output'
+    });
+    expect(strictSchemaViolations(record)).toEqual(['#/properties/notes: additionalProperties must be false']);
+    expect(strictSchemaViolations({ type: 'object' })).toEqual(['#: additionalProperties must be false']);
+    expect(strictSchemaViolations({ anyOf: [{ type: ['object', 'null'] }, { type: 'string' }] })).toEqual([
+      '#/anyOf/0: additionalProperties must be false'
+    ]);
+  });
+
+  it('the strict-schema check accepts a closed object with no properties', () => {
+    expect(strictSchemaViolations({ type: 'object', additionalProperties: false })).toEqual([]);
+    expect(strictSchemaViolations({ type: 'object', properties: {}, required: [], additionalProperties: false })).toEqual([]);
   });
 
   it('produces an object schema for the specification with all fields required', () => {
