@@ -1,0 +1,118 @@
+/**
+ * The process-wide register of operations that are running for a task and can
+ * be stopped.
+ *
+ * `Orchestrator.stop()` used to know only its own agent runs, so an operation
+ * that lives elsewhere — the plan-correction loop, an external plan-review call —
+ * was invisible to it: Stop moved the task to CANCELLED and the operation carried
+ * on in the background, free to write the specification or start another provider
+ * call for a task that had already ended. This registry is what Stop consults for
+ * everything that is not an agent run.
+ *
+ * It is built ONCE, in the composition root, and handed to the orchestrator and to
+ * every service the IPC layer builds per call. A per-call instance would give each
+ * invocation a private map and stop nothing. In memory on purpose: an entry means
+ * "a call is in flight in this process right now", which is only ever true of a
+ * live process; what survives a crash is the durable status of the rows.
+ *
+ * This is deliberately separate from `PlanReviewClaims`. Claims arbitrate which
+ * plan-review operations may overlap; this decides who can be cancelled. The two
+ * answer different questions and each keeps its own guarantees.
+ */
+
+import { AgentRelayError } from '../../shared/domain/errors';
+
+export type TaskOperationKind =
+  | 'plan_correction'
+  | 'plan_review'
+  | 'plan_reconcile'
+  | 'plan_resolve'
+  | 'plan_triage'
+  | 'plan_auto_decide';
+
+export interface TaskOperation {
+  readonly kind: TaskOperationKind;
+  /** The one signal every step of the operation must observe: Stop aborts it, and so does the caller's own. */
+  readonly signal: AbortSignal;
+  /** Idempotent. Always called in a `finally`, so an operation can never leave a stale entry behind. */
+  release(): void;
+}
+
+interface Entry {
+  readonly kind: TaskOperationKind;
+  readonly exclusive: boolean;
+  readonly controller: AbortController;
+}
+
+export class TaskOperationRegistry {
+  private readonly active = new Map<string, Set<Entry>>();
+
+  /**
+   * Register an operation for a task, or refuse.
+   *
+   * An `exclusive` operation is refused while anything else is registered for the
+   * task; a shared one (the analysis of one finding, of which several different
+   * findings may run at once) is refused only while an exclusive one is. Any
+   * `signal` the caller passes is linked to the operation's own controller, so
+   * aborting either stops the work.
+   */
+  begin(
+    taskId: string,
+    kind: TaskOperationKind,
+    options: { readonly exclusive: boolean; readonly signal?: AbortSignal }
+  ): TaskOperation {
+    const held = this.active.get(taskId);
+    if (held !== undefined && held.size > 0) {
+      const blocking = [...held].find((entry) => entry.exclusive || options.exclusive);
+      if (blocking !== undefined) {
+        throw new AgentRelayError(
+          'BUSY',
+          `This task already has an operation running (${blocking.kind.replace(/_/g, ' ')}). Stop it or wait for it to finish.`,
+          { remediation: 'Wait for the operation in flight to finish, or stop the task.' }
+        );
+      }
+    }
+
+    const controller = new AbortController();
+    const entry: Entry = { kind, exclusive: options.exclusive, controller };
+    const caller = options.signal;
+    const linked = (): void => controller.abort(caller?.reason);
+    if (caller?.aborted) controller.abort(caller.reason);
+    else caller?.addEventListener('abort', linked, { once: true });
+
+    const set = held ?? new Set<Entry>();
+    set.add(entry);
+    this.active.set(taskId, set);
+
+    let released = false;
+    return {
+      kind,
+      signal: controller.signal,
+      release: () => {
+        if (released) return;
+        released = true;
+        caller?.removeEventListener('abort', linked);
+        const current = this.active.get(taskId);
+        current?.delete(entry);
+        if (current !== undefined && current.size === 0) this.active.delete(taskId);
+      }
+    };
+  }
+
+  /** Abort everything registered for the task. Returns how many operations were signalled. */
+  abort(taskId: string): number {
+    const held = this.active.get(taskId);
+    if (held === undefined) return 0;
+    let signalled = 0;
+    for (const entry of [...held]) {
+      if (!entry.controller.signal.aborted) signalled += 1;
+      entry.controller.abort();
+    }
+    return signalled;
+  }
+
+  /** Whether any stoppable operation is registered for the task. */
+  isActive(taskId: string): boolean {
+    return (this.active.get(taskId)?.size ?? 0) > 0;
+  }
+}

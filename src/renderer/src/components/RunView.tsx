@@ -249,6 +249,7 @@ export function RunView(): React.JSX.Element {
   const [dirtyPrompt, setDirtyPrompt] = useState<string | null>(null);
   /** Non-null while the one primary action is in flight; names the action key. */
   const [primaryPending, setPrimaryPending] = useState<RunActionKey | null>(null);
+  const stopInFlight = useRef(false);
   const planPrimaryDispatch = useRef<((key: RunActionKey) => void) | null>(null);
   /** Synchronous double-click guard for "Continue anyway", mirroring `PrimaryActionButton`'s claim. */
   const continueAnywayClaim = useRef(false);
@@ -709,15 +710,28 @@ export function RunView(): React.JSX.Element {
             <button
               type="button"
               className="btn btn--danger btn--wide"
-              disabled={!running && isTerminal(task.status)}
-              onClick={() =>
+              // Stays usable while a correction loop or an agent runs — that is when it is
+              // needed — but not while its own request is pending, so a double click cannot
+              // send a second Stop for a task that is already ending.
+              disabled={busy['stop'] === true || (!running && isTerminal(task.status))}
+              aria-busy={busy['stop'] === true}
+              onClick={() => {
+                // Synchronous, like the other single-flight guards here: the disabled
+                // prop above only changes on the next render, and a burst of clicks in
+                // one tick must still send one Stop.
+                if (stopInFlight.current) return;
+                stopInFlight.current = true;
                 void perform('stop', 'Could not stop the task', async () => {
                   acceptTask(await expect('workflow:stop', { taskId: task.id }));
+                  // What was running read the task back and ended; show the result, not the old state.
+                  await refreshDetail(task.id);
                   notify({ tone: 'info', title: 'Task stopped' });
-                })
-              }
+                }).finally(() => {
+                  stopInFlight.current = false;
+                });
+              }}
             >
-              Stop task
+              {busy['stop'] === true ? <Spinner /> : null} {busy['stop'] === true ? 'Stopping…' : 'Stop task'}
             </button>
           </div>
         </Card>

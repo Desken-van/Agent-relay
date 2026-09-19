@@ -242,6 +242,55 @@ describe('Run screen — reflowed Actions still dispatch the original IPC channe
   });
 });
 
+describe('Run screen — Stop task while a plan-correction loop runs', () => {
+  const cancelledTask = () =>
+    taskSchema.parse({
+      id: 't', projectId: 'p', title: 'Fix the thing', originalRequest: 'Please fix it.',
+      status: 'CANCELLED', currentRound: 0, maxRounds: 3, codexThreadId: null,
+      claudeSessionId: null, worktreePath: null, branchName: null, baseBranch: null,
+      specificationJson: null, specificationApprovedAt: null, lastReviewJson: null,
+      lastError: 'Stopped by the user.', codexModel: null, claudeModel: null,
+      createdAt: '2026-09-10T00:00:00.000Z', updatedAt: '2026-09-10T00:00:00.000Z'
+    });
+
+  it('stays usable while the task sits in READY_FOR_IMPLEMENTATION — where the loop runs — and really calls workflow:stop', async () => {
+    const bridge = installBridge({ 'workflow:stop': () => ok<'workflow:stop'>(cancelledTask()) });
+    renderApp(<SeededRun detail={buildDetail({ status: 'READY_FOR_IMPLEMENTATION' })} />);
+
+    const button = await screen.findByRole('button', { name: 'Stop task' });
+    expect(button.hasAttribute('disabled')).toBe(false);
+    fireEvent.click(button);
+
+    await waitFor(() => expect(bridge.callsTo('workflow:stop')).toHaveLength(1));
+  });
+
+  it('shows the pending state, sends ONE stop however many times it is clicked, and reads the task back once it settles', async () => {
+    const detail = buildDetail({ status: 'READY_FOR_IMPLEMENTATION' });
+    const answer = deferred<ReturnType<typeof ok<'workflow:stop'>>>();
+    const bridge = installBridge({
+      'workflow:stop': () => answer.promise,
+      'tasks:get': () => ok<'tasks:get'>({ ...detail, task: cancelledTask() })
+    });
+    renderApp(<SeededRun detail={detail} />);
+
+    const button = await screen.findByRole('button', { name: 'Stop task' });
+    await burstClick(button, 4);
+
+    expect(bridge.callsTo('workflow:stop')).toHaveLength(1);
+    const pending = screen.getByRole('button', { name: /Stopping…/ });
+    expect(pending.hasAttribute('disabled')).toBe(true);
+    expect(pending.getAttribute('aria-busy')).toBe('true');
+    const readsBefore = bridge.callsTo('tasks:get').length;
+
+    await deliver(answer, ok<'workflow:stop'>(cancelledTask()));
+
+    // What was running has ended: the screen reads the task back instead of trusting the old state.
+    await waitFor(() => expect(bridge.callsTo('tasks:get').length).toBeGreaterThan(readsBefore));
+    expect(screen.queryByRole('button', { name: /Stopping…/ })).toBeNull();
+    expect(bridge.callsTo('workflow:stop')).toHaveLength(1);
+  });
+});
+
 describe('Run screen — publishing operation feedback', () => {
   const preview = {
     action: 'commit' as const,

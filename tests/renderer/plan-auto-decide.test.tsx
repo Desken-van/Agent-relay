@@ -822,6 +822,41 @@ describe('plan review: resolve and revise', () => {
     expect(block.textContent).toContain('Now tells the implementer to cap retries.');
   });
 
+  it('reports a Stop as a stop — never as a success, and not as a fault of the loop — and reads the round back', async () => {
+    serve(awaiting(1), (index, s) => s.decided(index, 'accept'));
+    bridge.set('planReview:resolveAndRevise', () =>
+      fail('The plan-correction loop was stopped. Nothing further was changed.', 'CANCELLED')
+    );
+    renderPanel();
+    await screen.findByText('Finding A');
+    fireEvent.click(autoButton('Finding A'));
+    await screen.findByText('Auto-decided: Accept');
+    const readsBefore = bridge.callsTo('planReview:get').length;
+
+    fireEvent.click(screen.getByRole('button', { name: /Resolve and revise plan/ }));
+
+    const notice = await screen.findByText(/The task was stopped\. The correction loop ended and nothing further was changed\./);
+    expect((notice.closest('[role="status"]') as HTMLElement).textContent).toContain('The plan-correction loop was stopped.');
+    // Not the success summary, and not the "loop failed" alert.
+    expect(screen.queryByText(/correction\(s\) run/)).toBeNull();
+    expect(screen.queryByText(/The correction loop stopped\. Nothing further was changed\./)).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    await waitFor(() => expect(bridge.callsTo('planReview:get').length).toBeGreaterThan(readsBefore));
+  });
+
+  it('reads the round back when the task it belongs to becomes CANCELLED, so it stops describing work that ended', async () => {
+    serve(awaiting(1), () => fail('unused'));
+    const view = renderPanel();
+    await screen.findByText('Finding A');
+    const readsBefore = bridge.callsTo('planReview:get').length;
+
+    view.rerender(
+      <PlanReviewPanel task={{ ...task(), status: 'CANCELLED' }} integrationEnabled onChanged={async () => undefined} />
+    );
+
+    await waitFor(() => expect(bridge.callsTo('planReview:get').length).toBeGreaterThan(readsBefore));
+  });
+
   it('shows the correction budget and the specification versions', async () => {
     serve(
       awaiting(1, {

@@ -63,6 +63,7 @@ import type {
   TaskRuleEvidenceRepository
 } from '../ports';
 import type { PlanReviewClaims } from './plan-review-claims';
+import type { TaskOperationRegistry } from './task-operations';
 import {
   planFindingsSha256,
   planReviewGateIdentity,
@@ -97,6 +98,12 @@ export interface PlanCorrectionDeps {
   readonly codex: Pick<CodexAdapter, 'reviseSpecification'>;
   readonly settings: SettingsRepository;
   readonly claims: PlanReviewClaims;
+  /**
+   * The process-wide register of stoppable operations — the SAME instance the
+   * orchestrator's `stop()` reads. Required, not optional: a loop that could not
+   * be stopped would be the defect this exists to prevent.
+   */
+  readonly operations: TaskOperationRegistry;
   readonly clock: Clock;
   readonly ids: IdGenerator;
   readonly events?: EventPublisher;
@@ -111,16 +118,22 @@ interface DerivedState {
   readonly max: number;
 }
 
-/** Run `work` over `items` with at most `limit` in flight; every item settles, none is skipped on failure. */
+/**
+ * Run `work` over `items` with at most `limit` in flight; every item that starts
+ * settles, none is skipped on failure. Once `stopped()` is true no further item is
+ * DISPATCHED (those already running finish on their own), and the result holds only
+ * the items that ran.
+ */
 async function settleAll<T, R>(
   items: readonly T[],
   limit: number,
-  work: (item: T) => Promise<R>
+  work: (item: T) => Promise<R>,
+  stopped: () => boolean = () => false
 ): Promise<PromiseSettledResult<R>[]> {
   const results: PromiseSettledResult<R>[] = new Array(items.length);
   let cursor = 0;
   const worker = async (): Promise<void> => {
-    while (cursor < items.length) {
+    while (cursor < items.length && !stopped()) {
       const index = cursor;
       cursor += 1;
       try {
@@ -131,7 +144,7 @@ async function settleAll<T, R>(
     }
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
-  return results;
+  return results.filter((entry) => entry !== undefined);
 }
 
 /** The dependencies the read side needs — no Codex, no Coai. */
@@ -272,11 +285,27 @@ export class PlanCorrectionService {
     taskId: string,
     autoContinue: boolean,
     initial: PlanResolveAndReviseRequest | null,
-    signal?: AbortSignal
+    callerSignal?: AbortSignal
   ): Promise<PlanAdvanceOutcome> {
+    // Registered as a stoppable operation BEFORE any provider work, in the
+    // process-wide register `Orchestrator.stop()` reads. Its signal is the ONE
+    // signal every step below observes — the caller's own is linked to it — and it
+    // is removed in the `finally`, whatever happens.
+    const operation = this.deps.operations.begin(taskId, 'plan_correction', {
+      exclusive: true,
+      signal: callerSignal
+    });
+    const signal = operation.signal;
     // One exclusive claim for the whole run: nothing else may touch this task's
-    // plan review between two of these steps.
-    const release = this.deps.claims.acquire(taskId, 'advance');
+    // plan review between two of these steps. (Ownership, not cancellation: the
+    // claim and the registration answer different questions and both are kept.)
+    let release: () => void;
+    try {
+      release = this.deps.claims.acquire(taskId, 'advance');
+    } catch (error) {
+      operation.release();
+      throw error;
+    }
     let correctionsRun = 0;
     let roundsReviewed = 0;
     const outcome = (stopped: PlanAdvanceStop, message: string): PlanAdvanceOutcome => ({
@@ -289,6 +318,9 @@ export class PlanCorrectionService {
     try {
       let pending = initial;
       for (let step = 0; step < MAX_LOOP_STEPS; step += 1) {
+        // Before every step, so a stop that landed while the previous one was in
+        // flight ends the loop here — no further provider call, no further write.
+        this.assertActive(taskId, signal);
         const state = this.derive(taskId);
         const round = state.all.length;
 
@@ -341,6 +373,7 @@ export class PlanCorrectionService {
             }
             this.deps.claims.setLoop(taskId, { phase: 'deciding', round });
             const decided = await this.autoDecideRound(taskId, gate, signal);
+            this.assertActive(taskId, signal);
             if (decided.kind === 'stop') return outcome('needs_user', decided.message);
             // Same rule as an explicit resolve: never record accepted findings the
             // budget cannot revise. The round stays open with its decisions saved.
@@ -364,7 +397,7 @@ export class PlanCorrectionService {
 
           case 'revise': {
             this.deps.claims.setLoop(taskId, { phase: 'revising', round: round + 1 });
-            const revised = await this.revise(state);
+            const revised = await this.revise(state, signal);
             if (revised) correctionsRun += 1;
             continue;
           }
@@ -414,7 +447,23 @@ export class PlanCorrectionService {
         'The plan-correction loop exceeded its step limit; it stopped without changing anything further.'
       );
     } finally {
+      // The claim first, then the registration: a task is never visible as
+      // stoppable with nothing running behind it. Both, on every exit.
       release();
+      operation.release();
+    }
+  }
+
+  /**
+   * Refuse to take another step once the task was stopped.
+   *
+   * The signal is what a step in flight observes; the task's own status is
+   * what survives a signal that was never delivered (or a stop that raced the
+   * operation's registration), and it is what every durable write re-reads.
+   */
+  private assertActive(taskId: string, signal: AbortSignal): void {
+    if (signal.aborted || this.deps.tasks.findById(taskId)?.status === 'CANCELLED') {
+      throw new AgentRelayError('CANCELLED', 'The plan-correction loop was stopped. Nothing further was changed.');
     }
   }
 
@@ -433,7 +482,7 @@ export class PlanCorrectionService {
   private async autoDecideRound(
     taskId: string,
     gate: PlanReviewGate,
-    signal?: AbortSignal
+    signal: AbortSignal
   ): Promise<{ kind: 'decided'; decisions: PlanReviewDecision[] } | { kind: 'stop'; message: string }> {
     const findingsJson = gate.findingsJson;
     const total = parsePlanReviewFindings(findingsJson).length;
@@ -443,9 +492,17 @@ export class PlanCorrectionService {
     const already = new Set(parsePlanReviewAutoDecisions(gate.autoDecisionsJson, sha).map((entry) => entry.finding));
     const todo = Array.from({ length: total }, (_, index) => index).filter((index) => !already.has(index));
 
-    const settled = await settleAll(todo, AUTO_DECIDE_CONCURRENCY, (findingIndex) =>
-      this.deps.gateService.runAutoDecide(taskId, { gateId: gate.id, findingsSha256: sha, findingIndex }, signal)
+    const settled = await settleAll(
+      todo,
+      AUTO_DECIDE_CONCURRENCY,
+      (findingIndex) =>
+        this.deps.gateService.runAutoDecide(taskId, { gateId: gate.id, findingsSha256: sha, findingIndex }, signal),
+      () => signal.aborted
     );
+    // A stop ends the round here. What the analyses that were already running
+    // report is not applied (each refuses to write for a stopped task) and is not
+    // presented as a stop for a person: the loop simply ends.
+    this.assertActive(taskId, signal);
     const failures = settled.filter((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
     if (failures.length > 0) {
       const first = failures[0]!.reason;
@@ -475,8 +532,10 @@ export class PlanCorrectionService {
   }
 
   /** Ask Codex to revise the specification from the accepted findings. Returns whether a new version was committed. */
-  private async revise(state: DerivedState): Promise<boolean> {
+  private async revise(state: DerivedState, signal: AbortSignal): Promise<boolean> {
     const { task, gate, max } = state;
+    // Before the correction row exists: a stop that already happened opens nothing.
+    this.assertActive(task.id, signal);
     const project = this.deps.projects.findById(task.projectId);
     if (project === null) throw new AgentRelayError('NOT_FOUND', `No project with id ${task.projectId}.`);
     if (task.status !== 'READY_FOR_IMPLEMENTATION') {
@@ -510,7 +569,9 @@ export class PlanCorrectionService {
 
     const settings = this.deps.settings.get();
     const context: AgentRunContext = {
-      signal: new AbortController().signal,
+      // The operation's own signal — the one Stop aborts — never a fresh one: a
+      // revision whose process the caller cannot reach would run to its timeout.
+      signal,
       timeoutMs: settings.processTimeoutMs,
       onProgress: () => undefined
     };
@@ -547,6 +608,14 @@ export class PlanCorrectionService {
       );
       throw error;
     }
+    // Stopped while Codex was revising. The revision is read-only and has no
+    // external effect, so discarding it is exact, not a guess: the row says it was
+    // stopped and that nothing was changed, and nothing below is reached.
+    if (signal.aborted || this.deps.tasks.findById(task.id)?.status === 'CANCELLED') {
+      const message = 'Stopped while Codex was revising the specification. The revision had no external effect and was discarded; nothing was changed.';
+      this.deps.corrections.fail(correction.id, message);
+      throw new AgentRelayError('CANCELLED', message);
+    }
 
     if (Buffer.byteLength(revisedJson, 'utf8') > MAX_SPECIFICATION_BYTES) {
       return fail('The revised specification is larger than the external review budget allows.');
@@ -579,6 +648,9 @@ export class PlanCorrectionService {
         expectedSpecificationJson: specificationJson,
         newSpecificationJson: revisedJson,
         newSpecificationSha256: revised.sha256,
+        // The write refuses a task that is no longer where it started: a stop that
+        // lands between the check above and this transaction still changes nothing.
+        expectedTaskStatus: task.status,
         addressedJson: JSON.stringify(addressed)
       });
     } catch (error) {

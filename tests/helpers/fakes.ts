@@ -133,6 +133,10 @@ export class FakeCodexAdapter implements CodexAdapter {
   }
 
   triageCalls: CodexTriageRequest[] = [];
+  /** The run context of every triage call, so a test can see which signal reached the provider. */
+  triageContexts: AgentRunContext[] = [];
+  /** The same for revisions. */
+  revisionContexts: AgentRunContext[] = [];
   /** Queue of recommendation sets, consumed one per `triageFindings` call. */
   triageQueue: FindingTriageRecommendation[][] = [];
   triageError: Error | null = null;
@@ -144,6 +148,7 @@ export class FakeCodexAdapter implements CodexAdapter {
     context: AgentRunContext
   ): Promise<CodexTriageOutcome> {
     this.triageCalls.push(request);
+    this.triageContexts.push(context);
     context.onProgress({ type: 'progress', text: 'fake codex: triaging' });
     if (this.triageGate) await this.triageGate;
     if (this.triageError) throw this.triageError;
@@ -169,6 +174,7 @@ export class FakeCodexAdapter implements CodexAdapter {
     context: AgentRunContext
   ): Promise<CodexRevisionOutcome> {
     this.revisionCalls.push(request);
+    this.revisionContexts.push(context);
     context.onProgress({ type: 'progress', text: 'fake codex: revising specification' });
     if (this.revisionGate) await this.revisionGate;
     if (this.revisionError) throw this.revisionError;

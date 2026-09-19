@@ -23,32 +23,42 @@ function setup(settings: Partial<Settings> = {}) {
   const reviewer = new FakePlanReviewer();
   const claims = new PlanReviewClaims();
   const corrections = new SqlitePlanCorrectionRepository(harness.db, harness.clock);
-  const gateService = new PlanReviewGateService({
-    tasks: harness.tasks,
-    projects: harness.projects,
-    ruleEvidence: harness.taskRuleEvidence,
-    gates: harness.planReviewGates,
-    reviewer,
-    codex: harness.codex,
-    settings: harness.settings,
-    clock: harness.clock,
-    ids: harness.ids,
-    claims
-  });
-  const loop = new PlanCorrectionService({
-    tasks: harness.tasks,
-    projects: harness.projects,
-    ruleEvidence: harness.taskRuleEvidence,
-    gates: harness.planReviewGates,
-    corrections,
-    gateService,
-    codex: harness.codex,
-    settings: harness.settings,
-    claims,
-    clock: harness.clock,
-    ids: harness.ids
-  });
-  return { harness, reviewer, claims, corrections, gateService, loop };
+  // Built the way the composition root builds them: the claims and the registry are
+  // the process-wide instances, everything else is made afresh per call — so
+  // `build()` is "another IPC call", and `harness.orchestrator` is the singleton
+  // whose `stop()` must reach an operation started through ANY of them.
+  const build = () => {
+    const gateService = new PlanReviewGateService({
+      tasks: harness.tasks,
+      projects: harness.projects,
+      ruleEvidence: harness.taskRuleEvidence,
+      gates: harness.planReviewGates,
+      reviewer,
+      codex: harness.codex,
+      settings: harness.settings,
+      clock: harness.clock,
+      ids: harness.ids,
+      claims,
+      operations: harness.operations
+    });
+    const loop = new PlanCorrectionService({
+      tasks: harness.tasks,
+      projects: harness.projects,
+      ruleEvidence: harness.taskRuleEvidence,
+      gates: harness.planReviewGates,
+      corrections,
+      gateService,
+      codex: harness.codex,
+      settings: harness.settings,
+      claims,
+      operations: harness.operations,
+      clock: harness.clock,
+      ids: harness.ids
+    });
+    return { gateService, loop };
+  };
+  const { gateService, loop } = build();
+  return { harness, reviewer, claims, corrections, gateService, loop, build };
 }
 type Value = ReturnType<typeof setup>;
 
@@ -779,6 +789,7 @@ describe('plan correction loop: the crash window between the commit and the next
       expectedSpecificationJson: original,
       newSpecificationJson: revised,
       newSpecificationSha256: specificationIdentity(revised).sha256,
+      expectedTaskStatus: 'READY_FOR_IMPLEMENTATION',
       addressedJson: JSON.stringify([{ finding: 0, field: 'summary', change: 'Revised.' }])
     });
     expect(value.harness.planReviewGates.listByTask(task.id)).toHaveLength(1);

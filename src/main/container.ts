@@ -90,6 +90,7 @@ import { GitCodeSnapshotSource } from './adapters/git/git-code-snapshot';
 import { CodeReviewClaims, CodeReviewService } from './services/code-review';
 import { SettingsBoundCodeReviewer } from './services/code-review-provider';
 import { PlanReviewClaims } from './services/plan-review-claims';
+import { TaskOperationRegistry } from './services/task-operations';
 import { PlanCorrectionService } from './services/plan-correction';
 import { PlanReviewGateService } from './services/plan-review-gate';
 import { RuleEvidenceService } from './services/rule-evidence';
@@ -159,6 +160,8 @@ export interface Application {
   readonly planReviewClaims: PlanReviewClaims;
   /** Exposed for the same reason: the detail read reports the analyses in flight. */
   readonly codeReviewClaims: CodeReviewClaims;
+  /** The process-wide register of stoppable operations; `orchestrator.stop()` reads the same instance. */
+  readonly taskOperations: TaskOperationRegistry;
   readonly taskContinuations: TaskContinuationRepository;
   readonly codeReviews: CodeReviewRepository;
   /**
@@ -329,6 +332,10 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   const planCorrections = new SqlitePlanCorrectionRepository(db, clock);
   const taskContinuations = new SqliteTaskContinuationRepository(db, clock);
   const planReviewClaims = new PlanReviewClaims();
+  // Built ONCE, here. The orchestrator's `stop()` and every plan-review service the
+  // IPC layer builds per call read this same instance; a per-call registry would
+  // give each invocation a private map and stop nothing.
+  const taskOperations = new TaskOperationRegistry();
   const codeReviews = new SqliteCodeReviewRepository(db, clock);
   const codeReviewClaims = new CodeReviewClaims();
   const operationTargets = new SqliteOperationTargetRepository(db, clock);
@@ -458,7 +465,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     // here is a separate, non-IPC interface — see `OrnithInferenceLeaseService`.
     ornith: new OrnithImplementationService(),
     ornithLease: localInference,
-    processRunner: runner
+    processRunner: runner,
+    operations: taskOperations
   });
 
   runtime.orchestrator = orchestrator;
@@ -538,6 +546,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
       ruleEvidence: taskRuleEvidence,
       gates: planReviewGates,
       claims: planReviewClaims,
+      operations: taskOperations,
       reviewer: new CoaiPlanReviewer(
         new StdioMcpClient(
           runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner()
@@ -564,6 +573,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     planCorrections,
     planReviewClaims,
     codeReviewClaims,
+    taskOperations,
     taskContinuations,
     codeReviews,
     codeReview,
@@ -595,6 +605,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
         codex: adapters.codex,
         settings,
         claims: planReviewClaims,
+        operations: taskOperations,
         clock,
         ids,
         events: options.events

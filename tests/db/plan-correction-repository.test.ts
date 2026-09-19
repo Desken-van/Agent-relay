@@ -108,6 +108,7 @@ describe('plan correction repository', () => {
       expectedSpecificationJson: '{"v":"one"}',
       newSpecificationJson: '{"v":"two"}',
       newSpecificationSha256: SHA('2'),
+      expectedTaskStatus: 'DRAFT',
       addressedJson: '[]'
     });
 
@@ -128,6 +129,7 @@ describe('plan correction repository', () => {
       expectedSpecificationJson: '{"v":"one"}',
       newSpecificationJson: '{"v":"two"}',
       newSpecificationSha256: SHA('2'),
+      expectedTaskStatus: 'DRAFT',
       addressedJson: addressed
     });
 
@@ -161,6 +163,7 @@ describe('plan correction repository', () => {
         expectedSpecificationJson: '{"v":"one"}',
         newSpecificationJson: '{"v":"two"}',
         newSpecificationSha256: SHA('2'),
+        expectedTaskStatus: 'DRAFT',
         addressedJson: '[]'
       })
     ).toThrow(/specification changed/i);
@@ -168,6 +171,53 @@ describe('plan correction repository', () => {
     expect(harness.tasks.findById(task.id)?.specificationJson).toBe('{"v":"elsewhere"}');
     expect(corrections.listVersions(task.id)).toHaveLength(1);
     expect(corrections.findBySourceGate(source.id)?.status).toBe('running');
+  });
+
+  it('refuses the swap for a task that was stopped, changing nothing: no specification, no version, no completed correction', () => {
+    const { harness, corrections, task, gate, begin } = setup();
+    const source = gate();
+    const opened = begin(source.id, SHA('1'), '{"v":"one"}');
+    // Stop wrote the task's status while the revision was still being computed.
+    harness.tasks.update(task.id, { status: 'CANCELLED' });
+
+    expect(() =>
+      corrections.complete({
+        correctionId: opened.id,
+        versionId: 'version-two',
+        expectedSpecificationJson: '{"v":"one"}',
+        newSpecificationJson: '{"v":"two"}',
+        newSpecificationSha256: SHA('2'),
+        expectedTaskStatus: 'DRAFT',
+        addressedJson: '[]'
+      })
+    ).toThrowError(expect.objectContaining({ code: 'CANCELLED' }));
+
+    // The specification text matched exactly, so ONLY the status check refused it.
+    expect(harness.tasks.findById(task.id)).toMatchObject({ specificationJson: '{"v":"one"}', status: 'CANCELLED' });
+    expect(corrections.listVersions(task.id)).toHaveLength(1);
+    expect(corrections.findBySourceGate(source.id)).toMatchObject({ status: 'running', toVersion: null, addressedJson: null });
+  });
+
+  it('refuses the swap for a task that moved to another status, as a state error and not as a cancellation', () => {
+    const { harness, corrections, task, gate, begin } = setup();
+    const source = gate();
+    const opened = begin(source.id, SHA('1'), '{"v":"one"}');
+    harness.tasks.update(task.id, { status: 'READY_FOR_IMPLEMENTATION' });
+
+    expect(() =>
+      corrections.complete({
+        correctionId: opened.id,
+        versionId: 'version-two',
+        expectedSpecificationJson: '{"v":"one"}',
+        newSpecificationJson: '{"v":"two"}',
+        newSpecificationSha256: SHA('2'),
+        expectedTaskStatus: 'DRAFT',
+        addressedJson: '[]'
+      })
+    ).toThrowError(expect.objectContaining({ code: 'INVALID_TRANSITION' }));
+
+    expect(harness.tasks.findById(task.id)?.specificationJson).toBe('{"v":"one"}');
+    expect(corrections.listVersions(task.id)).toHaveLength(1);
   });
 
   it('refuses to complete a correction that is not running', () => {
@@ -183,6 +233,7 @@ describe('plan correction repository', () => {
         expectedSpecificationJson: '{"v":"one"}',
         newSpecificationJson: '{"v":"two"}',
         newSpecificationSha256: SHA('2'),
+        expectedTaskStatus: 'DRAFT',
         addressedJson: '[]'
       })
     ).toThrow(/cannot be completed/i);
@@ -199,6 +250,7 @@ describe('plan correction repository', () => {
       expectedSpecificationJson: '{"v":"one"}',
       newSpecificationJson: '{"v":"two"}',
       newSpecificationSha256: SHA('2'),
+      expectedTaskStatus: 'DRAFT',
       addressedJson: '[]'
     });
     const second = begin(b.id, SHA('2'), '{"v":"two"}');
@@ -210,6 +262,7 @@ describe('plan correction repository', () => {
       expectedSpecificationJson: '{"v":"two"}',
       newSpecificationJson: '{"v":"one"}',
       newSpecificationSha256: SHA('1'),
+      expectedTaskStatus: 'DRAFT',
       addressedJson: '[]'
     });
 
@@ -239,6 +292,7 @@ describe('plan correction repository', () => {
       expectedSpecificationJson: '{"v":"one"}',
       newSpecificationJson: '{"v":"two"}',
       newSpecificationSha256: SHA('2'),
+      expectedTaskStatus: 'DRAFT',
       addressedJson: '[]'
     });
 

@@ -40,6 +40,7 @@ import type {
   TriageableFinding
 } from '../ports';
 import type { PlanReviewClaims } from './plan-review-claims';
+import type { TaskOperationKind, TaskOperationRegistry } from './task-operations';
 import { renderRuleEvidence, validateRuleEvidenceSnapshot } from './rule-evidence';
 
 const MAX_PLAN_BYTES = 1_500_000;
@@ -324,6 +325,13 @@ export interface PlanReviewGateDeps {
    * contend for the same claim rather than each holding their own.
    */
   readonly claims: PlanReviewClaims;
+  /**
+   * The process-wide register `Orchestrator.stop()` consults. Every claim-taking
+   * entry point below registers here, so Stop reaches an operation started by any
+   * IPC call, not only one that happens to share this service instance. Absent
+   * only where nothing can be stopped (tests that never stop).
+   */
+  readonly operations?: TaskOperationRegistry;
   /** For `triage()` only — a fresh, read-only, independent analysis call. Optional
    *  so existing tests that never exercise triage need not fake it. */
   readonly codex?: Pick<CodexAdapter, 'triageFindings'>;
@@ -633,12 +641,66 @@ export class PlanReviewGateService {
   async review(taskId: string, signal?: AbortSignal): Promise<PlanReviewGate> {
     // Taken before anything is read or dispatched, so a refusal costs a caller
     // nothing and reaches no provider.
-    const release = this.deps.claims.acquire(taskId, 'review');
+    return this.underOperation(
+      taskId,
+      'plan_review',
+      true,
+      () => this.deps.claims.acquire(taskId, 'review'),
+      signal,
+      (effective) => this.runReview(taskId, effective)
+    );
+  }
+
+  /**
+   * Run `body` as a registered, stoppable operation: register it (so Stop can
+   * reach it), take the plan-review claim (so it cannot overlap), and release both
+   * whatever happens. The registration comes first because a refusal there costs
+   * nothing, and the claim is released before the registration so a task is never
+   * visible as stoppable with nothing behind it.
+   */
+  private async underOperation<T>(
+    taskId: string,
+    kind: TaskOperationKind,
+    exclusive: boolean,
+    claim: () => () => void,
+    signal: AbortSignal | undefined,
+    body: (effective: AbortSignal | undefined) => Promise<T>
+  ): Promise<T> {
+    const operation = this.deps.operations?.begin(taskId, kind, { exclusive, signal });
     try {
-      return await this.runReview(taskId, signal);
+      const release = claim();
+      try {
+        return await body(operation?.signal ?? signal);
+      } finally {
+        release();
+      }
     } finally {
-      release();
+      operation?.release();
     }
+  }
+
+  /**
+   * Refuse to go on when the task was stopped or is no longer where this
+   * operation started. Called before every durable write that follows an awaited
+   * provider call, because the signal alone is not enough: Stop writes the task's
+   * status first, and a write that re-reads the task cannot outlive it.
+   *
+   * `dispatched` says whether an external call had already gone out. If it had,
+   * its outcome is UNKNOWN and is deliberately not recorded here — the gate keeps
+   * the phase it wrote before the call (`opening`, `reviewing`, `resolving`), which
+   * is exactly the evidence reconciliation reads, and the message says so.
+   */
+  private assertStillActive(taskId: string, signal: AbortSignal | undefined, dispatched: boolean): void {
+    const task = this.deps.tasks.findById(taskId);
+    if (signal?.aborted === true || task?.status === 'CANCELLED') {
+      throw new AgentRelayError(
+        'CANCELLED',
+        dispatched
+          ? 'The task was stopped while an external call was in flight, so its outcome is unknown and was not recorded. Reconcile the round before repeating anything.'
+          : 'The task was stopped before anything further was sent or written.'
+      );
+    }
+    this.requireReadyTask(taskId);
   }
 
   /**
@@ -670,6 +732,9 @@ export class PlanReviewGateService {
     // or credential-shaped rule text — leaves the gate exactly where it was,
     // and provably without any external effect.
     const text = planText(specification.specification, snapshot);
+    // Before the first write: a stop that already happened must leave the gate
+    // exactly as it was, not in an `opening` phase for a call that never went out.
+    this.assertStillActive(taskId, signal, false);
 
     try {
       // The round that is starting owns this row from here on. Whatever the
@@ -697,6 +762,10 @@ export class PlanReviewGateService {
         autoDecisionsJson: null
       });
       const session = await this.deps.reviewer.open(reviewSubject, signal);
+      // Stopped while `open` was in flight: nothing further is dispatched and
+      // nothing is recorded from it. The gate stays `opening`, which is the true
+      // state of knowledge, and reconciliation reads the session back.
+      this.assertStillActive(taskId, signal, true);
       gate = this.deps.gates.update(gate.id, {
         sessionId: session.sessionId,
         serverName: session.serverName,
@@ -709,6 +778,10 @@ export class PlanReviewGateService {
         status: 'reviewing'
       });
       const round = await this.deps.reviewer.reviewPlan(reviewSubject, text, signal);
+      // Stopped while the round ran: the round may well have completed at the
+      // provider, so its findings are neither applied nor called a failure. The
+      // gate keeps `reviewing` — an unknown outcome to be reconciled.
+      this.assertStillActive(taskId, signal, true);
       if (containsSecretShape(JSON.stringify(round))) {
         throw new AgentRelayError(
           'PARSE_FAILED',
@@ -762,12 +835,14 @@ export class PlanReviewGateService {
    * operator is told which fact is missing.
    */
   async reconcile(taskId: string, signal?: AbortSignal): Promise<PlanReviewGate> {
-    const release = this.deps.claims.acquire(taskId, 'reconcile');
-    try {
-      return await this.runReconcile(taskId, signal);
-    } finally {
-      release();
-    }
+    return this.underOperation(
+      taskId,
+      'plan_reconcile',
+      true,
+      () => this.deps.claims.acquire(taskId, 'reconcile'),
+      signal,
+      (effective) => this.runReconcile(taskId, effective)
+    );
   }
 
   private async runReconcile(taskId: string, signal?: AbortSignal): Promise<PlanReviewGate> {
@@ -819,10 +894,14 @@ export class PlanReviewGateService {
       // plan round. The same answer after `reviewing` or `resolving` proves no
       // such thing and is deliberately rethrown.
       if (gate.status === 'opening' && error instanceof AgentRelayError && error.code === 'NOT_FOUND') {
+        this.assertStillActive(taskId, signal, false);
         return settle({ status: 'prepared', lastError: null });
       }
       throw error;
     }
+    // A reading that arrives after a stop settles nothing: the gate keeps the
+    // unknown phase it had, and the next reconciliation reads it again.
+    this.assertStillActive(taskId, signal, false);
 
     // Classified before anything is taken from the answer, because "evidence of
     // nothing" has to include the identity the answer claims to speak for. A
@@ -955,12 +1034,14 @@ export class PlanReviewGateService {
     request: PlanReviewResolveRequest,
     signal?: AbortSignal
   ): Promise<PlanReviewGate> {
-    const release = this.deps.claims.acquire(taskId, 'resolve');
-    try {
-      return await this.runResolve(taskId, request, signal);
-    } finally {
-      release();
-    }
+    return this.underOperation(
+      taskId,
+      'plan_resolve',
+      true,
+      () => this.deps.claims.acquire(taskId, 'resolve'),
+      signal,
+      (effective) => this.runResolve(taskId, request, effective)
+    );
   }
 
   /** The unclaimed body of {@link resolve}; see {@link runReview} for who may call it. */
@@ -1017,6 +1098,9 @@ export class PlanReviewGateService {
     // check above is what gives the caller a clear reason; this is what closes
     // the window between that check and the write, so no `resolve` can be
     // dispatched for a round that stopped being current in between.
+    // A stop that already happened is honoured first: no `resolving` phase is
+    // written for a call that will not be made.
+    this.assertStillActive(taskId, signal, false);
     const resolving = this.deps.gates.updateIfUnchanged(
       gate.id,
       { status: 'resolving', decisionsJson, lastError: null },
@@ -1033,6 +1117,10 @@ export class PlanReviewGateService {
         decisions,
         signal
       );
+      // Stopped while the resolve was in flight: it may already have been applied
+      // at the provider. It is neither recorded as settled nor called a failure;
+      // `resolving` stays, and reconciliation reads the truth back.
+      this.assertStillActive(taskId, signal, true);
       const status = settledStatus(result.stage, result.awaitingResolve);
       if (status === null) {
         // The call was made and may well have been applied; only its meaning is
@@ -1078,12 +1166,14 @@ export class PlanReviewGateService {
    * implementation session or tool access is reused or granted.
    */
   async triage(taskId: string, request: PlanReviewTriageRequest, signal?: AbortSignal): Promise<PlanReviewGate> {
-    const release = this.deps.claims.acquire(taskId, 'triage');
-    try {
-      return await this.runTriage(taskId, request, signal);
-    } finally {
-      release();
-    }
+    return this.underOperation(
+      taskId,
+      'plan_triage',
+      true,
+      () => this.deps.claims.acquire(taskId, 'triage'),
+      signal,
+      (effective) => this.runTriage(taskId, request, effective)
+    );
   }
 
   private async runTriage(
@@ -1117,6 +1207,8 @@ export class PlanReviewGateService {
     }
 
     const validated = await this.analyzeFindings(task, project.localPath, findings, requestedIndexes, signal);
+    // A result that arrives after a stop is discarded, not stored.
+    this.assertStillActive(taskId, signal, false);
 
     // `triageForFindings` is set to the exact `findingsJson` this analysis
     // was computed against — captured before the Codex call, and never a
@@ -1219,12 +1311,16 @@ export class PlanReviewGateService {
     request: PlanReviewAutoDecideRequest,
     signal?: AbortSignal
   ): Promise<PlanReviewAutoDecideResult> {
-    const release = this.deps.claims.acquireFinding(taskId, request.findingIndex);
-    try {
-      return await this.runAutoDecide(taskId, request, signal);
-    } finally {
-      release();
-    }
+    // Shared, like its claim: several different findings may be analyzed at once,
+    // and a stop reaches every one of them.
+    return this.underOperation(
+      taskId,
+      'plan_auto_decide',
+      false,
+      () => this.deps.claims.acquireFinding(taskId, request.findingIndex),
+      signal,
+      (effective) => this.runAutoDecide(taskId, request, effective)
+    );
   }
 
   /** The unclaimed body of {@link autoDecide}; the caller holds a claim that excludes overlap. */
@@ -1265,7 +1361,11 @@ export class PlanReviewGateService {
     const stopped = this.savedStop(gate, request.findingIndex);
     if (stopped !== null) return { gate, outcome: stoppedOutcome(stopped) };
 
+    // A stopped task dispatches nothing, and a result that arrives after a stop is
+    // dropped: no automatic decision or stop is recorded for a task that has ended.
+    this.assertStillActive(taskId, signal, false);
     const validated = await this.analyzeFindings(task, project.localPath, findings, [request.findingIndex], signal);
+    this.assertStillActive(taskId, signal, false);
     const recommendation = validated.recommendations[0]!;
 
     // Persisted in ONE synchronous read-modify-write: nothing here awaits, so

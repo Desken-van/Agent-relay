@@ -80,6 +80,13 @@ export class FakePlanReviewer implements ExternalPlanReviewer {
   readonly reviewCalls: { subject: ExternalPlanReviewSubject; planText: string }[] = [];
   readonly resolveCalls: { subject: ExternalPlanReviewSubject; decisions: readonly PlanReviewDecision[] }[] = [];
   readonly statusCalls: ExternalPlanReviewSubject[] = [];
+  /** The signal each provider call was given, by call kind, so a test can see what reached the provider. */
+  readonly signals: Record<'open' | 'review' | 'resolve' | 'status', (AbortSignal | undefined)[]> = {
+    open: [],
+    review: [],
+    resolve: [],
+    status: []
+  };
   statusError: Error | null = null;
   onReview: (() => void) | null = null;
   onResolve: (() => void) | null = null;
@@ -149,9 +156,10 @@ export class FakePlanReviewer implements ExternalPlanReviewer {
   /** The same, for a resolution that has been dispatched and not yet answered. */
   resolveGate: Promise<unknown> | null = null;
 
-  async status(subject: ExternalPlanReviewSubject): Promise<ExternalPlanReviewStatus> {
+  async status(subject: ExternalPlanReviewSubject, signal?: AbortSignal): Promise<ExternalPlanReviewStatus> {
     const index = this.statusCalls.length;
     this.statusCalls.push(subject);
+    this.signals.status.push(signal);
     // Captured before the wait, so a delayed answer describes the session as it
     // was when it was read — which is exactly what a stale answer is.
     const answer = this.state;
@@ -161,14 +169,20 @@ export class FakePlanReviewer implements ExternalPlanReviewer {
     return answer;
   }
 
-  async open(subject: ExternalPlanReviewSubject): Promise<ExternalPlanReviewSession> {
+  async open(subject: ExternalPlanReviewSubject, signal?: AbortSignal): Promise<ExternalPlanReviewSession> {
     this.openCalls.push(subject);
+    this.signals.open.push(signal);
     if (this.openError) throw this.openError;
     return this.session;
   }
 
-  async reviewPlan(subject: ExternalPlanReviewSubject, planText: string): Promise<ExternalPlanReviewRound> {
+  async reviewPlan(
+    subject: ExternalPlanReviewSubject,
+    planText: string,
+    signal?: AbortSignal
+  ): Promise<ExternalPlanReviewRound> {
     this.reviewCalls.push({ subject, planText });
+    this.signals.review.push(signal);
     this.onReview?.();
     if (this.reviewGate) await this.reviewGate;
     if (this.reviewError) throw this.reviewError;
@@ -177,9 +191,11 @@ export class FakePlanReviewer implements ExternalPlanReviewer {
 
   async resolve(
     subject: ExternalPlanReviewSubject,
-    decisions: readonly PlanReviewDecision[]
+    decisions: readonly PlanReviewDecision[],
+    signal?: AbortSignal
   ): Promise<ExternalPlanReviewResolution> {
     this.resolveCalls.push({ subject, decisions });
+    this.signals.resolve.push(signal);
     this.onResolve?.();
     if (this.resolveGate) await this.resolveGate;
     if (this.resolveError) throw this.resolveError;

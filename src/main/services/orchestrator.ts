@@ -111,6 +111,7 @@ import {
 import type { VerificationExecutor } from './worktree-verification';
 import type { WorktreeDependencyInstaller, WorktreeDependencyPreparer } from './worktree-dependencies';
 import type { ProtectedContinuationAction } from './continuation-service';
+import type { TaskOperationRegistry } from './task-operations';
 import { redactAndTruncate, redactSecrets } from '../../shared/util/redact';
 import { ORNITH_LIMITS, ornithRelativePathSchema, redactAbsoluteMachinePaths } from '../../shared/domain/ornith';
 
@@ -166,6 +167,12 @@ export interface OrchestratorDeps {
   readonly ornithLease?: OrnithInferenceLeaseService;
   /** Used only to invoke fixed, read-only Git argv for the Ornith worktree tools. */
   readonly processRunner?: ProcessRunner;
+  /**
+   * The process-wide register of stoppable operations that are not agent runs
+   * (the plan-correction loop, external plan-review calls). `stop()` aborts them.
+   * Absent only in builds and tests that never start one.
+   */
+  readonly operations?: TaskOperationRegistry;
 }
 
 export class Orchestrator {
@@ -301,7 +308,7 @@ export class Orchestrator {
   }
 
   private beginExclusive(taskId: string): AbortController {
-    if (this.inFlight.has(taskId)) {
+    if (this.inFlight.has(taskId) || this.deps.operations?.isActive(taskId)) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
         'This task already has an agent running. Stop it before starting another operation.'
@@ -502,7 +509,7 @@ export class Orchestrator {
 
   async generateSpecification(taskId: string): Promise<Task> {
     let task = this.requireTask(taskId);
-    if (this.inFlight.has(taskId)) {
+    if (this.inFlight.has(taskId) || this.deps.operations?.isActive(taskId)) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
         'This task already has an agent running. Stop it before starting another operation.'
@@ -1662,6 +1669,14 @@ export class Orchestrator {
     }
 
     const stopped = this.applyEvent(task, 'cancelled', { lastError: 'Stopped by the user.' });
+    // Operations that are not agent runs (the plan-correction loop, external
+    // plan-review calls) have no run record and no catch block that would write
+    // CANCELLED for them, so the state is written here, synchronously, and THEN
+    // they are told to stop. In that order, and in the same tick, nothing they do
+    // after their next await can find the task still eligible: every durable
+    // write they make re-reads the task, and the specification swap itself refuses
+    // a task that is no longer in the status it was started in.
+    this.deps.operations?.abort(taskId);
     const continuation = this.deps.continuations?.findByContinuation(taskId);
     if (continuation) this.deps.continuations?.deleteClaim(continuation.sourceTaskId);
     return stopped;

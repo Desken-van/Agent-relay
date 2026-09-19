@@ -632,6 +632,38 @@ any decision set containing an accept, so the only way to settle such a round is
 loop that revises the plan.
 `Resolve review` (no revision) is available only when nothing was accepted.
 
+**Stopping.** The task stays `READY_FOR_IMPLEMENTATION` while the loop runs, so `Stop task`
+(`workflow:stop` → `Orchestrator.stop()`) has to reach it, and `Orchestrator.stop()` used
+to know only its own agent runs. `TaskOperationRegistry` is the process-wide register of
+stoppable operations, built ONCE in the composition root and handed to the orchestrator and
+to every plan-review service the IPC layer builds per call (a per-call registry would stop
+nothing). It is separate from `PlanReviewClaims`: claims arbitrate which plan-review
+operations may overlap, the registry decides who can be cancelled, and each keeps its own
+guarantees.
+- Every claim-taking entry point registers first — the loop (exclusive), `review`,
+  `resolve`, `reconcile`, `triage` (exclusive) and one finding's Auto decide (shared, like
+  its claim) — links any caller-supplied signal to the operation's own controller, and
+  removes the entry in a `finally`. A second conflicting operation for the task is refused
+  (`BUSY`), and so is an agent run.
+- That ONE signal is what the loop passes to Auto decide, Coai `resolve`/`open`/`review_plan`
+  and Codex `reviseSpecification` (which no longer builds a fresh, unreachable one), and the
+  loop checks it before every step. Analyses not yet dispatched are never sent.
+- `Orchestrator.stop()` writes `CANCELLED` first and THEN signals the registered operations,
+  synchronously, so nothing an operation does after its next `await` can find the task
+  still eligible. Every durable write that follows an awaited provider call re-reads the
+  task and refuses a stopped one; the specification swap itself
+  (`PlanCorrectionRepository.complete`) also requires the task to still be in the status the
+  revision started in, so a revision that returns after Stop changes nothing — no
+  specification, no version, no completed correction — whatever any signal says.
+- Honesty about outcomes: a stop while Coai `open`/`review_plan`/`resolve` is in flight
+  leaves the gate in the phase it wrote before the call (`opening`/`reviewing`/`resolving`)
+  with an error that says the outcome is unknown, so the next step is `reconcile`, never a
+  repeat. A stop while Codex revises marks the correction `failed` with a message saying the
+  read-only revision was discarded. A revision that committed atomically just before Stop
+  is preserved as the fact it is, but no later review starts.
+- The panel reports a stop as a stop (neither a success nor a fault of the loop), reads the
+  round back, and `Stop task` stays usable while the loop runs but cannot be double-submitted.
+
 **Code review** treats accepted findings as correction requirements, not fixes.
 `codeReview:get` returns them with one of three statuses — `open` (the code has not
 moved), `awaiting_fresh_review` (it moved; no review of it yet) and
@@ -1932,6 +1964,7 @@ Electron suite contacts the configured reviewer and is excluded from
 | `renderer/plan-review-view` · `renderer/plan-review-settings` | **The external plan-review UI against a fake preload bridge**: task-only rule capture, no retroactive opt-in, reasoned finding resolution, no retry affordance for an unknown in-flight call, and fixed process arguments/convention files that remain editable one line at a time |
 | `services/plan-auto-decide` · `services/plan-correction` · `db/plan-correction-repository` | **Auto decide and the correction loop through the real service, repositories and a real migrated SQLite database** with a fake external reviewer and Codex: one finding per request, round-identity pinning, concurrent merges, needs_user never applied, no overwrite of a durable decision, accepted findings revising the specification through an atomic compare-and-swap, one row/version/round per gate across retries and restarts, every stop condition, fail-closed approval and plain-resolve guards |
 | `services/external-code-corrections` · `services/code-review` (Auto decide) | Code-review Auto decide through the existing durable decision lifecycle; accepted findings as correction requirements handed to the existing correction round; `resolved` only after a fresh completed round on newer code |
+| `services/plan-correction-cancellation` · `services/task-operations` · `services/task-operations-wiring` | **Stop task against the loop, deterministically** (deferred promises and barriers, never timing): a stop during Codex revision, Coai resolve, Coai review, automatic triage and a single finding's Auto decide; the signal reaching each provider; a stop between Codex returning and the transaction, and immediately after it; the register being process-wide (a service built by one IPC call is stopped through the singleton orchestrator, on the real composition root too); refusal of a conflicting second operation; release on success, error, validation failure and cancellation |
 | `renderer/plan-auto-decide` · `renderer/code-review-triage` | **Both review panels through their real buttons** against a fake preload bridge: Auto decide inside each Decision row, exact single-finding request, immediate placement, needs_user, progress and failure inside the finding, double clicks, bulk counts and partial failure, drafts and decided findings untouched, `Resolve and revise plan` versus plain resolve, loop progress and failure, requirements and the correction hand-off |
 | `security/redaction-and-process` | Credential redaction, environment compartmentalisation, argv-not-shell execution |
 | `domain/operations-targets` · `domain/operations-diagnostics` · `domain/operations-ipc-contract` | The target and probe contracts: what they refuse — an adapter outside the enum, a config version this build cannot read, a credential value, a statement anywhere a probe id belongs |

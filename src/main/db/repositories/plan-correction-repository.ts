@@ -234,19 +234,36 @@ export class SqlitePlanCorrectionRepository implements PlanCorrectionRepository 
       // revision of its own for this, and the text is exactly what the revision
       // was computed from. Anything that changed it meanwhile (a regeneration, a
       // second window) makes this revision describe a document that is gone.
+      //
+      // The task must also still be in the status the revision was started in. A
+      // stop writes the task's status before it signals the operation, so a
+      // revision that returns after Stop can never pass this check, whatever any
+      // signal says: the guard is in the write itself, not in the code around it.
       const swapped = this.db
         .prepare(
           `UPDATE tasks
               SET specification_json = @next, specification_approved_at = NULL, updated_at = @now
-            WHERE id = @taskId AND specification_json = @expected`
+            WHERE id = @taskId AND specification_json = @expected AND status = @status`
         )
         .run({
           taskId: row.task_id,
           next: input.newSpecificationJson,
           expected: input.expectedSpecificationJson,
+          status: input.expectedTaskStatus,
           now
         });
       if (Number(swapped.changes) !== 1) {
+        const task = this.db.prepare('SELECT status FROM tasks WHERE id = ?').get(row.task_id) as
+          | { status: string }
+          | undefined;
+        if (task !== undefined && task.status !== input.expectedTaskStatus) {
+          throw new AgentRelayError(
+            task.status === 'CANCELLED' ? 'CANCELLED' : 'INVALID_TRANSITION',
+            task.status === 'CANCELLED'
+              ? 'The task was stopped, so the revision was not applied and nothing was changed.'
+              : `The task moved to ${task.status} while the correction was running, so the revision was not applied.`
+          );
+        }
         throw new AgentRelayError(
           'VALIDATION_FAILED',
           'The specification changed while the correction was running, so the revision was not applied.',

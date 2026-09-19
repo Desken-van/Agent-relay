@@ -31,6 +31,7 @@ import { defaultSettings } from '../../src/main/container';
 import type { OrnithInferenceLeaseService } from '../../src/main/ports';
 import type { OrnithImplementationService } from '../../src/main/services/ornith-implementation';
 import type { ProcessRunner } from '../../src/main/adapters/process/process-runner';
+import { TaskOperationRegistry } from '../../src/main/services/task-operations';
 import type { Project, Settings, Task } from '../../src/shared/domain/models';
 import {
   FakeClaudeAdapter,
@@ -61,6 +62,8 @@ export interface Harness {
   readonly approvals: SqliteApprovalRepository;
   readonly settings: SqliteSettingsRepository;
   readonly orchestrator: Orchestrator;
+  /** The process-wide register of stoppable operations, shared with `orchestrator.stop()`. */
+  readonly operations: TaskOperationRegistry;
   readonly publishService: PublishService;
   readonly continuationService: ContinuationService;
   readonly projectService: ProjectService;
@@ -122,6 +125,9 @@ export function createHarness(
   const confirmation = new RecordingConfirmationService(options.confirmAnswer ?? true);
 
   const runtime: { orchestrator?: Orchestrator } = {};
+  // The one process-wide register, exactly as the composition root builds it: the
+  // orchestrator's stop() and every plan-review service a test builds share it.
+  const operations = new TaskOperationRegistry();
   const continuationService = new ContinuationService({
     tasks,
     projects,
@@ -165,7 +171,8 @@ export function createHarness(
     },
     ornith: options.ornith,
     ornithLease: options.ornithLease,
-    processRunner: options.processRunner
+    processRunner: options.processRunner,
+    operations
   });
 
   const publishService = new PublishService({
@@ -229,6 +236,7 @@ export function createHarness(
     approvals,
     settings,
     orchestrator,
+    operations,
     publishService,
     continuationService,
     projectService,

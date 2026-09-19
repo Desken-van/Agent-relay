@@ -185,7 +185,11 @@ export function PlanReviewPanel({
   const [confirmBlind, setConfirmBlind] = useState(false);
   const [autoContinue, setAutoContinue] = useState(true);
   const [correctionResult, setCorrectionResult] = useState<
-    { readonly outcome: PlanAdvanceOutcome } | { readonly failure: string } | null
+    | { readonly outcome: PlanAdvanceOutcome }
+    | { readonly failure: string }
+    /** The task was stopped: the loop ended, which is neither a success nor a failure of its own. */
+    | { readonly stopped: string }
+    | null
   >(null);
   // Keyed on the findings actually rendered, not `gate.revision`: a decision
   // is an answer to a specific finding, and only a NEW set of findings (a
@@ -425,7 +429,12 @@ export function PlanReviewPanel({
       setDetail(answer.detail);
       setCorrectionResult({ outcome: answer.outcome });
     } catch (caught) {
-      setCorrectionResult({ failure: describeFailure(caught) });
+      // A stop is reported as a stop: never as a success, and not as a fault of the loop.
+      setCorrectionResult(
+        caught instanceof ApiError && caught.code === 'CANCELLED'
+          ? { stopped: describeFailure(caught) }
+          : { failure: describeFailure(caught) }
+      );
       try {
         setDetail(await expect('planReview:get', { taskId: task.id }));
       } catch {
@@ -447,6 +456,20 @@ export function PlanReviewPanel({
     const timer = setInterval(() => void refresh(), LOOP_POLL_MS);
     return () => clearInterval(timer);
   }, [busy, refresh]);
+  // Stop task ends whatever this panel had running. The task's own status is the
+  // signal (it arrives with the task the screen holds), and the round is read back
+  // once so nothing here goes on describing work that no longer exists.
+  const cancelled = task.status === 'CANCELLED';
+  useEffect(() => {
+    if (!cancelled) return undefined;
+    let active = true;
+    void call('planReview:get', { taskId: task.id }).then((result) => {
+      if (active && result.ok) adoptDetail(result.data);
+    });
+    return () => {
+      active = false;
+    };
+  }, [cancelled, task.id, adoptDetail]);
 
   const resolvePayload = (): PlanReviewDecision[] =>
     findings.map((_, index) => {
@@ -748,7 +771,11 @@ export function PlanReviewPanel({
       ) : null}
       {gate?.lastError ? <Notice tone="error">{gate.lastError}</Notice> : null}
 
-      {detail !== null && (busy === 'revise' || detail.correction.used > 0 || detail.correction.acceptedPending > 0) ? (
+      {detail !== null &&
+      (busy === 'revise' ||
+        correctionResult !== null ||
+        detail.correction.used > 0 ||
+        detail.correction.acceptedPending > 0) ? (
         <div className="stack stack--tight" aria-label="Plan correction">
           <div className="kv">
             <span className="kv__k">Correction rounds</span>
@@ -799,7 +826,14 @@ export function PlanReviewPanel({
             </Notice>
           ) : null}
           {busy !== 'revise' && correctionResult !== null ? (
-            'failure' in correctionResult ? (
+            'stopped' in correctionResult ? (
+              <Notice tone="warn" role="status">
+                <div className="stack stack--tight">
+                  <strong>The task was stopped. The correction loop ended and nothing further was changed.</strong>
+                  <span className="selectable">{correctionResult.stopped}</span>
+                </div>
+              </Notice>
+            ) : 'failure' in correctionResult ? (
               <Notice tone="error" role="alert">
                 <div className="stack stack--tight">
                   <strong>The correction loop stopped. Nothing further was changed.</strong>

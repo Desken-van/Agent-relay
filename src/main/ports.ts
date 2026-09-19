@@ -34,6 +34,7 @@ import type {
   TaskContinuation,
   ContinuationClaim
 } from '../shared/domain/models';
+import type { TaskStatus } from '../shared/domain/workflow';
 import type {
   OperationEnvironment,
   OperationTarget,
@@ -771,6 +772,13 @@ export interface PlanCorrectionRepository {
     readonly expectedSpecificationJson: string;
     readonly newSpecificationJson: string;
     readonly newSpecificationSha256: string;
+    /**
+     * The status the task must STILL be in for the swap to apply (the one the
+     * revision was started in). A task that was stopped or moved on meanwhile makes
+     * the whole transaction fail with nothing written — no specification change, no
+     * version, no completed correction.
+     */
+    readonly expectedTaskStatus: TaskStatus;
     /** JSON array of what Codex said it changed for each accepted finding; stored on the correction. */
     readonly addressedJson: string;
   }): { readonly correction: PlanCorrection; readonly version: SpecificationVersion };
