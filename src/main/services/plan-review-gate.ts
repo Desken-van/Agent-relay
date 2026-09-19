@@ -328,10 +328,12 @@ export interface PlanReviewGateDeps {
   /**
    * The process-wide register `Orchestrator.stop()` consults. Every claim-taking
    * entry point below registers here, so Stop reaches an operation started by any
-   * IPC call, not only one that happens to share this service instance. Absent
-   * only where nothing can be stopped (tests that never stop).
+   * IPC call, not only one that happens to share this service instance.
+   * Required, not optional: a service built without it would start provider calls
+   * that Stop cannot reach, silently bringing the defect back, so omitting the
+   * wiring is a compile-time error.
    */
-  readonly operations?: TaskOperationRegistry;
+  readonly operations: TaskOperationRegistry;
   /** For `triage()` only — a fresh, read-only, independent analysis call. Optional
    *  so existing tests that never exercise triage need not fake it. */
   readonly codex?: Pick<CodexAdapter, 'triageFindings'>;
@@ -666,16 +668,16 @@ export class PlanReviewGateService {
     signal: AbortSignal | undefined,
     body: (effective: AbortSignal | undefined) => Promise<T>
   ): Promise<T> {
-    const operation = this.deps.operations?.begin(taskId, kind, { exclusive, signal });
+    const operation = this.deps.operations.begin(taskId, kind, { exclusive, signal });
     try {
       const release = claim();
       try {
-        return await body(operation?.signal ?? signal);
+        return await body(operation.signal);
       } finally {
         release();
       }
     } finally {
-      operation?.release();
+      operation.release();
     }
   }
 

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { PlanReviewClaims } from '../../src/main/services/plan-review-claims';
+import { TaskOperationRegistry } from '../../src/main/services/task-operations';
 import { planReviewGateIdentity } from '../../src/main/services/plan-review-gate';
 import { PlanReviewGateService } from '../../src/main/services/plan-review-gate';
 import type { ExternalPlanReviewStatus, TaskRuleEvidenceRepository } from '../../src/main/ports';
@@ -64,7 +65,8 @@ function setup() {
       settings: harness.settings,
       clock: harness.clock,
       ids: harness.ids,
-      claims
+      claims,
+      operations: harness.operations
     });
   const service = build();
   /**
@@ -86,7 +88,10 @@ function setup() {
       settings: harness.settings,
       clock: harness.clock,
       ids: harness.ids,
-      claims: new PlanReviewClaims()
+      claims: new PlanReviewClaims(),
+      // Its own registry too: this seam exists to have NO arbitration, so a test using it
+      // exercises the durable revision guard alone, not the registry's refusal.
+      operations: new TaskOperationRegistry()
     });
   return { harness, reviewer, codex, service, claims, build, unguarded };
 }
@@ -1798,7 +1803,8 @@ describe('durable external plan review gate', () => {
         reviewer: value.reviewer,
         clock: value.harness.clock,
         ids: value.harness.ids,
-        claims: new PlanReviewClaims()
+        claims: new PlanReviewClaims(),
+        operations: value.harness.operations
       });
 
       await expect(

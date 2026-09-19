@@ -30,7 +30,8 @@ function setup() {
       settings: harness.settings,
       clock: harness.clock,
       ids: harness.ids,
-      claims
+      claims,
+      operations: harness.operations
     });
   return { harness, reviewer, claims, service: build(), build };
 }
