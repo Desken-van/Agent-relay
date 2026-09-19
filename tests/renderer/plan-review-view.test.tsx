@@ -613,6 +613,53 @@ describe('the external plan-review panel', () => {
         expect((decisions[0] as HTMLSelectElement).value).toBe('accept');
       });
 
+      it('keeps a decision the operator edits while the analysis runs, through its failure and the read-back', async () => {
+        const detail = twoFindingGate();
+        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
+        const answer = deferred<IpcResult<PlanReviewDetail>>();
+        bridge.set('planReview:triage', () => answer.promise);
+        render(
+          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+        );
+        const decisions = await screen.findAllByLabelText('Decision');
+        fireEvent.click(analyzeButton());
+        await screen.findByRole('status');
+
+        // The operator keeps working while Codex thinks.
+        fireEvent.change(decisions[0]!, { target: { value: 'reject' } });
+        fireEvent.change(screen.getAllByLabelText(/^Reason/)[0]!, { target: { value: 'Typed while waiting.' } });
+        await deliver(answer, fail('Codex failed.', 'TOOL_FAILED'));
+
+        await waitFor(() => expect(bridge.callsTo('planReview:get')).toHaveLength(2));
+        expect(screen.getByRole('alert').textContent).toContain('Codex failed.');
+        expect((decisions[0] as HTMLSelectElement).value).toBe('reject');
+        expect((screen.getAllByLabelText(/^Reason/)[0] as HTMLInputElement).value).toBe('Typed while waiting.');
+      });
+
+      it('keeps the alert and re-enables the action when the read-back after a failed analysis fails too', async () => {
+        const detail = twoFindingGate();
+        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
+        bridge.set('planReview:triage', () => {
+          bridge.set('planReview:get', () => fail('The database is unavailable.', 'INTERNAL'));
+          return fail('That plan-review round is no longer the current one.', 'VALIDATION_FAILED');
+        });
+        render(
+          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+        );
+        await screen.findByRole('button', { name: /Analyze undecided findings/i });
+        fireEvent.click(analyzeButton());
+        await screen.findByRole('alert');
+        await waitFor(() => expect(bridge.callsTo('planReview:get')).toHaveLength(2));
+
+        // The refusal is what the operator is told; the failed read-back adds nothing and breaks nothing.
+        const alert = screen.getByRole('alert');
+        expect(alert.textContent).toContain('no longer the current one');
+        expect(alert.textContent).not.toContain('database is unavailable');
+        expect(screen.queryByRole('status')).toBeNull();
+        expect(analyzeButton()).toHaveProperty('disabled', false);
+        expect(bridge.callsTo('planReview:triage')).toHaveLength(1);
+      });
+
       it('recovers from a timeout-coded failure and from a call that throws, each time re-enabling a retry', async () => {
         const detail = twoFindingGate();
         bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
