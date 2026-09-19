@@ -1,186 +1,20 @@
-import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { PlanReviewClaims } from '../../src/main/services/plan-review-claims';
 import { planReviewGateIdentity } from '../../src/main/services/plan-review-gate';
 import { PlanReviewGateService } from '../../src/main/services/plan-review-gate';
-import type {
-  ExternalPlanReviewer,
-  ExternalPlanReviewResolution,
-  ExternalPlanReviewRound,
-  ExternalPlanReviewSession,
-  ExternalPlanReviewStatus,
-  ExternalPlanReviewSubject,
-  TaskRuleEvidenceRepository
-} from '../../src/main/ports';
-import type {
-  PlanReviewDecision,
-  PlanReviewFinding,
-  PlanReviewGate
-} from '../../src/shared/domain/plan-review';
-import type { RuleEvidenceSnapshot } from '../../src/shared/domain/rule-evidence';
+import type { ExternalPlanReviewStatus, TaskRuleEvidenceRepository } from '../../src/main/ports';
+import type { PlanReviewDecision, PlanReviewGate } from '../../src/shared/domain/plan-review';
 import { AgentRelayError } from '../../src/shared/domain/errors';
 import { FakeCodexAdapter, makeSpecification } from '../helpers/fakes';
+import {
+  FINGERPRINT,
+  FakePlanReviewer,
+  deferred,
+  finding,
+  planRounds,
+  snapshot
+} from '../helpers/fake-plan-reviewer';
 import { createHarness, type Harness } from '../helpers/harness';
-
-interface Deferred {
-  readonly promise: Promise<unknown>;
-  resolve(value: unknown): void;
-}
-
-/** A promise a test resolves by hand, so it decides when an answer arrives. */
-function deferred(): Deferred {
-  let resolve!: (value: unknown) => void;
-  const promise = new Promise<unknown>((settle) => {
-    resolve = settle;
-  });
-  return { promise, resolve };
-}
-
-/** The provider's PlanReview round tally, defaulting to "nothing has run". */
-function planRounds(
-  counts: Partial<ExternalPlanReviewStatus['planRounds']> = {}
-): ExternalPlanReviewStatus['planRounds'] {
-  return { total: 0, running: 0, done: 0, interrupted: 0, ...counts };
-}
-
-function sha256(value: string): string {
-  return createHash('sha256').update(value).digest('hex');
-}
-
-/** A fixed, valid-shaped contract fingerprint — its value is asserted on only where a test names it. */
-const FINGERPRINT = 'f'.repeat(64);
-
-function snapshot(content = 'Run the repository verification command.\n'): RuleEvidenceSnapshot {
-  const contentBytes = Buffer.byteLength(content);
-  const sources = [{ id: 'project', kind: 'project' as const, revision: 'a'.repeat(40), clean: true }];
-  const files = [{
-    sourceId: 'project',
-    path: 'AGENTS.md',
-    bytes: contentBytes,
-    sha256: sha256(content),
-    content
-  }];
-  const omitted: RuleEvidenceSnapshot['omitted'] = [];
-  return {
-    version: 1,
-    sources,
-    files,
-    omitted,
-    totalBytes: contentBytes,
-    sha256: sha256(JSON.stringify({
-      version: 1,
-      sources,
-      files: files.map(({ sourceId, path, bytes, sha256: fileHash }) => ({
-        sourceId, path, bytes, sha256: fileHash
-      })),
-      omitted
-    })),
-    capturedAt: '2026-09-06T00:00:00.000Z'
-  };
-}
-
-class FakePlanReviewer implements ExternalPlanReviewer {
-  readonly openCalls: ExternalPlanReviewSubject[] = [];
-  readonly reviewCalls: { subject: ExternalPlanReviewSubject; planText: string }[] = [];
-  readonly resolveCalls: { subject: ExternalPlanReviewSubject; decisions: readonly PlanReviewDecision[] }[] = [];
-  readonly statusCalls: ExternalPlanReviewSubject[] = [];
-  statusError: Error | null = null;
-  onReview: (() => void) | null = null;
-  onResolve: (() => void) | null = null;
-  openError: Error | null = null;
-  reviewError: Error | null = null;
-  resolveError: Error | null = null;
-  session: ExternalPlanReviewSession = {
-    sessionId: 'session-1',
-    stage: 'PlanReview',
-    awaitingResolve: false,
-    planProceeded: false,
-    serverName: 'coai-mcp',
-    serverVersion: '1.2.3',
-    contractFingerprint: FINGERPRINT
-  };
-  round: ExternalPlanReviewRound = {
-    verdict: 'proceed',
-    gatingCount: 0,
-    threshold: 2,
-    reviewers: 'all 2 reviewers answered',
-    findings: [],
-    instruction: 'resolve every finding',
-    serverName: 'coai-mcp',
-    serverVersion: '1.2.3',
-    contractFingerprint: FINGERPRINT
-  };
-  resolution: ExternalPlanReviewResolution = {
-    stage: 'CodeReview',
-    awaitingResolve: false,
-    recordedDecisions: 0,
-    instruction: 'continue',
-    serverName: 'coai-mcp',
-    serverVersion: '1.2.3',
-    contractFingerprint: FINGERPRINT
-  };
-
-  state: ExternalPlanReviewStatus = {
-    sessionId: 'session-1',
-    stage: 'PlanReview',
-    awaitingResolve: false,
-    planProceeded: false,
-    planRounds: planRounds(),
-    serverName: 'coai-mcp',
-    serverVersion: '1.2.3',
-    contractFingerprint: FINGERPRINT
-  };
-
-  /**
-   * Hold a specific `status` call open, by its zero-based index.
-   *
-   * The point of the delay is not slowness but ordering: it lets a test decide
-   * when each answer comes back, and therefore construct the interleaving where
-   * a reading is computed from a world that changes before it is written.
-   */
-  onStatusCall: ((index: number) => Promise<unknown> | void) | null = null;
-  /** Held open so a round can still be executing while something else runs. */
-  reviewGate: Promise<unknown> | null = null;
-  /** The same, for a resolution that has been dispatched and not yet answered. */
-  resolveGate: Promise<unknown> | null = null;
-
-  async status(subject: ExternalPlanReviewSubject): Promise<ExternalPlanReviewStatus> {
-    const index = this.statusCalls.length;
-    this.statusCalls.push(subject);
-    // Captured before the wait, so a delayed answer describes the session as it
-    // was when it was read — which is exactly what a stale answer is.
-    const answer = this.state;
-    const wait = this.onStatusCall?.(index);
-    if (wait) await wait;
-    if (this.statusError) throw this.statusError;
-    return answer;
-  }
-
-  async open(subject: ExternalPlanReviewSubject): Promise<ExternalPlanReviewSession> {
-    this.openCalls.push(subject);
-    if (this.openError) throw this.openError;
-    return this.session;
-  }
-
-  async reviewPlan(subject: ExternalPlanReviewSubject, planText: string): Promise<ExternalPlanReviewRound> {
-    this.reviewCalls.push({ subject, planText });
-    this.onReview?.();
-    if (this.reviewGate) await this.reviewGate;
-    if (this.reviewError) throw this.reviewError;
-    return this.round;
-  }
-
-  async resolve(
-    subject: ExternalPlanReviewSubject,
-    decisions: readonly PlanReviewDecision[]
-  ): Promise<ExternalPlanReviewResolution> {
-    this.resolveCalls.push({ subject, decisions });
-    this.onResolve?.();
-    if (this.resolveGate) await this.resolveGate;
-    if (this.resolveError) throw this.resolveError;
-    return this.resolution;
-  }
-}
 
 /**
  * Resolve the round the gate is actually showing.
@@ -199,22 +33,12 @@ function resolveCurrent(
   return value.service.resolve(taskId, {
     gateId: gate.id,
     expectedRevision: gate.revision,
-    decisions
+    decisions,
+    // These tests are about what `resolve` does with the provider. That an
+    // accepted finding may only be resolved by the correction loop is the
+    // subject of its own tests below.
+    allowAccepted: true
   });
-}
-
-function finding(title: string): PlanReviewFinding {
-  return {
-    severity: 'major',
-    category: 'reliability',
-    file: 'src/service.ts',
-    line: 42,
-    title,
-    why: 'It matters for this round only.',
-    fix: 'Address it.',
-    providers: ['codex'],
-    role: 'SecurityReliability'
-  };
 }
 
 const harnesses: Harness[] = [];
@@ -1508,9 +1332,49 @@ describe('durable external plan review gate', () => {
     ).toBe('no_gate');
   });
 
-  it('uses bound evidence and accepted findings again for implementation and final Codex review', async () => {
+  it('refuses to approve a specification whose round accepted findings that were never folded into it', async () => {
     const value = setup();
-    const { task, rules } = await ready(value);
+    const { task } = await ready(value);
+    value.reviewer.round = {
+      ...value.reviewer.round,
+      findings: [finding('Serialize concurrent lifecycle calls')]
+    };
+    await value.service.review(task.id);
+    await resolveCurrent(value, task.id, [{ finding: 0, action: 'accept', reason: 'Cover the races.' }]);
+
+    // The provider moved on and the gate is `proceeded`, yet the specification is
+    // unchanged: approving it would carry the accepted finding forward unaddressed.
+    expect(value.harness.planReviewGates.findByTask(task.id)?.status).toBe('proceeded');
+    expect(() => value.harness.orchestrator.approveSpecification(task.id)).toThrow(/accepted findings/i);
+    expect(value.harness.tasks.findById(task.id)?.specificationApprovedAt).toBeNull();
+  });
+
+  it('refuses to resolve an accepted finding through the plain resolve, and dispatches nothing', async () => {
+    const value = setup();
+    const { task } = await ready(value);
+    value.reviewer.round = { ...value.reviewer.round, findings: [finding('Needs a plan change')] };
+    await value.service.review(task.id);
+    const gate = value.harness.planReviewGates.findByTask(task.id)!;
+
+    await expect(
+      value.service.resolve(task.id, {
+        gateId: gate.id,
+        expectedRevision: gate.revision,
+        decisions: [{ finding: 0, action: 'accept', reason: '' }]
+      })
+    ).rejects.toThrow(/revision of the plan/i);
+
+    expect(value.reviewer.resolveCalls).toHaveLength(0);
+    expect(value.harness.planReviewGates.findByTask(task.id)).toMatchObject({
+      status: 'awaiting_resolve',
+      decisionsJson: null,
+      revision: gate.revision
+    });
+  });
+
+  it('refuses implementation, even for a specification approved earlier, while accepted findings are uncorrected', async () => {
+    const value = setup();
+    const { task } = await ready(value);
     value.reviewer.round = {
       ...value.reviewer.round,
       findings: [finding('Serialize concurrent lifecycle calls')]
@@ -1521,14 +1385,23 @@ describe('durable external plan review gate', () => {
       action: 'accept',
       reason: 'Cover start/start and start/stop races.'
     }]);
+    // Approved by an earlier version, which checked hashes only.
+    value.harness.tasks.update(task.id, { specificationApprovedAt: value.harness.clock.nowIso() });
+
+    await expect(value.harness.orchestrator.sendToClaude(task.id)).rejects.toThrow(/accepted findings/i);
+    expect(value.harness.claude.calls).toHaveLength(0);
+  });
+
+  it('uses bound evidence again for implementation and final Codex review', async () => {
+    const value = setup();
+    const { task, rules } = await ready(value);
+    await value.service.review(task.id);
+    await resolveCurrent(value, task.id, []);
     value.harness.orchestrator.approveSpecification(task.id);
     await value.harness.orchestrator.sendToClaude(task.id);
     await value.harness.orchestrator.reviewWithCodex(task.id);
 
     expect(value.harness.claude.calls[0]?.prompt).toContain(rules.sha256);
-    expect(value.harness.claude.calls[0]?.prompt).toContain('Serialize concurrent lifecycle calls');
-    expect(value.harness.claude.calls[0]?.prompt).toContain('Address it.');
-    expect(value.harness.claude.calls[0]?.prompt).toContain('Cover start/start and start/stop races.');
     expect(value.harness.codex.reviewCalls[0]?.ruleEvidence).toContain(rules.sha256);
   });
 
@@ -1829,7 +1702,8 @@ describe('durable external plan review gate', () => {
         decisions: [
           { finding: 0, action: 'accept', reason: '' },
           { finding: 1, action: 'accept', reason: '' }
-        ]
+        ],
+        allowAccepted: true
       });
 
       inFlight.resolve(undefined);

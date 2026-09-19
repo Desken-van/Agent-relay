@@ -21,6 +21,8 @@ import type {
   CodexAdapter,
   CodexReviewOutcome,
   CodexReviewRequest,
+  CodexRevisionOutcome,
+  CodexRevisionRequest,
   CodexSpecificationRequest,
   CodexSpecificationResult,
   CodexTriageOutcome,
@@ -147,6 +149,36 @@ export class FakeCodexAdapter implements CodexAdapter {
       confidence: 'uncertain' as const
     }));
     return { recommendations, rawResponse: JSON.stringify({ results: recommendations }) };
+  }
+
+  revisionCalls: CodexRevisionRequest[] = [];
+  /** Specifications returned by `reviseSpecification`, one per call, in order. */
+  revisionQueue: TaskSpecification[] = [];
+  revisionError: Error | null = null;
+  /** Held open until resolved, so a test can observe state while a revision is in flight. */
+  revisionGate: Promise<unknown> | null = null;
+
+  async reviseSpecification(
+    request: CodexRevisionRequest,
+    context: AgentRunContext
+  ): Promise<CodexRevisionOutcome> {
+    this.revisionCalls.push(request);
+    context.onProgress({ type: 'progress', text: 'fake codex: revising specification' });
+    if (this.revisionGate) await this.revisionGate;
+    if (this.revisionError) throw this.revisionError;
+    // By default a genuinely different specification that reflects every accepted
+    // finding, so a loop test does not have to hand-write each revision.
+    const specification =
+      this.revisionQueue.shift() ??
+      makeSpecification({
+        ...request.currentSpecification,
+        summary: `${request.currentSpecification.summary} (revised in correction round ${request.round})`,
+        acceptanceCriteria: [
+          ...request.currentSpecification.acceptanceCriteria,
+          ...request.acceptedFindings.map((finding) => `Addresses: ${finding.title}`)
+        ]
+      });
+    return { specification, rawResponse: JSON.stringify(specification) };
   }
 
   async diagnose(): Promise<ToolDiagnostic> {

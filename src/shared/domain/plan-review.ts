@@ -156,6 +156,13 @@ export const planReviewGateSchema = z
      * round) invalidates a stored result.
      */
     triageForFindings: z.string().nullable(),
+    /**
+     * Decisions Codex triage made AND applied for this round's findings — see
+     * `planReviewAutoDecisionsSchema`. Durable so a refresh or a restart keeps
+     * what "Auto decide" filled in; never a resolution: only `resolve` sends
+     * decisions to the provider.
+     */
+    autoDecisionsJson: z.string().nullable(),
     createdAt: isoDateTime,
     updatedAt: isoDateTime
   })
@@ -191,6 +198,58 @@ export function parsePlanReviewTriage(json: string | null): PlanReviewTriageResu
     return planReviewTriageResultSchema.parse(JSON.parse(json));
   } catch {
     return null;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Automatic decisions                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One decision Codex triage made for one finding and Agent Relay applied to the
+ * operator's decision draft. Only `accept` and `reject`: a `needs_user`
+ * recommendation is never a decision and lives only in the triage result.
+ */
+export const planReviewAutoDecisionSchema = z
+  .object({
+    /** 0-based index into the gate's `findingsJson` array. */
+    finding: z.number().int().nonnegative(),
+    action: z.enum(['accept', 'reject']),
+    /** The audit reason that goes to the provider on resolve. Never empty. */
+    reason: z.string().min(1).max(10_000),
+    evidenceRef: z.string().min(1).max(500),
+    confidence: z.enum(['high', 'medium', 'low', 'uncertain']),
+    decidedAt: isoDateTime
+  })
+  .strict();
+export type PlanReviewAutoDecision = z.infer<typeof planReviewAutoDecisionSchema>;
+
+/**
+ * The stored form. `forFindingsSha256` is the SHA-256 of the exact
+ * `findingsJson` the decisions answer — the same identity rule the triage
+ * columns follow, expressed as a hash because the findings text itself can be
+ * large. A reader compares it with the gate's current findings, so a new round
+ * can never inherit an earlier round's decisions.
+ */
+export const planReviewAutoDecisionsSchema = z
+  .object({
+    forFindingsSha256: z.string().regex(/^[0-9a-f]{64}$/),
+    decisions: z.array(planReviewAutoDecisionSchema).max(256)
+  })
+  .strict();
+export type PlanReviewAutoDecisions = z.infer<typeof planReviewAutoDecisionsSchema>;
+
+/** The stored decisions that still describe `expectedFindingsSha256`, else none. */
+export function parsePlanReviewAutoDecisions(
+  json: string | null,
+  expectedFindingsSha256: string | null
+): PlanReviewAutoDecision[] {
+  if (json === null || expectedFindingsSha256 === null) return [];
+  try {
+    const stored = planReviewAutoDecisionsSchema.parse(JSON.parse(json));
+    return stored.forFindingsSha256 === expectedFindingsSha256 ? stored.decisions : [];
+  } catch {
+    return [];
   }
 }
 

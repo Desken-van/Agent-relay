@@ -21,7 +21,7 @@ import { SqliteTransactionRunner } from '../../src/main/db/transaction-runner';
 import { FixedClock, SequentialIdGenerator } from '../../src/main/infra/clock';
 import { InMemoryEventPublisher } from '../../src/main/services/event-bus';
 import { ContinuationService } from '../../src/main/services/continuation-service';
-import { Orchestrator } from '../../src/main/services/orchestrator';
+import { Orchestrator, type OrchestratorDeps } from '../../src/main/services/orchestrator';
 import type { VerificationExecutor } from '../../src/main/services/worktree-verification';
 import type { WorktreeDependencyInstaller, WorktreeDependencyPreparer } from '../../src/main/services/worktree-dependencies';
 import { ProjectService } from '../../src/main/services/project-service';
@@ -82,6 +82,8 @@ export function createHarness(
     ornith?: OrnithImplementationService;
     ornithLease?: OrnithInferenceLeaseService;
     processRunner?: ProcessRunner;
+    /** Findings accepted from an external code review; absent in every test that is not about them. */
+    externalCodeRequirements?: OrchestratorDeps['externalCodeRequirements'];
   } = {}
 ): Harness {
   const tempRoot = mkdtempSync(join(tmpdir(), 'agent-relay-test-'));
@@ -154,6 +156,7 @@ export function createHarness(
     ruleEvidence: taskRuleEvidence,
     planReviews: planReviewGates,
     continuations: taskContinuations,
+    externalCodeRequirements: options.externalCodeRequirements,
     continuationGuard: {
       prepareFirstAction: (...args) => continuationService.prepareFirstAction(...args),
       retargetFirstActionToVerification: (...args) =>

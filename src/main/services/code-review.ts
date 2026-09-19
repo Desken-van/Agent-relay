@@ -28,6 +28,8 @@ import {
   CODE_REVIEW_UNRESOLVED_STATUSES,
   CODE_SNAPSHOT_VERSION,
   providerCodeFindingSchema,
+  type CodeAutoDecideOutcome,
+  type CodeReviewDecision,
   type CodeReviewDecisionAction,
   type CodeReviewActor,
   type CodeReviewFinding,
@@ -250,9 +252,16 @@ export type CodeReviewOperation = 'review' | 'reconcile' | 'triage';
 
 export class CodeReviewClaims {
   private readonly held = new Map<string, CodeReviewOperation>();
+  /**
+   * Findings being auto-decided right now, per task. Analysing one finding is
+   * read-only towards the provider, so several DIFFERENT findings may run at
+   * once; a round dispatch, a reconciliation or a whole-set triage excludes them
+   * all, and is excluded by them.
+   */
+  private readonly analyzing = new Map<string, Set<string>>();
 
   acquire(taskId: string, operation: CodeReviewOperation): () => void {
-    const current = this.held.get(taskId);
+    const current = this.held.get(taskId) ?? ((this.analyzing.get(taskId)?.size ?? 0) > 0 ? 'triage' : undefined);
     if (current !== undefined) {
       throw new AgentRelayError('BUSY', `A code review ${current} is already running for this task.`, {
         remediation: 'Wait for the operation in flight to finish, then read the review again.'
@@ -267,8 +276,32 @@ export class CodeReviewClaims {
     };
   }
 
+  /** A shared claim on ONE finding's analysis; refused for the same finding twice or while an exclusive operation holds the task. */
+  acquireFinding(taskId: string, findingId: string): () => void {
+    const exclusive = this.held.get(taskId);
+    if (exclusive !== undefined) {
+      throw new AgentRelayError('BUSY', `A code review ${exclusive} is already running for this task.`, {
+        remediation: 'Wait for the operation in flight to finish, then read the review again.'
+      });
+    }
+    const set = this.analyzing.get(taskId) ?? new Set<string>();
+    if (set.has(findingId)) {
+      throw new AgentRelayError('BUSY', 'This finding is already being analyzed.', { remediation: 'Wait for its result.' });
+    }
+    set.add(findingId);
+    this.analyzing.set(taskId, set);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const current = this.analyzing.get(taskId);
+      current?.delete(findingId);
+      if (current !== undefined && current.size === 0) this.analyzing.delete(taskId);
+    };
+  }
+
   isHeld(taskId: string): boolean {
-    return this.held.has(taskId);
+    return this.held.has(taskId) || (this.analyzing.get(taskId)?.size ?? 0) > 0;
   }
 }
 
@@ -1528,25 +1561,45 @@ export class CodeReviewService {
       throw new AgentRelayError('NOT_FOUND', 'No such code review finding for this task.');
     }
 
-    const identity = await this.subjectIdentity(taskId);
-    if (identity.identity === 'incomplete') {
-      throw new AgentRelayError('VALIDATION_FAILED', SUBJECT_INCOMPLETE, {
-        remediation: 'Capture an exact subject before deciding its findings.'
-      });
-    }
-    if (identity.identity !== 'current' || identity.stored === null) {
-      throw new AgentRelayError(
-        'VALIDATION_FAILED',
-        'The reviewed code no longer matches the captured subject, so its findings cannot be decided.',
-        { remediation: 'Capture the subject again and run a fresh round before deciding.' }
-      );
-    }
-    if (finding.subjectSha256 !== identity.stored.subjectSha256) {
-      throw new AgentRelayError(
-        'VALIDATION_FAILED',
-        'This finding belongs to an earlier snapshot of the code and cannot be decided against the current one.',
-        { remediation: 'Decide the findings of the current round.' }
-      );
+    // `resolved` says "the code has moved on". For a finding of an EARLIER
+    // subject, a newer captured subject is not enough to say it: the operator
+    // would be judging code they were never shown a review of. What proves the
+    // claim is a COMPLETED round on the newest subject — a fresh external review
+    // of the corrected artifact, whose findings are on screen next to this one.
+    // Without it the finding stays history (see the "earlier snapshot" refusal
+    // below), exactly as before. This is the only decision an earlier subject's
+    // finding can ever receive: accepting or rejecting it would be a statement
+    // about code the task no longer has.
+    const newest = this.deps.reviews.latestSubject(taskId);
+    const movedOn =
+      request.action === 'resolved' &&
+      newest !== null &&
+      finding.subjectSha256 !== newest.subjectSha256 &&
+      this.deps.reviews
+        .listRounds(taskId)
+        .some((round) => round.subjectSha256 === newest.subjectSha256 && round.status === 'completed');
+
+    if (!movedOn) {
+      const identity = await this.subjectIdentity(taskId);
+      if (identity.identity === 'incomplete') {
+        throw new AgentRelayError('VALIDATION_FAILED', SUBJECT_INCOMPLETE, {
+          remediation: 'Capture an exact subject before deciding its findings.'
+        });
+      }
+      if (identity.identity !== 'current' || identity.stored === null) {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'The reviewed code no longer matches the captured subject, so its findings cannot be decided.',
+          { remediation: 'Capture the subject again and run a fresh round before deciding.' }
+        );
+      }
+      if (finding.subjectSha256 !== identity.stored.subjectSha256) {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'This finding belongs to an earlier snapshot of the code and cannot be decided against the current one.',
+          { remediation: 'Decide the findings of the current round.' }
+        );
+      }
     }
 
     const applied = this.deps.reviews.appendDecisionIfUnchanged(
@@ -1800,6 +1853,113 @@ export class CodeReviewService {
       throw new AgentRelayError('PARSE_FAILED', 'Codex did not return a recommendation for every requested finding.');
     }
     return recommendations;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Auto decide and correction requirements                                   */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Analyze ONE finding with Codex and, for accept/reject, record the decision
+   * durably — one click, no second "apply" step.
+   *
+   * The decision goes through the same {@link decide} every operator decision
+   * goes through, so the subject identity check, the credential-shape refusal
+   * and the conditional write on the finding's revision all still apply; only
+   * the actor (`system`) and source (`codeReview:autoDecide`) tell an audit
+   * reader it was automatic. A finding that already has a decision — or gets
+   * one while Codex is thinking — is reported `already_decided` and is never
+   * overwritten. `needs_user` records nothing.
+   */
+  async autoDecide(
+    taskId: string,
+    request: { readonly findingId: string },
+    signal?: AbortSignal
+  ): Promise<CodeAutoDecideOutcome> {
+    const release = this.deps.claims.acquireFinding(taskId, request.findingId);
+    try {
+      return await this.runAutoDecide(taskId, request.findingId, signal);
+    } finally {
+      release();
+    }
+  }
+
+  private async runAutoDecide(
+    taskId: string,
+    findingId: string,
+    signal?: AbortSignal
+  ): Promise<CodeAutoDecideOutcome> {
+    const finding = this.deps.reviews.findFindingById(findingId);
+    if (finding === null || finding.taskId !== taskId) {
+      throw new AgentRelayError('NOT_FOUND', 'No such code review finding for this task.');
+    }
+    const alreadyDecided = (): CodeAutoDecideOutcome | null => {
+      const existing = this.deps.reviews.latestDecision(findingId);
+      return existing === null ? null : { kind: 'already_decided', action: existing.action };
+    };
+    const before = alreadyDecided();
+    if (before !== null) return before;
+
+    let recommendation: FindingTriageRecommendation | undefined;
+    try {
+      const recommendations = await this.runTriage(taskId, { findingIds: [findingId] }, signal);
+      recommendation = recommendations.find((entry) => entry.findingRef === findingId);
+    } catch (error) {
+      // Triage refuses to persist an answer for a finding that was decided while
+      // it ran. That is not a failure of the analysis: the finding is simply no
+      // longer ours to decide.
+      const raced = alreadyDecided();
+      if (raced !== null) return raced;
+      throw error;
+    }
+    if (recommendation === undefined) {
+      throw new AgentRelayError('PARSE_FAILED', 'Codex did not return a recommendation for the finding.');
+    }
+    if (recommendation.recommendation === 'needs_user') {
+      return {
+        kind: 'needs_user',
+        reason: recommendation.reason,
+        evidenceRef: recommendation.evidenceRef,
+        confidence: recommendation.confidence
+      };
+    }
+
+    const reason = `Auto-decided by Codex triage (${recommendation.confidence} confidence): ${recommendation.reason} Evidence: ${recommendation.evidenceRef}`;
+    try {
+      await this.decide(taskId, {
+        findingId,
+        action: recommendation.recommendation,
+        reason,
+        expectedRevision: finding.revision,
+        actor: 'system',
+        source: 'codeReview:autoDecide'
+      });
+    } catch (error) {
+      const raced = alreadyDecided();
+      if (raced !== null) return raced;
+      throw error;
+    }
+    return {
+      kind: 'decided',
+      action: recommendation.recommendation,
+      reason,
+      confidence: recommendation.confidence
+    };
+  }
+
+  /**
+   * The findings someone accepted and nobody has yet shown to be fixed, across
+   * every subject, oldest first. Read from the repository only — no working
+   * tree is touched — so it is cheap enough to ask for on every detail read and
+   * for every correction request.
+   */
+  acceptedRequirements(taskId: string): { finding: CodeReviewFinding; decision: CodeReviewDecision }[] {
+    const accepted: { finding: CodeReviewFinding; decision: CodeReviewDecision }[] = [];
+    for (const finding of this.deps.reviews.listFindings(taskId)) {
+      const decision = this.deps.reviews.latestDecision(finding.id);
+      if (decision !== null && decision.action === 'accept') accepted.push({ finding, decision });
+    }
+    return accepted;
   }
 
   /* ------------------------------------------------------------------------ */

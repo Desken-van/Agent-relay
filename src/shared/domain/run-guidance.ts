@@ -18,6 +18,7 @@ export type RunActionKey =
   | 'run_plan_review'
   | 'reconcile_plan_review'
   | 'resolve_plan_review'
+  | 'continue_plan_correction'
   | 'approve_specification'
   | 'run_implementation'
   | 'run_verification'
@@ -45,7 +46,13 @@ export type PlanReviewPreparation =
   | 'run_next_review'
   | 'reconcile'
   | 'resolve'
+  /** Every finding is decided and at least one is accepted: the plan must be revised, not just resolved. */
+  | 'resolve_and_revise'
   | 'resolve_blocked'
+  /** Accepted findings await a revision of the specification (Codex), or the review of a revised one. */
+  | 'continue_correction'
+  /** Accepted findings remain but the configured correction budget is spent. */
+  | 'correction_limit'
   | 'passed'
   | 'working'
   | 'unavailable';
@@ -333,21 +340,48 @@ export function runGuidance(
             tone: 'warning'
           });
         }
-        if (planReviewPreparation === 'resolve' || planReviewPreparation === 'resolve_blocked') {
+        if (
+          planReviewPreparation === 'resolve' ||
+          planReviewPreparation === 'resolve_and_revise' ||
+          planReviewPreparation === 'resolve_blocked'
+        ) {
+          const revising = planReviewPreparation === 'resolve_and_revise';
           return acting({
             happened: 'External reviewers returned findings that require decisions.',
             stage: 'Step 1 of 5 · Resolve plan-review findings',
-            result: 'The specification is not approved until every finding has a decision.',
+            result: revising
+              ? 'Accepted findings are folded into the specification by Codex, which is then reviewed again. Nothing is approved automatically.'
+              : 'The specification is not approved until every finding has a decision.',
             action: action(
               'resolve_plan_review',
-              'Resolve external plan review',
-              planReviewPreparation === 'resolve',
+              revising ? 'Resolve and revise plan' : 'Resolve external plan review',
+              planReviewPreparation !== 'resolve_blocked',
               planReviewPreparation === 'resolve_blocked'
                 ? 'Decide every finding and provide a reason for each rejection.'
                 : null
             ),
             activeStep: 0,
             tone: 'warning'
+          });
+        }
+        if (planReviewPreparation === 'continue_correction') {
+          return acting({
+            happened: 'Findings were accepted, but the plan has not been fully revised and reviewed again for them.',
+            stage: 'Step 1 of 5 · Correct the plan',
+            result: 'The specification cannot be approved until its accepted findings are addressed and the revision passes review.',
+            action: action('continue_plan_correction', 'Continue correction'),
+            activeStep: 0,
+            tone: 'warning'
+          });
+        }
+        if (planReviewPreparation === 'correction_limit') {
+          return waiting({
+            happened: 'Findings were accepted, but the plan-correction budget is spent.',
+            stage: 'Step 1 of 5 · Plan correction limit reached',
+            result: 'The specification still has accepted findings it does not reflect, so it cannot be approved.',
+            next: 'Raise the maximum review rounds in Settings and continue, or regenerate the specification.',
+            activeStep: 0,
+            tone: 'error'
           });
         }
         return acting({

@@ -139,6 +139,11 @@ export const TRANSITIONS: TransitionTable = {
     verification_started: 'VERIFYING',
     verification_invalidated: 'READY_FOR_IMPLEMENTATION',
     review_started: 'REVIEWING',
+    // Findings accepted from an EXTERNAL code review are corrections owed even
+    // though no internal review asked for changes. Same correction round as any
+    // other; a recoverable failure returns to CHANGES_REQUESTED, exactly as it
+    // does from READY_TO_PUBLISH below.
+    corrections_sent: 'IMPLEMENTING',
     cancelled: 'CANCELLED'
   },
   REVIEWING: {
@@ -164,6 +169,8 @@ export const TRANSITIONS: TransitionTable = {
     verification_started: 'VERIFYING',
     // Requires an explicitly granted publishing approval; see `assertPublishable`.
     publish_approved: 'READY_TO_PUBLISH',
+    // Accepted external code-review findings still owed; see READY_FOR_REVIEW.
+    corrections_sent: 'IMPLEMENTING',
     cancelled: 'CANCELLED'
   },
   READY_TO_PUBLISH: {

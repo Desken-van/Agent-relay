@@ -1,17 +1,25 @@
 /** @vitest-environment jsdom */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { Task } from '../../src/shared/domain/models';
 import type { CodeReviewDetail, IpcResult } from '../../src/shared/ipc';
-import type { CodeReviewFinding, CodeReviewSubject, CodeReviewTriage } from '../../src/shared/domain/code-review';
+import type {
+  CodeAutoDecideOutcome,
+  CodeCorrectionRequirement,
+  CodeRequirementStatus,
+  CodeReviewDecision,
+  CodeReviewFinding,
+  CodeReviewSubject,
+  CodeReviewTriage
+} from '../../src/shared/domain/code-review';
 import { CodeReviewPanel } from '../../src/renderer/src/components/RunView';
 import { burstClick, deferred, deliver, fail, installBridge, ok, type Bridge } from './harness';
 
 const SUBJECT_SHA = 'a'.repeat(64);
-const OTHER_SUBJECT_SHA = 'b'.repeat(64);
+const NOW = '2026-09-06T00:00:00.000Z';
 
-const task = (): Task => ({
+const task = (overrides: Partial<Task> = {}): Task => ({
   id: 'task-1',
   projectId: 'project-1',
   title: 'Add a health route',
@@ -34,8 +42,9 @@ const task = (): Task => ({
   lastError: null,
   codexModel: null,
   claudeModel: null,
-  createdAt: '2026-09-06T00:00:00.000Z',
-  updatedAt: '2026-09-06T00:00:00.000Z'
+  createdAt: NOW,
+  updatedAt: NOW,
+  ...overrides
 });
 
 function subject(overrides: Partial<CodeReviewSubject> = {}): CodeReviewSubject {
@@ -52,15 +61,15 @@ function subject(overrides: Partial<CodeReviewSubject> = {}): CodeReviewSubject 
     truncated: false,
     complete: true,
     hasUncommittedState: false,
-    capturedAt: '2026-09-06T00:00:00.000Z',
-    createdAt: '2026-09-06T00:00:00.000Z',
+    capturedAt: NOW,
+    createdAt: NOW,
     ...overrides
   };
 }
 
 function finding(overrides: Partial<CodeReviewFinding> = {}): CodeReviewFinding {
   return {
-    id: 'finding-1',
+    id: 'f-1',
     taskId: 'task-1',
     subjectSha256: SUBJECT_SHA,
     fingerprint: 'f'.repeat(64),
@@ -78,676 +87,709 @@ function finding(overrides: Partial<CodeReviewFinding> = {}): CodeReviewFinding 
     lastRoundId: 'round-1',
     timesReported: 1,
     revision: 0,
-    createdAt: '2026-09-06T00:00:00.000Z',
-    updatedAt: '2026-09-06T00:00:00.000Z',
+    createdAt: NOW,
+    updatedAt: NOW,
+    ...overrides
+  };
+}
+
+function decisionRecord(
+  target: CodeReviewFinding,
+  action: CodeReviewDecision['action'],
+  overrides: Partial<CodeReviewDecision> = {}
+): CodeReviewDecision {
+  return {
+    id: `d-${target.id}`,
+    findingId: target.id,
+    subjectSha256: target.subjectSha256,
+    action,
+    reason: 'Decided.',
+    actor: 'operator',
+    source: 'test',
+    findingRevision: target.revision,
+    decidedAt: NOW,
+    createdAt: NOW,
     ...overrides
   };
 }
 
 function triageRecord(
-  findingsSnapshot: readonly (readonly [string, number])[],
+  snapshot: readonly (readonly [string, number])[],
   recommendations: readonly {
     findingId: string;
     recommendation: 'accept' | 'reject' | 'needs_user';
     reason: string;
     evidenceRef: string;
     confidence: 'high' | 'medium' | 'low' | 'uncertain';
-  }[],
-  overrides: Partial<CodeReviewTriage> = {}
+  }[]
 ): CodeReviewTriage {
   return {
     id: 'triage-1',
     taskId: 'task-1',
     subjectId: 'subject-1',
     subjectSha256: SUBJECT_SHA,
-    findingsSnapshotJson: JSON.stringify(findingsSnapshot.map(([id, revision]) => [id, revision])),
+    findingsSnapshotJson: JSON.stringify(snapshot.map(([id, revision]) => [id, revision])),
     triageJson: JSON.stringify({ recommendations }),
-    createdAt: '2026-09-06T00:00:00.000Z',
-    updatedAt: '2026-09-06T00:00:00.000Z',
-    ...overrides
+    createdAt: NOW,
+    updatedAt: NOW
   };
 }
 
-function detail(overrides: Partial<CodeReviewDetail> = {}): CodeReviewDetail {
-  return {
-    subject: null,
-    subjectIdentity: 'no_subject',
-    rounds: [],
-    findings: [],
-    historicalFindings: [],
-    latestDecisions: {},
-    totalFindingsEverRecorded: 0,
-    identityProblem: null,
-    triage: null,
-    ...overrides
-  };
+/**
+ * A stateful stand-in for the main process. Deciding bumps the finding's
+ * revision exactly as the durable lifecycle does, and a needs_user answer is
+ * kept as a stored recommendation with NO decision.
+ */
+class Server {
+  findings: CodeReviewFinding[];
+  decisions: Record<string, CodeReviewDecision> = {};
+  recommendations: Parameters<typeof triageRecord>[1][number][] = [];
+  statusOverrides: Record<string, CodeRequirementStatus> = {};
+  subject: CodeReviewSubject = subject();
+
+  constructor(count: number, titles: readonly string[] = ['Finding A', 'Finding B', 'Finding C']) {
+    this.findings = Array.from({ length: count }, (_, index) =>
+      finding({ id: `f-${index + 1}`, title: titles[index] ?? `Finding ${index + 1}`, line: 40 + index })
+    );
+  }
+
+  detail(): CodeReviewDetail {
+    const requirements: CodeCorrectionRequirement[] = this.findings.flatMap((entry) => {
+      const decision = this.decisions[entry.id];
+      if (decision?.action !== 'accept') return [];
+      return [{ finding: entry, decision, status: this.statusOverrides[entry.id] ?? 'open' }];
+    });
+    const snapshot = this.findings.map((entry) => [entry.id, entry.revision] as const);
+    return {
+      subject: this.subject,
+      subjectIdentity: 'current',
+      rounds: [],
+      findings: this.findings,
+      historicalFindings: [],
+      latestDecisions: this.decisions,
+      totalFindingsEverRecorded: this.findings.length,
+      identityProblem: null,
+      triage: this.recommendations.length > 0 ? triageRecord(snapshot, this.recommendations) : null,
+      correctionRequirements: requirements
+    };
+  }
+
+  /** The finding as decided by Codex: its revision moves on and a system decision is stored. */
+  autoDecided(id: string, action: 'accept' | 'reject', reason = 'Codex checked the code.') {
+    const target = this.findings.find((entry) => entry.id === id)!;
+    this.decisions = {
+      ...this.decisions,
+      [id]: decisionRecord(target, action, { reason, actor: 'system', source: 'auto_decide' })
+    };
+    this.findings = this.findings.map((entry) => (entry.id === id ? { ...entry, revision: entry.revision + 1 } : entry));
+    const outcome: CodeAutoDecideOutcome = { kind: 'decided', action, reason, confidence: 'high' };
+    return ok<'codeReview:autoDecide'>({ detail: this.detail(), outcome });
+  }
+
+  needsUser(id: string, reason = 'A product choice.') {
+    const target = this.findings.find((entry) => entry.id === id)!;
+    this.recommendations = [
+      ...this.recommendations,
+      { findingId: id, recommendation: 'needs_user', reason, evidenceRef: `${target.file}:${target.line}`, confidence: 'low' }
+    ];
+    const outcome: CodeAutoDecideOutcome = {
+      kind: 'needs_user',
+      reason,
+      evidenceRef: `${target.file}:${target.line}`,
+      confidence: 'low'
+    };
+    return ok<'codeReview:autoDecide'>({ detail: this.detail(), outcome });
+  }
+
+  /** Someone else decided it first: the durable decision stays and Codex's answer is dropped. */
+  alreadyDecided(id: string, action: 'accept' | 'reject') {
+    const target = this.findings.find((entry) => entry.id === id)!;
+    this.decisions = { ...this.decisions, [id]: decisionRecord(target, action, { reason: 'Decided by hand first.' }) };
+    this.findings = this.findings.map((entry) => (entry.id === id ? { ...entry, revision: entry.revision + 1 } : entry));
+    const outcome: CodeAutoDecideOutcome = { kind: 'already_decided', action };
+    return ok<'codeReview:autoDecide'>({ detail: this.detail(), outcome });
+  }
 }
 
 let bridge: Bridge;
+let server: Server;
 
 beforeEach(() => {
-  bridge = installBridge({ 'codeReview:get': () => ok<'codeReview:get'>(detail()) });
+  bridge = installBridge({ 'codeReview:get': () => ok<'codeReview:get'>(server.detail()) });
 });
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   delete (window as unknown as { agentRelay?: unknown }).agentRelay;
 });
 
-describe('the external code-review panel — automatic finding triage', () => {
-  it('dispatches "Analyze undecided findings" exactly once per burst of clicks, sending only durable identifiers', async () => {
-    const f1 = finding({ id: 'f-1' });
-    const f2 = finding({ id: 'f-2', title: 'Second finding' });
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2] })
-    ));
-    bridge.set('codeReview:triage', () => ok<'codeReview:triage'>({
-      recommendations: [],
-      detail: detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2] })
-    }));
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+/** Serve `count` findings; `answer` replies to each Auto decide call by finding id. */
+function serve(
+  count: number,
+  answer: (id: string, s: Server) => IpcResult<unknown> | Promise<IpcResult<unknown>> = (id, s) => s.autoDecided(id, 'accept')
+): Server {
+  server = new Server(count);
+  bridge.set('codeReview:get', () => ok<'codeReview:get'>(server.detail()));
+  bridge.set('codeReview:autoDecide', (input) => answer((input as { findingId: string }).findingId, server));
+  return server;
+}
 
-    const button = await screen.findByRole('button', { name: /Analyze undecided findings/i });
-    await burstClick(button, 3);
+const autoButton = (title: string): HTMLElement => screen.getByRole('button', { name: `Auto decide: ${title}` });
+const bulkButton = (): HTMLElement => screen.getByRole('button', { name: /Auto decide all undecided/ });
+const decisionSelects = (): HTMLSelectElement[] => screen.getAllByLabelText('Decision') as HTMLSelectElement[];
+const reasonInputs = (): HTMLInputElement[] => screen.getAllByLabelText(/^Reason/) as HTMLInputElement[];
+const autoCalls = () => bridge.callsTo('codeReview:autoDecide').map((call) => call.input as { taskId: string; findingId: string });
+const renderPanel = (
+  extra: { task?: Task; latestClaudeResult?: string | null; onCorrectionsSent?: (task: Task) => void } = {}
+) =>
+  render(
+    <CodeReviewPanel
+      task={extra.task ?? task()}
+      integrationEnabled
+      latestClaudeResult={extra.latestClaudeResult ?? null}
+      onCorrectionsSent={extra.onCorrectionsSent}
+    />
+  );
 
-    await waitFor(() => expect(bridge.callsTo('codeReview:triage')).toHaveLength(1));
-    expect(bridge.callsTo('codeReview:triage')[0]?.input).toEqual({
-      taskId: 'task-1',
-      findingIds: ['f-1', 'f-2']
-    });
+describe('code review: Auto decide beside every Decision', () => {
+  it('puts an Auto decide button in each finding’s Decision row, next to its own Decision and Reason', async () => {
+    serve(2);
+    renderPanel();
+
+    await screen.findByText('Finding A');
+    for (const [index, title] of (['Finding A', 'Finding B'] as const).entries()) {
+      const row = autoButton(title).closest('.decision-row') as HTMLElement;
+      expect(row).not.toBeNull();
+      expect(within(row).getByLabelText('Decision')).toBe(decisionSelects()[index]);
+      expect(within(row).getByLabelText(/^Reason/)).toBe(reasonInputs()[index]);
+    }
   });
 
-  it('shows one recommendation per undecided finding with its reason, evidence and confidence, and never decides anything on its own', async () => {
-    const f1 = finding({ id: 'f-1' });
-    const f2 = finding({ id: 'f-2', title: 'Second finding' });
-    const triage = triageRecord(
-      [['f-1', 0], ['f-2', 0]],
-      [
-        { findingId: 'f-1', recommendation: 'accept', reason: 'Matches criterion 1.', evidenceRef: 'src/service.ts:42', confidence: 'high' },
-        { findingId: 'f-2', recommendation: 'needs_user', reason: 'Genuine uncertainty.', evidenceRef: 'src/service.ts:50', confidence: 'low' }
-      ]
-    );
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2], triage })
-    ));
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+  it('asks about exactly the finding whose button was clicked, naming only durable identifiers', async () => {
+    serve(3);
+    renderPanel();
+    await screen.findByText('Finding B');
 
-    expect(await screen.findByText(/Recommended: accept/)).toBeTruthy();
-    expect(screen.getByText(/Matches criterion 1\./)).toBeTruthy();
-    expect(screen.getByText(/Evidence: src\/service\.ts:42/)).toBeTruthy();
-    expect(screen.getByText(/Needs a human decision/)).toBeTruthy();
+    fireEvent.click(autoButton('Finding B'));
 
-    // `needs_user` gets no apply affordance — it must remain undecided.
-    expect(screen.getAllByRole('button', { name: /^Apply recommendation$/ })).toHaveLength(1);
+    await waitFor(() => expect(autoCalls()).toHaveLength(1));
+    expect(bridge.callsTo('codeReview:autoDecide')[0]?.input).toEqual({ taskId: 'task-1', findingId: 'f-2' });
+  });
+
+  it('records an accept at once: the finding shows its durable decision and the renderer submits nothing itself', async () => {
+    serve(2, (id, s) => s.autoDecided(id, 'accept', 'Matches criterion 1.'));
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.click(autoButton('Finding A'));
+
+    const decided = await screen.findByText(/Decided: accept/);
+    const card = decided.closest('.finding') as HTMLElement;
+    expect(card.textContent).toContain('Finding A');
+    expect(card.textContent).toContain('auto-decided');
+    expect(card.textContent).toContain('Matches criterion 1.');
+    // The Decision controls of the decided finding are gone; the other finding is untouched.
+    expect(within(card).queryByLabelText('Decision')).toBeNull();
+    expect(decisionSelects()).toHaveLength(1);
+    // No second "apply" step, no renderer-side decide: the backend wrote it.
     expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
   });
 
-  it('applies one recommendation by submitting exactly that decision, using the recommendation\'s own reason', async () => {
-    const f1 = finding({ id: 'f-1', revision: 3 });
-    const triage = triageRecord(
-      [['f-1', 3]],
-      [{ findingId: 'f-1', recommendation: 'reject', reason: 'False premise.', evidenceRef: 'src/service.ts:42', confidence: 'medium' }]
-    );
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1], triage })
-    ));
-    bridge.set('codeReview:decide', () => ok<'codeReview:decide'>(
-      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1] })
-    ));
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+  it('records a reject at once, with its reason', async () => {
+    serve(2, (id, s) => s.autoDecided(id, 'reject', 'The premise is contradicted by src/x.ts.'));
+    renderPanel();
+    await screen.findByText('Finding A');
 
-    const apply = await screen.findByRole('button', { name: /^Apply recommendation$/ });
-    await burstClick(apply, 3);
+    fireEvent.click(autoButton('Finding B'));
+
+    const decided = await screen.findByText(/Decided: reject/);
+    expect((decided.closest('.finding') as HTMLElement).textContent).toContain('contradicted by src/x.ts');
+    expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
+  });
+
+  it('leaves a needs_user finding undecided and says, inside that finding, why automation stopped', async () => {
+    serve(2, (id, s) => s.needsUser(id, 'This is an architecture choice.'));
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.click(autoButton('Finding A'));
+
+    const stop = await screen.findByText(/Needs your decision — automation stopped on purpose/);
+    const card = stop.closest('.finding') as HTMLElement;
+    expect(card.textContent).toContain('Finding A');
+    expect(card.textContent).toContain('This is an architecture choice.');
+    // Still undecided: the operator's own controls remain, and nothing was recorded.
+    expect(within(card).getByLabelText('Decision')).toHaveProperty('value', '');
+    expect(within(card).getByRole('button', { name: /Submit decision/ })).toBeTruthy();
+    expect(screen.queryByText(/Decided:/)).toBeNull();
+    expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
+  });
+
+  it('shows Analyzing… in the finding, and disables only what conflicts with it', async () => {
+    const answer = deferred<IpcResult<unknown>>();
+    serve(2, (id, s) => (id === 'f-1' ? answer.promise : s.autoDecided(id, 'accept')));
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.click(autoButton('Finding A'));
+
+    const first = autoButton('Finding A');
+    await waitFor(() => expect(first.textContent).toContain('Analyzing…'));
+    expect(first).toHaveProperty('disabled', true);
+    expect(first.getAttribute('aria-busy')).toBe('true');
+    expect(within(first.closest('.finding') as HTMLElement).getByRole('status').textContent).toContain('Analyzing…');
+    // Another finding can still be worked on; actions that read the tree cannot.
+    expect(autoButton('Finding B')).toHaveProperty('disabled', false);
+    expect(decisionSelects()[0]).toHaveProperty('disabled', false);
+    expect(screen.getByRole('button', { name: /Capture subject again/ })).toHaveProperty('disabled', true);
+    expect(screen.getByRole('button', { name: /Run external code review/ })).toHaveProperty('disabled', true);
+
+    await deliver(answer, server.autoDecided('f-1', 'accept'));
+    await screen.findByText(/Decided: accept/);
+    expect(screen.getByRole('button', { name: /Capture subject again/ })).toHaveProperty('disabled', false);
+  });
+
+  it('keeps a failure inside its own finding with the real error and a Retry that works', async () => {
+    let attempts = 0;
+    serve(2, (id, s) => {
+      if (id === 'f-1' && (attempts += 1) === 1) return fail('Codex timed out.', 'TIMEOUT', 'Try again.');
+      return s.autoDecided(id, 'accept');
+    });
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.click(autoButton('Finding A'));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Failed — Retry. Nothing was decided.');
+    expect(alert.textContent).toContain('Codex timed out. Try again.');
+    expect((alert.closest('.finding') as HTMLElement).textContent).toContain('Finding A');
+    expect(screen.queryByText(/Decided:/)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry auto decide: Finding A' }));
+
+    await screen.findByText(/Decided: accept/);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(autoCalls().map((call) => call.findingId)).toEqual(['f-1', 'f-1']);
+  });
+
+  it('starts one analysis for a burst of clicks on the same button', async () => {
+    const answer = deferred<IpcResult<unknown>>();
+    serve(2, () => answer.promise);
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    await burstClick(autoButton('Finding A'), 4);
+
+    expect(autoCalls()).toHaveLength(1);
+    await deliver(answer, server.autoDecided('f-1', 'accept'));
+  });
+
+  it('never contradicts a decision someone else recorded first: the durable one is shown, not Codex’s', async () => {
+    serve(2, (id, s) => s.alreadyDecided(id, 'reject'));
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.click(autoButton('Finding A'));
+
+    const decided = await screen.findByText(/Decided: reject/);
+    expect((decided.closest('.finding') as HTMLElement).textContent).toContain('Decided by hand first.');
+    expect(screen.queryByText(/Decided: accept/)).toBeNull();
+  });
+
+  it('keeps what Auto decide saved across a refresh or restart', async () => {
+    serve(2, (id, s) => s.autoDecided(id, 'accept'));
+    const first = renderPanel();
+    await screen.findByText('Finding A');
+    fireEvent.click(autoButton('Finding A'));
+    await screen.findByText(/Decided: accept/);
+    first.unmount();
+
+    renderPanel();
+
+    const decided = await screen.findByText(/Decided: accept/);
+    expect(decided.closest('.finding')!.textContent).toContain('auto-decided');
+    expect(autoCalls()).toHaveLength(1);
+  });
+
+  it('keeps a stop Codex made on purpose across a refresh, until the operator decides', async () => {
+    serve(2, (id, s) => s.needsUser(id, 'Undecidable without the owner.'));
+    const first = renderPanel();
+    await screen.findByText('Finding A');
+    fireEvent.click(autoButton('Finding A'));
+    await screen.findByText('Undecidable without the owner.');
+    first.unmount();
+
+    renderPanel();
+
+    expect(await screen.findByText('Undecidable without the owner.')).toBeTruthy();
+    expect(autoCalls()).toHaveLength(1);
+  });
+});
+
+describe('code review: Auto decide all undecided', () => {
+  it('is the primary bulk action, and the old Analyze → Apply workflow is gone', async () => {
+    serve(3);
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    expect(bulkButton().className).toContain('btn--primary');
+    expect(bulkButton().textContent).toContain('(3)');
+    expect(screen.queryByRole('button', { name: /Analyze undecided findings/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Apply recommendation/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Apply all recommendations/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /Clear unsaved decisions/ })).toBeTruthy();
+    // The glossary explains accept / reject / needs_user in words.
+    expect(screen.getByText('What the choices mean').closest('.notice')!.textContent).toMatch(/Accepting it does not change any code/);
+  });
+
+  it('records every accept and reject, never a needs_user, and reports the counts beside the button', async () => {
+    serve(3, (id, s) => {
+      if (id === 'f-1') return s.autoDecided(id, 'accept');
+      if (id === 'f-2') return s.autoDecided(id, 'reject');
+      return s.needsUser(id, 'Undecidable without the product owner.');
+    });
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.click(bulkButton());
+
+    await waitFor(() => expect(screen.getByText(/Auto decide finished/)).toBeTruthy());
+    expect(autoCalls().map((call) => call.findingId).sort()).toEqual(['f-1', 'f-2', 'f-3']);
+    expect(Object.fromEntries(Object.entries(server.decisions).map(([id, entry]) => [id, entry.action]))).toEqual({
+      'f-1': 'accept',
+      'f-2': 'reject'
+    });
+    const summary = screen.getByText(/3 analyzed/).closest('.autodecide-summary') as HTMLElement;
+    expect(summary.textContent).toMatch(/3 analyzed · 1 accepted · 1 rejected · 1 need you · 0 failed/);
+    expect(screen.getByText('Undecidable without the product owner.')).toBeTruthy();
+    // Needs-user is left for the operator: it is not decided and not asked about again.
+    expect(server.decisions['f-3']).toBeUndefined();
+    expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
+  });
+
+  it('never touches a finding that has a decision, a draft, or a stop, and keeps the drafts', async () => {
+    serve(4);
+    server.autoDecided('f-1', 'reject', 'Already rejected.');
+    server.needsUser('f-4');
+    renderPanel();
+    await screen.findByText('Finding B');
+    fireEvent.change(decisionSelects()[0]!, { target: { value: 'reject' } });
+    fireEvent.change(reasonInputs()[0]!, { target: { value: 'Refuted by hand.' } });
+
+    fireEvent.click(bulkButton());
+
+    await waitFor(() => expect(screen.getByText(/Auto decide finished/)).toBeTruthy());
+    // Finding B is drafted, A is decided, D needs the operator: only C is analyzed.
+    expect(autoCalls().map((call) => call.findingId)).toEqual(['f-3']);
+    expect(server.decisions['f-1']!.action).toBe('reject');
+    expect(server.decisions['f-1']!.reason).toBe('Already rejected.');
+    expect(decisionSelects()[0]!.value).toBe('reject');
+    expect(reasonInputs()[0]!.value).toBe('Refuted by hand.');
+  });
+
+  it('isolates a failure: the others keep their results and only the failed one is retried', async () => {
+    let failing = true;
+    serve(3, (id, s) =>
+      id === 'f-2' && failing ? fail('Codex crashed on this one.', 'TOOL_FAILED') : s.autoDecided(id, 'accept')
+    );
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.click(bulkButton());
+
+    await screen.findByText(/Auto decide finished with failures/);
+    expect(Object.keys(server.decisions).sort()).toEqual(['f-1', 'f-3']);
+    const summary = screen.getByText(/analyzed/).closest('.autodecide-summary') as HTMLElement;
+    expect(summary.textContent).toMatch(/2 analyzed · 2 accepted · 0 rejected · 0 need you · 1 failed/);
+    expect(summary.textContent).toMatch(/2 finding\(s\) kept their results/);
+    const alert = screen.getByRole('alert');
+    expect((alert.closest('.finding') as HTMLElement).textContent).toContain('Finding B');
+    expect(alert.textContent).toContain('Codex crashed on this one.');
+
+    failing = false;
+    const before = autoCalls().length;
+    fireEvent.click(screen.getByRole('button', { name: /Retry 1 failed/ }));
+
+    await waitFor(() => expect(server.decisions['f-2']?.action).toBe('accept'));
+    expect(autoCalls().slice(before).map((call) => call.findingId)).toEqual(['f-2']);
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+  });
+
+  it('shows live counts while it runs, two analyses at a time', async () => {
+    const holds: Record<string, ReturnType<typeof deferred<IpcResult<unknown>>>> = {
+      'f-1': deferred(),
+      'f-2': deferred(),
+      'f-3': deferred()
+    };
+    serve(3, (id) => holds[id]!.promise);
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.click(bulkButton());
+
+    const running = await screen.findByText(/Auto decide running/);
+    expect((running.closest('.autodecide-summary') as HTMLElement).textContent).toMatch(/3 left/);
+    await waitFor(() => expect(autoCalls()).toHaveLength(2));
+    expect(autoButton('Finding C').textContent).toContain('Waiting…');
+
+    await deliver(holds['f-1']!, server.autoDecided('f-1', 'accept'));
+    await deliver(holds['f-2']!, server.autoDecided('f-2', 'reject'));
+    await waitFor(() => expect(autoCalls()).toHaveLength(3));
+    await deliver(holds['f-3']!, server.autoDecided('f-3', 'accept'));
+    await screen.findByText(/Auto decide finished/);
+  });
+
+  it('leaves alone a finding someone else decided while it was analyzing, and does not count it as its own', async () => {
+    serve(2, (id, s) => (id === 'f-1' ? s.alreadyDecided(id, 'reject') : s.autoDecided(id, 'accept')));
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.click(bulkButton());
+
+    await screen.findByText(/Auto decide finished/);
+    expect(server.decisions['f-1']!.action).toBe('reject');
+    expect(server.decisions['f-1']!.actor).toBe('operator');
+    const summary = screen.getByText(/analyzed/).closest('.autodecide-summary') as HTMLElement;
+    expect(summary.textContent).toMatch(/1 accepted · 0 rejected/);
+  });
+
+  it('reads the truth back once the queue is idle, so answers that finished out of order cannot leave stale rows', async () => {
+    serve(2);
+    renderPanel();
+    await screen.findByText('Finding A');
+    const reads = bridge.callsTo('codeReview:get').length;
+
+    fireEvent.click(bulkButton());
+
+    await screen.findByText(/Auto decide finished/);
+    await waitFor(() => expect(bridge.callsTo('codeReview:get').length).toBeGreaterThan(reads));
+  });
+
+  it('offers nothing to analyze once every finding has a decision, and says so', async () => {
+    serve(1);
+    server.autoDecided('f-1', 'accept');
+    renderPanel();
+
+    expect(await screen.findByText('All live findings have decisions recorded.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Auto decide all undecided/ })).toBeNull();
+    expect(screen.getByText(/Decided: accept/)).toBeTruthy();
+  });
+
+  it('“Clear unsaved decisions” discards only what was typed, never what is recorded', async () => {
+    serve(2);
+    server.autoDecided('f-1', 'accept');
+    renderPanel();
+    await screen.findByText('Finding B');
+    fireEvent.change(decisionSelects()[0]!, { target: { value: 'reject' } });
+    fireEvent.change(reasonInputs()[0]!, { target: { value: 'Typed, not sent.' } });
+
+    fireEvent.click(screen.getByRole('button', { name: /Clear unsaved decisions/ }));
+
+    expect(decisionSelects()[0]!.value).toBe('');
+    expect(reasonInputs()[0]!.value).toBe('');
+    expect(screen.getByText(/Decided: accept/)).toBeTruthy();
+    expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
+  });
+});
+
+describe('code review: manual decisions keep working beside Auto decide', () => {
+  it('preserves an in-progress draft for an untouched finding after a sibling is decided by hand', async () => {
+    serve(2);
+    renderPanel();
+    await screen.findByText('Finding B');
+    bridge.set('codeReview:decide', () => {
+      server.autoDecided('f-1', 'accept', 'Handled.');
+      return ok<'codeReview:decide'>(server.detail());
+    });
+    fireEvent.change(decisionSelects()[1]!, { target: { value: 'reject' } });
+    fireEvent.change(reasonInputs()[1]!, { target: { value: 'Draft reason for the second finding.' } });
+    fireEvent.change(decisionSelects()[0]!, { target: { value: 'accept' } });
+    fireEvent.change(reasonInputs()[0]!, { target: { value: 'Handled.' } });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /^Submit decision$/ })[0]!);
+
+    await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(1));
+    await screen.findByText(/Decided: accept/);
+    expect(reasonInputs()).toHaveLength(1);
+    expect(reasonInputs()[0]!.value).toBe('Draft reason for the second finding.');
+  });
+
+  it('preserves a draft when Auto decide changes a sibling and when a new finding appears for the same subject', async () => {
+    serve(2);
+    renderPanel();
+    await screen.findByText('Finding B');
+    fireEvent.change(reasonInputs()[1]!, { target: { value: 'Draft reason kept.' } });
+
+    server.findings = [...server.findings, finding({ id: 'f-3', title: 'Third finding' })];
+    fireEvent.click(autoButton('Finding A'));
+
+    await screen.findByText(/Decided: accept/);
+    await screen.findByText('Third finding');
+    expect(reasonInputs()).toHaveLength(2);
+    expect(reasonInputs()[0]!.value).toBe('Draft reason kept.');
+  });
+
+  it('a manual decision needs a reason before it can be submitted, and submits the finding’s own revision', async () => {
+    serve(1);
+    renderPanel();
+    await screen.findByText('Finding A');
+    const submit = screen.getByRole('button', { name: /^Submit decision$/ });
+    expect(submit).toHaveProperty('disabled', true);
+    bridge.set('codeReview:decide', () => ok<'codeReview:decide'>(server.detail()));
+
+    fireEvent.change(decisionSelects()[0]!, { target: { value: 'accept' } });
+    expect(submit).toHaveProperty('disabled', true);
+    fireEvent.change(reasonInputs()[0]!, { target: { value: 'Yes, it is valid.' } });
+    fireEvent.click(submit);
 
     await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(1));
     expect(bridge.callsTo('codeReview:decide')[0]?.input).toEqual({
       taskId: 'task-1',
       findingId: 'f-1',
-      expectedRevision: 3,
-      action: 'reject',
-      reason: 'False premise.'
+      expectedRevision: 0,
+      action: 'accept',
+      reason: 'Yes, it is valid.'
     });
   });
+});
 
-  it('applies all applicable recommendations, one decision per accept/reject finding, and skips needs_user', async () => {
-    const f1 = finding({ id: 'f-1', revision: 0 });
-    const f2 = finding({ id: 'f-2', revision: 0, title: 'Second' });
-    const f3 = finding({ id: 'f-3', revision: 0, title: 'Third' });
-    const triage = triageRecord(
-      [['f-1', 0], ['f-2', 0], ['f-3', 0]],
-      [
-        { findingId: 'f-1', recommendation: 'accept', reason: 'r1', evidenceRef: 'e', confidence: 'high' },
-        { findingId: 'f-2', recommendation: 'reject', reason: 'r2', evidenceRef: 'e', confidence: 'high' },
-        { findingId: 'f-3', recommendation: 'needs_user', reason: 'r3', evidenceRef: 'e', confidence: 'low' }
-      ]
-    );
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2, f3], triage })
-    ));
-    bridge.set('codeReview:decide', () => ok<'codeReview:decide'>(
-      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2, f3] })
-    ));
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+describe('code review: accepted findings are correction requirements, not proof of a fix', () => {
+  it('lists an accepted finding as a requirement that is still open, and says accepting changed no code', async () => {
+    serve(2);
+    server.autoDecided('f-1', 'accept');
+    renderPanel();
 
-    const applyAll = await screen.findByRole('button', { name: /Apply all recommendations to undecided findings/i });
-    await burstClick(applyAll, 3);
-
-    await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(2));
-    const inputs = bridge.callsTo('codeReview:decide').map((call) => call.input);
-    expect(inputs).toContainEqual({ taskId: 'task-1', findingId: 'f-1', expectedRevision: 0, action: 'accept', reason: 'r1' });
-    expect(inputs).toContainEqual({ taskId: 'task-1', findingId: 'f-2', expectedRevision: 0, action: 'reject', reason: 'r2' });
+    const block = await screen.findByLabelText('Correction requirements');
+    expect(block.textContent).toContain('Correction requirements (1)');
+    expect(block.textContent).toContain('Finding A');
+    expect(block.textContent).toContain('Accepted correction: Persist the intent before calling out.');
+    expect(block.textContent).toContain('Open — the code has not changed since this was accepted.');
+    expect(block.textContent).toMatch(/does not change any code/);
+    // A rejected or undecided finding is not a requirement.
+    expect(within(block).queryByText('Finding B')).toBeNull();
+    // Nothing offers to mark an unfixed finding resolved.
+    expect(within(block).queryByRole('button', { name: /Mark resolved/ })).toBeNull();
+    expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
   });
 
-  it('continues applying the rest of an apply-all batch after one item fails, and reports the failure', async () => {
-    const f1 = finding({ id: 'f-1', revision: 0 });
-    const f2 = finding({ id: 'f-2', revision: 0, title: 'Second' });
-    const triage = triageRecord(
-      [['f-1', 0], ['f-2', 0]],
-      [
-        { findingId: 'f-1', recommendation: 'accept', reason: 'r1', evidenceRef: 'e', confidence: 'high' },
-        { findingId: 'f-2', recommendation: 'reject', reason: 'r2', evidenceRef: 'e', confidence: 'high' }
-      ]
-    );
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2], triage })
-    ));
-    // f-1 was decided by someone else moments ago; f-2 is still fully valid.
-    bridge.set('codeReview:decide', (input) => {
-      const { findingId } = input as { findingId: string };
-      return findingId === 'f-1'
-        ? fail('This finding was decided by someone else while you were looking at it, so nothing was written.')
-        : ok<'codeReview:decide'>(detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2] }));
-    });
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+  it('hands the accepted findings to the existing correction round, and reports the task it returns', async () => {
+    serve(2);
+    server.autoDecided('f-1', 'accept');
+    const sent = task({ status: 'IMPLEMENTING', currentRound: 2 });
+    bridge.set('workflow:sendCorrections', () => ok<'workflow:sendCorrections'>(sent));
+    const onCorrectionsSent = vi.fn();
+    renderPanel({ onCorrectionsSent });
 
-    const applyAll = await screen.findByRole('button', { name: /Apply all recommendations to undecided findings/i });
-    await burstClick(applyAll, 1);
+    const send = await screen.findByRole('button', { name: /Send accepted findings as corrections/ });
+    expect(send).toHaveProperty('disabled', false);
+    fireEvent.click(send);
 
-    // Both items were attempted — the failure on f-1 did not stop f-2 from
-    // being submitted.
-    await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(2));
-    const inputs = bridge.callsTo('codeReview:decide').map((call) => call.input);
-    expect(inputs).toContainEqual({ taskId: 'task-1', findingId: 'f-1', expectedRevision: 0, action: 'accept', reason: 'r1' });
-    expect(inputs).toContainEqual({ taskId: 'task-1', findingId: 'f-2', expectedRevision: 0, action: 'reject', reason: 'r2' });
-
-    expect(await screen.findByText(/1 of 2 recommendations could not be applied/i)).toBeTruthy();
-    // The aggregate error is thrown AFTER the loop, inside act()'s try —
-    // its catch does not return early, so the unconditional codeReview:get
-    // re-read below it still runs: one on mount, one after this batch.
-    expect(bridge.callsTo('codeReview:get').length).toBeGreaterThanOrEqual(2);
+    await waitFor(() => expect(bridge.callsTo('workflow:sendCorrections')).toHaveLength(1));
+    // Only the task id: the accepted set is read from the durable decisions by the backend.
+    expect(bridge.callsTo('workflow:sendCorrections')[0]?.input).toEqual({ taskId: 'task-1' });
+    await waitFor(() => expect(onCorrectionsSent).toHaveBeenCalledWith(sent));
+    // Sending is not resolving.
+    expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
   });
 
-  it('never shows a stored recommendation once the reviewed subject has changed', async () => {
-    const f1 = finding({ id: 'f-1' });
-    const staleTriage = triageRecord(
-      [['f-1', 0]],
-      [{ findingId: 'f-1', recommendation: 'accept', reason: 'Stale recommendation.', evidenceRef: 'e', confidence: 'high' }],
-      { subjectSha256: OTHER_SUBJECT_SHA }
-    );
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1], triage: staleTriage })
-    ));
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+  it('does not offer to send while the task is somewhere corrections cannot start, and says where they can', async () => {
+    serve(1);
+    server.autoDecided('f-1', 'accept');
+    renderPanel({ task: task({ status: 'IMPLEMENTING' }) });
 
-    await screen.findByText(/The retry is ambiguous/);
-    expect(screen.queryByText(/Recommended: accept/)).toBeNull();
-    expect(screen.queryByText(/Stale recommendation\./)).toBeNull();
+    const block = await screen.findByLabelText('Correction requirements');
+    expect(within(block).queryByRole('button', { name: /Send accepted findings as corrections/ })).toBeNull();
+    expect(block.textContent).toMatch(/Corrections can be sent from a ready or approved round/);
+    expect(block.textContent).toContain('This task is implementing.');
   });
 
-  it('never shows a stored recommendation once one of its analyzed findings has since been decided', async () => {
-    // Live revision (1) has moved past what the stored analysis covered (0) —
-    // exactly what recording a decision on this finding does.
-    const f1 = finding({ id: 'f-1', revision: 1 });
-    const triage = triageRecord(
-      [['f-1', 0]],
-      [{ findingId: 'f-1', recommendation: 'accept', reason: 'Stale recommendation.', evidenceRef: 'e', confidence: 'high' }]
-    );
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1], triage })
-    ));
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+  it('disables the hand-off, with the reason, once the round budget is spent', async () => {
+    serve(1);
+    server.autoDecided('f-1', 'accept');
+    renderPanel({ task: task({ currentRound: 3, maxRounds: 3 }) });
 
-    await screen.findByText(/The retry is ambiguous/);
-    expect(screen.queryByText(/Recommended: accept/)).toBeNull();
-    expect(screen.queryByText(/Stale recommendation\./)).toBeNull();
+    const send = await screen.findByRole('button', { name: /Send accepted findings as corrections/ });
+    expect(send).toHaveProperty('disabled', true);
+    expect(send.getAttribute('title')).toBeTruthy();
   });
 
-  it('keeps a sibling finding\'s recommendation visible after another finding from the same analysis is decided', async () => {
-    // f-1 was decided (its live revision moved from the analyzed 0 to 1);
-    // f-2 is untouched and still at the revision it was analyzed at.
-    const f1 = finding({ id: 'f-1', revision: 1 });
-    const f2 = finding({ id: 'f-2', revision: 0, title: 'Second finding' });
-    const triage = triageRecord(
-      [['f-1', 0], ['f-2', 0]],
-      [
-        { findingId: 'f-1', recommendation: 'accept', reason: 'r1', evidenceRef: 'e', confidence: 'high' },
-        { findingId: 'f-2', recommendation: 'reject', reason: 'r2', evidenceRef: 'e', confidence: 'high' }
-      ]
-    );
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({
-        subject: subject(),
-        subjectIdentity: 'current',
-        findings: [f1, f2],
-        latestDecisions: {
-          'f-1': {
-            id: 'd-1',
-            findingId: 'f-1',
-            subjectSha256: SUBJECT_SHA,
-            action: 'accept',
-            reason: 'Decided already.',
-            actor: 'operator',
-            source: 'test',
-            findingRevision: 0,
-            decidedAt: '2026-09-06T00:00:00.000Z',
-            createdAt: '2026-09-06T00:00:00.000Z'
-          }
-        },
-        triage
-      })
-    ));
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+  it('tells the operator to capture and re-review once the code has moved, and offers no “resolved” yet', async () => {
+    serve(2);
+    server.autoDecided('f-1', 'accept');
+    server.statusOverrides = { 'f-1': 'awaiting_fresh_review' };
+    renderPanel();
 
-    // f-1 shows its decision, not a stale recommendation for itself.
-    await screen.findByText(/Decided: accept/);
-    expect(screen.queryByText(/^r1$/)).toBeNull();
-    // f-2's recommendation, from the SAME analysis, is unaffected by what
-    // happened to its sibling and remains applicable.
-    expect(screen.getByText(/Recommended: reject/)).toBeTruthy();
-    expect(await screen.findByRole('button', { name: /^Apply recommendation$/ })).toBeTruthy();
+    const block = await screen.findByLabelText('Correction requirements');
+    expect(block.textContent).toContain('The code has moved on. Capture it and run a fresh external review');
+    expect(within(block).queryByRole('button', { name: /Mark resolved/ })).toBeNull();
+    expect(within(block).queryByLabelText(/Why is this fixed/)).toBeNull();
   });
 
-  it('end to end: after finding A is decided elsewhere, B still applies through the UI, and exactly one decision is submitted for B alone', async () => {
-    const f1 = finding({ id: 'f-1', revision: 1 }); // A: already decided elsewhere
-    const f2 = finding({ id: 'f-2', revision: 0, title: 'Second finding' }); // B: untouched
-    const triage = triageRecord(
-      [['f-1', 0], ['f-2', 0]],
-      [
-        { findingId: 'f-1', recommendation: 'accept', reason: 'r1', evidenceRef: 'e', confidence: 'high' },
-        { findingId: 'f-2', recommendation: 'reject', reason: 'r2', evidenceRef: 'e', confidence: 'high' }
-      ]
-    );
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({
-        subject: subject(),
-        subjectIdentity: 'current',
-        findings: [f1, f2],
-        latestDecisions: {
-          'f-1': {
-            id: 'd-1', findingId: 'f-1', subjectSha256: SUBJECT_SHA, action: 'accept',
-            reason: 'Decided already.', actor: 'operator', source: 'test', findingRevision: 0,
-            decidedAt: '2026-09-06T00:00:00.000Z', createdAt: '2026-09-06T00:00:00.000Z'
-          }
-        },
-        triage
-      })
-    ));
-    bridge.set('codeReview:decide', () => ok<'codeReview:decide'>(
-      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2] })
-    ));
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+  it('offers “Mark resolved” only after a fresh review of the corrected code, and only with a reason', async () => {
+    serve(2);
+    server.autoDecided('f-1', 'accept');
+    server.statusOverrides = { 'f-1': 'fresh_review_done' };
+    bridge.set('codeReview:decide', () => ok<'codeReview:decide'>(server.detail()));
+    renderPanel();
 
-    // B's apply affordance is present and B alone gets submitted.
-    const apply = await screen.findByRole('button', { name: /^Apply recommendation$/ });
-    fireEvent.click(apply);
+    const block = await screen.findByLabelText('Correction requirements');
+    expect(block.textContent).toContain('A fresh review of the corrected code has run.');
+    const resolve = within(block).getByRole('button', { name: 'Mark resolved: Finding A' });
+    expect(resolve).toHaveProperty('disabled', true);
+
+    fireEvent.change(within(block).getByLabelText(/Why is this fixed/), { target: { value: 'The intent is persisted first now.' } });
+    expect(resolve).toHaveProperty('disabled', false);
+    fireEvent.click(resolve);
 
     await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(1));
     expect(bridge.callsTo('codeReview:decide')[0]?.input).toEqual({
       taskId: 'task-1',
-      findingId: 'f-2',
-      expectedRevision: 0,
-      action: 'reject',
-      reason: 'r2'
+      findingId: 'f-1',
+      expectedRevision: 1,
+      action: 'resolved',
+      reason: 'The intent is persisted first now.'
     });
   });
 
-  it('preserves an in-progress manual draft for an untouched finding after a sibling finding is decided', async () => {
-    const f1 = finding({ id: 'f-1', revision: 0, title: 'First finding' });
-    const f2 = finding({ id: 'f-2', revision: 0, title: 'Second finding' });
-    // Stateful: `act()`'s post-mutation reread is a SEPARATE codeReview:get
-    // call, not the codeReview:decide response — the mock must reflect the
-    // decision on its NEXT read, or this test cannot tell the fix from a
-    // mock that never actually re-rendered anything.
-    let f1Decided = false;
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({
-        subject: subject(),
-        subjectIdentity: 'current',
-        findings: [finding({ id: 'f-1', revision: f1Decided ? 1 : 0, title: 'First finding' }), f2],
-        latestDecisions: f1Decided ? {
-          'f-1': {
-            id: 'd-1', findingId: 'f-1', subjectSha256: SUBJECT_SHA, action: 'accept',
-            reason: 'Handled.', actor: 'operator', source: 'test', findingRevision: 0,
-            decidedAt: '2026-09-06T00:00:00.000Z', createdAt: '2026-09-06T00:00:00.000Z'
-          }
-        } : {}
-      })
-    ));
-    bridge.set('codeReview:decide', () => {
-      f1Decided = true;
-      return ok<'codeReview:decide'>(detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2] }));
-    });
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+  it('shows no requirements block when nothing was accepted', async () => {
+    serve(2, (id, s) => s.autoDecided(id, 'reject'));
+    renderPanel();
+    await screen.findByText('Finding A');
+    fireEvent.click(bulkButton());
+    await screen.findByText(/Auto decide finished/);
 
-    await screen.findByText('Second finding');
-    const decisionSelects = screen.getAllByLabelText('Decision');
-    // Not `getAllByLabelText('Reason')`: the Reason field's label also wraps
-    // a hint span ("Required for every decision"), so its accessible name is
-    // "ReasonRequired for every decision", not "Reason" alone.
-    const reasonInputs = screen.getAllByRole('textbox');
-    expect(decisionSelects).toHaveLength(2);
-
-    // A draft in progress for f-2 — never submitted.
-    fireEvent.change(decisionSelects[1]!, { target: { value: 'reject' } });
-    fireEvent.change(reasonInputs[1]!, { target: { value: 'Draft reason for the second finding.' } });
-
-    // f-1 is decided through the UI.
-    fireEvent.change(decisionSelects[0]!, { target: { value: 'accept' } });
-    fireEvent.change(reasonInputs[0]!, { target: { value: 'Handled.' } });
-    const submitButtons = screen.getAllByRole('button', { name: /^Submit decision$/ });
-    fireEvent.click(submitButtons[0]!);
-
-    await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(1));
-    // f-1 now shows its decision instead of controls; f-2's draft, entered
-    // before f-1 was decided, must still be there — not wiped by the
-    // unconditional reread that followed deciding an unrelated sibling.
-    await screen.findByText(/Decided: accept/);
-    const remainingReasonInputs = screen.getAllByRole('textbox');
-    expect(remainingReasonInputs).toHaveLength(1);
-    expect((remainingReasonInputs[0] as HTMLInputElement).value).toBe('Draft reason for the second finding.');
-  });
-
-  it('preserves an in-progress manual draft when a new finding appears for the same subject', async () => {
-    const f1 = finding({ id: 'f-1', revision: 0, title: 'First finding' });
-    const f2 = finding({ id: 'f-2', revision: 0, title: 'Second finding' });
-    // The refetch after "Analyze" now reports a brand-new third finding for
-    // the SAME subject — the set of live finding ids grows, which must not
-    // be confused with a genuinely different subject.
-    let newFindingAppeared = false;
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({
-        subject: subject(),
-        subjectIdentity: 'current',
-        findings: newFindingAppeared
-          ? [f1, f2, finding({ id: 'f-3', revision: 0, title: 'Third finding' })]
-          : [f1, f2]
-      })
-    ));
-    bridge.set('codeReview:triage', () => {
-      newFindingAppeared = true;
-      return ok<'codeReview:triage'>({
-        recommendations: [],
-        detail: detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2] })
-      });
-    });
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
-
-    await screen.findByText('Second finding');
-    const reasonInputs = screen.getAllByRole('textbox');
-    fireEvent.change(reasonInputs[1]!, { target: { value: 'Draft reason kept across a new finding.' } });
-
-    const analyze = await screen.findByRole('button', { name: /Analyze undecided findings/i });
-    fireEvent.click(analyze);
-
-    await screen.findByText('Third finding');
-    const reasonInputsAfter = screen.getAllByRole('textbox');
-    expect(reasonInputsAfter).toHaveLength(3);
-    expect((reasonInputsAfter[1] as HTMLInputElement).value).toBe('Draft reason kept across a new finding.');
-  });
-
-  it('resets the busy guard and shows an error when Analyze itself fails, leaving no control stuck disabled', async () => {
-    const f1 = finding({ id: 'f-1' });
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({ subject: subject(), subjectIdentity: 'current', findings: [f1] })
-    ));
-    bridge.set('codeReview:triage', () => fail('Codex did not respond in time.', 'TIMEOUT'));
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
-
-    const button = await screen.findByRole('button', { name: /Analyze undecided findings/i });
-    fireEvent.click(button);
-
-    expect(await screen.findByText(/Codex did not respond in time\./)).toBeTruthy();
-    // The single-flight guard was released — the button is enabled again,
-    // not left stuck disabled by a failure that never called release().
-    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
-  });
-
-  it('shows an explanatory status, not just the button disappearing, once every live finding has a decision', async () => {
-    const f1 = finding({ id: 'f-1' });
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(
-      detail({
-        subject: subject(),
-        subjectIdentity: 'current',
-        findings: [f1],
-        latestDecisions: {
-          'f-1': {
-            id: 'd-1', findingId: 'f-1', subjectSha256: SUBJECT_SHA, action: 'accept',
-            reason: 'Handled.', actor: 'operator', source: 'test', findingRevision: 0,
-            decidedAt: '2026-09-06T00:00:00.000Z', createdAt: '2026-09-06T00:00:00.000Z'
-          }
-        }
-      })
-    ));
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
-
-    expect(await screen.findByText('All live findings have decisions recorded.')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /Analyze undecided findings/i })).toBeNull();
-    // The decided finding itself is still shown, not replaced by the notice.
-    expect(screen.getByText(/Decided: accept/)).toBeTruthy();
-  });
-
-  it('offers no Analyze button, and shows no code-review panel content, when there is nothing captured and the integration is off', async () => {
-    render(<CodeReviewPanel task={task()} integrationEnabled={false} />);
-    await waitFor(() => expect(bridge.callsTo('codeReview:get')).toHaveLength(1));
-    expect(screen.queryByText('External code review')).toBeNull();
+    expect(screen.queryByLabelText('Correction requirements')).toBeNull();
+    expect(screen.queryByRole('button', { name: /Send accepted findings/ })).toBeNull();
   });
 });
 
-describe('the external code-review panel — progress and failure of an analysis, beside its action', () => {
-  const f1 = finding({ id: 'f-1' });
-  const f2 = finding({ id: 'f-2', title: 'Second finding' });
-  const live = (overrides: Partial<CodeReviewDetail> = {}): CodeReviewDetail =>
-    detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2], ...overrides });
-  const decisionRecord = (findingId: string): CodeReviewDetail['latestDecisions'][string] => ({
-    id: `d-${findingId}`, findingId, subjectSha256: SUBJECT_SHA, action: 'accept',
-    reason: 'Decided by hand.', actor: 'operator', source: 'test', findingRevision: 0,
-    decidedAt: '2026-09-06T00:00:00.000Z', createdAt: '2026-09-06T00:00:00.000Z'
-  });
-  const analyzeButton = (): HTMLElement => screen.getByRole('button', { name: /Analyze undecided findings/i });
-  /** The row of buttons that holds the trigger; the feedback must sit directly under it. */
-  const controls = (): Element => analyzeButton().closest('.row')!;
+describe('code review: panel visibility', () => {
+  it('shows nothing when the integration is off and nothing was ever captured', async () => {
+    serve(0);
+    server.subject = subject();
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>({ ...server.detail(), subject: null, subjectIdentity: 'no_subject' }));
+    render(<CodeReviewPanel task={task()} integrationEnabled={false} />);
 
-  it('says, right under the action, that Codex is analyzing, and keeps the action disabled meanwhile', async () => {
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
-    const answer = deferred<IpcResult<{ recommendations: never[]; detail: CodeReviewDetail }>>();
-    bridge.set('codeReview:triage', () => answer.promise);
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
-
-    expect(screen.queryByRole('status')).toBeNull();
-    await screen.findByRole('button', { name: /Analyze undecided findings/i });
-    fireEvent.click(analyzeButton());
-
-    const status = await screen.findByRole('status');
-    expect(status.textContent).toContain('Analyzing findings with Codex…');
-    expect(status.textContent).toMatch(/nothing changes until you apply a recommendation/i);
-    expect(controls().nextElementSibling).toBe(status);
-    expect(analyzeButton()).toHaveProperty('disabled', true);
-    expect(screen.queryByRole('alert')).toBeNull();
-
-    await deliver(answer, ok<'codeReview:triage'>({ recommendations: [], detail: live() }));
-    expect(screen.queryByRole('status')).toBeNull();
-    expect(analyzeButton()).toHaveProperty('disabled', false);
+    await waitFor(() => expect(bridge.callsTo('codeReview:get')).toHaveLength(1));
+    expect(screen.queryByText('External code review')).toBeNull();
   });
 
-  it('shows a failed analysis beside the action, says no decision changed, and keeps the operator’s drafts', async () => {
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
-    bridge.set('codeReview:triage', () =>
-      fail('Codex returned recommendations that do not match the expected shape.', 'PARSE_FAILED')
-    );
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+  it('with the integration off, offers no Auto decide, so nothing can be sent to a provider that is disabled', async () => {
+    serve(1);
+    render(<CodeReviewPanel task={task()} integrationEnabled={false} />);
 
-    const decisions = await screen.findAllByLabelText('Decision');
-    fireEvent.change(decisions[0]!, { target: { value: 'reject' } });
-    fireEvent.change(screen.getAllByLabelText(/^Reason/)[0]!, { target: { value: 'Already covered.' } });
-    fireEvent.click(analyzeButton());
-
-    const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toContain('Analysis failed');
-    expect(alert.textContent).toMatch(/No decisions were changed or applied/);
-    expect(alert.textContent).toContain('do not match the expected shape');
-    // Directly under the trigger — and reported once, not also at the top of the panel.
-    expect(controls().nextElementSibling).toBe(alert);
-    expect(screen.getAllByText(/do not match the expected shape/)).toHaveLength(1);
-    expect(screen.queryByRole('status')).toBeNull();
-
-    expect(analyzeButton()).toHaveProperty('disabled', false);
-    expect((decisions[0] as HTMLSelectElement).value).toBe('reject');
-    expect((screen.getAllByLabelText(/^Reason/)[0] as HTMLInputElement).value).toBe('Already covered.');
-    expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
+    await screen.findByText('Finding A');
+    expect(screen.queryByRole('button', { name: /Auto decide all undecided/ })).toBeNull();
+    expect(autoButton('Finding A')).toHaveProperty('disabled', true);
   });
 
-  it('recovers from a timeout-coded failure and from a call that throws, each time re-enabling a retry', async () => {
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
-    bridge.set('codeReview:triage', () => fail('The Codex process timeout expired.', 'TIMEOUT'));
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
+  it('shows the real error when reading the evidence fails', async () => {
+    serve(1);
+    bridge.set('codeReview:get', () => fail('The evidence database is locked.'));
+    renderPanel();
 
-    await screen.findByRole('button', { name: /Analyze undecided findings/i });
-    fireEvent.click(analyzeButton());
-    expect((await screen.findByRole('alert')).textContent).toContain('The Codex process timeout expired.');
-    expect(analyzeButton()).toHaveProperty('disabled', false);
-
-    bridge.set('codeReview:triage', () => {
-      throw new Error('The bridge went away.');
-    });
-    fireEvent.click(analyzeButton());
-    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('The bridge went away.'));
-    expect(screen.getByRole('alert').textContent).not.toContain('timeout expired');
-    expect(screen.queryByRole('status')).toBeNull();
-    expect(analyzeButton()).toHaveProperty('disabled', false);
-  });
-
-  it('keeps a failure on screen while the operator decides findings by hand, and replaces it on the next analysis', async () => {
-    let current = live();
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(current));
-    bridge.set('codeReview:triage', () => fail('Codex failed.', 'TOOL_FAILED'));
-    bridge.set('codeReview:decide', () => {
-      current = live({ latestDecisions: { 'f-1': decisionRecord('f-1') } });
-      return ok<'codeReview:decide'>(current);
-    });
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
-    await screen.findByRole('button', { name: /Analyze undecided findings/i });
-    fireEvent.click(analyzeButton());
-    await screen.findByRole('alert');
-
-    // "Decide each finding yourself" is the guidance shown; following it must not erase it.
-    fireEvent.change(screen.getAllByLabelText('Decision')[0]!, { target: { value: 'accept' } });
-    fireEvent.change(screen.getAllByLabelText(/^Reason/)[0]!, { target: { value: 'Decided by hand.' } });
-    fireEvent.click(screen.getAllByRole('button', { name: /Submit decision/i })[0]!);
-    await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(1));
-    await screen.findByText(/Decided: accept/);
-    expect(screen.getByRole('alert').textContent).toContain('Codex failed.');
-
-    // A new analysis replaces it: pending first, then the result.
-    const answer = deferred<IpcResult<{ recommendations: never[]; detail: CodeReviewDetail }>>();
-    bridge.set('codeReview:triage', () => answer.promise);
-    fireEvent.click(analyzeButton());
-    await screen.findByRole('status');
-    expect(screen.queryByRole('alert')).toBeNull();
-    await deliver(answer, ok<'codeReview:triage'>({ recommendations: [], detail: current }));
-    expect(screen.queryByRole('alert')).toBeNull();
-  });
-
-  it('reports a failed analysis at once, and stops saying it is running, while the re-read that follows is still pending', async () => {
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
-    const reread = deferred<IpcResult<CodeReviewDetail>>();
-    bridge.set('codeReview:triage', () => {
-      bridge.set('codeReview:get', () => reread.promise);
-      return fail('Codex failed.', 'TOOL_FAILED');
-    });
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
-    await screen.findByRole('button', { name: /Analyze undecided findings/i });
-    fireEvent.click(analyzeButton());
-
-    const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toContain('Codex failed.');
-    expect(screen.queryByRole('status')).toBeNull();
-    expect(analyzeButton()).toHaveProperty('disabled', true);
-
-    await deliver(reread, ok<'codeReview:get'>(live()));
-    expect(analyzeButton()).toHaveProperty('disabled', false);
-    expect(screen.getByRole('alert').textContent).toContain('Codex failed.');
-  });
-
-  it('passes on the backend’s own next step, not only what went wrong', async () => {
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
-    bridge.set('codeReview:triage', () =>
-      fail('300 findings are too many to analyze at once.', 'VALIDATION_FAILED', 'Decide some findings by hand, then analyze the rest.')
-    );
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
-    await screen.findByRole('button', { name: /Analyze undecided findings/i });
-    fireEvent.click(analyzeButton());
-
-    const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toContain('300 findings are too many to analyze at once.');
-    expect(alert.textContent).toContain('Decide some findings by hand, then analyze the rest.');
-  });
-
-  it('keeps the failure on screen even after the operator decides the last undecided finding by hand', async () => {
-    let current = live({ findings: [f1] });
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(current));
-    bridge.set('codeReview:triage', () => fail('Codex failed.', 'TOOL_FAILED'));
-    bridge.set('codeReview:decide', () => {
-      current = live({ findings: [f1], latestDecisions: { 'f-1': decisionRecord('f-1') } });
-      return ok<'codeReview:decide'>(current);
-    });
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
-    await screen.findByRole('button', { name: /Analyze undecided findings/i });
-    fireEvent.click(analyzeButton());
-    await screen.findByRole('alert');
-
-    fireEvent.change(screen.getByLabelText('Decision'), { target: { value: 'accept' } });
-    fireEvent.change(screen.getByLabelText(/^Reason/), { target: { value: 'Decided by hand.' } });
-    fireEvent.click(screen.getByRole('button', { name: /Submit decision/i }));
-
-    expect(await screen.findByText('All live findings have decisions recorded.')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /Analyze undecided findings/i })).toBeNull();
-    const alert = screen.getByRole('alert');
-    expect(alert.textContent).toContain('Codex failed.');
-    expect(alert.textContent).toContain('No decisions were changed or applied');
-  });
-
-  it('shows the summary and the apply controls on success without deciding anything, needs_user included', async () => {
-    let current = live();
-    bridge.set('codeReview:get', () => ok<'codeReview:get'>(current));
-    bridge.set('codeReview:triage', () => {
-      current = live({
-        triage: triageRecord(
-          [['f-1', 0], ['f-2', 0]],
-          [
-            { findingId: 'f-1', recommendation: 'accept', reason: 'Matches criterion 1.', evidenceRef: 'src/service.ts:42', confidence: 'high' },
-            { findingId: 'f-2', recommendation: 'needs_user', reason: 'Genuine uncertainty.', evidenceRef: 'src/service.ts:50', confidence: 'low' }
-          ]
-        )
-      });
-      return ok<'codeReview:triage'>({ recommendations: [], detail: current });
-    });
-    render(<CodeReviewPanel task={task()} integrationEnabled />);
-
-    // A draft typed by hand for the needs-a-human finding survives the analysis.
-    const decisions = await screen.findAllByLabelText('Decision');
-    fireEvent.change(decisions[1]!, { target: { value: 'reject' } });
-    fireEvent.change(screen.getAllByLabelText(/^Reason/)[1]!, { target: { value: 'My own reason.' } });
-    fireEvent.click(analyzeButton());
-
-    expect(await screen.findByText(/1 recommended accept/)).toBeTruthy();
-    expect(screen.getByText(/1 need a human/)).toBeTruthy();
-    expect(screen.getByRole('button', { name: /Apply all recommendations to undecided findings/i })).toBeTruthy();
-    expect(screen.getAllByRole('button', { name: /^Apply recommendation$/ })).toHaveLength(1);
-    expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
-
-    expect((decisions[1] as HTMLSelectElement).value).toBe('reject');
-    expect((screen.getAllByLabelText(/^Reason/)[1] as HTMLInputElement).value).toBe('My own reason.');
-    expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
+    expect(await screen.findByText('The evidence database is locked.')).toBeTruthy();
   });
 });

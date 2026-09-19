@@ -95,9 +95,22 @@ describe('workflow state machine', () => {
       expect(() => transition('DRAFT', 'review_approved')).toThrow(InvalidTransitionError);
       expect(() => transition('DRAFT', 'implementation_started')).toThrow(InvalidTransitionError);
       expect(() => transition('APPROVED', 'specification_started')).toThrow(InvalidTransitionError);
-      expect(() => transition('READY_FOR_REVIEW', 'corrections_sent')).toThrow(
+      expect(() => transition('REVIEWING', 'corrections_sent')).toThrow(InvalidTransitionError);
+      expect(() => transition('READY_FOR_IMPLEMENTATION', 'corrections_sent')).toThrow(
         InvalidTransitionError
       );
+    });
+
+    it('lets corrections owed from an external code review start from a ready or approved round, and no other quiet state', () => {
+      // Findings accepted from an EXTERNAL code review are corrections owed even
+      // when no internal review asked for changes. They enter the ordinary
+      // correction round, whose recoverable failure returns to CHANGES_REQUESTED.
+      expect(transition('READY_FOR_REVIEW', 'corrections_sent')).toBe('IMPLEMENTING');
+      expect(transition('APPROVED', 'corrections_sent')).toBe('IMPLEMENTING');
+      expect(transition('IMPLEMENTING', 'correction_aborted')).toBe('CHANGES_REQUESTED');
+      for (const status of ['DRAFT', 'SPECIFYING', 'VERIFYING', 'PUBLISHING'] as const) {
+        expect(() => transition(status, 'corrections_sent')).toThrow(InvalidTransitionError);
+      }
     });
 
     it('makes terminal states genuinely terminal', () => {

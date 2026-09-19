@@ -34,7 +34,26 @@ const task = (status: Task['status'] = 'DRAFT'): Task => ({
   updatedAt: '2026-09-06T00:00:00.000Z'
 });
 
+/** The correction workflow of a task that has never had a correction. */
+const NO_CORRECTION: PlanReviewDetail['correction'] = {
+  used: 0,
+  max: 3,
+  nextStep: 'none',
+  loop: null,
+  latest: null,
+  acceptedPending: 0,
+  versions: []
+};
+const ROUND_SHA = 'b'.repeat(64);
+/** The fields every detail carries since Auto decide and the correction loop. */
+const roundFields = {
+  findingsSha256: null,
+  autoDecisions: [],
+  correction: NO_CORRECTION
+} satisfies Pick<PlanReviewDetail, 'findingsSha256' | 'autoDecisions' | 'correction'>;
+
 const emptyDetail: PlanReviewDetail = {
+  ...roundFields,
   ruleEvidence: null,
   ruleEvidenceProblem: null,
   gate: null,
@@ -43,6 +62,7 @@ const emptyDetail: PlanReviewDetail = {
 };
 
 const evidenceDetail: PlanReviewDetail = {
+  ...roundFields,
   ruleEvidenceProblem: null,
   gateIdentity: 'no_gate',
   ruleEvidence: {
@@ -213,9 +233,11 @@ describe('the external plan-review panel', () => {
         revision: 0,
         triageJson: null,
         triageForFindings: null,
+        autoDecisionsJson: null,
         createdAt: '2026-09-06T00:00:00.000Z',
         updatedAt: '2026-09-06T00:00:00.000Z'
       },
+      findingsSha256: ROUND_SHA,
       findings: [
         {
           severity: 'major',
@@ -291,13 +313,17 @@ describe('the external plan-review panel', () => {
       lastError: null,
       reconciledAt: null,
       revision: 0,
+      triageJson: null,
+      triageForFindings: null,
+      autoDecisionsJson: null,
       createdAt: '2026-09-06T00:00:00.000Z',
       updatedAt: '2026-09-06T00:00:00.000Z',
       ...extra
-    } as PlanReviewDetail['gate']
+    } as PlanReviewDetail['gate'],
+    findingsSha256: ROUND_SHA
   });
 
-  it('fills every undecided finding with the safe accept recommendation without overwriting a rejection', async () => {
+  it('accepts every undecided finding only after an explicit warning, and never over a rejection', async () => {
     const awaiting: PlanReviewDetail = {
       ...gateWith('awaiting_resolve', {
         verdict: 'revise',
@@ -328,469 +354,17 @@ describe('the external plan-review panel', () => {
     fireEvent.change(screen.getAllByLabelText(/^Reason/)[0]!, {
       target: { value: 'The existing invariant already covers it.' }
     });
-    fireEvent.click(screen.getByRole('button', { name: /Accept all undecided findings/i }));
+    // Dangerous, so not one click: it warns first, and nothing changes until confirmed.
+    fireEvent.click(screen.getByRole('button', { name: /Accept all without analysis/i }));
+    expect(screen.getByText(/without looking at any of them/i)).toBeTruthy();
+    expect((decisions[1] as HTMLSelectElement).value).toBe('');
+    fireEvent.click(screen.getByRole('button', { name: /Yes, accept all without analysis/i }));
 
     expect((decisions[0] as HTMLSelectElement).value).toBe('reject');
     expect((decisions[1] as HTMLSelectElement).value).toBe('accept');
-    expect(screen.getByRole('button', { name: /Resolve external plan review/i })).toHaveProperty(
-      'disabled',
-      false
-    );
-  });
-
-  describe('Codex-assisted automatic triage', () => {
-    function twoFindingGate(overrides: Record<string, unknown> = {}): PlanReviewDetail {
-      return {
-        ...gateWith('awaiting_resolve', {
-          verdict: 'revise',
-          reviewers: 'codex:architecture',
-          gatingCount: 1,
-          threshold: 1,
-          ...overrides
-        }),
-        findings: [
-          {
-            severity: 'major', category: 'reliability', file: 'src/service.ts', line: 42,
-            title: 'First finding', why: 'Body one.', fix: 'Fix one.', providers: ['codex'], role: 'SecurityReliability'
-          },
-          {
-            severity: 'minor', category: 'ux', file: 'src/view.tsx', line: 12,
-            title: 'Second finding', why: 'Body two.', fix: 'Fix two.', providers: ['codex'], role: 'UX'
-          }
-        ]
-      };
-    }
-
-    it('sends only durable identifiers and the undecided finding indexes, and shows the returned recommendations', async () => {
-      const detail = twoFindingGate();
-      bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-      bridge.set('planReview:triage', () => ok<'planReview:triage'>({
-        ...detail,
-        gate: {
-          ...detail.gate!,
-          revision: 1,
-          triageForFindings: detail.gate!.findingsJson,
-          triageJson: JSON.stringify({
-            recommendations: [
-              { finding: 0, recommendation: 'accept', reason: 'Matches criterion 1.', evidenceRef: 'criterion 1', confidence: 'high' },
-              { finding: 1, recommendation: 'needs_user', reason: 'Architecture choice.', evidenceRef: 'body two', confidence: 'low' }
-            ]
-          })
-        }
-      }));
-      render(
-        <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-      );
-
-      const analyzeButton = await screen.findByRole('button', { name: /Analyze undecided findings/i });
-      fireEvent.click(analyzeButton);
-
-      await waitFor(() => expect(bridge.callsTo('planReview:triage')).toHaveLength(1));
-      expect(bridge.callsTo('planReview:triage')[0]?.input).toEqual({
-        taskId: 'task-1',
-        gateId: 'gate-1',
-        expectedRevision: 0,
-        findingIndexes: [0, 1]
-      });
-
-      expect(await screen.findByText(/Recommended: accept/)).toBeTruthy();
-      expect(screen.getByText(/Matches criterion 1\./)).toBeTruthy();
-      expect(screen.getByText(/Needs a human decision/)).toBeTruthy();
-      expect(screen.getByText(/1 recommended accept/)).toBeTruthy();
-      expect(screen.getByText(/1 need a human/)).toBeTruthy();
-    });
-
-    it('applies a recommendation without overwriting a decision the operator already made', async () => {
-      const detail = twoFindingGate();
-      bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-      bridge.set('planReview:triage', () => ok<'planReview:triage'>({
-        ...detail,
-        gate: {
-          ...detail.gate!,
-          revision: 1,
-          triageForFindings: detail.gate!.findingsJson,
-          triageJson: JSON.stringify({
-            recommendations: [
-              { finding: 0, recommendation: 'reject', reason: 'Already satisfied.', evidenceRef: 'e', confidence: 'high' },
-              { finding: 1, recommendation: 'accept', reason: 'Matches scope.', evidenceRef: 'e', confidence: 'medium' }
-            ]
-          })
-        }
-      }));
-      render(
-        <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-      );
-
-      // The operator decides finding 0 manually, BEFORE analysis runs.
-      const decisions = await screen.findAllByLabelText('Decision');
-      fireEvent.change(decisions[0]!, { target: { value: 'accept' } });
-
-      fireEvent.click(screen.getByRole('button', { name: /Analyze undecided findings/i }));
-      await screen.findByText(/Recommended: reject/);
-
-      // Only finding 1 (still undecided) offers an apply affordance; finding 0's
-      // manual "accept" is never replaced by the recommended "reject".
-      const applyButtons = screen.getAllByRole('button', { name: /^Apply recommendation$/ });
-      expect(applyButtons).toHaveLength(1);
-      fireEvent.click(applyButtons[0]!);
-
-      expect((decisions[0] as HTMLSelectElement).value).toBe('accept');
-      expect((decisions[1] as HTMLSelectElement).value).toBe('accept');
-    });
-
-    it('does not treat a stored recommendation as current once the findings it analyzed no longer match the gate (e.g. after a remount)', async () => {
-      // `triageForFindings` names a DIFFERENT findings snapshot than the
-      // gate's current one — exactly what a later round (different findings)
-      // produces. A fresh mount (a remount/restart) must not show this as a
-      // live recommendation.
-      const stale: PlanReviewDetail = {
-        ...twoFindingGate({
-          revision: 5,
-          findingsJson: 'current-findings-v2',
-          triageForFindings: 'earlier-findings-v1',
-          triageJson: JSON.stringify({
-            recommendations: [
-              { finding: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
-              { finding: 1, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
-            ]
-          })
-        })
-      };
-      bridge.set('planReview:get', () => ok<'planReview:get'>(stale));
-      render(
-        <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-      );
-
-      await screen.findByRole('button', { name: /Analyze undecided findings/i });
-      expect(screen.queryByText(/Recommended: accept/)).toBeNull();
-      expect(screen.queryByText(/recommended accept/)).toBeNull();
-    });
-
-    it('shows a freshly stored recommendation again after a remount, when its analyzed findings still match', async () => {
-      const current: PlanReviewDetail = {
-        ...twoFindingGate({
-          revision: 1,
-          findingsJson: 'current-findings-v2',
-          triageForFindings: 'current-findings-v2',
-          triageJson: JSON.stringify({
-            recommendations: [
-              { finding: 0, recommendation: 'accept', reason: 'Matches criterion 1.', evidenceRef: 'e', confidence: 'high' },
-              { finding: 1, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
-            ]
-          })
-        })
-      };
-      bridge.set('planReview:get', () => ok<'planReview:get'>(current));
-      render(
-        <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-      );
-
-      expect(await screen.findByText(/Matches criterion 1\./)).toBeTruthy();
-    });
-
-    it('keeps "Accept all undecided" visibly distinct from the analysis action', async () => {
-      bridge.set('planReview:get', () => ok<'planReview:get'>(twoFindingGate()));
-      render(
-        <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-      );
-
-      const blindButton = await screen.findByRole('button', { name: /Accept all undecided findings/i });
-      const analyzeButton = screen.getByRole('button', { name: /Analyze undecided findings/i });
-      expect(blindButton).not.toBe(analyzeButton);
-      expect(blindButton.textContent).toMatch(/blind/i);
-      expect(blindButton.getAttribute('title')).toMatch(/without looking at any of them/i);
-    });
-
-    describe('progress and failure feedback beside the action', () => {
-      const analyzeButton = (): HTMLElement => screen.getByRole('button', { name: /Analyze undecided findings/i });
-      /** The row of buttons that holds the trigger; the feedback must sit directly under it. */
-      const controls = (): Element => analyzeButton().closest('.row')!;
-
-      const analyzed = (detail: PlanReviewDetail): PlanReviewDetail => ({
-        ...detail,
-        gate: {
-          ...detail.gate!,
-          revision: 1,
-          triageForFindings: detail.gate!.findingsJson,
-          triageJson: JSON.stringify({
-            recommendations: [
-              { finding: 0, recommendation: 'accept', reason: 'Matches criterion 1.', evidenceRef: 'criterion 1', confidence: 'high' },
-              { finding: 1, recommendation: 'needs_user', reason: 'Architecture choice.', evidenceRef: 'body two', confidence: 'low' }
-            ]
-          })
-        }
-      });
-
-      it('says, right under the action, that Codex is analyzing, and keeps the action disabled meanwhile', async () => {
-        const detail = twoFindingGate();
-        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-        const answer = deferred<IpcResult<PlanReviewDetail>>();
-        bridge.set('planReview:triage', () => answer.promise);
-        render(
-          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-        );
-
-        expect(screen.queryByRole('status')).toBeNull();
-        await screen.findByRole('button', { name: /Analyze undecided findings/i });
-        fireEvent.click(analyzeButton());
-
-        const status = await screen.findByRole('status');
-        expect(status.textContent).toContain('Analyzing findings with Codex…');
-        expect(status.textContent).toMatch(/nothing changes until you apply a recommendation/i);
-        expect(controls().nextElementSibling).toBe(status);
-        expect(analyzeButton()).toHaveProperty('disabled', true);
-        expect(screen.queryByRole('alert')).toBeNull();
-
-        await deliver(answer, ok<'planReview:triage'>(analyzed(detail)));
-        expect(screen.queryByRole('status')).toBeNull();
-        expect(analyzeButton()).toHaveProperty('disabled', false);
-      });
-
-      it('shows a failed analysis beside the action, says no decision changed, and keeps the operator’s drafts', async () => {
-        const detail = twoFindingGate();
-        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-        bridge.set('planReview:triage', () =>
-          fail('Codex returned recommendations that do not match the expected shape.', 'PARSE_FAILED')
-        );
-        render(
-          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-        );
-
-        const decisions = await screen.findAllByLabelText('Decision');
-        fireEvent.change(decisions[0]!, { target: { value: 'reject' } });
-        fireEvent.change(screen.getAllByLabelText(/^Reason/)[0]!, { target: { value: 'Already covered by the invariant.' } });
-        fireEvent.click(analyzeButton());
-
-        const alert = await screen.findByRole('alert');
-        expect(alert.textContent).toContain('Analysis failed');
-        expect(alert.textContent).toMatch(/No decisions were changed or applied/);
-        expect(alert.textContent).toContain('do not match the expected shape');
-        // Directly under the trigger — and reported once, not also at the top of the panel.
-        expect(controls().nextElementSibling).toBe(alert);
-        expect(screen.getAllByText(/do not match the expected shape/)).toHaveLength(1);
-        expect(screen.queryByRole('status')).toBeNull();
-
-        // Retry is available, and the operator's own draft is exactly as it was.
-        expect(analyzeButton()).toHaveProperty('disabled', false);
-        expect((decisions[0] as HTMLSelectElement).value).toBe('reject');
-        expect((screen.getAllByLabelText(/^Reason/)[0] as HTMLInputElement).value).toBe('Already covered by the invariant.');
-        expect((decisions[1] as HTMLSelectElement).value).toBe('');
-        expect(bridge.callsTo('planReview:resolve')).toHaveLength(0);
-
-        // Following the banner's own advice — deciding by hand — does not erase it.
-        fireEvent.change(decisions[1]!, { target: { value: 'accept' } });
-        expect((decisions[1] as HTMLSelectElement).value).toBe('accept');
-        expect(screen.getByRole('alert').textContent).toContain('No decisions were changed or applied');
-      });
-
-      it('reads the gate back after a refused analysis, so that analyzing again uses the current revision', async () => {
-        const stale = twoFindingGate();
-        const current = twoFindingGate({ revision: 3 });
-        bridge.set('planReview:get', () => ok<'planReview:get'>(stale));
-        bridge.set('planReview:triage', () => {
-          // The round moved elsewhere: from now on the current gate is the newer one.
-          bridge.set('planReview:get', () => ok<'planReview:get'>(current));
-          return fail('That plan-review round is no longer the current one.', 'VALIDATION_FAILED');
-        });
-        render(
-          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-        );
-        const decisions = await screen.findAllByLabelText('Decision');
-        fireEvent.change(decisions[0]!, { target: { value: 'accept' } });
-
-        fireEvent.click(analyzeButton());
-        await screen.findByRole('alert');
-        await waitFor(() => expect(bridge.callsTo('planReview:get')).toHaveLength(2));
-
-        bridge.set('planReview:triage', () => ok<'planReview:triage'>(analyzed(current)));
-        fireEvent.click(analyzeButton());
-        expect(await screen.findByText(/Recommended: accept/)).toBeTruthy();
-
-        const inputs = bridge.callsTo('planReview:triage').map((entry) => entry.input);
-        expect(inputs[0]).toMatchObject({ expectedRevision: 0 });
-        expect(inputs[1]).toMatchObject({ expectedRevision: 3 });
-        // The round's findings did not change, so the operator's draft is still there.
-        expect((decisions[0] as HTMLSelectElement).value).toBe('accept');
-      });
-
-      it('keeps a decision the operator edits while the analysis runs, through its failure and the read-back', async () => {
-        const detail = twoFindingGate();
-        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-        const answer = deferred<IpcResult<PlanReviewDetail>>();
-        bridge.set('planReview:triage', () => answer.promise);
-        render(
-          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-        );
-        const decisions = await screen.findAllByLabelText('Decision');
-        fireEvent.click(analyzeButton());
-        await screen.findByRole('status');
-
-        // The operator keeps working while Codex thinks.
-        fireEvent.change(decisions[0]!, { target: { value: 'reject' } });
-        fireEvent.change(screen.getAllByLabelText(/^Reason/)[0]!, { target: { value: 'Typed while waiting.' } });
-        await deliver(answer, fail('Codex failed.', 'TOOL_FAILED'));
-
-        await waitFor(() => expect(bridge.callsTo('planReview:get')).toHaveLength(2));
-        expect(screen.getByRole('alert').textContent).toContain('Codex failed.');
-        expect((decisions[0] as HTMLSelectElement).value).toBe('reject');
-        expect((screen.getAllByLabelText(/^Reason/)[0] as HTMLInputElement).value).toBe('Typed while waiting.');
-      });
-
-      it('keeps the alert and re-enables the action when the read-back after a failed analysis fails too', async () => {
-        const detail = twoFindingGate();
-        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-        bridge.set('planReview:triage', () => {
-          bridge.set('planReview:get', () => fail('The database is unavailable.', 'INTERNAL'));
-          return fail('That plan-review round is no longer the current one.', 'VALIDATION_FAILED');
-        });
-        render(
-          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-        );
-        await screen.findByRole('button', { name: /Analyze undecided findings/i });
-        fireEvent.click(analyzeButton());
-        await screen.findByRole('alert');
-        await waitFor(() => expect(bridge.callsTo('planReview:get')).toHaveLength(2));
-
-        // The refusal is what the operator is told; the failed read-back adds nothing and breaks nothing.
-        const alert = screen.getByRole('alert');
-        expect(alert.textContent).toContain('no longer the current one');
-        expect(alert.textContent).not.toContain('database is unavailable');
-        expect(screen.queryByRole('status')).toBeNull();
-        expect(analyzeButton()).toHaveProperty('disabled', false);
-        expect(bridge.callsTo('planReview:triage')).toHaveLength(1);
-      });
-
-      it('reports a failed analysis at once, and stops saying it is running, while the read-back that follows is still pending', async () => {
-        const detail = twoFindingGate();
-        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-        const readBack = deferred<IpcResult<PlanReviewDetail>>();
-        bridge.set('planReview:triage', () => {
-          bridge.set('planReview:get', () => readBack.promise);
-          return fail('Codex failed.', 'TOOL_FAILED');
-        });
-        render(
-          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-        );
-        await screen.findByRole('button', { name: /Analyze undecided findings/i });
-        fireEvent.click(analyzeButton());
-
-        const alert = await screen.findByRole('alert');
-        expect(alert.textContent).toContain('Codex failed.');
-        expect(screen.queryByRole('status')).toBeNull();
-        // Still refreshing itself, so the action stays disabled: a retry must not go out with the old revision.
-        expect(analyzeButton()).toHaveProperty('disabled', true);
-
-        await deliver(readBack, ok<'planReview:get'>(detail));
-        expect(analyzeButton()).toHaveProperty('disabled', false);
-        expect(screen.getByRole('alert').textContent).toContain('Codex failed.');
-      });
-
-      it('passes on the backend’s own next step, not only what went wrong', async () => {
-        const detail = twoFindingGate();
-        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-        bridge.set('planReview:triage', () =>
-          fail('300 findings are too many to analyze at once.', 'VALIDATION_FAILED', 'Decide some findings by hand, then analyze the rest.')
-        );
-        render(
-          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-        );
-        await screen.findByRole('button', { name: /Analyze undecided findings/i });
-        fireEvent.click(analyzeButton());
-
-        const alert = await screen.findByRole('alert');
-        expect(alert.textContent).toContain('300 findings are too many to analyze at once.');
-        expect(alert.textContent).toContain('Decide some findings by hand, then analyze the rest.');
-      });
-
-      it('recovers from a timeout-coded failure and from a call that throws, each time re-enabling a retry', async () => {
-        const detail = twoFindingGate();
-        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-        bridge.set('planReview:triage', () => fail('The Codex process timeout expired.', 'TIMEOUT'));
-        render(
-          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-        );
-
-        await screen.findByRole('button', { name: /Analyze undecided findings/i });
-        fireEvent.click(analyzeButton());
-        expect((await screen.findByRole('alert')).textContent).toContain('The Codex process timeout expired.');
-        expect(analyzeButton()).toHaveProperty('disabled', false);
-
-        bridge.set('planReview:triage', () => {
-          throw new Error('The bridge went away.');
-        });
-        fireEvent.click(analyzeButton());
-        await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('The bridge went away.'));
-        expect(screen.getByRole('alert').textContent).not.toContain('timeout expired');
-        expect(screen.queryByRole('status')).toBeNull();
-        expect(analyzeButton()).toHaveProperty('disabled', false);
-      });
-
-      it('clears a previous failure when the next analysis starts, and then shows the recommendations', async () => {
-        const detail = twoFindingGate();
-        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-        bridge.set('planReview:triage', () => fail('Codex failed.', 'TOOL_FAILED'));
-        render(
-          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-        );
-        await screen.findByRole('button', { name: /Analyze undecided findings/i });
-        fireEvent.click(analyzeButton());
-        await screen.findByRole('alert');
-
-        bridge.set('planReview:triage', () => ok<'planReview:triage'>(analyzed(detail)));
-        fireEvent.click(analyzeButton());
-
-        expect(await screen.findByText(/Recommended: accept/)).toBeTruthy();
-        expect(screen.queryByRole('alert')).toBeNull();
-      });
-
-      it('shows the summary and the apply controls at once on success, without applying anything itself', async () => {
-        const detail = twoFindingGate();
-        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-        bridge.set('planReview:triage', () => ok<'planReview:triage'>(analyzed(detail)));
-        render(
-          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-        );
-
-        // A decision the operator already made by hand survives the analysis.
-        const decisions = await screen.findAllByLabelText('Decision');
-        fireEvent.change(decisions[1]!, { target: { value: 'accept' } });
-        fireEvent.change(screen.getAllByLabelText(/^Reason/)[1]!, { target: { value: 'Manual note.' } });
-        fireEvent.click(analyzeButton());
-
-        expect(await screen.findByText(/1 recommended accept/)).toBeTruthy();
-        expect(screen.getByText(/1 need a human/)).toBeTruthy();
-        expect(screen.getByRole('button', { name: /Apply all recommendations to undecided findings/i })).toBeTruthy();
-        expect(screen.getAllByRole('button', { name: /^Apply recommendation$/ })).toHaveLength(1);
-        expect(screen.queryByRole('alert')).toBeNull();
-        expect(screen.queryByRole('status')).toBeNull();
-
-        // Nothing was applied: the recommended accept is still only a suggestion,
-        // the needs-a-human finding keeps the operator's own choice, and the round
-        // is neither resolved nor resolvable.
-        expect((decisions[0] as HTMLSelectElement).value).toBe('');
-        expect((decisions[1] as HTMLSelectElement).value).toBe('accept');
-        expect((screen.getAllByLabelText(/^Reason/)[1] as HTMLInputElement).value).toBe('Manual note.');
-        expect(screen.getByRole('button', { name: /Resolve external plan review/i })).toHaveProperty('disabled', true);
-        expect(bridge.callsTo('planReview:resolve')).toHaveLength(0);
-      });
-
-      it('never applies a needs-a-human recommendation, not even through "apply all"', async () => {
-        const detail = twoFindingGate();
-        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
-        bridge.set('planReview:triage', () => ok<'planReview:triage'>(analyzed(detail)));
-        render(
-          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
-        );
-        const decisions = await screen.findAllByLabelText('Decision');
-        fireEvent.click(analyzeButton());
-
-        fireEvent.click(await screen.findByRole('button', { name: /Apply all recommendations to undecided findings/i }));
-
-        expect((decisions[0] as HTMLSelectElement).value).toBe('accept');
-        expect((decisions[1] as HTMLSelectElement).value).toBe('');
-        expect(bridge.callsTo('planReview:resolve')).toHaveLength(0);
-      });
-    });
+    // One finding is accepted, so the round must be resolved WITH a revision of the plan.
+    expect(screen.getByRole('button', { name: /Resolve and revise plan/i })).toHaveProperty('disabled', false);
+    expect(screen.queryByRole('button', { name: /^Resolve external plan review$/i })).toBeNull();
   });
 
   it('offers a read-only reconciliation for an unknown outcome, and never a repeat', async () => {
@@ -1090,6 +664,7 @@ describe('the external plan-review panel', () => {
   it('keeps the corrupt-binding message when the identity cannot be verified', async () => {
     bridge.set('planReview:get', () =>
       ok<'planReview:get'>({
+        ...roundFields,
         ruleEvidence: null,
         ruleEvidenceProblem: 'The stored rule-evidence binding does not match its snapshot.',
         gate: gateWith('proceeded').gate,
@@ -1190,6 +765,7 @@ describe('the external plan-review panel', () => {
   it('reports a corrupt binding as corrupt and refuses to offer a rebind', async () => {
     bridge.set('planReview:get', () =>
       ok<'planReview:get'>({
+        ...roundFields,
         ruleEvidence: null,
         ruleEvidenceProblem: 'The stored rule-evidence binding does not match its snapshot.',
         gate: null,
@@ -1231,6 +807,7 @@ describe('the external plan-review panel', () => {
           revision: 0,
           triageJson: null,
           triageForFindings: null,
+          autoDecisionsJson: null,
           createdAt: '2026-09-06T00:00:00.000Z',
           updatedAt: '2026-09-06T00:00:00.000Z'
         }

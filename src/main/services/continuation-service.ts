@@ -669,7 +669,8 @@ export class ContinuationService {
       // Triage recommendations describe a specific prior round's findings,
       // long since resolved for a `proceeded` gate; nothing carries forward.
       triageJson: null,
-      triageForFindings: null
+      triageForFindings: null,
+      autoDecisionsJson: null
     });
   }
 }

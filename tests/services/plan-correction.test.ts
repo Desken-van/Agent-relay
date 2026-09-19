@@ -1,0 +1,631 @@
+import { afterEach, describe, expect, it } from 'vitest';
+import { SqlitePlanCorrectionRepository } from '../../src/main/db/repositories/plan-correction-repository';
+import { PlanCorrectionService } from '../../src/main/services/plan-correction';
+import { PlanReviewClaims } from '../../src/main/services/plan-review-claims';
+import { PlanReviewGateService, planFindingsSha256 } from '../../src/main/services/plan-review-gate';
+import { specificationIdentity } from '../../src/main/services/specification-identity';
+import { parseAcceptedPlanFindings } from '../../src/shared/domain/plan-correction';
+import type { PlanReviewDecision } from '../../src/shared/domain/plan-review';
+import type { Settings } from '../../src/shared/domain/models';
+import type { ExternalPlanReviewRound } from '../../src/main/ports';
+import { deferred, FakePlanReviewer, finding, snapshot } from '../helpers/fake-plan-reviewer';
+import { makeSpecification } from '../helpers/fakes';
+import { createHarness, type Harness } from '../helpers/harness';
+
+const harnesses: Harness[] = [];
+afterEach(() => {
+  for (const harness of harnesses.splice(0)) harness.dispose();
+});
+
+function setup(settings: Partial<Settings> = {}) {
+  const harness = createHarness({ settings });
+  harnesses.push(harness);
+  const reviewer = new FakePlanReviewer();
+  const claims = new PlanReviewClaims();
+  const corrections = new SqlitePlanCorrectionRepository(harness.db, harness.clock);
+  const gateService = new PlanReviewGateService({
+    tasks: harness.tasks,
+    projects: harness.projects,
+    ruleEvidence: harness.taskRuleEvidence,
+    gates: harness.planReviewGates,
+    reviewer,
+    codex: harness.codex,
+    settings: harness.settings,
+    clock: harness.clock,
+    ids: harness.ids,
+    claims
+  });
+  const loop = new PlanCorrectionService({
+    tasks: harness.tasks,
+    projects: harness.projects,
+    ruleEvidence: harness.taskRuleEvidence,
+    gates: harness.planReviewGates,
+    corrections,
+    gateService,
+    codex: harness.codex,
+    settings: harness.settings,
+    claims,
+    clock: harness.clock,
+    ids: harness.ids
+  });
+  return { harness, reviewer, claims, corrections, gateService, loop };
+}
+type Value = ReturnType<typeof setup>;
+
+/** A task with rule evidence, a generated specification and an isolated branch. */
+async function ready(value: Value) {
+  const project = value.harness.createProject();
+  const created = value.harness.createTask(project.id);
+  value.gateService.bindRules(created.id, snapshot());
+  await value.harness.orchestrator.generateSpecification(created.id);
+  return value.harness.orchestrator.preparePlanReviewWorktree(created.id);
+}
+
+const roundWith = (
+  value: Value,
+  titles: readonly string[],
+  verdict: ExternalPlanReviewRound['verdict'] = 'revise'
+): ExternalPlanReviewRound => ({
+  ...value.reviewer.round,
+  verdict,
+  gatingCount: titles.length,
+  threshold: 1,
+  findings: titles.map(finding)
+});
+
+/** Coai keeps the session in PlanReview after a `revise` resolution: the gate settles as changes_requested. */
+const revise = (value: Value) => ({ ...value.reviewer.resolution, stage: 'PlanReview', awaitingResolve: false });
+/** Coai moves past the plan gate: the gate settles as proceeded. */
+const proceed = (value: Value) => ({ ...value.reviewer.resolution, stage: 'CodeReview', awaitingResolve: false });
+
+const rec = (
+  findingRef: number,
+  recommendation: 'accept' | 'reject' | 'needs_user',
+  reason = `Reason ${findingRef}.`
+) => ({ findingRef, recommendation, reason, evidenceRef: `evidence ${findingRef}`, confidence: 'high' as const });
+
+const currentGate = (value: Value, taskId: string) => value.harness.planReviewGates.findByTask(taskId)!;
+const specOf = (value: Value, taskId: string) => value.harness.tasks.findById(taskId)!.specificationJson as string;
+
+const decide = (
+  ...entries: readonly (readonly [number, 'accept' | 'reject', string])[]
+): PlanReviewDecision[] => entries.map(([findingIndex, action, reason]) => ({ finding: findingIndex, action, reason }));
+
+async function resolveAndRevise(
+  value: Value,
+  taskId: string,
+  decisions: readonly PlanReviewDecision[],
+  autoContinue = false
+) {
+  const gate = currentGate(value, taskId);
+  return value.loop.resolveAndRevise(taskId, {
+    gateId: gate.id,
+    expectedRevision: gate.revision,
+    decisions,
+    autoContinue
+  });
+}
+
+describe('plan correction loop: resolve, revise, review again', () => {
+  it('revises the specification from ONLY the accepted findings and reviews the revised text', async () => {
+    const value = setup();
+    const task = await ready(value);
+    const original = specOf(value, task.id);
+    value.reviewer.roundQueue = [roundWith(value, ['Add a retry budget', 'Rename the helper']), roundWith(value, ['Document the budget'])];
+    value.reviewer.resolutionQueue = [revise(value)];
+    await value.gateService.review(task.id);
+    const firstGate = currentGate(value, task.id);
+
+    const outcome = await resolveAndRevise(
+      value,
+      task.id,
+      decide([0, 'accept', 'A retry budget is required.'], [1, 'reject', 'Naming is out of scope.'])
+    );
+
+    expect(outcome).toMatchObject({ stopped: 'awaiting_decisions', correctionsRun: 1, roundsReviewed: 1 });
+
+    // Codex was asked with the accepted finding only, the current specification and the operator's note.
+    expect(value.harness.codex.revisionCalls).toHaveLength(1);
+    const request = value.harness.codex.revisionCalls[0]!;
+    expect(request.acceptedFindings.map((entry) => entry.title)).toEqual(['Add a retry budget']);
+    expect(request.acceptedFindings[0]?.operatorNote).toBe('A retry budget is required.');
+    expect(request.originalRequest).toBe(task.originalRequest);
+    expect(JSON.stringify(request.currentSpecification)).toBe(original);
+    expect(request.round).toBe(1);
+
+    // The specification really changed, and the version history records both texts.
+    const revised = specOf(value, task.id);
+    expect(revised).not.toBe(original);
+    const versions = value.corrections.listVersions(task.id);
+    expect(versions.map((entry) => [entry.version, entry.origin])).toEqual([
+      [1, 'generated'],
+      [2, 'plan_correction']
+    ]);
+    expect(versions[0]?.specificationJson).toBe(original);
+    expect(versions[1]?.specificationJson).toBe(revised);
+    expect(versions[1]?.specificationSha256).toBe(specificationIdentity(revised).sha256);
+
+    // The fresh external round reviewed the REVISED text, and is bound to its hash.
+    expect(value.reviewer.reviewCalls).toHaveLength(2);
+    expect(value.reviewer.reviewCalls[1]?.planText).toContain('revised in correction round 1');
+    const gates = value.harness.planReviewGates.listByTask(task.id);
+    expect(gates).toHaveLength(2);
+    expect(gates[0]).toMatchObject({
+      status: 'awaiting_resolve',
+      specificationSha256: specificationIdentity(revised).sha256
+    });
+
+    // Historical evidence is untouched.
+    expect(gates[1]).toMatchObject({
+      id: firstGate.id,
+      status: 'changes_requested',
+      specificationSha256: specificationIdentity(original).sha256,
+      findingsJson: firstGate.findingsJson
+    });
+    expect(gates[1]?.decisionsJson).toContain('A retry budget is required.');
+
+    // The correction row is the audit record and is completed.
+    const [correction] = value.corrections.listByTask(task.id);
+    expect(correction).toMatchObject({ round: 1, status: 'completed', attempts: 1, toVersion: 2, sourceGateId: firstGate.id });
+    expect(parseAcceptedPlanFindings(correction!.acceptedJson).map((entry) => entry.title)).toEqual(['Add a retry budget']);
+  });
+
+  it('does not revise anything when no finding was accepted', async () => {
+    const value = setup();
+    const task = await ready(value);
+    const original = specOf(value, task.id);
+    value.reviewer.roundQueue = [roundWith(value, ['Refuted finding'])];
+    value.reviewer.resolutionQueue = [revise(value)];
+    await value.gateService.review(task.id);
+
+    const outcome = await resolveAndRevise(value, task.id, decide([0, 'reject', 'Contradicted by the code.']));
+
+    expect(outcome.stopped).toBe('settled');
+    expect(value.harness.codex.revisionCalls).toHaveLength(0);
+    expect(value.corrections.listVersions(task.id)).toEqual([]);
+    expect(specOf(value, task.id)).toBe(original);
+    expect(value.reviewer.reviewCalls).toHaveLength(1);
+  });
+
+  it('reports a clean result when the provider proceeds and nothing was accepted', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Refuted finding'], 'proceed')];
+    value.reviewer.resolutionQueue = [proceed(value)];
+    await value.gateService.review(task.id);
+
+    const outcome = await resolveAndRevise(value, task.id, decide([0, 'reject', 'Refuted.']));
+
+    expect(outcome.stopped).toBe('clean');
+    // Nothing accepted, so the ordinary approval path is open.
+    value.harness.orchestrator.approveSpecification(task.id);
+    expect(value.harness.tasks.findById(task.id)?.specificationApprovedAt).not.toBeNull();
+  });
+
+  it('keeps going by itself through several correction rounds until the review is clean', async () => {
+    const value = setup();
+    const task = await ready(value);
+    const original = specOf(value, task.id);
+    value.reviewer.roundQueue = [
+      roundWith(value, ['Round one A', 'Round one B']),
+      roundWith(value, ['Round two C']),
+      roundWith(value, [], 'proceed')
+    ];
+    value.reviewer.resolutionQueue = [revise(value), revise(value), proceed(value)];
+    // Round 1: A accepted, B rejected. Round 2: C accepted.
+    value.harness.codex.triageQueue.push([rec(0, 'accept')], [rec(1, 'reject')], [rec(0, 'accept')]);
+    await value.gateService.review(task.id);
+
+    const outcome = await value.loop.continueCorrection(task.id, { autoContinue: true });
+
+    expect(outcome).toMatchObject({ stopped: 'clean', correctionsRun: 2, roundsReviewed: 2 });
+    expect(value.harness.codex.revisionCalls.map((call) => call.acceptedFindings.map((entry) => entry.title))).toEqual([
+      ['Round one A'],
+      ['Round two C']
+    ]);
+    expect(value.corrections.listByTask(task.id).map((entry) => [entry.round, entry.status])).toEqual([
+      [1, 'completed'],
+      [2, 'completed']
+    ]);
+    expect(value.corrections.listVersions(task.id).map((entry) => entry.version)).toEqual([1, 2, 3]);
+    expect(value.reviewer.resolveCalls).toHaveLength(3);
+    // The final specification is the reviewed and approved one, and the operator still has to approve it.
+    expect(specOf(value, task.id)).not.toBe(original);
+    expect(value.harness.tasks.findById(task.id)?.specificationApprovedAt).toBeNull();
+    value.harness.orchestrator.approveSpecification(task.id);
+    expect(currentGate(value, task.id).status).toBe('proceeded');
+  });
+
+  it('cannot approve while a round with accepted findings is still uncorrected, or after the revision until it passes', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change']), roundWith(value, ['A new finding'])];
+    value.reviewer.resolutionQueue = [revise(value)];
+    await value.gateService.review(task.id);
+    await resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']));
+
+    // The revised specification has its own round awaiting decisions: not approved.
+    expect(() => value.harness.orchestrator.approveSpecification(task.id)).toThrow(/plan review/i);
+  });
+});
+
+describe('plan correction loop: stop conditions', () => {
+  it('stops for a person when Auto decide says a finding needs one, keeping the decisions it did make', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Clear', 'Ambiguous'])];
+    value.harness.codex.triageQueue.push([rec(0, 'accept')], [rec(1, 'needs_user', 'A product choice.')]);
+    await value.gateService.review(task.id);
+
+    const outcome = await value.loop.continueCorrection(task.id, { autoContinue: true });
+
+    expect(outcome.stopped).toBe('needs_user');
+    expect(outcome.message).toMatch(/need your decision/i);
+    expect(value.reviewer.resolveCalls).toHaveLength(0);
+    expect(value.harness.codex.revisionCalls).toHaveLength(0);
+    const gate = currentGate(value, task.id);
+    expect(gate.status).toBe('awaiting_resolve');
+    expect(JSON.parse(gate.autoDecisionsJson as string).decisions).toHaveLength(1);
+  });
+
+  it('isolates a failed analysis: the other findings keep their decisions and the loop stops', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['One', 'Two', 'Three'])];
+    await value.gateService.review(task.id);
+    const original = value.harness.codex.triageFindings.bind(value.harness.codex);
+    value.harness.codex.triageFindings = async (request, context) => {
+      if (request.findings[0]?.ref === 1) throw new Error('Codex crashed on finding two.');
+      return original(request, context);
+    };
+    value.harness.codex.triageQueue.push([rec(0, 'accept')], [rec(2, 'reject')]);
+
+    const outcome = await value.loop.continueCorrection(task.id, { autoContinue: true });
+
+    expect(outcome.stopped).toBe('needs_user');
+    expect(outcome.message).toMatch(/1 of 3 finding\(s\) could not be analyzed/);
+    expect(JSON.parse(currentGate(value, task.id).autoDecisionsJson as string).decisions.map((entry: { finding: number }) => entry.finding)).toEqual([0, 2]);
+    expect(value.reviewer.resolveCalls).toHaveLength(0);
+  });
+
+  it('does not decide anything automatically when the provider itself asks for a person', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Serious'], 'call_human')];
+    await value.gateService.review(task.id);
+
+    const outcome = await value.loop.continueCorrection(task.id, { autoContinue: true });
+
+    expect(outcome.stopped).toBe('verdict_needs_human');
+    expect(value.harness.codex.triageCalls).toHaveLength(0);
+    expect(value.reviewer.resolveCalls).toHaveLength(0);
+  });
+
+  it('stops when the Coai tool contract changed between rounds', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change']), roundWith(value, [], 'proceed')];
+    value.reviewer.resolutionQueue = [revise(value)];
+    await value.gateService.review(task.id);
+    // From now on the server reports a different contract, consistently within one call.
+    const drifted = 'e'.repeat(64);
+    value.reviewer.session = { ...value.reviewer.session, contractFingerprint: drifted };
+    value.reviewer.roundQueue[0] = { ...value.reviewer.roundQueue[0]!, contractFingerprint: drifted };
+
+    const outcome = await resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']), true);
+
+    expect(outcome.stopped).toBe('contract_drift');
+    expect(currentGate(value, task.id).contractMismatchAt).not.toBeNull();
+    // The drifted round is left for a person: it was neither decided nor resolved.
+    expect(currentGate(value, task.id).status).toBe('awaiting_resolve');
+    expect(value.reviewer.resolveCalls).toHaveLength(1);
+
+    // And it stays that way on a later resume: a flagged gate is never decided automatically.
+    const resumed = await value.loop.continueCorrection(task.id, { autoContinue: true });
+    expect(resumed.stopped).toBe('contract_drift');
+    expect(value.harness.codex.triageCalls).toHaveLength(0);
+  });
+
+  it('stops at the configured maximum with accepted findings left uncorrected, and cannot be approved', async () => {
+    const value = setup({ maxReviewRounds: 1 });
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['First']), roundWith(value, ['Second'])];
+    value.reviewer.resolutionQueue = [revise(value), revise(value)];
+    value.harness.codex.triageQueue.push([rec(0, 'accept')], [rec(0, 'accept')]);
+    await value.gateService.review(task.id);
+
+    const outcome = await value.loop.continueCorrection(task.id, { autoContinue: true });
+
+    expect(outcome.stopped).toBe('round_limit');
+    expect(outcome.correctionsRun).toBe(1);
+    expect(value.harness.codex.revisionCalls).toHaveLength(1);
+    expect(value.loop.detail(task.id)).toMatchObject({ used: 1, max: 1, nextStep: 'round_limit', acceptedPending: 1 });
+    // Either refusal is right: the round is not `proceeded`, and it accepted findings the plan does not reflect.
+    expect(() => value.harness.orchestrator.approveSpecification(task.id)).toThrow(/external plan review/i);
+    expect(value.harness.tasks.findById(task.id)?.specificationApprovedAt).toBeNull();
+  });
+
+  it('refuses a stale round before anything is sent anywhere', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change'])];
+    await value.gateService.review(task.id);
+    const gate = currentGate(value, task.id);
+
+    await expect(
+      value.loop.resolveAndRevise(task.id, {
+        gateId: gate.id,
+        expectedRevision: gate.revision + 1,
+        decisions: decide([0, 'accept', 'Yes.']),
+        autoContinue: false
+      })
+    ).rejects.toThrow(/no longer the current one/i);
+
+    expect(value.reviewer.resolveCalls).toHaveLength(0);
+    expect(value.harness.codex.revisionCalls).toHaveLength(0);
+    expect(value.corrections.listByTask(task.id)).toEqual([]);
+  });
+
+  it('asks nothing of a provider that was never told: an unknown external outcome stops the loop, and is never repeated', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change'])];
+    await value.gateService.review(task.id);
+    value.reviewer.resolveError = new Error('The connection dropped after the request left.');
+
+    await expect(resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']))).rejects.toThrow(/connection dropped/);
+    expect(currentGate(value, task.id).status).toBe('resolving');
+
+    const resumed = await value.loop.continueCorrection(task.id, { autoContinue: true });
+
+    expect(resumed.stopped).toBe('reconcile_required');
+    // The non-idempotent Coai call was made exactly once, and no correction started on a guess.
+    expect(value.reviewer.resolveCalls).toHaveLength(1);
+    expect(value.harness.codex.revisionCalls).toHaveLength(0);
+    expect(value.loop.detail(task.id).nextStep).toBe('reconcile');
+  });
+
+  it('after a lost review, resumes only by reconciliation: the correction is not repeated and no second round is dispatched', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change'])];
+    value.reviewer.resolutionQueue = [revise(value)];
+    await value.gateService.review(task.id);
+    value.reviewer.reviewError = new Error('The review answer was lost.');
+
+    await expect(resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']))).rejects.toThrow(/answer was lost/);
+    // The correction committed; the new gate is in the unknown `reviewing` phase.
+    expect(value.corrections.listByTask(task.id)[0]?.status).toBe('completed');
+    expect(currentGate(value, task.id).status).toBe('reviewing');
+    const reviewsBefore = value.reviewer.reviewCalls.length;
+
+    value.reviewer.reviewError = null;
+    const resumed = await value.loop.continueCorrection(task.id, { autoContinue: true });
+
+    expect(resumed.stopped).toBe('reconcile_required');
+    expect(value.reviewer.reviewCalls).toHaveLength(reviewsBefore);
+    expect(value.harness.codex.revisionCalls).toHaveLength(1);
+    expect(value.corrections.listVersions(task.id)).toHaveLength(2);
+    expect(value.harness.planReviewGates.listByTask(task.id)).toHaveLength(2);
+  });
+});
+
+describe('plan correction loop: the Codex revision', () => {
+  it('leaves everything unchanged when Codex fails, then retries the SAME correction without duplicating anything', async () => {
+    const value = setup();
+    const task = await ready(value);
+    const original = specOf(value, task.id);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change']), roundWith(value, [], 'proceed')];
+    value.reviewer.resolutionQueue = [revise(value), proceed(value)];
+    await value.gateService.review(task.id);
+    value.harness.codex.revisionError = new Error('Codex timed out.');
+
+    await expect(resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']))).rejects.toThrow(/timed out/);
+
+    expect(specOf(value, task.id)).toBe(original);
+    expect(value.harness.planReviewGates.listByTask(task.id)).toHaveLength(1);
+    const [failed] = value.corrections.listByTask(task.id);
+    expect(failed).toMatchObject({ status: 'failed', attempts: 1, lastError: expect.stringContaining('timed out') });
+    // The reviewed text was recorded before anything could change it.
+    expect(value.corrections.listVersions(task.id).map((entry) => entry.origin)).toEqual(['generated']);
+    expect(value.loop.detail(task.id)).toMatchObject({ nextStep: 'revise', acceptedPending: 1 });
+
+    value.harness.codex.revisionError = null;
+    const resumed = await value.loop.continueCorrection(task.id, { autoContinue: true });
+
+    expect(resumed.stopped).toBe('clean');
+    const rows = value.corrections.listByTask(task.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: failed!.id, status: 'completed', attempts: 2 });
+    expect(value.corrections.listVersions(task.id).map((entry) => entry.version)).toEqual([1, 2]);
+    expect(value.harness.planReviewGates.listByTask(task.id)).toHaveLength(2);
+  });
+
+  it('does not count a retry of the last permitted round against the budget', async () => {
+    const value = setup({ maxReviewRounds: 1 });
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change']), roundWith(value, [], 'proceed')];
+    value.reviewer.resolutionQueue = [revise(value), proceed(value)];
+    await value.gateService.review(task.id);
+    value.harness.codex.revisionError = new Error('Codex timed out.');
+    await expect(resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']))).rejects.toThrow();
+    value.harness.codex.revisionError = null;
+
+    expect(value.loop.detail(task.id).nextStep).toBe('revise');
+    const resumed = await value.loop.continueCorrection(task.id, { autoContinue: true });
+    expect(resumed.stopped).toBe('clean');
+  });
+
+  it('refuses a "revision" that is identical, because that would leave the accepted findings unaddressed', async () => {
+    const value = setup();
+    const task = await ready(value);
+    const original = specOf(value, task.id);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change'])];
+    value.reviewer.resolutionQueue = [revise(value)];
+    await value.gateService.review(task.id);
+    value.harness.codex.revisionQueue.push(specificationIdentity(original).specification);
+
+    await expect(resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']))).rejects.toThrow(/unchanged/i);
+
+    expect(specOf(value, task.id)).toBe(original);
+    expect(value.corrections.listByTask(task.id)[0]?.status).toBe('failed');
+    expect(value.corrections.listVersions(task.id)).toHaveLength(1);
+    expect(value.harness.planReviewGates.listByTask(task.id)).toHaveLength(1);
+  });
+
+  it('refuses a credential-shaped revision and stores nothing of it', async () => {
+    const value = setup();
+    const task = await ready(value);
+    const original = specOf(value, task.id);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change'])];
+    value.reviewer.resolutionQueue = [revise(value)];
+    await value.gateService.review(task.id);
+    value.harness.codex.revisionQueue.push(
+      makeSpecification({ summary: 'Use the key sk-abcdefghijklmnopqrstuvwxyz123456 for the service.' })
+    );
+
+    await expect(resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']))).rejects.toThrow(/credential-shaped/i);
+
+    expect(specOf(value, task.id)).toBe(original);
+    expect(value.corrections.listVersions(task.id)).toHaveLength(1);
+  });
+
+  it('applies nothing when the specification changed while Codex was revising it', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change'])];
+    value.reviewer.resolutionQueue = [revise(value)];
+    await value.gateService.review(task.id);
+    const release = deferred();
+    value.harness.codex.revisionGate = release.promise;
+
+    const running = resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']));
+    await tick();
+    // Someone regenerates the specification while the revision is in flight.
+    const elsewhere = JSON.stringify(makeSpecification({ title: 'Regenerated elsewhere' }));
+    value.harness.tasks.update(task.id, { specificationJson: elsewhere });
+    release.resolve(undefined);
+
+    await expect(running).rejects.toThrow(/specification changed while the correction was running/i);
+    expect(specOf(value, task.id)).toBe(elsewhere);
+    expect(value.corrections.listByTask(task.id)[0]?.status).toBe('failed');
+    expect(value.corrections.listVersions(task.id).map((entry) => entry.origin)).toEqual(['generated']);
+  });
+
+  it('reads a correction left `running` by a crash as interrupted, and resumes THE SAME row', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change']), roundWith(value, [], 'proceed')];
+    value.reviewer.resolutionQueue = [revise(value), proceed(value)];
+    await value.gateService.review(task.id);
+    // Resolve as the loop would, then "crash" right after the correction row was opened.
+    const gate = currentGate(value, task.id);
+    await value.gateService.runResolve(task.id, {
+      gateId: gate.id,
+      expectedRevision: gate.revision,
+      decisions: decide([0, 'accept', 'Yes.']),
+      allowAccepted: true
+    });
+    const settled = currentGate(value, task.id);
+    const opened = value.corrections.begin({
+      id: 'crashed-correction',
+      versionId: 'crashed-version',
+      taskId: task.id,
+      sourceGateId: settled.id,
+      fromSpecificationSha256: specificationIdentity(specOf(value, task.id)).sha256,
+      currentSpecificationJson: specOf(value, task.id),
+      acceptedJson: JSON.stringify([
+        { finding: 0, severity: 'major', category: 'reliability', file: '', line: 0, title: 'Needs a change', why: 'w', fix: 'f', operatorNote: 'Yes.' }
+      ])
+    });
+    expect(opened.status).toBe('running');
+
+    // No loop is alive in this process: what is left behind is an interrupted attempt.
+    expect(value.loop.detail(task.id).latest).toMatchObject({ status: 'interrupted', attempts: 1 });
+
+    const resumed = await value.loop.continueCorrection(task.id, { autoContinue: true });
+
+    expect(resumed.stopped).toBe('clean');
+    const rows = value.corrections.listByTask(task.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: 'crashed-correction', status: 'completed', attempts: 2 });
+    expect(value.corrections.listVersions(task.id).map((entry) => entry.version)).toEqual([1, 2]);
+  });
+
+  it('revises a round resolved before the loop existed, from its recorded decisions', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Legacy accepted finding'], 'proceed'), roundWith(value, [], 'proceed')];
+    value.reviewer.resolutionQueue = [proceed(value), proceed(value)];
+    await value.gateService.review(task.id);
+    const gate = currentGate(value, task.id);
+    await value.gateService.runResolve(task.id, {
+      gateId: gate.id,
+      expectedRevision: gate.revision,
+      decisions: decide([0, 'accept', 'Legacy note.']),
+      allowAccepted: true
+    });
+    expect(currentGate(value, task.id).status).toBe('proceeded');
+    expect(value.loop.detail(task.id).nextStep).toBe('revise');
+
+    const outcome = await value.loop.continueCorrection(task.id, { autoContinue: true });
+
+    expect(outcome.stopped).toBe('clean');
+    expect(value.harness.codex.revisionCalls[0]?.acceptedFindings[0]?.operatorNote).toBe('Legacy note.');
+  });
+});
+
+describe('plan correction loop: exclusion and reporting', () => {
+  it('holds the task for its whole run: nothing else touches the plan review, and the phase is visible', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change']), roundWith(value, [], 'proceed')];
+    value.reviewer.resolutionQueue = [revise(value), proceed(value)];
+    await value.gateService.review(task.id);
+    const gate = currentGate(value, task.id);
+    const release = deferred();
+    value.harness.codex.revisionGate = release.promise;
+
+    const running = value.loop.resolveAndRevise(task.id, {
+      gateId: gate.id,
+      expectedRevision: gate.revision,
+      decisions: decide([0, 'accept', 'Yes.']),
+      autoContinue: false
+    });
+    await tick();
+
+    expect(value.loop.detail(task.id).loop).toEqual({ phase: 'revising', round: 1 });
+    await expect(value.gateService.review(task.id)).rejects.toMatchObject({ code: 'BUSY' });
+    await expect(value.gateService.reconcile(task.id)).rejects.toMatchObject({ code: 'BUSY' });
+    await expect(
+      value.gateService.autoDecide(task.id, { gateId: gate.id, findingsSha256: planFindingsSha256(gate.findingsJson as string), findingIndex: 0 })
+    ).rejects.toMatchObject({ code: 'BUSY' });
+    await expect(value.loop.continueCorrection(task.id, { autoContinue: true })).rejects.toMatchObject({ code: 'BUSY' });
+
+    release.resolve(undefined);
+    await running;
+    expect(value.loop.detail(task.id).loop).toBeNull();
+  });
+
+  it('reports versions, the budget and the next step', async () => {
+    const value = setup({ maxReviewRounds: 3 });
+    const task = await ready(value);
+    expect(value.loop.detail(task.id)).toMatchObject({ used: 0, max: 3, nextStep: 'none', versions: [], latest: null });
+
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change']), roundWith(value, ['Another'])];
+    value.reviewer.resolutionQueue = [revise(value)];
+    await value.gateService.review(task.id);
+    expect(value.loop.detail(task.id).nextStep).toBe('decide');
+
+    await resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']));
+    const detail = value.loop.detail(task.id);
+    expect(detail).toMatchObject({ used: 1, max: 3, nextStep: 'decide', acceptedPending: 0 });
+    expect(detail.latest).toMatchObject({ round: 1, status: 'completed', acceptedCount: 1 });
+    expect(detail.versions.map((entry) => entry.origin)).toEqual(['generated', 'plan_correction']);
+  });
+});
+
+/** Let work that is already scheduled run, so a held call is really in flight. */
+function tick(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}

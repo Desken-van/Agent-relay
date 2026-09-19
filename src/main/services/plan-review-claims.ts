@@ -25,43 +25,111 @@
  */
 
 import { AgentRelayError } from '../../shared/domain/errors';
+import type { PlanCorrectionLoopPhase } from '../../shared/domain/plan-correction';
 
-/** The operations that reach an external provider (Coai or Codex) and must not overlap. */
-export type PlanReviewOperation = 'review' | 'reconcile' | 'resolve' | 'triage';
+/**
+ * The operations that reach an external provider (Coai or Codex) and must not
+ * overlap. `advance` is the whole correction loop: it holds the task for its
+ * entire run and drives the other operations itself, so nothing can slip in
+ * between two of its steps.
+ */
+export type PlanReviewOperation = 'review' | 'reconcile' | 'resolve' | 'triage' | 'advance';
+
+/** What the correction loop is doing, published for the detail read while it runs. */
+export interface PlanCorrectionLoopState {
+  readonly phase: PlanCorrectionLoopPhase;
+  readonly round: number;
+}
+
+const BUSY_REMEDIATION =
+  'Wait for the operation in flight to finish, then read the gate again before starting another.';
 
 export class PlanReviewClaims {
-  private readonly held = new Map<string, PlanReviewOperation>();
+  private readonly exclusive = new Map<string, PlanReviewOperation>();
+  /**
+   * Findings being analyzed right now, per task. Analysis of one finding is
+   * read-only towards every provider, so several DIFFERENT findings may be
+   * analyzed at once; anything that writes or dispatches is exclusive against
+   * all of them.
+   */
+  private readonly analyzing = new Map<string, Set<number>>();
+  private readonly loops = new Map<string, PlanCorrectionLoopState>();
 
   /**
-   * Take the claim for a task, or refuse.
+   * Take the exclusive claim for a task, or refuse.
    *
    * Returns the release function. It is idempotent, so a `finally` that runs
    * twice cannot hand the claim to a caller that never took it.
    */
   acquire(taskId: string, operation: PlanReviewOperation): () => void {
-    const current = this.held.get(taskId);
-    if (current !== undefined) {
+    const current = this.heldBy(taskId);
+    if (current !== null) {
       throw new AgentRelayError(
         'BUSY',
         `An external plan-review ${current} is already running for this task.`,
-        {
-          remediation:
-            'Wait for the operation in flight to finish, then read the gate again before starting another.'
-        }
+        { remediation: BUSY_REMEDIATION }
       );
     }
-    this.held.set(taskId, operation);
+    this.exclusive.set(taskId, operation);
 
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      this.held.delete(taskId);
+      this.exclusive.delete(taskId);
+      this.loops.delete(taskId);
     };
+  }
+
+  /**
+   * Take a shared claim on ONE finding's analysis, or refuse.
+   *
+   * Refused while any exclusive operation holds the task, and refused for a
+   * finding that is already being analyzed — two analyses of the same finding
+   * would race to write different answers.
+   */
+  acquireFinding(taskId: string, findingIndex: number): () => void {
+    const exclusive = this.exclusive.get(taskId);
+    if (exclusive !== undefined) {
+      throw new AgentRelayError(
+        'BUSY',
+        `An external plan-review ${exclusive} is already running for this task.`,
+        { remediation: BUSY_REMEDIATION }
+      );
+    }
+    const held = this.analyzing.get(taskId) ?? new Set<number>();
+    if (held.has(findingIndex)) {
+      throw new AgentRelayError('BUSY', 'This finding is already being analyzed.', {
+        remediation: 'Wait for its result.'
+      });
+    }
+    held.add(findingIndex);
+    this.analyzing.set(taskId, held);
+
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const current = this.analyzing.get(taskId);
+      current?.delete(findingIndex);
+      if (current !== undefined && current.size === 0) this.analyzing.delete(taskId);
+    };
+  }
+
+  /** Publish the loop's phase. Cleared automatically when its claim is released. */
+  setLoop(taskId: string, state: PlanCorrectionLoopState): void {
+    if (this.exclusive.get(taskId) === 'advance') this.loops.set(taskId, state);
+  }
+
+  /** The correction loop running for this task in this process, if any. */
+  loopOf(taskId: string): PlanCorrectionLoopState | null {
+    return this.loops.get(taskId) ?? null;
   }
 
   /** The operation holding this task's claim, if any. For diagnostics only. */
   heldBy(taskId: string): PlanReviewOperation | null {
-    return this.held.get(taskId) ?? null;
+    const exclusive = this.exclusive.get(taskId);
+    if (exclusive !== undefined) return exclusive;
+    return (this.analyzing.get(taskId)?.size ?? 0) > 0 ? 'triage' : null;
   }
 }

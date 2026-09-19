@@ -48,6 +48,7 @@ import {
   type SnapshotFileOps
 } from '../../src/main/adapters/git/git-code-snapshot';
 import {
+  codeCorrectionRequirements,
   codeReviewCurrentTriageRecommendations,
   parseCodeReviewTriage,
   type ProviderCodeFinding
@@ -3087,5 +3088,263 @@ describe('code-review automatic finding triage', () => {
     expect(identity.currentSha256).toBe(stored.subjectSha256);
     const current = codeReviewCurrentTriageRecommendations(stored, identity.currentSha256, liveNow);
     expect(current.map((r) => r.findingId)).toEqual([findings[1]!.id]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Auto decide                                                                 */
+/* -------------------------------------------------------------------------- */
+
+describe('code-review Auto decide', () => {
+  async function withFindings(titles: readonly string[] = ['First finding', 'Second finding', 'Third finding']) {
+    const value = setup();
+    const codex = new FakeCodexAdapter();
+    const service = value.build({ codex, settings: value.harness.settings });
+    value.reviewer.answer = { ...value.reviewer.answer, findings: titles.map((title) => finding({ title })) };
+    const outcome = await reviewOnce(value);
+    return { value, codex, service, findings: outcome.findings };
+  }
+  const recommend = (
+    findingRef: string,
+    recommendation: 'accept' | 'reject' | 'needs_user',
+    reason = 'Because.'
+  ) => ({ findingRef, recommendation, reason, evidenceRef: 'src/service.ts:42', confidence: 'high' as const });
+
+  it('sends only the named finding, by its stable id', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageQueue.push([recommend(findings[1]!.id, 'accept')]);
+
+    await service.autoDecide(value.task.id, { findingId: findings[1]!.id });
+
+    expect(codex.triageCalls).toHaveLength(1);
+    expect(codex.triageCalls[0]?.refKind).toBe('id');
+    expect(codex.triageCalls[0]?.findings.map((entry) => entry.ref)).toEqual([findings[1]!.id]);
+  });
+
+  it('records an accept durably at once — no second "apply" step — as an automatic decision', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    const target = findings[0]!;
+    codex.triageQueue.push([recommend(target.id, 'accept', 'Matches criterion 1.')]);
+
+    const outcome = await service.autoDecide(value.task.id, { findingId: target.id });
+
+    expect(outcome).toMatchObject({ kind: 'decided', action: 'accept', confidence: 'high' });
+    const stored = value.reviews.latestDecision(target.id)!;
+    expect(stored).toMatchObject({ action: 'accept', actor: 'system', source: 'codeReview:autoDecide' });
+    expect(stored.reason).toContain('Matches criterion 1.');
+    expect(stored.reason).toContain('src/service.ts:42');
+    expect(value.reviews.findFindingById(target.id)?.revision).toBe(target.revision + 1);
+    // Only this finding was touched.
+    expect(value.reviews.latestDecision(findings[1]!.id)).toBeNull();
+  });
+
+  it('records a reject durably with its reason', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageQueue.push([recommend(findings[2]!.id, 'reject', 'The premise is contradicted.')]);
+
+    await service.autoDecide(value.task.id, { findingId: findings[2]!.id });
+
+    expect(value.reviews.latestDecision(findings[2]!.id)).toMatchObject({ action: 'reject', actor: 'system' });
+    expect(value.reviews.latestDecision(findings[2]!.id)?.reason).toContain('contradicted');
+  });
+
+  it('never decides a needs_user finding, and keeps the explanation', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageQueue.push([recommend(findings[0]!.id, 'needs_user', 'A product choice.')]);
+
+    const outcome = await service.autoDecide(value.task.id, { findingId: findings[0]!.id });
+
+    expect(outcome).toMatchObject({ kind: 'needs_user', reason: 'A product choice.' });
+    expect(value.reviews.latestDecision(findings[0]!.id)).toBeNull();
+    expect(value.reviews.listDecisions(findings[0]!.id)).toEqual([]);
+    expect(value.reviews.getTriage(value.task.id)?.triageJson).toContain('A product choice.');
+  });
+
+  it('never overwrites a durable decision, and does not even ask Codex', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    await value.service.decide(value.task.id, {
+      findingId: findings[0]!.id,
+      action: 'reject',
+      reason: 'Operator says no.',
+      expectedRevision: findings[0]!.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+
+    const outcome = await service.autoDecide(value.task.id, { findingId: findings[0]!.id });
+
+    expect(outcome).toEqual({ kind: 'already_decided', action: 'reject' });
+    expect(codex.triageCalls).toHaveLength(0);
+    expect(value.reviews.listDecisions(findings[0]!.id)).toHaveLength(1);
+  });
+
+  it('never overwrites a decision that arrives while Codex is analyzing', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    const target = findings[0]!;
+    let release!: (value: unknown) => void;
+    codex.triageGate = new Promise((resolve) => {
+      release = resolve;
+    });
+    codex.triageQueue.push([recommend(target.id, 'accept', 'Auto says yes.')]);
+
+    const running = service.autoDecide(value.task.id, { findingId: target.id });
+    await Promise.resolve();
+    await value.service.decide(value.task.id, {
+      findingId: target.id,
+      action: 'reject',
+      reason: 'The operator got there first.',
+      expectedRevision: target.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+    release(undefined);
+
+    expect(await running).toEqual({ kind: 'already_decided', action: 'reject' });
+    const decisions = value.reviews.listDecisions(target.id);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({ action: 'reject', actor: 'operator' });
+  });
+
+  it('analyzes different findings at once, refuses the same one twice, and excludes a round dispatch', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    let release!: (value: unknown) => void;
+    codex.triageGate = new Promise((resolve) => {
+      release = resolve;
+    });
+    codex.triageQueue.push([recommend(findings[0]!.id, 'accept')], [recommend(findings[1]!.id, 'reject')]);
+
+    const first = service.autoDecide(value.task.id, { findingId: findings[0]!.id });
+    const second = service.autoDecide(value.task.id, { findingId: findings[1]!.id });
+    await Promise.resolve();
+
+    await expect(service.autoDecide(value.task.id, { findingId: findings[0]!.id })).rejects.toMatchObject({ code: 'BUSY' });
+    await expect(service.review(value.task.id)).rejects.toMatchObject({ code: 'BUSY' });
+    await expect(service.triage(value.task.id)).rejects.toMatchObject({ code: 'BUSY' });
+
+    release(undefined);
+    await Promise.all([first, second]);
+    expect(value.reviews.latestDecision(findings[0]!.id)?.action).toBe('accept');
+    expect(value.reviews.latestDecision(findings[1]!.id)?.action).toBe('reject');
+    // Both recommendations survive in the durable triage record: results merge, they do not replace.
+    const stored = value.reviews.getTriage(value.task.id)!.triageJson;
+    expect(stored).toContain(findings[0]!.id);
+    expect(stored).toContain(findings[1]!.id);
+  });
+
+  it('keeps a failed analysis local: nothing is decided, and an explicit retry succeeds', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageError = new Error('Codex timed out.');
+
+    await expect(service.autoDecide(value.task.id, { findingId: findings[0]!.id })).rejects.toThrow(/timed out/i);
+    expect(value.reviews.latestDecision(findings[0]!.id)).toBeNull();
+
+    codex.triageError = null;
+    codex.triageQueue.push([recommend(findings[0]!.id, 'accept')]);
+    expect(await service.autoDecide(value.task.id, { findingId: findings[0]!.id })).toMatchObject({ kind: 'decided' });
+  });
+
+  it('decides nothing about code that has moved on since it was reviewed', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageQueue.push([recommend(findings[0]!.id, 'accept')]);
+    value.snapshots.headCommit = '9'.repeat(40);
+
+    await expect(service.autoDecide(value.task.id, { findingId: findings[0]!.id })).rejects.toThrow(/no longer matches/i);
+    expect(value.reviews.latestDecision(findings[0]!.id)).toBeNull();
+  });
+
+  it('refuses a credential-shaped analysis and stores nothing of it', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageQueue.push([recommend(findings[0]!.id, 'accept', 'Use the key sk-abcdefghijklmnopqrstuvwxyz123456.')]);
+
+    await expect(service.autoDecide(value.task.id, { findingId: findings[0]!.id })).rejects.toThrow(/credential-shaped/i);
+    expect(value.reviews.latestDecision(findings[0]!.id)).toBeNull();
+  });
+
+  it('refuses a finding of another task or an unknown one', async () => {
+    const { value, service } = await withFindings();
+    await expect(service.autoDecide(value.task.id, { findingId: 'missing' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+});
+
+describe('code-review accepted findings as correction requirements', () => {
+  async function withAccepted() {
+    const value = setup();
+    value.reviewer.answer = {
+      ...value.reviewer.answer,
+      findings: [finding({ title: 'Accepted one' }), finding({ title: 'Rejected one' }), finding({ title: 'Undecided one' })]
+    };
+    const outcome = await reviewOnce(value);
+    const [accepted, rejected] = outcome.findings;
+    const decide = (target: typeof accepted, action: 'accept' | 'reject' | 'resolved') =>
+      value.service.decide(value.task.id, {
+        findingId: target!.id,
+        action,
+        reason: `${action} by the operator.`,
+        expectedRevision: value.reviews.findFindingById(target!.id)!.revision,
+        actor: 'operator',
+        source: 'test'
+      });
+    await decide(accepted, 'accept');
+    await decide(rejected, 'reject');
+    return { value, accepted: accepted!, decide };
+  }
+
+  it('collects exactly the accepted findings, not the rejected or undecided ones', async () => {
+    const { value, accepted } = await withAccepted();
+
+    expect(value.service.acceptedRequirements(value.task.id).map((entry) => entry.finding.title)).toEqual([accepted.title]);
+  });
+
+  it('keeps an accepted finding open until a completed round on a NEW subject exists, and never resolves it by itself', async () => {
+    const { value, accepted, decide } = await withAccepted();
+    const requirementsStatus = async () => {
+      const identity = await value.service.subjectIdentity(value.task.id);
+      const live =
+        identity.identity === 'current' && identity.stored !== null
+          ? value.reviews.listFindings(value.task.id).filter((entry) => entry.subjectSha256 === identity.stored!.subjectSha256)
+          : [];
+      return codeCorrectionRequirements({
+        accepted: value.service.acceptedRequirements(value.task.id),
+        liveFindingIds: new Set(live.map((entry) => entry.id)),
+        newestSubjectSha256: value.reviews.latestSubject(value.task.id)?.subjectSha256 ?? null,
+        reviewedSubjectSha256s: new Set(
+          value.reviews.listRounds(value.task.id).filter((round) => round.status === 'completed').map((round) => round.subjectSha256)
+        )
+      }).map((entry) => entry.status);
+    };
+
+    // Same code: the accepted finding is simply open.
+    expect(await requirementsStatus()).toEqual(['open']);
+
+    // The code moves on and is captured — but no review has run against it yet.
+    value.snapshots.headCommit = '9'.repeat(40);
+    await value.service.captureSubject(value.task.id);
+    expect(await requirementsStatus()).toEqual(['awaiting_fresh_review']);
+    // The operator is refused: they have not been shown a review of this code.
+    await expect(decide(accepted, 'resolved')).rejects.toThrow(/earlier snapshot/i);
+    expect(value.service.acceptedRequirements(value.task.id)).toHaveLength(1);
+
+    // A fresh round on the new subject runs: only now is the evidence there.
+    const fresh = await value.service.review(value.task.id);
+    expect(fresh.round.subjectSha256).toBe(value.reviews.latestSubject(value.task.id)!.subjectSha256);
+    expect(fresh.findings.every((entry) => entry.subjectSha256 === fresh.round.subjectSha256)).toBe(true);
+    expect(await requirementsStatus()).toEqual(['fresh_review_done']);
+    // Nothing resolved it by itself.
+    expect(value.reviews.latestDecision(accepted.id)?.action).toBe('accept');
+
+    // Now the operator may say the code moved on — and only then does the requirement close.
+    await decide(accepted, 'resolved');
+    expect(value.reviews.latestDecision(accepted.id)?.action).toBe('resolved');
+    expect(value.service.acceptedRequirements(value.task.id)).toEqual([]);
+  });
+
+  it('does not offer accept or reject on an earlier subject, even after a fresh round', async () => {
+    const { value, accepted, decide } = await withAccepted();
+    value.snapshots.headCommit = '9'.repeat(40);
+    await value.service.captureSubject(value.task.id);
+    await value.service.review(value.task.id);
+
+    await expect(decide(accepted, 'reject')).rejects.toThrow(/earlier snapshot/i);
+    await expect(decide(accepted, 'accept')).rejects.toThrow(/earlier snapshot/i);
   });
 });

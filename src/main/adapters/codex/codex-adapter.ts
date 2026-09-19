@@ -41,6 +41,8 @@ import type {
   CodexAdapter,
   CodexReviewOutcome,
   CodexReviewRequest,
+  CodexRevisionOutcome,
+  CodexRevisionRequest,
   CodexSpecificationRequest,
   CodexSpecificationResult,
   CodexTriageOutcome,
@@ -49,7 +51,12 @@ import type {
 } from '../../ports';
 import { locateExecutable } from '../process/executable-locator';
 import type { ProcessRunner } from '../process/process-runner';
-import { buildReviewPrompt, buildSpecificationPrompt, buildTriagePrompt } from './prompts';
+import {
+  buildReviewPrompt,
+  buildSpecificationPrompt,
+  buildSpecificationRevisionPrompt,
+  buildTriagePrompt
+} from './prompts';
 import {
   MAX_STDERR_DIAGNOSTIC_CHARS,
   formatTerminalError,
@@ -413,6 +420,56 @@ export class CodexSdkAdapter implements CodexAdapter {
     return new AgentRelayError('TOOL_FAILED', `Codex failed: ${redacted.slice(0, 500)}`, {
       details: threadId ? `thread ${threadId}` : undefined
     });
+  }
+
+  async reviseSpecification(
+    request: CodexRevisionRequest,
+    context: AgentRunContext
+  ): Promise<CodexRevisionOutcome> {
+    if (request.acceptedFindings.length === 0) {
+      // Nothing to correct: refusing here keeps "revise" from ever meaning
+      // "rewrite the plan on a whim" and costs no provider call.
+      throw new AgentRelayError('VALIDATION_FAILED', 'There are no accepted findings to revise the specification from.');
+    }
+    const prompt = buildSpecificationRevisionPrompt({
+      projectPath: request.projectPath,
+      taskTitle: request.taskTitle,
+      originalRequest: request.originalRequest,
+      currentSpecification: request.currentSpecification,
+      acceptedFindings: request.acceptedFindings,
+      ruleEvidence: request.ruleEvidence,
+      round: request.round,
+      maxRounds: request.maxRounds
+    });
+
+    const outcome = await this.runTurn(
+      // Always null: the prompt carries everything the revision may use, so it
+      // never depends on, or continues, another conversation.
+      null,
+      prompt,
+      this.threadOptions(request.model, {
+        // A revision reads the repository to be accurate; it never writes to it.
+        sandboxMode: 'read-only',
+        workingDirectory: request.projectPath,
+        approvalPolicy: 'never',
+        networkAccessEnabled: false
+      }),
+      taskSpecificationJsonSchema(),
+      context
+    );
+
+    const parsed = parseTaskSpecification(outcome.finalResponse);
+    if (!parsed.ok || !parsed.value) {
+      throw new AgentRelayError(
+        'PARSE_FAILED',
+        parsed.error ?? 'Codex did not return a usable revised specification.',
+        {
+          remediation: 'Use "Continue correction" to try the revision again; nothing was changed.',
+          details: parsed.raw ? redactSecrets(parsed.raw).slice(0, 2000) : undefined
+        }
+      );
+    }
+    return { specification: parsed.value, rawResponse: outcome.finalResponse };
   }
 
   async createSpecification(

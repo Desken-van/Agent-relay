@@ -525,6 +525,93 @@ five decisions and restart read-back. This is evidence for that one path, not a
 claim that provider failure, `revise`, timeout and crash windows are all live-
 accepted; those remain INT-G scope.
 
+### Auto decide and the plan-correction loop
+
+Migration 19 (`plan-auto-decisions-and-corrections`) adds the durable state for
+both. Nothing else about the gate changed: `resolve` is still the only call that
+sends decisions to the external provider, and it still refuses an incomplete set.
+
+**Auto decide** asks Codex about ONE finding and records the answer, so the
+decision is on the finding when the click finishes. It is a request about one named
+round: the renderer sends only `taskId`, `gateId`, `findingsSha256` (the SHA-256 of
+the stored `findings_json`) and `findingIndex`; it cannot supply a decision, a
+recommendation or a prompt. The main process re-reads the round, refuses when the
+identity is not the current one, and merges the result into
+`plan_review_gates.auto_decisions_json` with a synchronous read-modify-write, so
+concurrent analyses of different findings all survive. An `accept` or `reject` is
+stored as a decision with its reason and evidence; `needs_user` is stored only as a
+recommendation and leaves the finding undecided. A stored automatic decision never
+replaces an existing decision, and the operator's own draft always wins over it.
+A stored decision is not a resolution: the round stays `awaiting_resolve` until the
+operator resolves it. Plan review has no per-finding durable decision, so this
+stands in for one, keyed by the round it answers so a new round can never inherit it.
+Code review needs no such record: `codeReview:autoDecide` writes the existing
+per-finding decision (`decide`, conditional on the finding's revision) as `system`.
+
+**The correction loop.** Accepting a plan finding says it is valid; it does not
+change the specification. `Resolve and revise plan` (`planReview:resolveAndRevise`)
+resolves the round and then keeps going until a stop condition:
+
+```
+awaiting decisions ──resolve──▶ settled round ─┬─ no accepted finding ─▶ plain resolve, done
+                                               └─ accepted findings ───▶ Codex revises
+      ▲                                                                       │
+      │                                                  atomic complete: new immutable version
+ Auto decide                                                                  │
+      └── fresh Coai plan review ◀── new gate for the revised hash ◀──────────┘
+```
+
+The loop owns no state. `planCorrectionNextStep` derives the next step from durable
+rows only — the gate, its decisions, the correction row for that gate and the
+task's specification — so a crash, a restart or a second window resumes from what
+is recorded:
+
+| Durable state | Next step |
+|---|---|
+| No gate; identity unknown or no gate | none |
+| Gate in `opening`/`reviewing`/`resolving`/`failed` | **reconcile** (never repeat a non-idempotent Coai call) |
+| Gate `awaiting_resolve` | **decide** (needs decisions) |
+| Current gate settled with accepted findings, correction not completed | **revise** — or `round_limit` once `Settings.maxReviewRounds` corrections have run |
+| Current gate `proceeded` | clean |
+| Current gate `changes_requested`/`interrupted` with no accepted finding | run the next review |
+| Gate `prepared` | run its review |
+| Obsolete gate | run a review only if a correction completed; otherwise none |
+
+`plan_review_corrections` holds one row per gate that needed a revision, with
+`UNIQUE(source_gate_id)` as the idempotency key: a retry reopens the SAME row, so
+one gate can never yield two corrections, two versions or two review rounds. The row
+freezes what Codex was given (`accepted_json`). The Codex call has no effect until
+`complete`, which in one transaction swaps `tasks.specification_json`
+(compare-and-swap on the exact text the correction started from), appends the
+version and closes the row. A crash before that leaves a `running` row that is read
+as `interrupted` when no loop is alive in this process. `task_specification_versions`
+is append-only, enforced by an `UPDATE` trigger; the first version is recorded
+lazily in the transaction that opens the first correction. Every revised
+specification is a new hash, so the existing gate-per-hash rule gives it a fresh
+rule-evidence binding and a fresh Coai session round.
+
+The loop stops, and says why, on: `needs_user` findings (Auto decide stops on
+purpose), a verdict that needs a human, Coai's contract fingerprint changing, a gate
+that needs reconciliation, the correction budget, a stale revision or concurrent
+mutation, or a Codex/validation failure (the row is marked `failed` and nothing is
+changed). It never approves the specification and never advances past an accepted
+finding the specification does not yet reflect: approval refuses a specification whose
+own review round accepted findings (`APPROVAL_REQUIRED`), and a plain `resolve` refuses
+any decision set containing an accept, so the only way to settle such a round is the
+loop that revises the plan.
+`Resolve review` (no revision) is available only when nothing was accepted.
+
+**Code review** treats accepted findings as correction requirements, not fixes.
+`codeReview:get` returns them with one of three statuses — `open` (the code has not
+moved), `awaiting_fresh_review` (it moved; no review of it yet) and
+`fresh_review_done`. The requirements are merged into the existing correction round
+(`Orchestrator.sendCorrections`, allowed from `READY_FOR_REVIEW`/`APPROVED` through
+the `corrections_sent` workflow edges), so the implementation provider, round budget,
+verification and review are the ones every correction already uses. A finding is
+closed only by an explicit `resolved` decision, which the service accepts for a
+finding of an older subject only when a completed review round exists on the newest
+subject.
+
 ### Authoritative Run actions and linked continuations
 
 `runGuidance` is the authoritative projection for **Run → Actions**. It maps the
@@ -1808,6 +1895,9 @@ Electron suite contacts the configured reviewer and is excluded from
 | `adapters/coai-plan-reviewer` · `services/plan-review-gate` | **Typed external plan gate**: fixed tool names, refusal/error separation, immutable task evidence, durable pre-call intent, decision completeness, secret-shaped input refusal, stale-plan invalidation and approval enforcement |
 | `services/plan-review-configuration` · `domain/plan-review-ipc-contract` | **Saved integration boundary**: opt-in configuration, absolute shell-free process paths, no credential arguments, exact clean convention sources, and operational IPC with no executable, repository, prompt or rule-content fields |
 | `renderer/plan-review-view` · `renderer/plan-review-settings` | **The external plan-review UI against a fake preload bridge**: task-only rule capture, no retroactive opt-in, reasoned finding resolution, no retry affordance for an unknown in-flight call, and fixed process arguments/convention files that remain editable one line at a time |
+| `services/plan-auto-decide` · `services/plan-correction` · `db/plan-correction-repository` | **Auto decide and the correction loop through the real service, repositories and a real migrated SQLite database** with a fake external reviewer and Codex: one finding per request, round-identity pinning, concurrent merges, needs_user never applied, no overwrite of a durable decision, accepted findings revising the specification through an atomic compare-and-swap, one row/version/round per gate across retries and restarts, every stop condition, fail-closed approval and plain-resolve guards |
+| `services/external-code-corrections` · `services/code-review` (Auto decide) | Code-review Auto decide through the existing durable decision lifecycle; accepted findings as correction requirements handed to the existing correction round; `resolved` only after a fresh completed round on newer code |
+| `renderer/plan-auto-decide` · `renderer/code-review-triage` | **Both review panels through their real buttons** against a fake preload bridge: Auto decide inside each Decision row, exact single-finding request, immediate placement, needs_user, progress and failure inside the finding, double clicks, bulk counts and partial failure, drafts and decided findings untouched, `Resolve and revise plan` versus plain resolve, loop progress and failure, requirements and the correction hand-off |
 | `security/redaction-and-process` | Credential redaction, environment compartmentalisation, argv-not-shell execution |
 | `domain/operations-targets` · `domain/operations-diagnostics` · `domain/operations-ipc-contract` | The target and probe contracts: what they refuse — an adapter outside the enum, a config version this build cannot read, a credential value, a statement anywhere a probe id belongs |
 | `db/operations-repositories` | Migration 3 on a fresh database *and* on one that already has 1 and 2, CRUD, uniqueness, the `RESTRICT` audit policy, close/reopen on disk |

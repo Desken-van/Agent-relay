@@ -57,6 +57,11 @@ import type {
   TaskRuleEvidenceBinding
 } from '../shared/domain/plan-review';
 import type {
+  AcceptedPlanFinding,
+  PlanCorrection,
+  SpecificationVersion
+} from '../shared/domain/plan-correction';
+import type {
   CodeReviewDecision,
   CodeReviewFinding,
   CodeReviewOccurrence,
@@ -351,6 +356,30 @@ export interface CodexTriageOutcome {
   readonly rawResponse: string;
 }
 
+/**
+ * Revise a specification from the external plan-review findings the operator
+ * (or Auto decide) ACCEPTED — and from nothing else.
+ */
+export interface CodexRevisionRequest {
+  /** The project checkout, used as the read-only sandbox root. */
+  readonly projectPath: string;
+  readonly taskTitle: string;
+  /** What the user originally asked for. The revision must stay faithful to it. */
+  readonly originalRequest: string;
+  readonly currentSpecification: TaskSpecification;
+  /** The only correction requirements. Rejected findings are never sent. */
+  readonly acceptedFindings: readonly AcceptedPlanFinding[];
+  readonly ruleEvidence?: string;
+  readonly round: number;
+  readonly maxRounds: number;
+  readonly model: string | null;
+}
+
+export interface CodexRevisionOutcome {
+  readonly specification: TaskSpecification;
+  readonly rawResponse: string;
+}
+
 export type { CodexModelCatalogResult, CodexModelOption };
 
 export interface CodexModelCatalog {
@@ -385,6 +414,17 @@ export interface CodexAdapter {
     request: CodexTriageRequest,
     context: AgentRunContext
   ): Promise<CodexTriageOutcome>;
+
+  /**
+   * Revise a specification from accepted plan-review findings. MUST run with
+   * `sandboxMode: 'read-only'`, no network, and MUST always start a fresh thread:
+   * the request carries everything the revision may use, and the result has no
+   * effect until the caller validates and commits it.
+   */
+  reviseSpecification(
+    request: CodexRevisionRequest,
+    context: AgentRunContext
+  ): Promise<CodexRevisionOutcome>;
 
   diagnose(): Promise<ToolDiagnostic>;
 }
@@ -654,7 +694,11 @@ export type PlanReviewGatePatch = Partial<
 >;
 
 export interface PlanReviewGateRepository {
+  /** The task's newest gate. */
   findByTask(taskId: string): PlanReviewGate | null;
+  findById(id: string): PlanReviewGate | null;
+  /** Every gate of the task, newest first. Rows are append-only across specification identities. */
+  listByTask(taskId: string): PlanReviewGate[];
   create(gate: NewPlanReviewGate): PlanReviewGate;
   update(id: string, patch: PlanReviewGatePatch): PlanReviewGate;
   /**
@@ -671,6 +715,56 @@ export interface PlanReviewGateRepository {
     patch: PlanReviewGatePatch,
     expectedRevision: number
   ): PlanReviewGate | null;
+}
+
+/**
+ * Persistence for the plan-correction loop: the append-only specification
+ * history and the one-row-per-gate correction lifecycle.
+ *
+ * Every write that has to be atomic is ONE method, so a service can never leave
+ * a half-applied correction: there is no separate "insert version" and "update
+ * task" for a caller to interleave.
+ */
+export interface PlanCorrectionRepository {
+  /** Ascending by round. */
+  listByTask(taskId: string): PlanCorrection[];
+  findBySourceGate(gateId: string): PlanCorrection | null;
+  /** Ascending by version. */
+  listVersions(taskId: string): SpecificationVersion[];
+  /**
+   * Open the correction for a gate, or reopen it — in one transaction.
+   *
+   * First time: records the CURRENT specification as a version if it is not
+   * already the task's latest one (so the text that was reviewed is never lost),
+   * then inserts the correction as `running` with `attempts = 1`. Retry: the
+   * existing row is moved to `running` and `attempts` is incremented; a
+   * `completed` row is returned untouched. Never creates a second row for a gate.
+   */
+  begin(input: {
+    readonly id: string;
+    readonly versionId: string;
+    readonly taskId: string;
+    readonly sourceGateId: string;
+    readonly fromSpecificationSha256: string;
+    readonly currentSpecificationJson: string;
+    readonly acceptedJson: string;
+  }): PlanCorrection;
+  /** `running` → `failed`, recording a bounded reason. A no-op for any other status. */
+  fail(id: string, message: string): PlanCorrection;
+  /**
+   * Commit a validated revision atomically: compare-and-swap the task's
+   * specification (refused if it is no longer `expectedSpecificationJson`),
+   * clear its approval, append the new version, and mark the correction
+   * `completed`. Throws `AgentRelayError('VALIDATION_FAILED')` when the task's
+   * specification moved, leaving everything untouched.
+   */
+  complete(input: {
+    readonly correctionId: string;
+    readonly versionId: string;
+    readonly expectedSpecificationJson: string;
+    readonly newSpecificationJson: string;
+    readonly newSpecificationSha256: string;
+  }): { readonly correction: PlanCorrection; readonly version: SpecificationVersion };
 }
 
 /* -------------------------------------------------------------------------- */

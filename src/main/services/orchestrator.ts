@@ -155,6 +155,12 @@ export interface OrchestratorDeps {
   readonly planReviews: PlanReviewGateRepository;
   readonly continuationGuard?: ContinuationActionGuard;
   readonly continuations?: TaskContinuationRepository;
+  /**
+   * Findings accepted from an external code review that nobody has shown to be
+   * fixed. Absent in builds without code review; then no correction ever
+   * carries one.
+   */
+  readonly externalCodeRequirements?: (taskId: string) => readonly ExternalCodeRequirement[];
   /** Present only when Ornith is wired; absent build configurations simply cannot select it. */
   readonly ornith?: OrnithImplementationService;
   readonly ornithLease?: OrnithInferenceLeaseService;
@@ -859,6 +865,10 @@ export class Orchestrator {
     let task = this.requireTask(taskId);
     const settings = this.deps.settings.get();
 
+    // Findings the operator accepted from an external code review are
+    // corrections still owed. They travel through THIS round, not a parallel one.
+    const external = this.deps.externalCodeRequirements?.(taskId) ?? [];
+
     // The same decision the button makes, from the same function. Asking it
     // here is what makes it a rule rather than a UI convenience: a renderer is
     // not a domain boundary, and this entry point is reachable without one.
@@ -866,7 +876,8 @@ export class Orchestrator {
       status: task.status,
       currentRound: task.currentRound,
       maxRounds: task.maxRounds,
-      latestClaudeStructuredResult: latestClaudeRoundResult(this.deps.runs.listByTask(taskId))
+      latestClaudeStructuredResult: latestClaudeRoundResult(this.deps.runs.listByTask(taskId)),
+      externalRequirementsOpen: external.length > 0
     });
 
     if (action.kind === 'unavailable') {
@@ -888,7 +899,7 @@ export class Orchestrator {
     // configuration must not reach the point of writing a run row.
     this.assertImplementationConfigured(task, settings);
 
-    const review = readReview(task);
+    const review = mergeExternalRequirements(readReview(task), external);
     if (!review && !recovering) {
       throw new AgentRelayError('VALIDATION_FAILED', 'There is no review to send corrections from.');
     }
@@ -1724,6 +1735,54 @@ export function readReview(task: Task): CodexReviewResult | null {
   if (!task.lastReviewJson) return null;
   const parsed = codexReviewResultSchema.safeParse(JSON.parse(task.lastReviewJson));
   return parsed.success ? parsed.data : null;
+}
+
+/** A finding the operator accepted from an external code review, as a correction requirement. */
+export interface ExternalCodeRequirement {
+  readonly title: string;
+  readonly body: string;
+  readonly fix: string;
+  readonly severity: 'blocking' | 'major' | 'minor' | 'nit';
+  readonly file: string;
+  readonly line: number;
+}
+
+const EXTERNAL_SEVERITY: Record<ExternalCodeRequirement['severity'], CodexReviewResult['findings'][number]['severity']> = {
+  blocking: 'critical',
+  major: 'high',
+  minor: 'medium',
+  nit: 'low'
+};
+
+/**
+ * The review a correction round is built from: the internal review's findings
+ * plus every accepted external finding, so the existing correction prompt (and
+ * Ornith's structured rendering) carry them without a second code path. With no
+ * internal review the external findings ARE the review. Returns the internal
+ * review untouched when nothing external is owed.
+ */
+export function mergeExternalRequirements(
+  review: CodexReviewResult | null,
+  external: readonly ExternalCodeRequirement[]
+): CodexReviewResult | null {
+  if (external.length === 0) return review;
+  const findings = external.map((requirement) => ({
+    severity: EXTERNAL_SEVERITY[requirement.severity],
+    title: `External code review: ${requirement.title}`,
+    description: requirement.fix.trim().length > 0
+      ? `${requirement.body}\nAccepted correction: ${requirement.fix}`
+      : requirement.body,
+    file: requirement.file.length > 0 ? requirement.file : null,
+    line: requirement.line > 0 ? requirement.line : null
+  }));
+  const note = `The operator accepted ${external.length} finding(s) from an external code review; they are corrections still owed.`;
+  return {
+    verdict: 'changes_requested',
+    summary: review ? `${review.summary}\n\n${note}` : note,
+    findings: [...(review?.findings ?? []), ...findings],
+    followUpPrompt: review?.followUpPrompt ?? '',
+    suggestedTests: review?.suggestedTests ?? []
+  };
 }
 
 /**

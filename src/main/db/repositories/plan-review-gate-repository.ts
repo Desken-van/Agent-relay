@@ -13,7 +13,7 @@ const COLUMNS = `id, task_id, specification_sha256, rule_evidence_sha256,
                  contract_fingerprint, contract_mismatch_at, status, verdict,
                  findings_json, decisions_json, reviewers, gating_count, threshold,
                  last_error, reconciled_at, revision, triage_json, triage_for_findings,
-                 created_at, updated_at`;
+                 auto_decisions_json, created_at, updated_at`;
 
 interface GateRow {
   id: string;
@@ -37,6 +37,7 @@ interface GateRow {
   revision: number;
   triage_json: string | null;
   triage_for_findings: string | null;
+  auto_decisions_json: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -64,6 +65,7 @@ function toGate(row: GateRow): PlanReviewGate {
     revision: row.revision,
     triageJson: row.triage_json,
     triageForFindings: row.triage_for_findings,
+    autoDecisionsJson: row.auto_decisions_json,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -87,6 +89,25 @@ export class SqlitePlanReviewGateRepository implements PlanReviewGateRepository 
     return row ? toGate(row) : null;
   }
 
+  findById(id: string): PlanReviewGate | null {
+    const row = this.db
+      .prepare(`SELECT ${COLUMNS} FROM plan_review_gates WHERE id = ?`)
+      .get(id) as GateRow | undefined;
+    return row ? toGate(row) : null;
+  }
+
+  listByTask(taskId: string): PlanReviewGate[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT ${COLUMNS} FROM plan_review_gates
+            WHERE task_id = ?
+            ORDER BY created_at DESC, rowid DESC`
+        )
+        .all(taskId) as GateRow[]
+    ).map(toGate);
+  }
+
   create(gate: NewPlanReviewGate): PlanReviewGate {
     const now = this.clock.nowIso();
     this.db
@@ -97,14 +118,14 @@ export class SqlitePlanReviewGateRepository implements PlanReviewGateRepository 
            contract_fingerprint, contract_mismatch_at, status, verdict,
            findings_json, decisions_json, reviewers, gating_count, threshold,
            last_error, reconciled_at, revision, triage_json, triage_for_findings,
-           created_at, updated_at)
+           auto_decisions_json, created_at, updated_at)
          VALUES (
            @id, @taskId, @specificationSha256, @ruleEvidenceSha256,
            @sessionId, @serverName, @serverVersion,
            @contractFingerprint, @contractMismatchAt, @status, @verdict,
            @findingsJson, @decisionsJson, @reviewers, @gatingCount, @threshold,
            @lastError, @reconciledAt, @revision, @triageJson, @triageForFindings,
-           @createdAt, @updatedAt)`
+           @autoDecisionsJson, @createdAt, @updatedAt)`
       )
       .run({ ...gate, revision: 0, createdAt: now, updatedAt: now });
     return { ...gate, revision: 0, createdAt: now, updatedAt: now };
@@ -172,6 +193,7 @@ export class SqlitePlanReviewGateRepository implements PlanReviewGateRepository 
            revision = @revision,
            triage_json = @triageJson,
            triage_for_findings = @triageForFindings,
+           auto_decisions_json = @autoDecisionsJson,
            updated_at = @updatedAt
          WHERE id = @id AND revision = @currentRevision`
       )
