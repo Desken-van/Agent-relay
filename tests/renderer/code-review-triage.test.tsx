@@ -428,6 +428,8 @@ describe('code review: Auto decide beside every Decision', () => {
     const blocked = autoButton('Finding A');
     expect(blocked).toHaveProperty('disabled', true);
     expect(blocked.getAttribute('title')).toMatch(/already chosen a decision/i);
+    // A tooltip on a disabled button is not announced, so the reason is also its description.
+    expect(document.getElementById(blocked.getAttribute('aria-describedby') as string)?.textContent).toMatch(/already chosen a decision/i);
     fireEvent.click(blocked);
     expect(autoCalls()).toHaveLength(0);
     expect(decisionSelects()[0]!.value).toBe('reject');

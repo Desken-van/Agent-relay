@@ -9,7 +9,7 @@
  * "reject" mean. They are here once so the two screens cannot drift apart.
  */
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Notice, Spinner } from './primitives';
 
 /* -------------------------------------------------------------------------- */
@@ -239,31 +239,42 @@ export function AutoDecideButton({
   onClick: () => void;
 }): React.JSX.Element {
   const working = state?.phase === 'analyzing' || state?.phase === 'queued';
+  // A tooltip on a disabled button is not reliably announced, so the reason is
+  // also a description the button points at (the element itself is not shown).
+  const reasonId = useId();
   return (
-    <button
-      type="button"
-      className="btn btn--sm btn--primary decision-row__auto"
-      disabled={disabled || working || blockedReason !== null}
-      aria-busy={working}
-      aria-label={`${state?.phase === 'failed' ? 'Retry auto decide' : 'Auto decide'}: ${findingLabel}`}
-      title={
-        blockedReason ??
-        'Ask Codex to analyze this finding, then accept or reject it for you. It stops and asks you when it cannot decide.'
-      }
-      onClick={onClick}
-    >
-      {state?.phase === 'analyzing' ? (
-        <>
-          <Spinner /> Analyzing…
-        </>
-      ) : state?.phase === 'queued' ? (
-        'Waiting…'
-      ) : state?.phase === 'failed' ? (
-        'Retry'
-      ) : (
-        'Auto decide'
-      )}
-    </button>
+    <>
+      <button
+        type="button"
+        className="btn btn--sm btn--primary decision-row__auto"
+        disabled={disabled || working || blockedReason !== null}
+        aria-busy={working}
+        aria-label={`${state?.phase === 'failed' ? 'Retry auto decide' : 'Auto decide'}: ${findingLabel}`}
+        aria-describedby={blockedReason !== null ? reasonId : undefined}
+        title={
+          blockedReason ??
+          'Ask Codex to analyze this finding, then accept or reject it for you. It stops and asks you when it cannot decide.'
+        }
+        onClick={onClick}
+      >
+        {state?.phase === 'analyzing' ? (
+          <>
+            <Spinner /> Analyzing…
+          </>
+        ) : state?.phase === 'queued' ? (
+          'Waiting…'
+        ) : state?.phase === 'failed' ? (
+          'Retry'
+        ) : (
+          'Auto decide'
+        )}
+      </button>
+      {blockedReason !== null ? (
+        <span id={reasonId} hidden>
+          {blockedReason}
+        </span>
+      ) : null}
+    </>
   );
 }
 

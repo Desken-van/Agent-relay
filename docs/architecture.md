@@ -547,7 +547,8 @@ an answer that finishes after another writer saved one is dropped in its favour,
 first saved answer stands and a repeat can never contradict it. A stop is just as
 firm: once automation has stopped on a finding (`needs_user`) for a round, asking again
 reports the stored stop with no Codex call, so a repeat cannot turn "needs a person"
-into an automatic decision, and the button says why it is off. The operator's own
+into an automatic decision, and the button says why it is off (in its tooltip and as its
+accessible description, since a tooltip on a disabled button is not announced). The operator's own
 draft always wins over a saved decision, and a finding with a typed draft cannot be
 analyzed at all (its Auto decide button is disabled), so a draft is never replaced.
 The detail read (`planReview:get`, `codeReview:get`) also reports `analyzing`, the
