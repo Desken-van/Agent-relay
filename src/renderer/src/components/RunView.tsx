@@ -886,6 +886,17 @@ export function RunView(): React.JSX.Element {
 
 /* -------------------------------------------------------------------------- */
 
+/**
+ * A failed analysis as the operator should read it: what went wrong, followed
+ * by the backend's own next step when it gave one (for example, to decide some
+ * findings by hand before analyzing the rest, or to reload a round that moved).
+ */
+function describeTriageFailure(caught: unknown): string {
+  if (!(caught instanceof Error)) return String(caught);
+  const remediation = caught instanceof ApiError ? caught.remediation : undefined;
+  return remediation ? `${caught.message} ${remediation}` : caught.message;
+}
+
 type DecisionDraft = { action: '' | 'accept' | 'reject'; reason: string };
 
 /** Decision drafts, tagged with the round they answer. */
@@ -1069,7 +1080,7 @@ export function PlanReviewPanel({
       await onChanged();
     } catch (caught) {
       if (key === 'triage') {
-        setTriageError(caught instanceof Error ? caught.message : String(caught));
+        setTriageError(describeTriageFailure(caught));
       } else if (caught instanceof ApiError && caught.code === 'GIT_DIRTY' && key === 'prepare') {
         setDirtyPrompt(caught.message + (caught.details ? `\n\n${caught.details}` : ''));
       } else {
@@ -1702,7 +1713,9 @@ export function CodeReviewPanel({
     try {
       await operation();
     } catch (caught) {
-      opError = caught instanceof Error ? caught.message : String(caught);
+      opError = key === 'triage'
+        ? describeTriageFailure(caught)
+        : caught instanceof Error ? caught.message : String(caught);
     }
     if (key === 'triage') {
       setTriageError(opError);

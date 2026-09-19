@@ -657,6 +657,20 @@ describe('the external code-review panel — progress and failure of an analysis
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
+  it('passes on the backend’s own next step, not only what went wrong', async () => {
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
+    bridge.set('codeReview:triage', () =>
+      fail('300 findings are too many to analyze at once.', 'VALIDATION_FAILED', 'Decide some findings by hand, then analyze the rest.')
+    );
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+    await screen.findByRole('button', { name: /Analyze undecided findings/i });
+    fireEvent.click(analyzeButton());
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('300 findings are too many to analyze at once.');
+    expect(alert.textContent).toContain('Decide some findings by hand, then analyze the rest.');
+  });
+
   it('keeps the failure on screen even after the operator decides the last undecided finding by hand', async () => {
     let current = live({ findings: [f1] });
     bridge.set('codeReview:get', () => ok<'codeReview:get'>(current));

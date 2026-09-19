@@ -660,6 +660,23 @@ describe('the external plan-review panel', () => {
         expect(bridge.callsTo('planReview:triage')).toHaveLength(1);
       });
 
+      it('passes on the backend’s own next step, not only what went wrong', async () => {
+        const detail = twoFindingGate();
+        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
+        bridge.set('planReview:triage', () =>
+          fail('300 findings are too many to analyze at once.', 'VALIDATION_FAILED', 'Decide some findings by hand, then analyze the rest.')
+        );
+        render(
+          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+        );
+        await screen.findByRole('button', { name: /Analyze undecided findings/i });
+        fireEvent.click(analyzeButton());
+
+        const alert = await screen.findByRole('alert');
+        expect(alert.textContent).toContain('300 findings are too many to analyze at once.');
+        expect(alert.textContent).toContain('Decide some findings by hand, then analyze the rest.');
+      });
+
       it('recovers from a timeout-coded failure and from a call that throws, each time re-enabling a retry', async () => {
         const detail = twoFindingGate();
         bridge.set('planReview:get', () => ok<'planReview:get'>(detail));

@@ -263,6 +263,15 @@ describe('CodexSdkAdapter.triageFindings — fails closed before any provider ca
     expect(sdk.runs).toHaveLength(1);
   });
 
+  it('rejects a request that names no known reference kind, with the same error rather than a later TypeError', async () => {
+    for (const refKind of ['id ', 'number', '', undefined]) {
+      const error = await rejection(unsound({ ...codeRequest(), refKind }));
+      expect(error.code).toBe('VALIDATION_FAILED');
+      expect(error.message).toMatch(/Unknown finding reference kind/);
+    }
+    expectNothingDispatched();
+  });
+
   it('accepts prior decisions of the request kind', async () => {
     sdk.answer = answer(2);
     await new CodexSdkAdapter(runner).triageFindings(

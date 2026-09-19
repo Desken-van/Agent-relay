@@ -27,6 +27,7 @@ import type { ToolDiagnostic } from '../../../shared/domain/diagnostics';
 import { AgentRelayError } from '../../../shared/domain/errors';
 import {
   MAX_TRIAGE_FINDINGS,
+  TRIAGE_REF_KINDS,
   codexReviewResultJsonSchema,
   findingTriageResultJsonSchema,
   parseCodexReviewResult,
@@ -169,8 +170,8 @@ export function openThread<TThread>(
 
 /**
  * Fails closed, before dispatch, on a triage request that is empty or larger
- * than one answer can cover, or whose finding or prior-decision references are
- * not all of the kind it declared.
+ * than one answer can cover, that names no known reference kind, or whose
+ * finding or prior-decision references are not all of the kind it declared.
  *
  * Mixed reference kinds are not a supported request: plan review only has
  * indexes, code review only ids, and one response can only be held to one
@@ -179,6 +180,14 @@ export function openThread<TThread>(
  * after a provider call, as a rejected response.
  */
 function assertTriageRefsMatchKind(request: CodexTriageRequest): void {
+  // The type says this cannot happen; a caller that got round it would
+  // otherwise fail later, with an incidental TypeError instead of this.
+  if (!(TRIAGE_REF_KINDS as readonly unknown[]).includes(request.refKind)) {
+    throw new AgentRelayError(
+      'VALIDATION_FAILED',
+      `Unknown finding reference kind ${JSON.stringify(request.refKind)}, so nothing was sent to Codex.`
+    );
+  }
   const isDeclaredKind = (ref: unknown): boolean =>
     request.refKind === 'index'
       ? typeof ref === 'number' && Number.isInteger(ref) && ref >= 0
