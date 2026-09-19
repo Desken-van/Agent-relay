@@ -130,33 +130,73 @@ export type TriageRecommendation = (typeof TRIAGE_RECOMMENDATIONS)[number];
 export type TriageConfidence = (typeof TRIAGE_CONFIDENCES)[number];
 
 /**
- * One independent recommendation for one undecided finding. `findingRef` is
- * either a plan-review finding's 0-based index or a code-review finding's
- * stable id — the caller validates it names one of the specific undecided
- * findings it asked about; this schema only bounds its shape.
+ * Which kind of reference names a finding in ONE triage call. A plan-review
+ * finding is named by its 0-based `index` (a JSON number); a code-review
+ * finding by its stable `id` (a JSON string). A call is always about exactly
+ * one kind, so the schema the model is constrained by and the schema its answer
+ * is validated against both admit only that kind — never `number | string`,
+ * which let a model answer a plan gate with `"0"` and lose the whole result to
+ * the plan-review validator after the provider call had already been paid for.
  */
-export const findingTriageRecommendationSchema = z
-  .object({
-    findingRef: z.union([z.number().int().nonnegative(), z.string().min(1).max(100)]),
-    recommendation: z
-      .enum(TRIAGE_RECOMMENDATIONS)
-      .describe('accept = valid, actionable, in scope. reject = false premise, duplicate, out of scope, or already satisfied. needs_user = a product/architecture choice or genuine uncertainty.'),
-    reason: z.string().min(1).max(2_000).describe('Concise reason for the recommendation.'),
-    evidenceRef: z.string().min(1).max(500).describe('A concrete reference into the reviewed material that supports this recommendation.'),
-    confidence: z.enum(TRIAGE_CONFIDENCES)
-  })
-  .strict();
+export const TRIAGE_REF_KINDS = ['index', 'id'] as const;
+export type TriageRefKind = (typeof TRIAGE_REF_KINDS)[number];
 
-export type FindingTriageRecommendation = z.infer<typeof findingTriageRecommendationSchema>;
+const TRIAGE_REF_SCHEMAS = {
+  index: z
+    .number()
+    .int()
+    .nonnegative()
+    .describe('The finding index, copied exactly from its "Finding ref=" line, as a JSON number.'),
+  id: z
+    .string()
+    .min(1)
+    .max(100)
+    .describe('The finding id, copied exactly from its "Finding ref=" line, as a JSON string.')
+} as const;
 
-/** Wrapped in an object, not a bare array, so the same brace-scanning `extractJsonObject` parses it. */
-export const findingTriageResultSchema = z
-  .object({
-    results: z.array(findingTriageRecommendationSchema).min(1).max(256)
-  })
-  .strict();
+/**
+ * One independent recommendation for each undecided finding, keyed by
+ * `findingRef`. The caller still validates that the refs name exactly the
+ * findings it asked about; the schema only bounds their shape. Everything but
+ * `findingRef` is defined here once for both kinds.
+ *
+ * Wrapped in an object, not a bare array, so the same brace-scanning
+ * `extractJsonObject` parses it.
+ */
+function triageResultSchemaFor<Ref extends z.ZodType<number | string>>(findingRef: Ref) {
+  const recommendation = z
+    .object({
+      findingRef,
+      recommendation: z
+        .enum(TRIAGE_RECOMMENDATIONS)
+        .describe('accept = valid, actionable, in scope. reject = false premise, duplicate, out of scope, or already satisfied. needs_user = a product/architecture choice or genuine uncertainty.'),
+      reason: z.string().min(1).max(2_000).describe('Concise reason for the recommendation.'),
+      evidenceRef: z.string().min(1).max(500).describe('A concrete reference into the reviewed material that supports this recommendation.'),
+      confidence: z.enum(TRIAGE_CONFIDENCES)
+    })
+    .strict();
+  return z.object({ results: z.array(recommendation).min(1).max(256) }).strict();
+}
 
-export type FindingTriageResult = z.infer<typeof findingTriageResultSchema>;
+const TRIAGE_RESULT_SCHEMAS = {
+  index: triageResultSchemaFor(TRIAGE_REF_SCHEMAS.index),
+  id: triageResultSchemaFor(TRIAGE_REF_SCHEMAS.id)
+} as const;
+
+export const findingTriageResultSchemaFor = <Kind extends TriageRefKind>(
+  kind: Kind
+): (typeof TRIAGE_RESULT_SCHEMAS)[Kind] => TRIAGE_RESULT_SCHEMAS[kind];
+
+export type FindingTriageResult = z.infer<(typeof TRIAGE_RESULT_SCHEMAS)[TriageRefKind]>;
+
+/**
+ * A recommendation of either kind. `findingRef` is deliberately widened here:
+ * this is the type carried past the adapter (IPC, services), which each
+ * re-validate the ref against the kind of finding they asked about.
+ */
+export type FindingTriageRecommendation = Omit<FindingTriageResult['results'][number], 'findingRef'> & {
+  readonly findingRef: number | string;
+};
 
 /* -------------------------------------------------------------------------- */
 /* JSON Schema projections handed to the Codex SDK                             */
@@ -177,8 +217,9 @@ export const taskSpecificationJsonSchema = (): Record<string, unknown> =>
 export const codexReviewResultJsonSchema = (): Record<string, unknown> =>
   toCodexOutputSchema(codexReviewResultSchema);
 
-export const findingTriageResultJsonSchema = (): Record<string, unknown> =>
-  toCodexOutputSchema(findingTriageResultSchema);
+/** Only the reference kind of THIS call is exposed to the model. */
+export const findingTriageResultJsonSchema = (kind: TriageRefKind): Record<string, unknown> =>
+  toCodexOutputSchema(findingTriageResultSchemaFor(kind));
 
 /* -------------------------------------------------------------------------- */
 /* Tolerant parsing                                                            */
@@ -296,6 +337,9 @@ export function parseCodexReviewResult(text: string): ParseOutcome<CodexReviewRe
   return parseStructured(codexReviewResultSchema, text);
 }
 
-export function parseFindingTriageResult(text: string): ParseOutcome<FindingTriageResult> {
-  return parseStructured(findingTriageResultSchema, text);
+export function parseFindingTriageResult(
+  text: string,
+  kind: TriageRefKind
+): ParseOutcome<FindingTriageResult> {
+  return parseStructured<FindingTriageResult>(findingTriageResultSchemaFor(kind), text);
 }

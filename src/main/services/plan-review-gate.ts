@@ -1005,7 +1005,7 @@ export class PlanReviewGateService {
     if (snapshot === null) throw new AgentRelayError('VALIDATION_FAILED', 'No rule evidence is bound.');
     const specification = specificationIdentity(task.specificationJson);
 
-    const triageableFindings: TriageableFinding[] = requestedIndexes.map((index) => {
+    const triageableFindings: TriageableFinding<number>[] = requestedIndexes.map((index) => {
       const finding = findings[index]!;
       return {
         ref: index,
@@ -1028,6 +1028,9 @@ export class PlanReviewGateService {
 
     const outcome = await this.deps.codex.triageFindings(
       {
+        // A plan gate's findings are named by index, so the model is held to
+        // JSON numbers; a string reference would fail `validateTriageOutcome`.
+        refKind: 'index',
         worktreePath: project.localPath,
         specification: specification.specification,
         ruleEvidence: renderRuleEvidence(snapshot),

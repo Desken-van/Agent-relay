@@ -71,12 +71,63 @@ export function Field({
 
 export function Notice({
   tone,
+  role,
   children
 }: {
   tone: 'info' | 'success' | 'warn' | 'error';
+  /** Set when the notice appears in response to an action and must be announced. */
+  role?: 'status' | 'alert';
   children: ReactNode;
 }): React.JSX.Element {
-  return <div className={`notice notice--${tone}`}>{children}</div>;
+  return (
+    <div className={`notice notice--${tone}`} role={role}>
+      {children}
+    </div>
+  );
+}
+
+/**
+ * What an automatic finding analysis is doing, or how it failed, shown directly
+ * beside the button that started it. A spinner inside a disabled button is too
+ * small to notice, and an error rendered at the top of a long review panel may
+ * be out of view — so an analysis that is running or has failed says so here,
+ * where the operator just clicked.
+ *
+ * A failure says outright that no decision was changed: analysis only ever
+ * produces recommendations, and the operator's own decisions are untouched.
+ */
+export function TriageFeedback({
+  pending,
+  error
+}: {
+  pending: boolean;
+  error: string | null;
+}): React.JSX.Element | null {
+  if (pending) {
+    return (
+      <Notice tone="info" role="status">
+        <Spinner />
+        <div className="stack stack--tight">
+          <strong>Analyzing findings with Codex…</strong>
+          <span>
+            This can take a minute or more. Nothing changes until you apply a recommendation.
+          </span>
+        </div>
+      </Notice>
+    );
+  }
+  if (error !== null) {
+    return (
+      <Notice tone="error" role="alert">
+        <div className="stack stack--tight">
+          <strong>Analysis failed. No decisions were changed or applied.</strong>
+          <span className="selectable">{error}</span>
+          <span>You can analyze again, or decide each finding yourself.</span>
+        </div>
+      </Notice>
+    );
+  }
+  return null;
 }
 
 export function Empty({ title, hint }: { title: string; hint?: string }): React.JSX.Element {

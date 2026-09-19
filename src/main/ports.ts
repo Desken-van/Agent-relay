@@ -295,9 +295,10 @@ export interface CodexReviewOutcome {
 /** One undecided finding, in the one shape both plan-review and code-review
  *  findings can be mapped into for triage — the adapter and its prompt never
  *  need to know which kind of review it came from. */
-export interface TriageableFinding {
-  /** A plan-review finding's 0-based index, or a code-review finding's stable id. */
-  readonly ref: number | string;
+export interface TriageableFinding<Ref extends number | string = number | string> {
+  /** A plan-review finding's 0-based index (number), or a code-review
+   *  finding's stable id (string) — see {@link CodexTriageRequest.refKind}. */
+  readonly ref: Ref;
   readonly severity: string;
   readonly category: string;
   readonly file: string | null;
@@ -308,23 +309,42 @@ export interface TriageableFinding {
 }
 
 /** A decision already recorded against some other finding in the same round/gate. */
-export interface TriageableDecision {
-  readonly findingRef: number | string;
+export interface TriageableDecision<Ref extends number | string = number | string> {
+  readonly findingRef: Ref;
   readonly action: string;
   readonly reason: string | null;
 }
 
-export interface CodexTriageRequest {
+interface CodexTriageRequestBase {
   /** Read-only sandbox root. A task worktree for code review; the project
    *  checkout for plan review, which has none yet. */
   readonly worktreePath: string;
   readonly specification: TaskSpecification;
   readonly ruleEvidence?: string;
-  /** Exactly the undecided findings being triaged — never the full history. */
-  readonly findings: readonly TriageableFinding[];
-  readonly priorDecisions: readonly TriageableDecision[];
   readonly model: string | null;
 }
+
+/**
+ * A triage call names its findings with ONE kind of reference, declared by the
+ * caller and proven by the adapter before anything is dispatched: `index` for a
+ * plan gate's findings (JSON numbers), `id` for code-review findings (JSON
+ * strings). The output schema the model is held to, and the parser its answer
+ * goes through, both follow this kind — a call never accepts both.
+ */
+export type CodexTriageRequest = CodexTriageRequestBase &
+  (
+    | {
+        readonly refKind: 'index';
+        /** Exactly the undecided findings being triaged — never the full history. */
+        readonly findings: readonly TriageableFinding<number>[];
+        readonly priorDecisions: readonly TriageableDecision<number>[];
+      }
+    | {
+        readonly refKind: 'id';
+        readonly findings: readonly TriageableFinding<string>[];
+        readonly priorDecisions: readonly TriageableDecision<string>[];
+      }
+  );
 
 export interface CodexTriageOutcome {
   readonly recommendations: readonly FindingTriageRecommendation[];

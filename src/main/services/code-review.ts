@@ -1671,7 +1671,7 @@ export class CodeReviewService {
     const requestedIds = new Set(targets.map((f) => f.id));
 
     const specification = specificationIdentity(task.specificationJson).specification;
-    const triageableFindings: TriageableFinding[] = targets.map((f) => ({
+    const triageableFindings: TriageableFinding<string>[] = targets.map((f) => ({
       ref: f.id,
       severity: f.severity,
       category: f.category,
@@ -1696,6 +1696,8 @@ export class CodeReviewService {
 
     const outcome = await this.deps.codex.triageFindings(
       {
+        // Code-review findings are rows with a stable string id.
+        refKind: 'id',
         worktreePath: task.worktreePath,
         specification,
         findings: triageableFindings,

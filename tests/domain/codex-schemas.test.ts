@@ -1,3 +1,4 @@
+import Ajv from 'ajv';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { IMPLEMENTATION_REPORT_SCHEMA } from '../../src/main/adapters/codex/codex-adapter';
@@ -7,6 +8,7 @@ import {
   extractJsonObject,
   findingTriageResultJsonSchema,
   parseCodexReviewResult,
+  parseFindingTriageResult,
   parseTaskSpecification,
   taskSpecificationJsonSchema,
   taskSpecificationResponseSchema,
@@ -284,7 +286,8 @@ describe('JSON Schema projection handed to Codex', () => {
     const schemas: Record<string, unknown> = {
       specification: taskSpecificationJsonSchema(),
       review: codexReviewResultJsonSchema(),
-      triage: findingTriageResultJsonSchema(),
+      planTriage: findingTriageResultJsonSchema('index'),
+      codeTriage: findingTriageResultJsonSchema('id'),
       implementationReport: IMPLEMENTATION_REPORT_SCHEMA
     };
     for (const [name, schema] of Object.entries(schemas)) {
@@ -392,6 +395,113 @@ describe('JSON Schema projection handed to Codex', () => {
       const stripped = { ...makeReview() } as Record<string, unknown>;
       delete stripped[field];
       expect(codexReviewResultSchema.safeParse(stripped).success).toBe(false);
+    }
+  });
+});
+
+describe('finding triage: exactly one kind of finding reference per call', () => {
+  const recommendation = (findingRef: unknown): Record<string, unknown> => ({
+    findingRef,
+    recommendation: 'accept',
+    reason: 'Matches acceptance criterion 1.',
+    evidenceRef: 'criterion 1',
+    confidence: 'high'
+  });
+  const result = (...refs: unknown[]): unknown => ({ results: refs.map(recommendation) });
+  const accepts = (schema: Record<string, unknown>, value: unknown): boolean => new Ajv().compile(schema)(value) === true;
+
+  interface ResultSchema {
+    properties: { results: { items: { properties: { findingRef: Record<string, unknown> } } } };
+  }
+  const findingRefSchema = (kind: 'index' | 'id'): Record<string, unknown> =>
+    (findingTriageResultJsonSchema(kind) as unknown as ResultSchema).properties.results.items.properties.findingRef;
+
+  it('hands the model a plan schema whose findingRef is an integer number and nothing else', () => {
+    const findingRef = findingRefSchema('index');
+    expect(findingRef.type).toBe('integer');
+    expect(findingRef).not.toHaveProperty('anyOf');
+    expect(JSON.stringify(findingRef)).not.toContain('"string"');
+
+    const schema = findingTriageResultJsonSchema('index');
+    expect(accepts(schema, result(0, 1))).toBe(true);
+    expect(accepts(schema, result('0'))).toBe(false);
+    expect(accepts(schema, result(-1))).toBe(false);
+    expect(accepts(schema, result(1.5))).toBe(false);
+  });
+
+  it('hands the model a code-review schema whose findingRef is a non-empty string and nothing else', () => {
+    const findingRef = findingRefSchema('id');
+    expect(findingRef.type).toBe('string');
+    expect(findingRef).not.toHaveProperty('anyOf');
+    expect(JSON.stringify(findingRef)).not.toContain('"integer"');
+
+    const schema = findingTriageResultJsonSchema('id');
+    expect(accepts(schema, result('finding-1', 'finding-2'))).toBe(true);
+    expect(accepts(schema, result(0))).toBe(false);
+    expect(accepts(schema, result(''))).toBe(false);
+  });
+
+  it('tells the model, in the schema itself, which JSON type to copy the reference as', () => {
+    expect(findingRefSchema('index').description).toMatch(/JSON number/);
+    expect(findingRefSchema('id').description).toMatch(/JSON string/);
+  });
+
+  // The exact answer Codex gave for the real plan gate that lost its triage:
+  // valid JSON, valid under the old shared `number | string` contract, and
+  // rejected wholesale later by the plan-review validator.
+  const ORIGINAL_STRING_REFS = JSON.stringify({
+    results: [
+      {
+        findingRef: '0',
+        recommendation: 'accept',
+        reason: 'The finding is valid.',
+        evidenceRef: 'acceptance criterion 2',
+        confidence: 'high'
+      },
+      {
+        findingRef: '1',
+        recommendation: 'needs_user',
+        reason: 'An architecture choice.',
+        evidenceRef: 'constraint 1',
+        confidence: 'low'
+      }
+    ]
+  });
+
+  it('no longer lets the plan-review contract produce the string references the provider once returned', () => {
+    expect(accepts(findingTriageResultJsonSchema('index'), JSON.parse(ORIGINAL_STRING_REFS))).toBe(false);
+
+    const parsed = parseFindingTriageResult(ORIGINAL_STRING_REFS, 'index');
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain('results.0.findingRef');
+    expect(parsed.value).toBeUndefined();
+  });
+
+  it('parses the plan answer with numeric references, also when it is wrapped in a fence', () => {
+    const numeric = JSON.stringify(result(0, 1));
+    const parsed = parseFindingTriageResult('```json\n' + numeric + '\n```', 'index');
+    expect(parsed.ok).toBe(true);
+    expect(parsed.value?.results.map((entry) => entry.findingRef)).toEqual([0, 1]);
+  });
+
+  it('parses the code-review answer with string ids, and rejects numbers for it', () => {
+    const parsed = parseFindingTriageResult(JSON.stringify(result('a1', 'b2')), 'id');
+    expect(parsed.ok).toBe(true);
+    expect(parsed.value?.results.map((entry) => entry.findingRef)).toEqual(['a1', 'b2']);
+
+    expect(parseFindingTriageResult(JSON.stringify(result(0, 1)), 'id').ok).toBe(false);
+  });
+
+  it('does not coerce a numeric-looking string into an index, or a number into an id', () => {
+    expect(parseFindingTriageResult(JSON.stringify(result('7')), 'index').ok).toBe(false);
+    expect(parseFindingTriageResult(JSON.stringify(result(7)), 'id').ok).toBe(false);
+  });
+
+  it('keeps the shape rules shared by both kinds: at least one result, no unknown fields', () => {
+    for (const kind of ['index', 'id'] as const) {
+      expect(parseFindingTriageResult(JSON.stringify({ results: [] }), kind).ok).toBe(false);
+      const extra = { results: [{ ...recommendation(kind === 'index' ? 0 : 'a'), note: 'x' }] };
+      expect(parseFindingTriageResult(JSON.stringify(extra), kind).ok).toBe(false);
     }
   });
 });

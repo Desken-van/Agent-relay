@@ -33,7 +33,7 @@ import { formatDateTime, pluralize } from '../lib/format';
 import { useStore } from '../state/store';
 import { ChangesPanel } from './ChangesPanel';
 import { codexModelLabel } from './TasksView';
-import { Card, Empty, Field, Notice, Rounds, Scope, Spinner, StatusBadge } from './primitives';
+import { Card, Empty, Field, Notice, Rounds, Scope, Spinner, StatusBadge, TriageFeedback } from './primitives';
 import { RelayTimeline } from './RelayTimeline';
 
 const FLOW_STEPS = ['Specification', 'Implementation', 'Verification', 'Review', 'Publish'] as const;
@@ -970,6 +970,9 @@ export function PlanReviewPanel({
   const [busy, setBusy] = useState<string | null>(null);
   const inFlightRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
+  // A failed analysis is reported beside its own button, never in `error`: that
+  // one renders at the top of the panel, out of view of a long findings list.
+  const [triageError, setTriageError] = useState<string | null>(null);
   const [dirtyPrompt, setDirtyPrompt] = useState<string | null>(null);
   const [draftState, setDraftState] = useState<DecisionDrafts>({ roundKey: null, drafts: {} });
   // Keyed on the findings actually rendered, not `gate.revision`: a decision
@@ -1055,13 +1058,19 @@ export function PlanReviewPanel({
     inFlightRef.current = true;
     setBusy(key);
     setError(null);
+    // Every plan-review action other than an analysis replaces the gate
+    // wholesale (a decisions draft is local state and never goes through
+    // here), so the previous analysis failure no longer describes anything.
+    setTriageError(null);
     try {
       const next = await operation();
       setDetail(next);
       setDirtyPrompt(null);
       await onChanged();
     } catch (caught) {
-      if (caught instanceof ApiError && caught.code === 'GIT_DIRTY' && key === 'prepare') {
+      if (key === 'triage') {
+        setTriageError(caught instanceof Error ? caught.message : String(caught));
+      } else if (caught instanceof ApiError && caught.code === 'GIT_DIRTY' && key === 'prepare') {
         setDirtyPrompt(caught.message + (caught.details ? `\n\n${caught.details}` : ''));
       } else {
         setError(caught instanceof Error ? caught.message : String(caught));
@@ -1423,6 +1432,7 @@ export function PlanReviewPanel({
               </button>
             ) : null}
           </div>
+          <TriageFeedback pending={busy === 'triage'} error={triageError} />
           {triageSummary ? (
             <div className="row muted" style={{ marginTop: 4 }}>
               Analysis: {triageSummary.accept} recommended accept · {triageSummary.reject} recommended reject ·
@@ -1597,6 +1607,9 @@ export function CodeReviewPanel({
   const [busy, setBusy] = useState<string | null>(null);
   const inFlightRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
+  // A failed analysis is reported beside its own button, never in `error`: that
+  // one renders at the top of the panel, out of view of a long findings list.
+  const [triageError, setTriageError] = useState<string | null>(null);
   const [draftState, setDraftState] = useState<{
     readonly subjectSha256: string | null;
     readonly drafts: Record<string, CodeDecisionDraft>;
@@ -1674,11 +1687,21 @@ export function CodeReviewPanel({
     if (inFlightRef.current) return;
     inFlightRef.current = true;
     setBusy(key);
+    // Deciding a finding (one, or every applicable one) says nothing about
+    // whether the last analysis worked, and the guidance beside its failure is
+    // often "decide each finding yourself" — so acting on that guidance must
+    // not wipe it. Anything that can change the subject or its findings, or a
+    // new analysis, replaces it instead.
+    if (!key.startsWith('decide:') && key !== 'apply-all') setTriageError(null);
     let opError: string | null = null;
     try {
       await operation();
     } catch (caught) {
       opError = caught instanceof Error ? caught.message : String(caught);
+    }
+    if (key === 'triage') {
+      setTriageError(opError);
+      opError = null;
     }
     // The single-flight guard is released in `finally` below regardless of
     // what happens here: `call` (unlike `expect`) is documented to resolve
@@ -1829,6 +1852,7 @@ export function CodeReviewPanel({
           </button>
         ) : null}
       </div>
+      <TriageFeedback pending={busy === 'triage'} error={undecidedIds.length > 0 ? triageError : null} />
 
       {latestRound ? (
         <div className="kv">
