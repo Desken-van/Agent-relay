@@ -32,7 +32,9 @@ import {
   findingTriageResultJsonSchema,
   parseCodexReviewResult,
   parseFindingTriageResult,
+  parseSpecificationRevision,
   parseTaskSpecification,
+  specificationRevisionJsonSchema,
   taskSpecificationJsonSchema
 } from '../../../shared/schemas/codex';
 import { redactSecrets } from '../../../shared/util/redact';
@@ -454,11 +456,11 @@ export class CodexSdkAdapter implements CodexAdapter {
         approvalPolicy: 'never',
         networkAccessEnabled: false
       }),
-      taskSpecificationJsonSchema(),
+      specificationRevisionJsonSchema(),
       context
     );
 
-    const parsed = parseTaskSpecification(outcome.finalResponse);
+    const parsed = parseSpecificationRevision(outcome.finalResponse);
     if (!parsed.ok || !parsed.value) {
       throw new AgentRelayError(
         'PARSE_FAILED',
@@ -469,7 +471,11 @@ export class CodexSdkAdapter implements CodexAdapter {
         }
       );
     }
-    return { specification: parsed.value, rawResponse: outcome.finalResponse };
+    return {
+      specification: parsed.value.specification,
+      addressed: parsed.value.addressed,
+      rawResponse: outcome.finalResponse
+    };
   }
 
   async createSpecification(

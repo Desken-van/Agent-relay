@@ -9,7 +9,13 @@
 import type { ToolDiagnostic } from '../../src/shared/domain/diagnostics';
 import type { GitChangeSet, RepositoryInfo, WorktreeInfo } from '../../src/shared/domain/git';
 import type { PublishConfirmation } from '../../src/shared/ipc';
-import type { CodexReviewResult, FindingTriageRecommendation, TaskSpecification } from '../../src/shared/schemas/codex';
+import {
+  SPECIFICATION_FIELD_NAMES,
+  type CodexReviewResult,
+  type FindingTriageRecommendation,
+  type SpecificationRevisionAddressed,
+  type TaskSpecification
+} from '../../src/shared/schemas/codex';
 import type {
   AgentRunContext,
   ClaudeAdapter,
@@ -178,8 +184,25 @@ export class FakeCodexAdapter implements CodexAdapter {
           ...request.acceptedFindings.map((finding) => `Addresses: ${finding.title}`)
         ]
       });
-    return { specification, rawResponse: JSON.stringify(specification) };
+    // Honest by default: each accepted finding is reported against the first field
+    // that really differs. A test that needs a lie sets `revisionAddressed`.
+    const changedField =
+      SPECIFICATION_FIELD_NAMES.find(
+        (field) => JSON.stringify(request.currentSpecification[field]) !== JSON.stringify(specification[field])
+      ) ?? 'summary';
+    const addressed =
+      this.revisionAddressed ??
+      request.acceptedFindings.map((finding) => ({
+        finding: finding.finding,
+        field: changedField,
+        change: `Reflected "${finding.title}" in ${changedField}.`
+      }));
+    this.revisionAddressed = null;
+    return { specification, addressed, rawResponse: JSON.stringify({ specification, addressed }) };
   }
+
+  /** Overrides what the next revision claims to have addressed (consumed by one call). */
+  revisionAddressed: SpecificationRevisionAddressed[] | null = null;
 
   async diagnose(): Promise<ToolDiagnostic> {
     return okDiagnostic('codex');

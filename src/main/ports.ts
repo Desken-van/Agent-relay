@@ -71,7 +71,12 @@ import type {
   CodeSnapshotChange,
   ProviderCodeFinding
 } from '../shared/domain/code-review';
-import type { CodexReviewResult, FindingTriageRecommendation, TaskSpecification } from '../shared/schemas/codex';
+import type {
+  CodexReviewResult,
+  FindingTriageRecommendation,
+  SpecificationRevisionAddressed,
+  TaskSpecification
+} from '../shared/schemas/codex';
 
 /* -------------------------------------------------------------------------- */
 /* Infrastructure primitives                                                   */
@@ -377,6 +382,8 @@ export interface CodexRevisionRequest {
 
 export interface CodexRevisionOutcome {
   readonly specification: TaskSpecification;
+  /** For each accepted finding, the specification field Codex says it addressed it in. Checked by the caller. */
+  readonly addressed: readonly SpecificationRevisionAddressed[];
   readonly rawResponse: string;
 }
 
@@ -764,6 +771,8 @@ export interface PlanCorrectionRepository {
     readonly expectedSpecificationJson: string;
     readonly newSpecificationJson: string;
     readonly newSpecificationSha256: string;
+    /** JSON array of what Codex said it changed for each accepted finding; stored on the correction. */
+    readonly addressedJson: string;
   }): { readonly correction: PlanCorrection; readonly version: SpecificationVersion };
 }
 

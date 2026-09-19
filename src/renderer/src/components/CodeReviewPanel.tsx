@@ -418,6 +418,11 @@ export function CodeReviewPanel({
                         state={queue.stateOf(finding.id)}
                         findingLabel={finding.title}
                         disabled={!integrationEnabled || busy !== null}
+                        blockedReason={
+                          draft.action !== '' || draft.reason.trim().length > 0
+                            ? 'You have already chosen a decision for this finding. Clear it first if you want Auto decide to decide instead.'
+                            : null
+                        }
                         onClick={() => queue.start([finding.id])}
                       />
                       <div className="decision-row__reason">

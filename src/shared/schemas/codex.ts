@@ -81,6 +81,52 @@ export const taskSpecificationSchema = taskSpecificationResponseSchema.extend({
 
 export type TaskSpecification = z.infer<typeof taskSpecificationSchema>;
 
+/**
+ * The specification fields a revision may name as the place it addressed a
+ * finding. Read from the schema itself, so a field added to the contract is
+ * nameable at once.
+ */
+export const SPECIFICATION_FIELD_NAMES = Object.keys(taskSpecificationResponseSchema.shape) as [
+  keyof typeof taskSpecificationResponseSchema.shape,
+  ...(keyof typeof taskSpecificationResponseSchema.shape)[]
+];
+export type SpecificationFieldName = (typeof SPECIFICATION_FIELD_NAMES)[number];
+
+/**
+ * What Codex returns when it revises a specification from accepted external
+ * review findings: the complete revised specification AND, for every accepted
+ * finding, the field in which it was addressed. The claim is checked (the field
+ * must really differ from the specification being revised, and every accepted
+ * finding must be named) and recorded with the version, so a revision that
+ * changed something unrelated is refused instead of being carried forward.
+ */
+export const specificationRevisionResponseSchema = z.object({
+  specification: taskSpecificationResponseSchema,
+  addressed: z
+    .array(
+      z.object({
+        finding: z
+          .number()
+          .int()
+          .nonnegative()
+          .describe('The number of an accepted finding, exactly as it was listed to you.'),
+        field: z
+          .enum(SPECIFICATION_FIELD_NAMES)
+          .describe('The specification field in which you addressed it. That field MUST differ from the current specification.'),
+        change: z
+          .string()
+          .min(1)
+          .max(1_000)
+          .describe('One or two sentences: what you changed in that field and why it addresses the finding.')
+      })
+    )
+    .min(1)
+    .max(256)
+});
+
+export type SpecificationRevisionResponse = z.infer<typeof specificationRevisionResponseSchema>;
+export type SpecificationRevisionAddressed = SpecificationRevisionResponse['addressed'][number];
+
 /* -------------------------------------------------------------------------- */
 /* Review                                                                      */
 /* -------------------------------------------------------------------------- */
@@ -222,6 +268,9 @@ function toCodexOutputSchema(schema: z.ZodType): Record<string, unknown> {
 export const taskSpecificationJsonSchema = (): Record<string, unknown> =>
   toCodexOutputSchema(taskSpecificationResponseSchema);
 
+export const specificationRevisionJsonSchema = (): Record<string, unknown> =>
+  toCodexOutputSchema(specificationRevisionResponseSchema);
+
 export const codexReviewResultJsonSchema = (): Record<string, unknown> =>
   toCodexOutputSchema(codexReviewResultSchema);
 
@@ -339,6 +388,27 @@ export function parseStructured<T>(schema: z.ZodType<T>, text: string): ParseOut
 
 export function parseTaskSpecification(text: string): ParseOutcome<TaskSpecification> {
   return parseStructured(taskSpecificationSchema, text);
+}
+
+/**
+ * A revision, read the way a stored specification is read: the specification
+ * goes through {@link taskSpecificationSchema}, so its defaults are filled in
+ * exactly as they are for every other specification.
+ */
+export function parseSpecificationRevision(
+  text: string
+): ParseOutcome<{ specification: TaskSpecification; addressed: SpecificationRevisionAddressed[] }> {
+  const parsed = parseStructured(specificationRevisionResponseSchema, text);
+  if (!parsed.ok || parsed.value === undefined) {
+    return { ok: false, error: parsed.error, raw: parsed.raw };
+  }
+  return {
+    ok: true,
+    value: {
+      specification: taskSpecificationSchema.parse(parsed.value.specification),
+      addressed: parsed.value.addressed
+    }
+  };
 }
 
 export function parseCodexReviewResult(text: string): ParseOutcome<CodexReviewResult> {

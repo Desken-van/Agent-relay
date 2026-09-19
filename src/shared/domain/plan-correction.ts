@@ -10,6 +10,11 @@
  */
 
 import { z } from 'zod';
+import {
+  SPECIFICATION_FIELD_NAMES,
+  type SpecificationRevisionAddressed,
+  type TaskSpecification
+} from '../schemas/codex';
 import { idSchema, isoDateTime } from './models';
 import {
   PLAN_FINDING_CATEGORIES,
@@ -68,6 +73,8 @@ export const planCorrectionSchema = z
     attempts: z.number().int().min(0),
     toSpecificationSha256: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
     toVersion: z.number().int().min(1).nullable(),
+    /** Which accepted finding Codex says it addressed in which field; set when the correction completes. */
+    addressedJson: z.string().nullable(),
     lastError: z.string().max(10_000).nullable(),
     revision: z.number().int().nonnegative(),
     createdAt: isoDateTime,
@@ -75,6 +82,61 @@ export const planCorrectionSchema = z
   })
   .strict();
 export type PlanCorrection = z.infer<typeof planCorrectionSchema>;
+
+export type PlanRevisionAddressed = SpecificationRevisionAddressed;
+
+/** The stored claim of a completed correction; unreadable or absent reads as none. */
+export function parsePlanRevisionAddressed(json: string | null): PlanRevisionAddressed[] {
+  if (json === null) return [];
+  try {
+    const value: unknown = JSON.parse(json);
+    if (!Array.isArray(value)) return [];
+    return value.filter(
+      (entry): entry is PlanRevisionAddressed =>
+        typeof entry === 'object' &&
+        entry !== null &&
+        Number.isInteger((entry as PlanRevisionAddressed).finding) &&
+        (SPECIFICATION_FIELD_NAMES as readonly string[]).includes((entry as PlanRevisionAddressed).field) &&
+        typeof (entry as PlanRevisionAddressed).change === 'string'
+    );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Whether a revision can be believed to have addressed what it was asked to.
+ * Returns the reason it cannot, or null.
+ *
+ * This proves less than "the finding is fixed" — only an independent review of
+ * the revised text can — but it removes the cheap failures: a finding Codex
+ * never mentioned, a finding nobody accepted, and a claim about a field that did
+ * not change. Each of those would otherwise be carried into a fresh review as
+ * though it had been dealt with.
+ */
+export function revisionAddressesProblem(input: {
+  readonly accepted: readonly Pick<AcceptedPlanFinding, 'finding'>[];
+  readonly addressed: readonly PlanRevisionAddressed[];
+  readonly current: TaskSpecification;
+  readonly revised: TaskSpecification;
+}): string | null {
+  const acceptedIndexes = new Set(input.accepted.map((entry) => entry.finding));
+  const claimed = new Set<number>();
+  for (const entry of input.addressed) {
+    if (!acceptedIndexes.has(entry.finding)) {
+      return `Codex said it addressed finding ${entry.finding}, which was not one of the accepted findings.`;
+    }
+    if (JSON.stringify(input.current[entry.field]) === JSON.stringify(input.revised[entry.field])) {
+      return `Codex said it addressed finding ${entry.finding} in "${entry.field}", but that field is unchanged.`;
+    }
+    claimed.add(entry.finding);
+  }
+  const missing = [...acceptedIndexes].filter((index) => !claimed.has(index)).sort((a, b) => a - b);
+  if (missing.length > 0) {
+    return `Codex did not say where it addressed accepted finding${missing.length === 1 ? '' : 's'} ${missing.join(', ')}.`;
+  }
+  return null;
+}
 
 export const specificationVersionSchema = z
   .object({
@@ -251,6 +313,8 @@ export interface PlanCorrectionDetail {
     readonly attempts: number;
     readonly lastError: string | null;
     readonly acceptedCount: number;
+    /** What Codex said it changed for each accepted finding, once the correction completed. */
+    readonly addressed: readonly (PlanRevisionAddressed & { readonly title: string })[];
   } | null;
   /** Accepted findings on the latest gate that the specification does not yet reflect. */
   readonly acceptedPending: number;

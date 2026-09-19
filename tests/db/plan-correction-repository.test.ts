@@ -107,12 +107,45 @@ describe('plan correction repository', () => {
       versionId: 'version-two',
       expectedSpecificationJson: '{"v":"one"}',
       newSpecificationJson: '{"v":"two"}',
-      newSpecificationSha256: SHA('2')
+      newSpecificationSha256: SHA('2'),
+      addressedJson: '[]'
     });
 
     expect(correction).toMatchObject({ status: 'completed', toVersion: 2, toSpecificationSha256: SHA('2'), lastError: null });
     expect(version).toMatchObject({ version: 2, origin: 'plan_correction', sourceCorrectionId: opened.id, specificationJson: '{"v":"two"}' });
     expect(harness.tasks.findById(task.id)).toMatchObject({ specificationJson: '{"v":"two"}', specificationApprovedAt: null });
+  });
+
+  it('stores what Codex said it addressed with the completion, and never before it', () => {
+    const { corrections, gate, begin } = setup();
+    const opened = begin(gate().id, SHA('1'), '{"v":"one"}');
+    expect(opened.addressedJson).toBeNull();
+
+    const addressed = JSON.stringify([{ finding: 0, field: 'summary', change: 'Reflected it.' }]);
+    const { correction } = corrections.complete({
+      correctionId: opened.id,
+      versionId: 'version-two',
+      expectedSpecificationJson: '{"v":"one"}',
+      newSpecificationJson: '{"v":"two"}',
+      newSpecificationSha256: SHA('2'),
+      addressedJson: addressed
+    });
+
+    expect(correction.addressedJson).toBe(addressed);
+    expect(corrections.findBySourceGate(opened.sourceGateId)?.addressedJson).toBe(addressed);
+  });
+
+  it('numbers a correction after the newest round, so a missing row can never wedge the next one', () => {
+    const { harness, corrections, task, gate, begin } = setup();
+    begin(gate().id, SHA('1'), '{"v":"one"}');
+    begin(gate().id, SHA('1'), '{"v":"one"}');
+    // A row that is gone leaves a gap; a count would now collide with round 2.
+    harness.db.prepare('DELETE FROM plan_review_corrections WHERE task_id = ? AND round = 1').run(task.id);
+
+    const next = begin(gate().id, SHA('1'), '{"v":"one"}');
+
+    expect(next.round).toBe(3);
+    expect(corrections.listByTask(task.id).map((entry) => entry.round)).toEqual([2, 3]);
   });
 
   it('rolls everything back when the specification moved: no version, no swap, the correction stays running', () => {
@@ -127,7 +160,8 @@ describe('plan correction repository', () => {
         versionId: 'version-two',
         expectedSpecificationJson: '{"v":"one"}',
         newSpecificationJson: '{"v":"two"}',
-        newSpecificationSha256: SHA('2')
+        newSpecificationSha256: SHA('2'),
+        addressedJson: '[]'
       })
     ).toThrow(/specification changed/i);
 
@@ -148,7 +182,8 @@ describe('plan correction repository', () => {
         versionId: 'x',
         expectedSpecificationJson: '{"v":"one"}',
         newSpecificationJson: '{"v":"two"}',
-        newSpecificationSha256: SHA('2')
+        newSpecificationSha256: SHA('2'),
+        addressedJson: '[]'
       })
     ).toThrow(/cannot be completed/i);
   });
@@ -163,7 +198,8 @@ describe('plan correction repository', () => {
       versionId: 'v2',
       expectedSpecificationJson: '{"v":"one"}',
       newSpecificationJson: '{"v":"two"}',
-      newSpecificationSha256: SHA('2')
+      newSpecificationSha256: SHA('2'),
+      addressedJson: '[]'
     });
     const second = begin(b.id, SHA('2'), '{"v":"two"}');
 
@@ -173,7 +209,8 @@ describe('plan correction repository', () => {
       versionId: 'v3',
       expectedSpecificationJson: '{"v":"two"}',
       newSpecificationJson: '{"v":"one"}',
-      newSpecificationSha256: SHA('1')
+      newSpecificationSha256: SHA('1'),
+      addressedJson: '[]'
     });
 
     expect(corrections.listVersions(task.id).map((entry) => [entry.version, entry.specificationSha256])).toEqual([
@@ -201,7 +238,8 @@ describe('plan correction repository', () => {
       versionId: 'v2',
       expectedSpecificationJson: '{"v":"one"}',
       newSpecificationJson: '{"v":"two"}',
-      newSpecificationSha256: SHA('2')
+      newSpecificationSha256: SHA('2'),
+      addressedJson: '[]'
     });
 
     harness.tasks.delete(task.id);

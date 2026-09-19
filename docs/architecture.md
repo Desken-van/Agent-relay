@@ -540,8 +540,12 @@ identity is not the current one, and merges the result into
 `plan_review_gates.auto_decisions_json` with a synchronous read-modify-write, so
 concurrent analyses of different findings all survive. An `accept` or `reject` is
 stored as a decision with its reason and evidence; `needs_user` is stored only as a
-recommendation and leaves the finding undecided. A stored automatic decision never
-replaces an existing decision, and the operator's own draft always wins over it.
+recommendation and leaves the finding undecided. A finding that already has a saved
+automatic decision is never analyzed again: a repeated request (a refresh, a second
+window, a click after a lost answer) returns the saved decision with no Codex call, and
+an answer that finishes after another writer saved one is dropped in its favour, so the
+first saved answer stands and a repeat can never contradict it. The operator's own
+draft always wins over a saved decision.
 A stored decision is not a resolution: the round stays `awaiting_resolve` until the
 operator resolves it. Plan review has no per-finding durable decision, so this
 stands in for one, keyed by the round it answers so a new round can never inherit it.
@@ -580,7 +584,17 @@ is recorded:
 `plan_review_corrections` holds one row per gate that needed a revision, with
 `UNIQUE(source_gate_id)` as the idempotency key: a retry reopens the SAME row, so
 one gate can never yield two corrections, two versions or two review rounds. The row
-freezes what Codex was given (`accepted_json`). The Codex call has no effect until
+freezes what Codex was given (`accepted_json`). Codex must answer with the complete
+revised specification AND, for every accepted finding, the specification field in which
+it was addressed and what changed there (`addressed_json`, stored with the completion
+and shown in the panel). Before anything is committed the service checks that every
+accepted finding is named, that none is named that was not accepted, and that every
+claimed field really differs from the specification being revised; otherwise the
+correction is marked `failed`, nothing is stored, and the same row is retried. This
+does not prove a finding is fixed — only the fresh independent review can — but a
+revision that changed something unrelated, or ignored a finding, is refused instead of
+being carried into that review as though it were dealt with. The round number is the
+newest one plus one, not a count. The Codex call has no effect until
 `complete`, which in one transaction swaps `tasks.specification_json`
 (compare-and-swap on the exact text the correction started from), appends the
 version and closes the row. A crash before that leaves a `running` row that is read
@@ -610,7 +624,9 @@ the `corrections_sent` workflow edges), so the implementation provider, round bu
 verification and review are the ones every correction already uses. A finding is
 closed only by an explicit `resolved` decision, which the service accepts for a
 finding of an older subject only when a completed review round exists on the newest
-subject.
+subject, and refuses outright for an accepted finding on the current code (it is a
+correction still owed, and the code has not moved). A finding nobody accepted keeps
+the behaviour it always had.
 
 ### Authoritative Run actions and linked continuations
 

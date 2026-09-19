@@ -4,7 +4,7 @@ import { PlanCorrectionService } from '../../src/main/services/plan-correction';
 import { PlanReviewClaims } from '../../src/main/services/plan-review-claims';
 import { PlanReviewGateService, planFindingsSha256 } from '../../src/main/services/plan-review-gate';
 import { specificationIdentity } from '../../src/main/services/specification-identity';
-import { parseAcceptedPlanFindings } from '../../src/shared/domain/plan-correction';
+import { parseAcceptedPlanFindings, parsePlanRevisionAddressed } from '../../src/shared/domain/plan-correction';
 import type { PlanReviewDecision } from '../../src/shared/domain/plan-review';
 import type { Settings } from '../../src/shared/domain/models';
 import type { ExternalPlanReviewRound } from '../../src/main/ports';
@@ -471,6 +471,83 @@ describe('plan correction loop: the Codex revision', () => {
     expect(value.corrections.listByTask(task.id)[0]?.status).toBe('failed');
     expect(value.corrections.listVersions(task.id)).toHaveLength(1);
     expect(value.harness.planReviewGates.listByTask(task.id)).toHaveLength(1);
+  });
+
+  describe('what Codex says it addressed', () => {
+    /** A round with two accepted findings, ready to be revised. */
+    async function twoAccepted() {
+      const value = setup();
+      const task = await ready(value);
+      value.reviewer.roundQueue = [roundWith(value, ['First problem', 'Second problem'])];
+      value.reviewer.resolutionQueue = [revise(value)];
+      await value.gateService.review(task.id);
+      return { value, task, original: specOf(value, task.id) };
+    }
+    const nothingStored = (value: Value, taskId: string, original: string) => {
+      expect(specOf(value, taskId)).toBe(original);
+      expect(value.corrections.listVersions(taskId)).toHaveLength(1);
+      expect(value.corrections.listByTask(taskId)[0]).toMatchObject({ status: 'failed', addressedJson: null });
+      expect(value.harness.planReviewGates.listByTask(taskId)).toHaveLength(1);
+    };
+    const both = decide([0, 'accept', 'Yes.'], [1, 'accept', 'Yes too.']);
+
+    it('records, per accepted finding, the field it was addressed in, and reports it', async () => {
+      const { value, task } = await twoAccepted();
+
+      await resolveAndRevise(value, task.id, both);
+
+      const [correction] = value.corrections.listByTask(task.id);
+      expect(correction?.status).toBe('completed');
+      expect(parsePlanRevisionAddressed(correction?.addressedJson ?? null).map((entry) => entry.finding)).toEqual([0, 1]);
+      const detail = value.loop.detail(task.id);
+      expect(detail.latest?.addressed.map((entry) => entry.finding)).toEqual([0, 1]);
+    });
+
+    it('refuses a revision that says nothing about one of the accepted findings, and stores nothing', async () => {
+      const { value, task, original } = await twoAccepted();
+      value.harness.codex.revisionAddressed = [{ finding: 0, field: 'summary', change: 'Only the first.' }];
+
+      await expect(resolveAndRevise(value, task.id, both)).rejects.toThrow(/did not say where it addressed accepted finding 1\b/i);
+
+      nothingStored(value, task.id, original);
+    });
+
+    it('refuses a claim about a field that did not change', async () => {
+      const { value, task, original } = await twoAccepted();
+      // The revision only touches the summary and the acceptance criteria; it claims "constraints".
+      value.harness.codex.revisionAddressed = [
+        { finding: 0, field: 'summary', change: 'Real.' },
+        { finding: 1, field: 'constraints', change: 'A lie: nothing changed there.' }
+      ];
+
+      await expect(resolveAndRevise(value, task.id, both)).rejects.toThrow(/"constraints", but that field is unchanged/i);
+
+      nothingStored(value, task.id, original);
+    });
+
+    it('refuses a claim about a finding nobody accepted', async () => {
+      const { value, task, original } = await twoAccepted();
+      value.harness.codex.revisionAddressed = [
+        { finding: 0, field: 'summary', change: 'Real.' },
+        { finding: 1, field: 'summary', change: 'Real.' },
+        { finding: 7, field: 'summary', change: 'A finding that does not exist.' }
+      ];
+
+      await expect(resolveAndRevise(value, task.id, both)).rejects.toThrow(/finding 7, which was not one of the accepted/i);
+
+      nothingStored(value, task.id, original);
+    });
+
+    it('lets the operator retry the same correction after such a refusal, and then completes it', async () => {
+      const { value, task } = await twoAccepted();
+      value.harness.codex.revisionAddressed = [{ finding: 0, field: 'summary', change: 'Only the first.' }];
+      await expect(resolveAndRevise(value, task.id, both)).rejects.toThrow(/did not say where/i);
+
+      await value.loop.continueCorrection(task.id, { autoContinue: false });
+
+      expect(value.corrections.listByTask(task.id)).toHaveLength(1);
+      expect(value.corrections.listByTask(task.id)[0]).toMatchObject({ status: 'completed', attempts: 2 });
+    });
   });
 
   it('refuses a credential-shaped revision and stores nothing of it', async () => {

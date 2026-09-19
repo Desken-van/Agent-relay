@@ -266,6 +266,12 @@ export function PlanReviewPanel({
     const saved = autoByFinding.get(index);
     return saved ? { action: saved.action, reason: saved.reason } : { action: '', reason: '' };
   };
+  // Something the operator has chosen or typed for this finding. A draft emptied
+  // again is not one: it holds nothing that Auto decide could overwrite.
+  const hasDraft = (index: number): boolean => {
+    const draft = decisions[index];
+    return draft !== undefined && (draft.action !== '' || draft.reason.trim().length > 0);
+  };
   const allDecided = findings.every((_, index) => {
     const decision = effective(index);
     return decision.action === 'accept' ||
@@ -336,7 +342,7 @@ export function PlanReviewPanel({
     .filter((index) => {
       const state = queue.stateOf(index);
       return (
-        decisions[index] === undefined &&
+        !hasDraft(index) &&
         !autoByFinding.has(index) &&
         !needsUserByFinding.has(index) &&
         (state === undefined || state.phase === 'failed')
@@ -755,6 +761,16 @@ export function PlanReviewPanel({
                     .join(' → ')}
             </span>
           </div>
+          {detail.correction.latest?.status === 'completed' && detail.correction.latest.addressed.length > 0 ? (
+            <div className="stack stack--tight" aria-label="What the last revision changed">
+              <strong>What Codex changed for each accepted finding (round {detail.correction.latest.round})</strong>
+              {detail.correction.latest.addressed.map((entry) => (
+                <div className="faint selectable" key={`${entry.finding}:${entry.field}`}>
+                  {entry.title} — <span className="mono">{entry.field}</span>: {entry.change}
+                </div>
+              ))}
+            </div>
+          ) : null}
           {busy === 'revise' ? (
             <Notice tone="info" role="status">
               <Spinner />
@@ -884,7 +900,7 @@ export function PlanReviewPanel({
                       setConfirmBlind(false);
                       findings.forEach((_, index) => {
                         // Never over a draft the operator has, or a decision already saved.
-                        if (decisions[index] === undefined && !autoByFinding.has(index)) {
+                        if (!hasDraft(index) && !autoByFinding.has(index)) {
                           editFinding(index, { action: 'accept', reason: '' });
                         }
                       });
@@ -949,6 +965,11 @@ export function PlanReviewPanel({
                     state={queue.stateOf(index)}
                     findingLabel={finding.title}
                     disabled={!integrationEnabled || busy !== null}
+                    blockedReason={
+                      hasDraft(index)
+                        ? 'You have already chosen a decision for this finding. Clear it first if you want Auto decide to decide instead.'
+                        : null
+                    }
                     onClick={() => startAutoDecide([index], false)}
                   />
                   <div className="decision-row__reason">

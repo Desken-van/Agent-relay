@@ -9,7 +9,10 @@ import {
   findingTriageResultJsonSchema,
   parseCodexReviewResult,
   parseFindingTriageResult,
+  parseSpecificationRevision,
   parseTaskSpecification,
+  SPECIFICATION_FIELD_NAMES,
+  specificationRevisionJsonSchema,
   taskSpecificationJsonSchema,
   taskSpecificationResponseSchema,
   taskSpecificationSchema
@@ -188,6 +191,45 @@ describe('specification parsing', () => {
   });
 });
 
+describe('specification revision parsing', () => {
+  const revision = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      specification: makeSpecification(),
+      addressed: [{ finding: 0, field: 'summary', change: 'Reflected it.' }],
+      ...over
+    });
+
+  it('accepts a revision and reads its specification like any stored one', () => {
+    const parsed = parseSpecificationRevision(revision());
+
+    expect(parsed.ok).toBe(true);
+    expect(parsed.value?.specification.title).toBe(makeSpecification().title);
+    expect(parsed.value?.addressed).toEqual([{ finding: 0, field: 'summary', change: 'Reflected it.' }]);
+  });
+
+  it('names every specification field, taken from the schema itself', () => {
+    expect([...SPECIFICATION_FIELD_NAMES]).toEqual(Object.keys(taskSpecificationResponseSchema.shape));
+    expect(SPECIFICATION_FIELD_NAMES).toContain('implementationPrompt');
+  });
+
+  it('refuses a revision that says nothing about what it addressed, or names a field that does not exist', () => {
+    expect(parseSpecificationRevision(revision({ addressed: [] })).ok).toBe(false);
+    expect(
+      parseSpecificationRevision(revision({ addressed: [{ finding: 0, field: 'nonsense', change: 'x' }] })).ok
+    ).toBe(false);
+    expect(
+      parseSpecificationRevision(revision({ addressed: [{ finding: 0, field: 'summary', change: '' }] })).ok
+    ).toBe(false);
+  });
+
+  it('refuses a bare specification, so the accountability part can never be skipped', () => {
+    const parsed = parseSpecificationRevision(JSON.stringify(makeSpecification()));
+
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toMatch(/specification|addressed/);
+  });
+});
+
 describe('review parsing', () => {
   it('accepts an approval with no findings', () => {
     const outcome = parseCodexReviewResult(JSON.stringify(makeReview()));
@@ -285,6 +327,7 @@ describe('JSON Schema projection handed to Codex', () => {
   it('holds every model-facing Codex schema to the strict-output rules at every object level', () => {
     const schemas: Record<string, unknown> = {
       specification: taskSpecificationJsonSchema(),
+      specificationRevision: specificationRevisionJsonSchema(),
       review: codexReviewResultJsonSchema(),
       planTriage: findingTriageResultJsonSchema('index'),
       codeTriage: findingTriageResultJsonSchema('id'),

@@ -135,18 +135,73 @@ describe('plan review: per-finding Auto decide', () => {
     ]);
   });
 
-  it('a re-analysis that now needs a person removes the earlier automatic decision', async () => {
+  it('a repeated request returns the saved decision without a second analysis, so it can never contradict it', async () => {
     const value = setup();
     const { task, gate } = await awaitingThree(value);
-    value.harness.codex.triageQueue.push([recommend(0, 'accept')], [recommend(0, 'needs_user', 'Unsure now.')]);
+    // The second answer would reject: it must never be asked for.
+    value.harness.codex.triageQueue.push([recommend(0, 'accept', 'First and only.')], [recommend(0, 'reject', 'Contradiction.')]);
+
+    const first = await value.service.autoDecide(task.id, request(gate, 0));
+    const before = value.harness.planReviewGates.findByTask(task.id) as PlanReviewGate;
+    const second = await value.service.autoDecide(task.id, request(gate, 0));
+    const after = value.harness.planReviewGates.findByTask(task.id) as PlanReviewGate;
+
+    expect(value.harness.codex.triageCalls).toHaveLength(1);
+    expect(second.outcome).toEqual(first.outcome);
+    expect(second.outcome).toMatchObject({ kind: 'decided', decision: { finding: 0, action: 'accept' } });
+    // Nothing was written: the row, its revision and the decisions are untouched.
+    expect(after.revision).toBe(before.revision);
+    expect(after.autoDecisionsJson).toBe(before.autoDecisionsJson);
+    expect(value.harness.codex.triageQueue).toHaveLength(1);
+  });
+
+  it('keeps the first saved answer when another writer saved one while this analysis ran', async () => {
+    const value = setup();
+    const { task, gate } = await awaitingThree(value);
+    const release = deferred();
+    value.harness.codex.triageGate = release.promise;
+    // The provider will answer "reject", but only after another process has saved "accept".
+    value.harness.codex.triageQueue.push([recommend(0, 'reject', 'Slow window.')]);
+    const sha = planFindingsSha256(gate.findingsJson as string);
+
+    const pending = value.service.autoDecide(task.id, request(gate, 0));
+    await Promise.resolve();
+    const current = value.harness.planReviewGates.findByTask(task.id) as PlanReviewGate;
+    value.harness.planReviewGates.updateIfUnchanged(
+      current.id,
+      {
+        autoDecisionsJson: JSON.stringify({
+          forFindingsSha256: sha,
+          decisions: [
+            { finding: 0, action: 'accept', reason: 'Fast window.', evidenceRef: 'e', confidence: 'high', decidedAt: '2026-09-06T00:00:00.000Z' }
+          ]
+        })
+      },
+      current.revision
+    );
+    release.resolve(undefined);
+    const late = await pending;
+
+    // The slow window is told the saved answer; the contradicting one is never stored.
+    expect(late.outcome).toMatchObject({ kind: 'decided', decision: { finding: 0, action: 'accept', reason: 'Fast window.' } });
+    const saved = parsePlanReviewAutoDecisions(
+      (value.harness.planReviewGates.findByTask(task.id) as PlanReviewGate).autoDecisionsJson,
+      sha
+    );
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({ finding: 0, action: 'accept' });
+  });
+
+  it('still lets a finding with only a stop recommendation be analyzed again', async () => {
+    const value = setup();
+    const { task, gate } = await awaitingThree(value);
+    value.harness.codex.triageQueue.push([recommend(0, 'needs_user', 'Unsure.')], [recommend(0, 'accept', 'Clear now.')]);
 
     await value.service.autoDecide(task.id, request(gate, 0));
     const second = await value.service.autoDecide(task.id, request(gate, 0));
 
-    expect(
-      parsePlanReviewAutoDecisions(second.gate.autoDecisionsJson, planFindingsSha256(gate.findingsJson as string))
-    ).toEqual([]);
-    expect(parsePlanReviewTriage(second.gate.triageJson)?.recommendations[0]?.recommendation).toBe('needs_user');
+    expect(second.outcome).toMatchObject({ kind: 'decided', decision: { finding: 0, action: 'accept' } });
+    expect(value.harness.codex.triageCalls).toHaveLength(2);
   });
 
   it('merges results per finding instead of replacing what siblings already learned', async () => {

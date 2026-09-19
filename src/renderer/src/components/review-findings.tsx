@@ -200,12 +200,15 @@ export function AutoDecideButton({
   state,
   findingLabel,
   disabled,
+  blockedReason = null,
   onClick
 }: {
   state: AutoDecideItemState | undefined;
   /** Names the finding for assistive technology; the visible text stays "Auto decide". */
   findingLabel: string;
   disabled: boolean;
+  /** Why this finding must not be analyzed right now (for example, the operator has already chosen). */
+  blockedReason?: string | null;
   onClick: () => void;
 }): React.JSX.Element {
   const working = state?.phase === 'analyzing' || state?.phase === 'queued';
@@ -213,10 +216,13 @@ export function AutoDecideButton({
     <button
       type="button"
       className="btn btn--sm btn--primary decision-row__auto"
-      disabled={disabled || working}
+      disabled={disabled || working || blockedReason !== null}
       aria-busy={working}
       aria-label={`${state?.phase === 'failed' ? 'Retry auto decide' : 'Auto decide'}: ${findingLabel}`}
-      title="Ask Codex to analyze this finding, then accept or reject it for you. It stops and asks you when it cannot decide."
+      title={
+        blockedReason ??
+        'Ask Codex to analyze this finding, then accept or reject it for you. It stops and asks you when it cannot decide.'
+      }
       onClick={onClick}
     >
       {state?.phase === 'analyzing' ? (

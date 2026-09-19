@@ -1600,6 +1600,21 @@ export class CodeReviewService {
           { remediation: 'Decide the findings of the current round.' }
         );
       }
+      // An ACCEPTED finding on the current code is a correction still owed:
+      // accepting says it is valid, not that anything was fixed, and the code has
+      // not moved. Only the proof above can close it. The panel never offers this
+      // earlier, and the service refuses it too, so no other caller — a stale
+      // screen, a script — can close a requirement on code that has not changed.
+      if (request.action === 'resolved') {
+        const latest = this.deps.reviews.latestDecision(finding.id);
+        if (latest !== null && latest.action === 'accept') {
+          throw new AgentRelayError(
+            'VALIDATION_FAILED',
+            'This finding was accepted, so it is a correction still owed. It can be marked resolved only after the code was corrected and a fresh external review of the corrected code has completed.',
+            { remediation: 'Send the accepted findings as corrections, capture the corrected code and run a fresh review.' }
+          );
+        }
+      }
     }
 
     const applied = this.deps.reviews.appendDecisionIfUnchanged(

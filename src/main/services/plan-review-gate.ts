@@ -1237,6 +1237,13 @@ export class PlanReviewGateService {
       throw new AgentRelayError('VALIDATION_FAILED', 'That finding does not exist in the current round.');
     }
 
+    // A request repeated after the first one committed — a refresh, a second
+    // window, a click after a lost answer — must not run a second analysis that
+    // could contradict the saved one. The saved decision is the answer; the
+    // operator overrides it by deciding the finding themselves, not by asking again.
+    const saved = this.savedAutoDecision(gate, request.findingIndex);
+    if (saved !== null) return { gate, outcome: { kind: 'decided', decision: saved } };
+
     const validated = await this.analyzeFindings(task, project.localPath, findings, [request.findingIndex], signal);
     const recommendation = validated.recommendations[0]!;
 
@@ -1254,6 +1261,9 @@ export class PlanReviewGateService {
       } catch {
         break;
       }
+      // Written by another process while this analysis ran: the first saved answer stands.
+      const winner = this.savedAutoDecision(current, request.findingIndex);
+      if (winner !== null) return { gate: current, outcome: { kind: 'decided', decision: winner } };
       const merged = this.mergeAutoResult(current, recommendation);
       const applied = this.deps.gates.updateIfUnchanged(current.id, merged.patch, current.revision);
       if (applied !== null) return { gate: applied, outcome: merged.outcome };
@@ -1261,6 +1271,16 @@ export class PlanReviewGateService {
     throw new AgentRelayError('VALIDATION_FAILED', STALE_ROUND, {
       remediation: 'The round changed while the analysis was running. Reload and analyze the current round.'
     });
+  }
+
+  /** The automatic decision already saved for this finding of this round, if any. */
+  private savedAutoDecision(gate: PlanReviewGate, findingIndex: number): PlanReviewAutoDecision | null {
+    if (gate.findingsJson === null) return null;
+    return (
+      parsePlanReviewAutoDecisions(gate.autoDecisionsJson, planFindingsSha256(gate.findingsJson)).find(
+        (decision) => decision.finding === findingIndex
+      ) ?? null
+    );
   }
 
   /** The gate is the round the caller named: same row, same findings. */
@@ -1293,8 +1313,8 @@ export class PlanReviewGateService {
     let decisions = retained;
     let outcome: PlanAutoDecideOutcome;
     if (recommendation.recommendation === 'needs_user') {
-      // A finding re-analyzed into "needs a human" loses any earlier automatic
-      // decision: the newest analysis is the one that stopped on purpose.
+      // Only reached for a finding with no saved decision (see `savedAutoDecision`),
+      // so nothing is lost: the analysis stopped on purpose and says so.
       outcome = {
         kind: 'needs_user',
         reason: recommendation.reason,

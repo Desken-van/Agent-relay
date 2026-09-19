@@ -385,6 +385,29 @@ describe('plan review: Auto decide beside every Decision', () => {
     expect(decisionSelects()[0]!.value).toBe('reject');
   });
 
+  it('will not analyze a finding the operator has already chosen or typed for, so a draft can never be discarded', async () => {
+    serve(awaiting(2), (index, s) => s.decided(index, 'accept'));
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.change(reasonInputs()[0]!, { target: { value: 'My own reasoning.' } });
+
+    const blocked = autoButton('Finding A');
+    expect(blocked).toHaveProperty('disabled', true);
+    expect(blocked.getAttribute('title')).toMatch(/already chosen a decision/i);
+    fireEvent.click(blocked);
+    expect(autoCalls()).toHaveLength(0);
+    expect(reasonInputs()[0]!.value).toBe('My own reasoning.');
+    // Another finding is unaffected.
+    expect(autoButton('Finding B')).toHaveProperty('disabled', false);
+
+    // Emptying the draft again hands the finding back to Auto decide.
+    fireEvent.change(reasonInputs()[0]!, { target: { value: '' } });
+    expect(autoButton('Finding A')).toHaveProperty('disabled', false);
+    fireEvent.click(autoButton('Finding A'));
+    await waitFor(() => expect(decisionSelects()[0]!.value).toBe('accept'));
+  });
+
   it('never replaces a decision the operator edits while Codex is still analyzing', async () => {
     const answer = deferred<IpcResult<unknown>>();
     serve(awaiting(2), () => answer.promise);
@@ -698,7 +721,7 @@ describe('plan review: resolve and revise', () => {
         used: 1,
         nextStep: 'revise',
         acceptedPending: 1,
-        latest: { round: 1, status: 'failed', attempts: 1, lastError: 'Codex timed out while revising.', acceptedCount: 1 }
+        latest: { round: 1, status: 'failed', attempts: 1, lastError: 'Codex timed out while revising.', acceptedCount: 1, addressed: [] }
       }
     });
 
@@ -714,6 +737,35 @@ describe('plan review: resolve and revise', () => {
     fireEvent.click(continueButton);
     await waitFor(() => expect(bridge.callsTo('planReview:continueCorrection')).toHaveLength(1));
     expect(bridge.callsTo('planReview:continueCorrection')[0]!.input).toEqual({ taskId: 'task-1', autoContinue: true });
+  });
+
+  it('shows, per accepted finding, which field Codex changed for it in the last revision', async () => {
+    serve(
+      awaiting(1, {
+        correction: {
+          ...NO_CORRECTION,
+          used: 1,
+          latest: {
+            round: 1,
+            status: 'completed',
+            attempts: 1,
+            lastError: null,
+            acceptedCount: 1,
+            addressed: [
+              { finding: 0, title: 'Add a retry budget', field: 'implementationPrompt', change: 'Now tells the implementer to cap retries.' }
+            ]
+          }
+        }
+      }),
+      () => fail('unused')
+    );
+    renderPanel();
+
+    const block = await screen.findByLabelText('What the last revision changed');
+    expect(block.textContent).toContain('round 1');
+    expect(block.textContent).toContain('Add a retry budget');
+    expect(block.textContent).toContain('implementationPrompt');
+    expect(block.textContent).toContain('Now tells the implementer to cap retries.');
   });
 
   it('shows the correction budget and the specification versions', async () => {

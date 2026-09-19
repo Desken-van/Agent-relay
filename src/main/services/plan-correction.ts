@@ -30,13 +30,16 @@ import { AgentRelayError } from '../../shared/domain/errors';
 import type { Task } from '../../shared/domain/models';
 import {
   parseAcceptedPlanFindings,
+  parsePlanRevisionAddressed,
   planCorrectionNextStep,
+  revisionAddressesProblem,
   type AcceptedPlanFinding,
   type PlanAdvanceOutcome,
   type PlanAdvanceStop,
   type PlanCorrection,
   type PlanCorrectionDetail,
-  type PlanCorrectionNextStep
+  type PlanCorrectionNextStep,
+  type PlanRevisionAddressed
 } from '../../shared/domain/plan-correction';
 import {
   parsePlanReviewAutoDecisions,
@@ -166,9 +169,12 @@ export function describePlanCorrection(deps: PlanCorrectionReadDeps, taskId: str
   const interrupted = latest?.status === 'running' && deps.claims.heldBy(taskId) !== 'advance';
 
   let acceptedCount = 0;
+  const titles = new Map<number, string>();
   if (latest !== null) {
     try {
-      acceptedCount = parseAcceptedPlanFindings(latest.acceptedJson).length;
+      const accepted = parseAcceptedPlanFindings(latest.acceptedJson);
+      acceptedCount = accepted.length;
+      for (const entry of accepted) titles.set(entry.finding, entry.title);
     } catch {
       acceptedCount = 0;
     }
@@ -193,7 +199,11 @@ export function describePlanCorrection(deps: PlanCorrectionReadDeps, taskId: str
             status: interrupted ? 'interrupted' : latest.status,
             attempts: latest.attempts,
             lastError: latest.lastError,
-            acceptedCount
+            acceptedCount,
+            addressed: parsePlanRevisionAddressed(latest.addressedJson).map((entry) => ({
+              ...entry,
+              title: titles.get(entry.finding) ?? `Finding ${entry.finding}`
+            }))
           },
     acceptedPending,
     versions: deps.corrections.listVersions(taskId).map((version) => ({
@@ -497,6 +507,7 @@ export class PlanCorrectionService {
     };
 
     let revisedJson: string;
+    let addressed: readonly PlanRevisionAddressed[];
     try {
       const outcome = await this.deps.codex.reviseSpecification(
         {
@@ -513,6 +524,7 @@ export class PlanCorrectionService {
         context
       );
       revisedJson = JSON.stringify(outcome.specification);
+      addressed = outcome.addressed;
     } catch (error) {
       this.deps.corrections.fail(
         correction.id,
@@ -533,6 +545,17 @@ export class PlanCorrectionService {
         `Codex returned the specification unchanged although ${accepted.length} finding(s) were accepted, so they were not addressed.`
       );
     }
+    // Every accepted finding must be accounted for, in a field that really changed.
+    // Anything less would be carried into a fresh review as though it were dealt with.
+    const unaddressed = revisionAddressesProblem({
+      accepted,
+      addressed,
+      current: current.specification,
+      revised: revised.specification
+    });
+    if (unaddressed !== null) {
+      return fail(`${unaddressed} The revision was not stored, so the accepted findings are still not addressed.`);
+    }
 
     try {
       this.deps.corrections.complete({
@@ -540,7 +563,8 @@ export class PlanCorrectionService {
         versionId: this.deps.ids.next(),
         expectedSpecificationJson: specificationJson,
         newSpecificationJson: revisedJson,
-        newSpecificationSha256: revised.sha256
+        newSpecificationSha256: revised.sha256,
+        addressedJson: JSON.stringify(addressed)
       });
     } catch (error) {
       this.deps.corrections.fail(

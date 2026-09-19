@@ -374,6 +374,25 @@ describe('code review: Auto decide beside every Decision', () => {
     expect(autoCalls().map((call) => call.findingId)).toEqual(['f-1', 'f-1']);
   });
 
+  it('will not analyze a finding the operator has already chosen or typed for, so a draft can never be buried', async () => {
+    serve(2);
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.change(decisionSelects()[0]!, { target: { value: 'reject' } });
+
+    const blocked = autoButton('Finding A');
+    expect(blocked).toHaveProperty('disabled', true);
+    expect(blocked.getAttribute('title')).toMatch(/already chosen a decision/i);
+    fireEvent.click(blocked);
+    expect(autoCalls()).toHaveLength(0);
+    expect(decisionSelects()[0]!.value).toBe('reject');
+    expect(autoButton('Finding B')).toHaveProperty('disabled', false);
+
+    fireEvent.change(decisionSelects()[0]!, { target: { value: '' } });
+    expect(autoButton('Finding A')).toHaveProperty('disabled', false);
+  });
+
   it('starts one analysis for a burst of clicks on the same button', async () => {
     const answer = deferred<IpcResult<unknown>>();
     serve(2, () => answer.promise);

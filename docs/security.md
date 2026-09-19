@@ -121,7 +121,8 @@ window.agentRelay.onEvent(listener)        // read-only push subscription
   itself. `planReview:resolveAndRevise` accepts the operator's typed decisions plus a
   boolean, and `planReview:continueCorrection` only a task id and that boolean; the
   revised specification is produced by Codex in the main process, validated against
-  the same schema and secret-shape checks as any specification, and committed only
+  the same schema and secret-shape checks as any specification, required to account
+  for every accepted finding in a field that really changed, and committed only
   by a compare-and-swap on the text the correction started from. No channel can
   approve a specification, and none can settle a round that accepted a finding
   without the revision that puts it into the plan.

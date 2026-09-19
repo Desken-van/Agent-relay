@@ -85,11 +85,13 @@ export interface SpecificationRevisionPromptInput {
   readonly maxRounds: number;
 }
 
-function renderAcceptedFinding(finding: AcceptedPlanFinding, position: number): string {
+function renderAcceptedFinding(finding: AcceptedPlanFinding): string {
   const location = finding.file
     ? `${finding.file}${finding.line > 0 ? `:${finding.line}` : ''}`
     : '(no specific location)';
-  return `${position + 1}. [${finding.severity} · ${finding.category}] ${finding.title}
+  // Named by the round's own number, which is what the answer must use to say
+  // where each one was addressed.
+  return `Finding ${finding.finding}. [${finding.severity} · ${finding.category}] ${finding.title}
    Location: ${location}
    Why it matters: ${finding.why}
    Required correction: ${finding.fix}${
@@ -127,8 +129,15 @@ ${JSON.stringify(input.currentSpecification, null, 2)}
 === ACCEPTED FINDINGS — the ONLY corrections you are asked to make ===
 ${input.acceptedFindings.map(renderAcceptedFinding).join('\n\n')}
 
-Produce a single JSON object matching the required schema: the COMPLETE revised
-specification, every field present, with these rules:
+Produce a single JSON object matching the required schema, with two parts:
+- "specification": the COMPLETE revised specification, every field present.
+- "addressed": one entry for EACH accepted finding above — its number exactly as listed
+  ("Finding N" is N), the specification field in which you addressed it, and one or two
+  sentences saying what you changed there. That field must really differ from the current
+  specification: a finding you claim but did not change is refused, and so is an accepted
+  finding you do not mention.
+
+Rules for the revision:
 
 - Address every accepted finding in the specification itself — in the summary, the
   acceptance criteria, the constraints, the suggested tests and, above all, the

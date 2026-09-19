@@ -1122,6 +1122,9 @@ export const MIGRATIONS: readonly Migration[] = [
           attempts                   INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
           to_specification_sha256    TEXT CHECK (to_specification_sha256 IS NULL OR length(to_specification_sha256) = 64),
           to_version                 INTEGER CHECK (to_version IS NULL OR to_version >= 1),
+          -- What Codex said it changed for each accepted finding (checked before
+          -- the revision was committed). Set with the completion, never before.
+          addressed_json             TEXT,
           last_error                 TEXT,
           revision                   INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
           created_at                 TEXT NOT NULL,

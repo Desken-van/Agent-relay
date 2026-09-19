@@ -3338,6 +3338,26 @@ describe('code-review accepted findings as correction requirements', () => {
     expect(value.service.acceptedRequirements(value.task.id)).toEqual([]);
   });
 
+  it('refuses to close an accepted finding on the SAME code, however the request arrives', async () => {
+    const { value, accepted, decide } = await withAccepted();
+
+    // No code has moved and no fresh review exists: the finding is still owed.
+    await expect(decide(accepted, 'resolved')).rejects.toThrow(/correction still owed/i);
+    expect(value.reviews.latestDecision(accepted.id)?.action).toBe('accept');
+    expect(value.service.acceptedRequirements(value.task.id)).toHaveLength(1);
+    // A finding nobody accepted keeps the behaviour it always had: the operator may say it is resolved.
+    const [, , untouched] = value.reviews.listFindings(value.task.id);
+    await value.service.decide(value.task.id, {
+      findingId: untouched!.id,
+      action: 'resolved',
+      reason: 'Already fixed before the review ran.',
+      expectedRevision: untouched!.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+    expect(value.reviews.latestDecision(untouched!.id)?.action).toBe('resolved');
+  });
+
   it('does not offer accept or reject on an earlier subject, even after a fresh round', async () => {
     const { value, accepted, decide } = await withAccepted();
     value.snapshots.headCommit = '9'.repeat(40);

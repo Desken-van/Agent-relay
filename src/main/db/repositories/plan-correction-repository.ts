@@ -19,6 +19,7 @@ interface CorrectionRow {
   attempts: number;
   to_specification_sha256: string | null;
   to_version: number | null;
+  addressed_json: string | null;
   last_error: string | null;
   revision: number;
   created_at: string;
@@ -38,7 +39,7 @@ interface VersionRow {
 
 const CORRECTION_COLUMNS = `id, task_id, source_gate_id, round, from_specification_sha256,
                             accepted_json, status, attempts, to_specification_sha256,
-                            to_version, last_error, revision, created_at, updated_at`;
+                            to_version, addressed_json, last_error, revision, created_at, updated_at`;
 const VERSION_COLUMNS = `id, task_id, version, specification_sha256, specification_json,
                          origin, source_correction_id, created_at`;
 
@@ -54,6 +55,7 @@ function toCorrection(row: CorrectionRow): PlanCorrection {
     attempts: row.attempts,
     toSpecificationSha256: row.to_specification_sha256,
     toVersion: row.to_version,
+    addressedJson: row.addressed_json,
     lastError: row.last_error,
     revision: row.revision,
     createdAt: row.created_at,
@@ -159,9 +161,12 @@ export class SqlitePlanCorrectionRepository implements PlanCorrectionRepository 
           });
       }
 
+      // The newest round plus one, not a count: a count drifts from the ordinal the
+      // moment a row is ever missing, and UNIQUE(task_id, round) would then wedge
+      // every later correction.
       const round =
         (this.db
-          .prepare('SELECT COUNT(*) AS n FROM plan_review_corrections WHERE task_id = ?')
+          .prepare('SELECT COALESCE(MAX(round), 0) AS n FROM plan_review_corrections WHERE task_id = ?')
           .get(input.taskId) as { n: number }).n + 1;
       this.db
         .prepare(
@@ -271,10 +276,11 @@ export class SqlitePlanCorrectionRepository implements PlanCorrectionRepository 
         .prepare(
           `UPDATE plan_review_corrections
               SET status = 'completed', to_specification_sha256 = @sha, to_version = @version,
-                  last_error = NULL, revision = revision + 1, updated_at = @now
+                  addressed_json = @addressed, last_error = NULL, revision = revision + 1,
+                  updated_at = @now
             WHERE id = @id`
         )
-        .run({ id: row.id, sha: input.newSpecificationSha256, version, now });
+        .run({ id: row.id, sha: input.newSpecificationSha256, version, addressed: input.addressedJson, now });
 
       const updated = this.db
         .prepare(`SELECT ${CORRECTION_COLUMNS} FROM plan_review_corrections WHERE id = ?`)
