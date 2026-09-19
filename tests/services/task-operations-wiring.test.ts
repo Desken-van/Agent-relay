@@ -101,7 +101,7 @@ describe('composition-root wiring of the task-operation register', () => {
       code: 'BUSY'
     });
     await expect(app.createPlanReviewGate(CONFIG).review(task.id)).rejects.toMatchObject({ code: 'BUSY' });
-    await expect(app.orchestrator.generateSpecification(task.id)).rejects.toThrow(/already has an agent running/i);
+    await expect(app.orchestrator.generateSpecification(task.id)).rejects.toThrow(/already has a plan-review operation running/i);
 
     operation.release();
   });

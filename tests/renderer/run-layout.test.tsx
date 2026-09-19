@@ -8,7 +8,8 @@ import { taskSchema } from '../../src/shared/domain/models';
 import type { TaskDetail } from '../../src/shared/ipc';
 import type { GitChangeSet } from '../../src/shared/domain/git';
 import type { CodexReviewResult, TaskSpecification } from '../../src/shared/schemas/codex';
-import { burstClick, deferred, deliver, installBridge, ok, renderApp } from './harness';
+import { Toasts } from '../../src/renderer/src/components/Toasts';
+import { burstClick, deferred, deliver, fail, installBridge, ok, renderApp } from './harness';
 
 afterEach(() => {
   cleanup();
@@ -288,6 +289,66 @@ describe('Run screen — Stop task while a plan-correction loop runs', () => {
     await waitFor(() => expect(bridge.callsTo('tasks:get').length).toBeGreaterThan(readsBefore));
     expect(screen.queryByRole('button', { name: /Stopping…/ })).toBeNull();
     expect(bridge.callsTo('workflow:stop')).toHaveLength(1);
+  });
+});
+
+describe('Run screen — Stop task outcomes', () => {
+  const cancelledTask = () =>
+    taskSchema.parse({
+      id: 't', projectId: 'p', title: 'Fix the thing', originalRequest: 'Please fix it.',
+      status: 'CANCELLED', currentRound: 0, maxRounds: 3, codexThreadId: null,
+      claudeSessionId: null, worktreePath: null, branchName: null, baseBranch: null,
+      specificationJson: null, specificationApprovedAt: null, lastReviewJson: null,
+      lastError: 'Stopped by the user.', codexModel: null, claudeModel: null,
+      createdAt: '2026-09-10T00:00:00.000Z', updatedAt: '2026-09-10T00:00:00.000Z'
+    });
+
+  it('never reports a Stop that succeeded as a failed one because the read-back afterwards failed', async () => {
+    installBridge({
+      'workflow:stop': () => ok<'workflow:stop'>(cancelledTask()),
+      'tasks:get': () => {
+        throw new Error('The bridge dropped the read.');
+      }
+    });
+    renderApp(
+      <>
+        <SeededRun detail={buildDetail({ status: 'READY_FOR_IMPLEMENTATION' })} />
+        <Toasts />
+      </>
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop task' }));
+
+    expect(await screen.findByText('Task stopped')).toBeTruthy();
+    expect(screen.queryByText('Could not stop the task')).toBeNull();
+  });
+
+  it('after a Stop that failed, shows the error, clears the pending state, and lets the operator retry', async () => {
+    let attempts = 0;
+    const bridge = installBridge({
+      'workflow:stop': () => {
+        attempts += 1;
+        return attempts === 1 ? fail('database is locked') : ok<'workflow:stop'>(cancelledTask());
+      }
+    });
+    renderApp(
+      <>
+        <SeededRun detail={buildDetail({ status: 'READY_FOR_IMPLEMENTATION' })} />
+        <Toasts />
+      </>
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop task' }));
+
+    await waitFor(() => expect(bridge.callsTo('workflow:stop')).toHaveLength(1));
+    expect(await screen.findByText('Could not stop the task')).toBeTruthy();
+    const again = await screen.findByRole('button', { name: 'Stop task' });
+    expect(again.hasAttribute('disabled')).toBe(false);
+    expect(again.getAttribute('aria-busy')).not.toBe('true');
+
+    fireEvent.click(again);
+    await waitFor(() => expect(bridge.callsTo('workflow:stop')).toHaveLength(2));
+    expect(await screen.findByText('Task stopped')).toBeTruthy();
   });
 });
 

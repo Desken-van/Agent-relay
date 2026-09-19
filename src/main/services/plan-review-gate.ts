@@ -40,7 +40,7 @@ import type {
   TriageableFinding
 } from '../ports';
 import type { PlanReviewClaims } from './plan-review-claims';
-import type { TaskOperationKind, TaskOperationRegistry } from './task-operations';
+import { asStopped, type TaskOperationKind, type TaskOperationRegistry } from './task-operations';
 import { renderRuleEvidence, validateRuleEvidenceSnapshot } from './rule-evidence';
 
 const MAX_PLAN_BYTES = 1_500_000;
@@ -108,6 +108,10 @@ const SUPERSEDE_BLOCKING = [
 const NO_TERMINAL_EVIDENCE =
   'The provider records no plan round for this session, which is not proof that the round already dispatched from here was refused: an empty list is equally consistent with a request the provider has accepted and not yet recorded. Nothing was repeated and no new round may start. Resolve or close the round in the provider, or reconcile again once it appears.';
 
+const STOPPED_OUTCOME_UNKNOWN =
+  'The task was stopped while an external call was in flight, so its outcome is unknown and was not recorded. Reconcile the round before repeating anything.';
+const STOPPED_BEFORE_WRITE = 'The task was stopped before anything further was sent or written.';
+const STOPPED_DURING_OPERATION = 'The task was stopped while this operation was running. Nothing further was changed.';
 const STALE_ROUND =
   'These decisions were taken against a plan-review round that is no longer the current one, so nothing was sent to the provider. Re-read the round and decide its findings again.';
 
@@ -673,6 +677,10 @@ export class PlanReviewGateService {
       const release = claim();
       try {
         return await body(operation.signal);
+      } catch (error) {
+        // Whatever the provider threw when the stop killed its call, this ended
+        // because it was stopped.
+        throw asStopped(error, operation.signal, STOPPED_DURING_OPERATION);
       } finally {
         release();
       }
@@ -695,14 +703,23 @@ export class PlanReviewGateService {
   private assertStillActive(taskId: string, signal: AbortSignal | undefined, dispatched: boolean): void {
     const task = this.deps.tasks.findById(taskId);
     if (signal?.aborted === true || task?.status === 'CANCELLED') {
-      throw new AgentRelayError(
-        'CANCELLED',
-        dispatched
-          ? 'The task was stopped while an external call was in flight, so its outcome is unknown and was not recorded. Reconcile the round before repeating anything.'
-          : 'The task was stopped before anything further was sent or written.'
-      );
+      throw new AgentRelayError('CANCELLED', dispatched ? STOPPED_OUTCOME_UNKNOWN : STOPPED_BEFORE_WRITE);
     }
     this.requireReadyTask(taskId);
+  }
+
+  /**
+   * The note kept on a gate whose call ended with an error. When the operation was
+   * stopped, what the provider threw for it is beside the point — a killed process
+   * or request can throw anything — so the note says the outcome is unknown and
+   * keeps the provider's own words after it.
+   */
+  private failureNote(error: unknown, signal: AbortSignal | undefined): string {
+    const raw = error instanceof Error ? error.message : String(error);
+    if (signal?.aborted === true && !raw.startsWith(STOPPED_OUTCOME_UNKNOWN)) {
+      return redactAndTruncate(`${STOPPED_OUTCOME_UNKNOWN} (${raw})`, 10_000);
+    }
+    return redactAndTruncate(raw, 10_000);
   }
 
   /**
@@ -820,10 +837,8 @@ export class PlanReviewGateService {
       // take effect, and nothing on this side can know that: the request left
       // the process and only its answer was lost. The phase is the evidence,
       // and reconciliation is what turns it back into knowledge.
-      this.deps.gates.update(gate.id, {
-        lastError: redactAndTruncate(error instanceof Error ? error.message : String(error), 10_000)
-      });
-      throw error;
+      this.deps.gates.update(gate.id, { lastError: this.failureNote(error, signal) });
+      throw asStopped(error, signal, STOPPED_OUTCOME_UNKNOWN);
     }
   }
 
@@ -1154,10 +1169,8 @@ export class PlanReviewGateService {
       // `resolving` is kept for the same reason `reviewing` is: the decisions
       // were dispatched, and a lost answer is not evidence that they were
       // refused. Calling this "failed" would be a claim, not a fact.
-      this.deps.gates.update(resolving.id, {
-        lastError: redactAndTruncate(error instanceof Error ? error.message : String(error), 10_000)
-      });
-      throw error;
+      this.deps.gates.update(resolving.id, { lastError: this.failureNote(error, signal) });
+      throw asStopped(error, signal, STOPPED_OUTCOME_UNKNOWN);
     }
   }
 

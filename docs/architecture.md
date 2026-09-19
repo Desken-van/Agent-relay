@@ -661,6 +661,12 @@ guarantees.
   repeat. A stop while Codex revises marks the correction `failed` with a message saying the
   read-only revision was discarded. A revision that committed atomically just before Stop
   is preserved as the fact it is, but no later review starts.
+- Whatever a provider throws when the stop kills its call (a typed CANCELLED, a generic exit,
+  a transport error), an operation whose own signal was aborted is reported as a stop
+  (`asStopped`), a Codex revision's row says it was stopped and discarded, and a gate's note
+  says the outcome is unknown with the provider's words after it. `operations` is a REQUIRED
+  dependency of both `PlanReviewGateService` and `PlanCorrectionService`, so building either
+  without the cancellation wiring is a compile-time error.
 - The panel reports a stop as a stop (neither a success nor a fault of the loop), reads the
   round back, and `Stop task` stays usable while the loop runs but cannot be double-submitted.
 

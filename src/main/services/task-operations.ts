@@ -44,6 +44,21 @@ interface Entry {
   readonly controller: AbortController;
 }
 
+/**
+ * What an operation should throw when it ends after a stop.
+ *
+ * A stop kills a provider's process or request, and what the provider throws for
+ * that is up to its adapter — usually a typed CANCELLED, but a generic exit or
+ * transport error is possible. Whatever it was, an operation whose own signal was
+ * aborted ended because it was stopped, so it is reported as a stop and not as a
+ * fault of the provider. An error that is already a CANCELLED is kept as it is.
+ */
+export function asStopped(error: unknown, signal: AbortSignal | undefined, message: string): unknown {
+  if (signal?.aborted !== true) return error;
+  if (error instanceof AgentRelayError && error.code === 'CANCELLED') return error;
+  return new AgentRelayError('CANCELLED', message, { cause: error });
+}
+
 export class TaskOperationRegistry {
   private readonly active = new Map<string, Set<Entry>>();
 

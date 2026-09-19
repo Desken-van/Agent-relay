@@ -724,7 +724,13 @@ export function RunView(): React.JSX.Element {
                 void perform('stop', 'Could not stop the task', async () => {
                   acceptTask(await expect('workflow:stop', { taskId: task.id }));
                   // What was running read the task back and ended; show the result, not the old state.
-                  await refreshDetail(task.id);
+                  // Best-effort: the task IS stopped, so a failed read-back must never be reported as a
+                  // failed Stop (and must not hide the confirmation below).
+                  try {
+                    await refreshDetail(task.id);
+                  } catch {
+                    // The stopped task above is already what the screen holds.
+                  }
                   notify({ tone: 'info', title: 'Task stopped' });
                 }).finally(() => {
                   stopInFlight.current = false;

@@ -307,13 +307,28 @@ export class Orchestrator {
     return updated;
   }
 
-  private beginExclusive(taskId: string): AbortController {
-    if (this.inFlight.has(taskId) || this.deps.operations?.isActive(taskId)) {
+  /**
+   * Refuse to start an agent run while something else is running for the task,
+   * and say WHICH: an agent run, or a plan-review operation (the correction loop, a
+   * review, a resolve) that has no run of its own to point at.
+   */
+  private assertNothingRunning(taskId: string): void {
+    if (this.inFlight.has(taskId)) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
         'This task already has an agent running. Stop it before starting another operation.'
       );
     }
+    if (this.deps.operations?.isActive(taskId)) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'This task already has a plan-review operation running. Wait for it to finish, or stop the task, before starting an agent.'
+      );
+    }
+  }
+
+  private beginExclusive(taskId: string): AbortController {
+    this.assertNothingRunning(taskId);
     const controller = new AbortController();
     this.inFlight.set(taskId, controller);
     return controller;
@@ -509,12 +524,7 @@ export class Orchestrator {
 
   async generateSpecification(taskId: string): Promise<Task> {
     let task = this.requireTask(taskId);
-    if (this.inFlight.has(taskId) || this.deps.operations?.isActive(taskId)) {
-      throw new AgentRelayError(
-        'VALIDATION_FAILED',
-        'This task already has an agent running. Stop it before starting another operation.'
-      );
-    }
+    this.assertNothingRunning(taskId);
     if (task.status !== 'DRAFT' && task.status !== 'READY_FOR_IMPLEMENTATION') {
       throw new InvalidTransitionError(task.status, 'specification_started');
     }

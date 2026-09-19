@@ -296,6 +296,110 @@ describe('Stop task during the plan-correction loop', () => {
   });
 });
 
+describe('a stop is reported as a stop whatever the provider threw for it', () => {
+  it('turns a generic Codex failure raised because the process was killed into CANCELLED, with an honest audit row', async () => {
+    const value = scenario();
+    const task = await acceptedAndResolved(value);
+    const original = specOf(value, task.id);
+    const release = deferred();
+    value.harness.codex.revisionGate = release.promise;
+    // What an adapter might throw when the stop kills its process: not a typed CANCELLED.
+    value.harness.codex.revisionError = new Error('Codex exited with code 1.');
+
+    const running = outcomeOf(value.loop.continueCorrection(task.id, { autoContinue: true }));
+    await until(() => value.harness.codex.revisionCalls.length === 1, 'the revision to reach Codex');
+    value.harness.orchestrator.stop(task.id);
+    release.resolve(undefined);
+
+    const error = await running;
+    expect(error).toMatchObject({ code: 'CANCELLED' });
+    expectNothingWritten(value, task.id, original);
+    const [correction] = value.corrections.listByTask(task.id);
+    expect(correction?.status).toBe('failed');
+    // Not the provider's opaque exit message: the row says it was stopped and discarded.
+    expect(correction?.lastError).toMatch(/Stopped while Codex was revising/);
+    expect(correction?.lastError).not.toMatch(/exited with code/);
+    expectReleased(value, task.id);
+  });
+
+  it('turns a generic Coai failure raised because the call was killed into CANCELLED, and keeps the outcome-unknown note with the provider’s words', async () => {
+    const value = scenario();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change'])];
+    value.reviewer.resolutionQueue = [revise(value)];
+    await value.gateService.review(task.id);
+    const release = deferred();
+    value.reviewer.resolveGate = release.promise;
+    value.reviewer.resolveError = new Error('socket hang up');
+
+    const running = outcomeOf(value.loop.resolveAndRevise(task.id, resolveRequest(value, task.id, decide([0, 'accept', 'Yes.']))));
+    await until(() => value.reviewer.resolveCalls.length === 1, 'the resolve to reach Coai');
+    value.harness.orchestrator.stop(task.id);
+    release.resolve(undefined);
+
+    expect(await running).toMatchObject({ code: 'CANCELLED' });
+    const gate = currentGate(value, task.id);
+    // Still an unknown outcome to reconcile — never called a failure — and it says so first.
+    expect(gate.status).toBe('resolving');
+    expect(gate.lastError).toMatch(/^The task was stopped while an external call was in flight, so its outcome is unknown/);
+    expect(gate.lastError).toContain('socket hang up');
+    expect(value.loop.detail(task.id).nextStep).toBe('reconcile');
+    expectReleased(value, task.id);
+  });
+
+  it('does the same for a review started directly, and for a single finding’s Auto decide', async () => {
+    const value = scenario();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['A'])];
+    const release = deferred();
+    value.reviewer.reviewGate = release.promise;
+    value.reviewer.reviewError = new Error('connection reset');
+
+    const review = outcomeOf(value.gateService.review(task.id));
+    await until(() => value.reviewer.reviewCalls.length === 1, 'the review to reach Coai');
+    value.harness.orchestrator.stop(task.id);
+    release.resolve(undefined);
+
+    expect(await review).toMatchObject({ code: 'CANCELLED' });
+    expect(currentGate(value, task.id).lastError).toMatch(/outcome is unknown/);
+    expectReleased(value, task.id);
+  });
+
+  it('turns a generic triage failure raised because the analysis was killed into CANCELLED', async () => {
+    const value = scenario();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['A', 'B'])];
+    await value.gateService.review(task.id);
+    const gate = currentGate(value, task.id);
+    const release = deferred();
+    value.harness.codex.triageGate = release.promise;
+    value.harness.codex.triageError = new Error('Codex exited with code 1.');
+
+    const running = outcomeOf(
+      value.gateService.autoDecide(task.id, { gateId: gate.id, findingsSha256: planFindingsSha256(gate.findingsJson as string), findingIndex: 0 })
+    );
+    await until(() => value.harness.codex.triageCalls.length === 1, 'the analysis to reach Codex');
+    value.harness.orchestrator.stop(task.id);
+    release.resolve(undefined);
+
+    expect(await running).toMatchObject({ code: 'CANCELLED' });
+    expect(currentGate(value, task.id).autoDecisionsJson).toBeNull();
+    expectReleased(value, task.id);
+  });
+
+  it('still reports an ordinary failure, with no stop, as the failure it is', async () => {
+    const value = scenario();
+    const task = await acceptedAndResolved(value);
+    value.harness.codex.revisionError = new Error('Codex exited with code 1.');
+
+    await expect(value.loop.continueCorrection(task.id, { autoContinue: false })).rejects.toThrow(/exited with code 1/);
+
+    expect(value.corrections.listByTask(task.id)[0]?.lastError).toMatch(/exited with code 1/);
+    expect(statusOf(value, task.id)).toBe('READY_FOR_IMPLEMENTATION');
+    expectReleased(value, task.id);
+  });
+});
+
 describe('the cancellation register is process-wide', () => {
   it('lets the singleton orchestrator stop a loop that another IPC call started through its own service instances', async () => {
     const value = scenario();
@@ -337,7 +441,7 @@ describe('the cancellation register is process-wide', () => {
       second.gateService.autoDecide(task.id, { gateId: gate.id, findingsSha256: 'a'.repeat(64), findingIndex: 0 })
     ).rejects.toMatchObject({ code: 'BUSY' });
     // An agent run is refused too, by the orchestrator, for the same reason.
-    await expect(value.harness.orchestrator.generateSpecification(task.id)).rejects.toThrow(/already has an agent running/i);
+    await expect(value.harness.orchestrator.generateSpecification(task.id)).rejects.toThrow(/already has a plan-review operation running/i);
     expect(value.harness.codex.revisionCalls).toHaveLength(1);
 
     release.resolve(undefined);

@@ -63,7 +63,7 @@ import type {
   TaskRuleEvidenceRepository
 } from '../ports';
 import type { PlanReviewClaims } from './plan-review-claims';
-import type { TaskOperationRegistry } from './task-operations';
+import { asStopped, type TaskOperationRegistry } from './task-operations';
 import {
   planFindingsSha256,
   planReviewGateIdentity,
@@ -73,6 +73,9 @@ import {
 import { renderRuleEvidence } from './rule-evidence';
 import { specificationIdentity } from './specification-identity';
 
+const LOOP_STOPPED = 'The plan-correction loop was stopped. Nothing further was changed.';
+const STOPPED_DURING_REVISION =
+  'Stopped while Codex was revising the specification. The revision had no external effect and was discarded; nothing was changed.';
 const MAX_SPECIFICATION_BYTES = 1_500_000;
 /** A hard ceiling on loop iterations. The real bound is the correction budget; this only guards a logic error. */
 const MAX_LOOP_STEPS = 64;
@@ -446,6 +449,10 @@ export class PlanCorrectionService {
         'INTERNAL',
         'The plan-correction loop exceeded its step limit; it stopped without changing anything further.'
       );
+    } catch (error) {
+      // Whatever a provider threw when the stop killed its call, the loop ended
+      // because it was stopped, and is reported as a stop.
+      throw asStopped(error, signal, LOOP_STOPPED);
     } finally {
       // The claim first, then the registration: a task is never visible as
       // stoppable with nothing running behind it. Both, on every exit.
@@ -462,9 +469,11 @@ export class PlanCorrectionService {
    * operation's registration), and it is what every durable write re-reads.
    */
   private assertActive(taskId: string, signal: AbortSignal): void {
-    if (signal.aborted || this.deps.tasks.findById(taskId)?.status === 'CANCELLED') {
-      throw new AgentRelayError('CANCELLED', 'The plan-correction loop was stopped. Nothing further was changed.');
-    }
+    if (this.isStopped(taskId, signal)) throw new AgentRelayError('CANCELLED', LOOP_STOPPED);
+  }
+
+  private isStopped(taskId: string, signal: AbortSignal): boolean {
+    return signal.aborted || this.deps.tasks.findById(taskId)?.status === 'CANCELLED';
   }
 
   /* ------------------------------------------------------------------------ */
@@ -602,19 +611,25 @@ export class PlanCorrectionService {
       revisedJson = JSON.stringify(outcome.specification);
       addressed = outcome.addressed;
     } catch (error) {
+      // What Codex throws when a stop kills its process is up to the adapter; if
+      // this ended because it was stopped, the row and the error say so, whatever
+      // was thrown. The revision is read-only, so "discarded" is exact.
+      if (this.isStopped(task.id, signal)) {
+        this.deps.corrections.fail(correction.id, STOPPED_DURING_REVISION);
+        throw new AgentRelayError('CANCELLED', STOPPED_DURING_REVISION, { cause: error });
+      }
       this.deps.corrections.fail(
         correction.id,
         redactAndTruncate(error instanceof Error ? error.message : String(error), 10_000)
       );
       throw error;
     }
-    // Stopped while Codex was revising. The revision is read-only and has no
-    // external effect, so discarding it is exact, not a guess: the row says it was
+    // Stopped while Codex was revising, and Codex answered anyway. Same reasoning:
+    // the revision has no external effect, so it is discarded, the row says it was
     // stopped and that nothing was changed, and nothing below is reached.
-    if (signal.aborted || this.deps.tasks.findById(task.id)?.status === 'CANCELLED') {
-      const message = 'Stopped while Codex was revising the specification. The revision had no external effect and was discarded; nothing was changed.';
-      this.deps.corrections.fail(correction.id, message);
-      throw new AgentRelayError('CANCELLED', message);
+    if (this.isStopped(task.id, signal)) {
+      this.deps.corrections.fail(correction.id, STOPPED_DURING_REVISION);
+      throw new AgentRelayError('CANCELLED', STOPPED_DURING_REVISION);
     }
 
     if (Buffer.byteLength(revisedJson, 'utf8') > MAX_SPECIFICATION_BYTES) {
