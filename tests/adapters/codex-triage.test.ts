@@ -153,13 +153,20 @@ describe('CodexSdkAdapter.triageFindings — the reference kind of one call', ()
   it('states the required JSON type of findingRef in the prompt, for each kind', async () => {
     sdk.answer = answer(0, 1);
     await new CodexSdkAdapter(runner).triageFindings(planRequest(), context());
-    expect(sdk.runs[0]!.prompt).toContain('Finding ref=0 ---');
-    expect(sdk.runs[0]!.prompt).toMatch(/"findingRef" is a JSON NUMBER/);
+    const planPrompt = sdk.runs[0]!.prompt;
+    expect(planPrompt).toContain('Finding ref=0 ---');
+    expect(planPrompt).toMatch(/"findingRef" is a JSON NUMBER/);
+    // The prohibition of exactly the representation that lost a real result.
+    expect(planPrompt).toContain('written without quotes — never a string such as "0"');
+    expect(planPrompt).not.toMatch(/JSON STRING/);
 
     sdk.answer = answer('finding-a', 'finding-b');
     await new CodexSdkAdapter(runner).triageFindings(codeRequest(), context());
-    expect(sdk.runs[1]!.prompt).toContain('Finding ref="finding-a" ---');
-    expect(sdk.runs[1]!.prompt).toMatch(/"findingRef" is a JSON STRING/);
+    const codePrompt = sdk.runs[1]!.prompt;
+    expect(codePrompt).toContain('Finding ref="finding-a" ---');
+    expect(codePrompt).toMatch(/"findingRef" is a JSON STRING/);
+    expect(codePrompt).toContain('never as a number');
+    expect(codePrompt).not.toMatch(/JSON NUMBER/);
   });
 
   it('returns the numeric recommendations of a plan request, and the string ones of a code-review request', async () => {
