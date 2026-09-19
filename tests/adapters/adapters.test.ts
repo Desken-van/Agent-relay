@@ -1185,6 +1185,27 @@ describe('prompt construction', () => {
     expect(prompt).toContain('discovery hint');
   });
 
+  it('tells the specifier to return an empty scopedFilePaths array rather than omit it', () => {
+    const prompt = buildSpecificationPrompt({
+      projectPath: 'C:\\repo\\demo',
+      taskTitle: 'Document the manual test',
+      originalRequest: 'update docs/manual-test.md'
+    });
+    // The bullet is wrapped across lines; compare it as running text.
+    const bullet = prompt
+      .slice(prompt.indexOf('- "scopedFilePaths"'), prompt.indexOf('Scope discipline'))
+      .replace(/\s+/g, ' ');
+
+    expect(bullet).toContain('must always be present');
+    expect(bullet).toContain('provide every one of them');
+    expect(bullet).toMatch(/Otherwise return an empty array \(\[\]\)/);
+    expect(bullet).toContain('Never omit the field');
+    expect(bullet).toContain('not an access restriction');
+    // The strict response schema requires the field, so nothing may say it is optional.
+    expect(prompt).not.toMatch(/omit it/i);
+    expect(prompt).not.toMatch(/\(or omit/i);
+  });
+
   it('tells the reviewer it must not modify files and gives it the evidence', () => {
     const prompt = buildReviewPrompt({
       specification: makeSpecification(),

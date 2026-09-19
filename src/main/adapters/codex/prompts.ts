@@ -54,14 +54,14 @@ Produce a single JSON object matching the required schema, with these rules:
   the coding agent. Make it complete and self-contained: what to change, which files are
   involved, the expected end state, and how to verify it. Do not address the user in it;
   address the implementer.
-- "scopedFilePaths": when you are confident the ENTIRE implementation stays within a small,
-  explicit list of existing repository-relative file paths (for example, a documentation-only
-  edit to one named file), list every one of them here, using forward slashes relative to the
-  repository root. This is a discovery hint for the implementing agent, not an access
-  restriction — it lets the agent read the named file(s) directly instead of first scanning the
-  whole repository to find them. Leave it empty (or omit it) whenever more than a few files
-  might be touched, a new file might need to be created, or you are not fully certain of the
-  exact set of paths.
+- "scopedFilePaths" must always be present. When you are confident the ENTIRE implementation
+  stays within a small, explicit list of existing repository-relative file paths (for example,
+  a documentation-only edit to one named file), provide every one of them, using forward
+  slashes relative to the repository root. This is a discovery hint for the implementing
+  agent, not an access restriction — it lets the agent read the named file(s) directly
+  instead of first scanning the whole repository to find them. Otherwise return an empty
+  array ([]) — whenever more than a few files might be touched, a new file might need to be
+  created, or you are not fully certain of the exact set of paths. Never omit the field.
 
 Scope discipline: specify the change the user asked for. Do not add refactors, upgrades,
 or "while we're here" improvements.

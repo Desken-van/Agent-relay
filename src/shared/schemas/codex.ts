@@ -17,7 +17,7 @@ import { z } from 'zod';
 /* Specification                                                               */
 /* -------------------------------------------------------------------------- */
 
-export const taskSpecificationSchema = z.object({
+const specificationFields = {
   title: z.string().min(1).max(200).describe('Short imperative title for the change.'),
   summary: z.string().min(1).describe('One or two paragraphs describing what will be built.'),
   assumptions: z
@@ -38,19 +38,45 @@ export const taskSpecificationSchema = z.object({
     .min(1)
     .describe(
       'A complete, self-contained instruction for the coding agent that will implement this task.'
-    ),
-  scopedFilePaths: z
-    .array(z.string().min(1).max(1024))
-    .max(20)
-    .optional()
-    .describe(
-      'When the ENTIRE implementation is confidently limited to a small, explicit list of existing ' +
-        'repository-relative file paths (for example, a documentation-only edit to one named file), ' +
-        'list every one of them here, using forward slashes relative to the repository root. This is ' +
-        'a discovery hint for the implementing agent, not an access restriction. Omit it whenever more ' +
-        'than a few files might be touched, a new file might need to be created, or you are not fully ' +
-        'certain of the exact set of paths.'
     )
+};
+
+const scopedFilePathsField = z
+  .array(z.string().min(1).max(1024))
+  .max(20)
+  .describe(
+    'Always include this field. When the ENTIRE implementation is confidently limited to a small, ' +
+      'explicit list of existing repository-relative file paths (for example, a documentation-only ' +
+      'edit to one named file), list every one of them here, using forward slashes relative to the ' +
+      'repository root. Otherwise return an empty array: more than a few files might be touched, a ' +
+      'new file might need to be created, or you are not fully certain of the exact set of paths. ' +
+      'This is a discovery hint for the implementing agent, not an access restriction.'
+  );
+
+/**
+ * The strict, model-facing specification contract. Every field is required:
+ * OpenAI structured outputs reject a schema whose `required` array does not
+ * list every key of `properties`, so an optional field can never be part of what
+ * the model is asked to produce. {@link taskSpecificationJsonSchema} is
+ * generated from this schema and from nothing else.
+ */
+export const taskSpecificationResponseSchema = z.object({
+  ...specificationFields,
+  scopedFilePaths: scopedFilePathsField
+});
+
+/**
+ * How Agent Relay reads a specification: the response contract, except that
+ * `scopedFilePaths` may be absent and then means "no declared scope" (`[]`).
+ * A specification stored before the field existed must stay readable, and
+ * every consumer of a stored specification uses this schema, so the fallback
+ * is defined once here. The factory gives each parse its own array.
+ *
+ * Derived from the response schema, overriding only that one field, so a field
+ * added to the contract reaches both the model and every reader.
+ */
+export const taskSpecificationSchema = taskSpecificationResponseSchema.extend({
+  scopedFilePaths: scopedFilePathsField.default(() => [])
 });
 
 export type TaskSpecification = z.infer<typeof taskSpecificationSchema>;
@@ -146,7 +172,7 @@ function toCodexOutputSchema(schema: z.ZodType): Record<string, unknown> {
 }
 
 export const taskSpecificationJsonSchema = (): Record<string, unknown> =>
-  toCodexOutputSchema(taskSpecificationSchema);
+  toCodexOutputSchema(taskSpecificationResponseSchema);
 
 export const codexReviewResultJsonSchema = (): Record<string, unknown> =>
   toCodexOutputSchema(codexReviewResultSchema);

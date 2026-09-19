@@ -33,6 +33,16 @@ export function specificationIdentity(raw: string | null): {
     });
   }
   const specification = taskSpecificationSchema.parse(value);
-  const canonical = JSON.stringify(specification);
+  // The identity is persisted (plan-review gates, review subjects) and compared
+  // by equality, so it must not move when the reader fills in a default. Only
+  // the keys the stored JSON actually had are hashed (still in the schema's key
+  // order, as before): a specification stored without `scopedFilePaths` keeps
+  // the hash it had before that field was normalized, and so would one lacking
+  // any field defaulted later. Presence is read from the stored JSON, because
+  // the parsed value always has every defaulted key.
+  const stored = value as Record<string, unknown>;
+  const canonical = JSON.stringify(
+    Object.fromEntries(Object.entries(specification).filter(([key]) => Object.hasOwn(stored, key)))
+  );
   return { specification, canonical, sha256: hash(canonical) };
 }

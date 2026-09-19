@@ -47,7 +47,8 @@ const specification: TaskSpecification = {
   acceptanceCriteria: ['It works.'],
   constraints: [],
   suggestedTests: ['Run the tests.'],
-  implementationPrompt: 'Do it.'
+  implementationPrompt: 'Do it.',
+  scopedFilePaths: []
 };
 
 function buildDetail(): TaskDetail {

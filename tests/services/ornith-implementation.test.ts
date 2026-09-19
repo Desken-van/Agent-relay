@@ -40,7 +40,8 @@ const specification: TaskSpecification = {
   constraints: [],
   assumptions: [],
   suggestedTests: [],
-  implementationPrompt: 'Use only the structured tool protocol.'
+  implementationPrompt: 'Use only the structured tool protocol.',
+  scopedFilePaths: []
 };
 
 async function git(cwd: string, args: readonly string[]): Promise<void> {

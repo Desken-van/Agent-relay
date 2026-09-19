@@ -47,6 +47,18 @@ import type {
 import { locateExecutable } from '../process/executable-locator';
 import type { ProcessRunner } from '../process/process-runner';
 import { buildReviewPrompt, buildSpecificationPrompt, buildTriagePrompt } from './prompts';
+import {
+  MAX_STDERR_DIAGNOSTIC_CHARS,
+  formatTerminalError,
+  isAuthenticationFailure,
+  parseCodexTerminalError,
+  preferTerminalError,
+  safeExcerpt,
+  scrubHomeDirectory,
+  splitProcessExit,
+  terminalEventMessage,
+  type CodexTerminalError
+} from './terminal-error';
 import { CodexImplementationEvidence } from './implementation-evidence';
 import { parseShellToolRule } from '../../../shared/domain/claude-tool-rules';
 import type { ImplementationRequest, ImplementationResult } from '../../ports';
@@ -88,6 +100,14 @@ export function bundledCodexPaths(): string[] {
     return [];
   }
 }
+
+/** The model-facing shape of an implementation turn's answer. Strict: every property is required. */
+export const IMPLEMENTATION_REPORT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: { report: { type: 'string' } },
+  required: ['report'],
+  additionalProperties: false
+};
 
 interface TurnOutcome {
   readonly threadId: string | null;
@@ -193,7 +213,7 @@ export class CodexSdkAdapter implements CodexAdapter {
     const thread = openThread(codex, threadId, threadOptions);
 
     const messages: string[] = [];
-    let failure: string | null = null;
+    let terminal: CodexTerminalError | null = null;
     let completed = false;
     const deadline = AbortSignal.timeout(context.timeoutMs);
     const signal = AbortSignal.any([context.signal, deadline]);
@@ -250,14 +270,14 @@ export class CodexSdkAdapter implements CodexAdapter {
             break;
 
           case 'turn.failed':
-            failure = event.error.message;
-            context.onProgress({ type: 'error', text: redactSecrets(event.error.message) });
+          case 'error': {
+            // The raw event stays in the run's event log; `terminal` is what
+            // the user is told, whatever the process does afterwards.
+            const raw = terminalEventMessage(event) ?? 'Codex reported an error without a message.';
+            terminal = preferTerminalError(terminal, parseCodexTerminalError(raw));
+            context.onProgress({ type: 'error', text: safeExcerpt(raw, 4_000) });
             break;
-
-          case 'error':
-            failure = event.message;
-            context.onProgress({ type: 'error', text: redactSecrets(event.message) });
-            break;
+          }
 
           default:
             break;
@@ -265,14 +285,23 @@ export class CodexSdkAdapter implements CodexAdapter {
       }
     } catch (error) {
       checkAbort();
-      throw this.toDomainError(error, thread.id ?? threadId);
+      // Captured before anything is persisted, so a failure while recording the
+      // diagnostic can never replace the provider's own error.
+      const domainError =
+        terminal === null
+          ? this.toDomainError(error, thread.id ?? threadId)
+          : this.toTerminalDomainError(terminal, thread.id ?? threadId);
+      recordProcessDiagnostics(error, context);
+      throw domainError;
     }
 
     checkAbort();
-    if (!completed && !failure) failure = 'The stream ended before the turn completed.';
 
-    if (failure) {
-      throw this.toDomainError(new Error(failure), thread.id ?? threadId);
+    if (terminal !== null) {
+      throw this.toTerminalDomainError(terminal, thread.id ?? threadId);
+    }
+    if (!completed) {
+      throw this.toDomainError(new Error('The stream ended before the turn completed.'), thread.id ?? threadId);
     }
 
     const finalResponse = messages.at(-1) ?? '';
@@ -280,9 +309,28 @@ export class CodexSdkAdapter implements CodexAdapter {
     return { threadId: thread.id ?? threadId, finalResponse };
   }
 
+  /**
+   * The failure the provider itself reported. It wins over anything the process
+   * printed: stderr is kept in the event log, never used to explain the cause.
+   */
+  private toTerminalDomainError(terminal: CodexTerminalError, threadId: string | null): AgentRelayError {
+    const message = formatTerminalError(terminal);
+    const details = threadId ? `thread ${threadId}` : undefined;
+
+    if (isAuthenticationFailure(terminal)) {
+      return new AgentRelayError('TOOL_UNAUTHENTICATED', 'Codex is not authenticated.', {
+        remediation: 'Run `codex login` in a terminal, then retry.',
+        details: message
+      });
+    }
+
+    return new AgentRelayError('TOOL_FAILED', `Codex failed: ${message}`, { details });
+  }
+
+  /** Fallback when Codex named no cause: whatever the process or transport said, bounded. */
   private toDomainError(error: unknown, threadId: string | null): AgentRelayError {
     const message = error instanceof Error ? error.message : String(error);
-    const redacted = redactSecrets(message);
+    const redacted = scrubHomeDirectory(redactSecrets(message));
     const lower = redacted.toLowerCase();
 
     if (lower.includes('abort') || lower.includes('cancel')) {
@@ -363,8 +411,7 @@ export class CodexSdkAdapter implements CodexAdapter {
       `${request.prompt}\n\nContinue from the files already present. Inspect the current diff before editing.\nRun a configured verification command as a standalone command after your final edit:\n${request.verificationCommands.map(rule => parseShellToolRule(rule)?.prefix).filter(Boolean).join('\n')}\nDo not commit, publish, discard files, or use MCP tools.`,
       this.threadOptions(request.model, { workingDirectory: request.worktreePath, sandboxMode: 'workspace-write',
         approvalPolicy: 'never', networkAccessEnabled: false, webSearchMode: 'disabled' }),
-      { type: 'object', properties: { report: { type: 'string' } }, required: ['report'], additionalProperties: false },
-      context, (event) => evidence.accept(event));
+      IMPLEMENTATION_REPORT_SCHEMA, context, (event) => evidence.accept(event));
     let report: unknown;
     try { report = JSON.parse(result.finalResponse).report; } catch { /* handled below */ }
     if (typeof report !== 'string' || !report.trim()) throw new AgentRelayError('PARSE_FAILED', 'Codex returned no implementation report.');
@@ -523,6 +570,25 @@ export class CodexSdkAdapter implements CodexAdapter {
 
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/**
+ * Keep the process's stderr in the run's event log when the SDK reports the
+ * process exiting non-zero. Best-effort: recording a diagnostic must never
+ * change, delay, or replace the error the run is failing with.
+ */
+function recordProcessDiagnostics(error: unknown, context: AgentRunContext): void {
+  const exit = splitProcessExit(error instanceof Error ? error.message : String(error));
+  if (exit === null || exit.stderr.trim().length === 0) return;
+  try {
+    context.onProgress({
+      type: 'stderr',
+      text: `Codex process stderr (${exit.exit}; diagnostic output, not the failure cause):\n${safeExcerpt(exit.stderr, MAX_STDERR_DIAGNOSTIC_CHARS)}`,
+      data: { exit: exit.exit }
+    });
+  } catch {
+    // Deliberately swallowed: see above.
+  }
 }
 
 /** Turn a Codex thread item into a timeline entry, or null when not worth showing. */
