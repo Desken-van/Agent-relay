@@ -480,7 +480,9 @@ export function CodeReviewPanel({
                         blockedReason={
                           draft.action !== '' || draft.reason.trim().length > 0
                             ? 'You have already chosen a decision for this finding. Clear it first if you want Auto decide to decide instead.'
-                            : null
+                            : stop
+                              ? 'Auto decide stopped on this finding on purpose. It needs your decision.'
+                              : null
                         }
                         onClick={() => queue.start([finding.id])}
                       />

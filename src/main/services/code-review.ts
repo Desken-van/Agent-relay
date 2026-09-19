@@ -1919,6 +1919,25 @@ export class CodeReviewService {
     };
     const before = alreadyDecided();
     if (before !== null) return before;
+    // A stop automation already made for this finding, on this code, is not asked
+    // about again: asking twice must not be a way to turn "needs a person" into an
+    // automatic decision. The stored answer is reported as it was.
+    const newest = this.deps.reviews.latestSubject(taskId);
+    const stopped = codeReviewCurrentTriageRecommendations(
+      this.deps.reviews.getTriage(taskId),
+      newest?.subjectSha256 ?? null,
+      newest === null
+        ? []
+        : this.deps.reviews.listFindings(taskId).filter((entry) => entry.subjectSha256 === newest.subjectSha256)
+    ).find((entry) => entry.findingId === findingId && entry.recommendation === 'needs_user');
+    if (stopped !== undefined) {
+      return {
+        kind: 'needs_user',
+        reason: stopped.reason,
+        evidenceRef: stopped.evidenceRef,
+        confidence: stopped.confidence
+      };
+    }
 
     let recommendation: FindingTriageRecommendation | undefined;
     try {

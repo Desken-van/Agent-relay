@@ -544,7 +544,10 @@ recommendation and leaves the finding undecided. A finding that already has a sa
 automatic decision is never analyzed again: a repeated request (a refresh, a second
 window, a click after a lost answer) returns the saved decision with no Codex call, and
 an answer that finishes after another writer saved one is dropped in its favour, so the
-first saved answer stands and a repeat can never contradict it. The operator's own
+first saved answer stands and a repeat can never contradict it. A stop is just as
+firm: once automation has stopped on a finding (`needs_user`) for a round, asking again
+reports the stored stop with no Codex call, so a repeat cannot turn "needs a person"
+into an automatic decision, and the button says why it is off. The operator's own
 draft always wins over a saved decision, and a finding with a typed draft cannot be
 analyzed at all (its Auto decide button is disabled), so a draft is never replaced.
 The detail read (`planReview:get`, `codeReview:get`) also reports `analyzing`, the

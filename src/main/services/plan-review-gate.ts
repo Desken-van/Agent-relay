@@ -445,6 +445,11 @@ export function assertPlanReviewAllowsApproval(input: {
   }
 }
 
+/** A recorded stop, reported the way a fresh one is. */
+function stoppedOutcome(stop: PlanReviewTriageRecommendation): PlanAutoDecideOutcome {
+  return { kind: 'needs_user', reason: stop.reason, evidenceRef: stop.evidenceRef, confidence: stop.confidence };
+}
+
 function planText(specification: TaskSpecification, snapshot: RuleEvidenceSnapshot): string {
   const text = [
     '## Specification under review',
@@ -1254,6 +1259,11 @@ export class PlanReviewGateService {
     // operator overrides it by deciding the finding themselves, not by asking again.
     const saved = this.savedAutoDecision(gate, request.findingIndex);
     if (saved !== null) return { gate, outcome: { kind: 'decided', decision: saved } };
+    // Likewise a stop: once automation has stopped on a finding of this round because
+    // it needs a person, asking again cannot turn that into an automatic decision.
+    // The operator decides it; nothing is re-analyzed on their behalf.
+    const stopped = this.savedStop(gate, request.findingIndex);
+    if (stopped !== null) return { gate, outcome: stoppedOutcome(stopped) };
 
     const validated = await this.analyzeFindings(task, project.localPath, findings, [request.findingIndex], signal);
     const recommendation = validated.recommendations[0]!;
@@ -1275,6 +1285,8 @@ export class PlanReviewGateService {
       // Written by another process while this analysis ran: the first saved answer stands.
       const winner = this.savedAutoDecision(current, request.findingIndex);
       if (winner !== null) return { gate: current, outcome: { kind: 'decided', decision: winner } };
+      const halted = this.savedStop(current, request.findingIndex);
+      if (halted !== null) return { gate: current, outcome: stoppedOutcome(halted) };
       const merged = this.mergeAutoResult(current, recommendation);
       const applied = this.deps.gates.updateIfUnchanged(current.id, merged.patch, current.revision);
       if (applied !== null) return { gate: applied, outcome: merged.outcome };
@@ -1290,6 +1302,16 @@ export class PlanReviewGateService {
     return (
       parsePlanReviewAutoDecisions(gate.autoDecisionsJson, planFindingsSha256(gate.findingsJson)).find(
         (decision) => decision.finding === findingIndex
+      ) ?? null
+    );
+  }
+
+  /** The stop Auto decide already recorded for this finding of this round, if any. */
+  private savedStop(gate: PlanReviewGate, findingIndex: number): PlanReviewTriageRecommendation | null {
+    if (gate.findingsJson === null || gate.triageForFindings !== gate.findingsJson) return null;
+    return (
+      parsePlanReviewTriage(gate.triageJson)?.recommendations.find(
+        (entry) => entry.finding === findingIndex && entry.recommendation === 'needs_user'
       ) ?? null
     );
   }

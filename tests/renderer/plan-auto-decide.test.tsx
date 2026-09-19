@@ -286,6 +286,10 @@ describe('plan review: Auto decide beside every Decision', () => {
     expect(screen.getByText('This is an architecture choice.')).toBeTruthy();
     expect(decisionSelects()[0]!.value).toBe('');
     expect(reasonInputs()[0]!.value).toBe('');
+    // Asking again would not change the answer, so the button says why it is off.
+    expect(autoButton('Finding A')).toHaveProperty('disabled', true);
+    expect(autoButton('Finding A').getAttribute('title')).toMatch(/stopped on this finding on purpose/i);
+    expect(autoButton('Finding B')).toHaveProperty('disabled', false);
   });
 
   it('shows Analyzing… inside the finding, disables only that finding’s button, and leaves the rest usable', async () => {

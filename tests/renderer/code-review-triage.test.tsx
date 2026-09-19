@@ -335,6 +335,10 @@ describe('code review: Auto decide beside every Decision', () => {
     expect(within(card).getByRole('button', { name: /Submit decision/ })).toBeTruthy();
     expect(screen.queryByText(/Decided:/)).toBeNull();
     expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
+    // Asking again would not change the answer, so the button says why it is off.
+    expect(autoButton('Finding A')).toHaveProperty('disabled', true);
+    expect(autoButton('Finding A').getAttribute('title')).toMatch(/stopped on this finding on purpose/i);
+    expect(autoButton('Finding B')).toHaveProperty('disabled', false);
   });
 
   it('shows Analyzing… in the finding, and disables only what conflicts with it', async () => {

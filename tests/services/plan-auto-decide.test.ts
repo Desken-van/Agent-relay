@@ -192,16 +192,27 @@ describe('plan review: per-finding Auto decide', () => {
     expect(saved[0]).toMatchObject({ finding: 0, action: 'accept' });
   });
 
-  it('still lets a finding with only a stop recommendation be analyzed again', async () => {
+
+  it('a stop is sticky for the round: asking again reports it and never turns it into an automatic decision', async () => {
     const value = setup();
     const { task, gate } = await awaitingThree(value);
+    // The second answer would accept: it must never be asked for.
     value.harness.codex.triageQueue.push([recommend(0, 'needs_user', 'Unsure.')], [recommend(0, 'accept', 'Clear now.')]);
 
-    await value.service.autoDecide(task.id, request(gate, 0));
+    const first = await value.service.autoDecide(task.id, request(gate, 0));
+    const before = value.harness.planReviewGates.findByTask(task.id) as PlanReviewGate;
     const second = await value.service.autoDecide(task.id, request(gate, 0));
+    const after = value.harness.planReviewGates.findByTask(task.id) as PlanReviewGate;
 
-    expect(second.outcome).toMatchObject({ kind: 'decided', decision: { finding: 0, action: 'accept' } });
-    expect(value.harness.codex.triageCalls).toHaveLength(2);
+    expect(first.outcome).toMatchObject({ kind: 'needs_user', reason: 'Unsure.' });
+    expect(second.outcome).toEqual(first.outcome);
+    expect(value.harness.codex.triageCalls).toHaveLength(1);
+    expect(after.revision).toBe(before.revision);
+    expect(parsePlanReviewAutoDecisions(after.autoDecisionsJson, planFindingsSha256(gate.findingsJson as string))).toEqual([]);
+    // The "accept" answer was never consumed. Other findings are unaffected by the stop.
+    expect(value.harness.codex.triageQueue).toHaveLength(1);
+    value.harness.codex.triageQueue.splice(0, 1, [recommend(1, 'accept', 'Fine.')]);
+    expect((await value.service.autoDecide(task.id, request(gate, 1))).outcome).toMatchObject({ kind: 'decided' });
   });
 
   it('merges results per finding instead of replacing what siblings already learned', async () => {

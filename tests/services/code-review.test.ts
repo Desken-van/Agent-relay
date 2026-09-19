@@ -3160,6 +3160,20 @@ describe('code-review Auto decide', () => {
     expect(value.reviews.getTriage(value.task.id)?.triageJson).toContain('A product choice.');
   });
 
+  it('a stop is sticky for that code: asking again reports it and never turns it into an automatic decision', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    // The second answer would accept: it must never be asked for.
+    codex.triageQueue.push([recommend(findings[0]!.id, 'needs_user', 'A product choice.')], [recommend(findings[0]!.id, 'accept', 'Clear now.')]);
+
+    const first = await service.autoDecide(value.task.id, { findingId: findings[0]!.id });
+    const second = await service.autoDecide(value.task.id, { findingId: findings[0]!.id });
+
+    expect(first).toMatchObject({ kind: 'needs_user', reason: 'A product choice.' });
+    expect(second).toEqual(first);
+    expect(codex.triageCalls).toHaveLength(1);
+    expect(value.reviews.latestDecision(findings[0]!.id)).toBeNull();
+  });
+
   it('never overwrites a durable decision, and does not even ask Codex', async () => {
     const { value, codex, service, findings } = await withFindings();
     await value.service.decide(value.task.id, {

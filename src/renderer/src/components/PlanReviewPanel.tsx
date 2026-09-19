@@ -971,7 +971,9 @@ export function PlanReviewPanel({
                     blockedReason={
                       hasDraft(index)
                         ? 'You have already chosen a decision for this finding. Clear it first if you want Auto decide to decide instead.'
-                        : null
+                        : needsUserByFinding.has(index)
+                          ? 'Auto decide stopped on this finding on purpose. It needs your decision.'
+                          : null
                     }
                     onClick={() => startAutoDecide([index], false)}
                   />
