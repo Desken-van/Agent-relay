@@ -588,7 +588,18 @@ export class PlanReviewGateService {
    */
   prepare(taskId: string, options: { inheritContractFrom?: PlanReviewGate | null } = {}): PlanReviewGate {
     const { snapshot, specificationSha256, reusable } = this.preparable(taskId);
-    if (reusable !== null) return reusable;
+    if (reusable !== null) {
+      // A gate for this specification may already exist — prepared by an earlier
+      // attempt or from another screen before the loop got here — without a
+      // fingerprint. Reusing it as it is would let the review adopt whatever
+      // contract the provider now has; the previous round's fingerprint is
+      // carried onto it, so `open` compares against it as it would for a new row.
+      const inherited = options.inheritContractFrom?.contractFingerprint ?? null;
+      if (inherited !== null && reusable.status === 'prepared' && reusable.contractFingerprint === null) {
+        return this.deps.gates.update(reusable.id, { contractFingerprint: inherited });
+      }
+      return reusable;
+    }
     return this.deps.gates.create({
       id: this.deps.ids.next(),
       taskId,

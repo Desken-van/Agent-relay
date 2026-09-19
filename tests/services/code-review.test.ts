@@ -3217,12 +3217,15 @@ describe('code-review Auto decide', () => {
     const second = service.autoDecide(value.task.id, { findingId: findings[1]!.id });
     await Promise.resolve();
 
+    // The detail read reports exactly what is running, so a reloaded screen can show it.
+    expect([...value.claims.analyzingFindings(value.task.id)].sort()).toEqual([findings[0]!.id, findings[1]!.id].sort());
     await expect(service.autoDecide(value.task.id, { findingId: findings[0]!.id })).rejects.toMatchObject({ code: 'BUSY' });
     await expect(service.review(value.task.id)).rejects.toMatchObject({ code: 'BUSY' });
     await expect(service.triage(value.task.id)).rejects.toMatchObject({ code: 'BUSY' });
 
     release(undefined);
     await Promise.all([first, second]);
+    expect(value.claims.analyzingFindings(value.task.id)).toEqual([]);
     expect(value.reviews.latestDecision(findings[0]!.id)?.action).toBe('accept');
     expect(value.reviews.latestDecision(findings[1]!.id)?.action).toBe('reject');
     // Both recommendations survive in the durable triage record: results merge, they do not replace.
@@ -3335,6 +3338,16 @@ describe('code-review accepted findings as correction requirements', () => {
     // Now the operator may say the code moved on — and only then does the requirement close.
     await decide(accepted, 'resolved');
     expect(value.reviews.latestDecision(accepted.id)?.action).toBe('resolved');
+    expect(value.service.acceptedRequirements(value.task.id)).toEqual([]);
+  });
+
+  it('lets the operator overrule an accepted finding with a rejection, keeping both decisions in the history', async () => {
+    const { value, accepted, decide } = await withAccepted();
+
+    await decide(accepted, 'reject');
+
+    expect(value.reviews.latestDecision(accepted.id)?.action).toBe('reject');
+    expect(value.reviews.listDecisions(accepted.id).map((entry) => entry.action)).toEqual(['accept', 'reject']);
     expect(value.service.acceptedRequirements(value.task.id)).toEqual([]);
   });
 

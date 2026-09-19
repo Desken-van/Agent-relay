@@ -116,6 +116,11 @@ export class PlanReviewClaims {
     };
   }
 
+  /** The findings being analyzed in this process right now, ascending. For the detail read. */
+  analyzingFindings(taskId: string): number[] {
+    return [...(this.analyzing.get(taskId) ?? [])].sort((a, b) => a - b);
+  }
+
   /** Publish the loop's phase. Cleared automatically when its claim is released. */
   setLoop(taskId: string, state: PlanCorrectionLoopState): void {
     if (this.exclusive.get(taskId) === 'advance') this.loops.set(taskId, state);

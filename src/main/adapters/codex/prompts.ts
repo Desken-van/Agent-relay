@@ -135,7 +135,9 @@ Produce a single JSON object matching the required schema, with two parts:
   ("Finding N" is N), the specification field in which you addressed it, and one or two
   sentences saying what you changed there. That field must really differ from the current
   specification: a finding you claim but did not change is refused, and so is an accepted
-  finding you do not mention.
+  finding you do not mention. List EVERY field you changed: a field that differs from the
+  current specification but is not tied to an accepted finding is an unrequested change and
+  the whole revision is refused.
 
 Rules for the revision:
 

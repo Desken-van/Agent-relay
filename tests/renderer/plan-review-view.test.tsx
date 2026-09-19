@@ -49,8 +49,9 @@ const ROUND_SHA = 'b'.repeat(64);
 const roundFields = {
   findingsSha256: null,
   autoDecisions: [],
+  analyzing: [],
   correction: NO_CORRECTION
-} satisfies Pick<PlanReviewDetail, 'findingsSha256' | 'autoDecisions' | 'correction'>;
+} satisfies Pick<PlanReviewDetail, 'findingsSha256' | 'autoDecisions' | 'analyzing' | 'correction'>;
 
 const emptyDetail: PlanReviewDetail = {
   ...roundFields,

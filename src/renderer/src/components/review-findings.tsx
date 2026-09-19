@@ -188,6 +188,33 @@ export function useAutoDecideQueue<K extends string | number>(options: {
   };
 }
 
+const BACKEND_ANALYZING: AutoDecideItemState = { phase: 'analyzing' };
+const BACKEND_POLL_MS = 2_000;
+
+/**
+ * What to show for a finding: what this screen's own queue says, else
+ * "analyzing" when the main process says a request for it is still running — a
+ * request a reloaded or second screen started and this one has no memory of.
+ * While such requests run, the round is read back every couple of seconds, so
+ * the finding shows its result when it arrives and never offers a second click
+ * for work that is already under way.
+ */
+export function useAnalysisState<K extends string | number>(options: {
+  readonly queue: AutoDecideQueue<K>;
+  readonly analyzing: readonly K[];
+  readonly refresh: () => Promise<void>;
+}): (key: K) => AutoDecideItemState | undefined {
+  const { queue, analyzing, refresh } = options;
+  const foreign = analyzing.some((key) => queue.stateOf(key) === undefined);
+  const busy = queue.busy;
+  useEffect(() => {
+    if (!foreign || busy) return undefined;
+    const timer = setInterval(() => void refresh(), BACKEND_POLL_MS);
+    return () => clearInterval(timer);
+  }, [foreign, busy, refresh]);
+  return (key) => queue.stateOf(key) ?? (analyzing.includes(key) ? BACKEND_ANALYZING : undefined);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Controls                                                                     */
 /* -------------------------------------------------------------------------- */

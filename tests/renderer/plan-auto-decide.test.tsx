@@ -104,6 +104,7 @@ function awaiting(count: number, overrides: Partial<PlanReviewDetail> = {}): Pla
       role: 'SecurityReliability'
     })),
     autoDecisions: [],
+    analyzing: [],
     correction: NO_CORRECTION,
     ...overrides
   };
@@ -123,6 +124,10 @@ function round(initial: PlanReviewDetail) {
   });
   return {
     get: (): PlanReviewDetail => current,
+    /** What the main process reports as being analyzed right now. */
+    setAnalyzing(indexes: readonly number[]): void {
+      current = { ...current, analyzing: indexes };
+    },
     decided(finding: number, action: 'accept' | 'reject', reason = `Because ${finding}.`) {
       const decision: PlanReviewAutoDecision = {
         finding,
@@ -383,6 +388,34 @@ describe('plan review: Auto decide beside every Decision', () => {
 
     expect(await screen.findByText(/You chose Reject instead/)).toBeTruthy();
     expect(decisionSelects()[0]!.value).toBe('reject');
+  });
+
+  it('after a reload, still shows an analysis the main process is running, offers no second click, and picks up its result', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    serve(awaiting(2, { analyzing: [0] }), (index, s) => s.decided(index, 'accept'));
+    renderPanel();
+
+    // This screen has no memory of the request, but the process says it is running.
+    const first = await screen.findByRole('button', { name: 'Auto decide: Finding A' });
+    expect(first.textContent).toContain('Analyzing…');
+    expect(first).toHaveProperty('disabled', true);
+    expect(within(first.closest('.finding') as HTMLElement).getByRole('status').textContent).toContain('Analyzing…');
+    fireEvent.click(first);
+    expect(autoCalls()).toHaveLength(0);
+    // Other findings are unaffected, and "all undecided" leaves the running one alone.
+    expect(autoButton('Finding B')).toHaveProperty('disabled', false);
+    fireEvent.click(screen.getByRole('button', { name: /Auto decide all undecided/ }));
+    await waitFor(() => expect(autoCalls().map((call) => call.findingIndex)).toEqual([1]));
+
+    // The request finishes in the main process; the next read shows its saved decision.
+    server.decided(0, 'accept');
+    server.setAnalyzing([]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_100);
+    });
+    await waitFor(() => expect(decisionSelects()[0]!.value).toBe('accept'));
+    expect(autoButton('Finding A').textContent).not.toContain('Analyzing');
+    expect(autoCalls().map((call) => call.findingIndex)).toEqual([1]);
   });
 
   it('will not analyze a finding the operator has already chosen or typed for, so a draft can never be discarded', async () => {

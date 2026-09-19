@@ -32,6 +32,7 @@ import {
   AutoDecideSummaryLine,
   AutoFindingStatus,
   DecisionGlossary,
+  useAnalysisState,
   useAutoDecideQueue,
   type AutoDecideKind
 } from './review-findings';
@@ -39,6 +40,7 @@ import {
 type CodeDecisionDraft = { action: '' | CodeReviewDecisionAction; reason: string };
 const NO_CODE_DECISIONS: Record<string, CodeDecisionDraft> = {};
 const NO_CODE_FINDINGS: readonly CodeReviewFinding[] = [];
+const NO_ANALYZING: readonly string[] = [];
 /** Findings analyzed at once. Each analysis re-reads the working tree, so this stays small. */
 const AUTO_DECIDE_CONCURRENCY = 2;
 
@@ -90,6 +92,9 @@ export function CodeReviewPanel({
     readonly drafts: Record<string, CodeDecisionDraft>;
   }>({ subjectSha256: null, drafts: {} });
   const [resolveReasons, setResolveReasons] = useState<Record<string, string>>({});
+  // Findings whose automatic decision the operator is overruling, and why.
+  const [changing, setChanging] = useState<Record<string, boolean>>({});
+  const [changeReasons, setChangeReasons] = useState<Record<string, string>>({});
 
   const refresh = useCallback(async (): Promise<void> => {
     const result = await call('codeReview:get', { taskId: task.id });
@@ -178,12 +183,13 @@ export function CodeReviewPanel({
     // once the queue drains the panel reads the truth back once.
     onIdle: () => void refresh()
   });
+  const autoStateOf = useAnalysisState({ queue, analyzing: detail?.analyzing ?? NO_ANALYZING, refresh });
   // "Undecided" for the bulk action: no durable decision, nothing being drafted,
   // and not a finding Codex already stopped on. Failed ones are included.
   const bulkIds = undecidedFindings
     .filter((finding) => {
       const draft = decisions[finding.id];
-      const state = queue.stateOf(finding.id);
+      const state = autoStateOf(finding.id);
       return (
         (draft === undefined || (draft.action === '' && draft.reason.trim().length === 0)) &&
         !needsUserById.has(finding.id) &&
@@ -382,15 +388,68 @@ export function CodeReviewPanel({
                 {finding.fix ? <div className="muted selectable" style={{ marginTop: 6 }}>Suggested: {finding.fix}</div> : null}
 
                 {decided ? (
-                  <div className="muted selectable" style={{ marginTop: 6 }}>
-                    <strong>Decided: {decided.action}</strong>
-                    {decided.actor === 'system' ? <span className="tag"> auto-decided</span> : null} — {decided.reason}
-                  </div>
+                  <>
+                    <div className="muted selectable" style={{ marginTop: 6 }}>
+                      <strong>Decided: {decided.action}</strong>
+                      {decided.actor === 'system' ? <span className="tag"> auto-decided</span> : null} — {decided.reason}
+                    </div>
+                    {/* Codex can be wrong. An automatic accept or reject stays in the audit history;
+                        the operator's own decision is recorded after it and is the one in force. */}
+                    {decided.actor === 'system' && decided.action !== 'resolved' ? (
+                      changing[finding.id] === true ? (
+                        <div className="decision-row">
+                          <div className="decision-row__reason">
+                            <Field label={`Why ${decided.action === 'accept' ? 'reject' : 'accept'} it instead?`} hint="Required">
+                              <input
+                                className="input"
+                                value={changeReasons[finding.id] ?? ''}
+                                onChange={(event) =>
+                                  setChangeReasons((current) => ({ ...current, [finding.id]: event.target.value }))
+                                }
+                              />
+                            </Field>
+                          </div>
+                          <button
+                            type="button"
+                            className="btn btn--sm"
+                            disabled={busy !== null || (changeReasons[finding.id] ?? '').trim().length === 0}
+                            aria-label={`${decided.action === 'accept' ? 'Reject' : 'Accept'} instead: ${finding.title}`}
+                            onClick={() => {
+                              decide(finding, decided.action === 'accept' ? 'reject' : 'accept', changeReasons[finding.id] ?? '');
+                              setChanging((current) => ({ ...current, [finding.id]: false }));
+                            }}
+                          >
+                            {decided.action === 'accept' ? 'Reject instead' : 'Accept instead'}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn--sm btn--ghost"
+                            onClick={() => setChanging((current) => ({ ...current, [finding.id]: false }))}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="row" style={{ marginTop: 6 }}>
+                          <button
+                            type="button"
+                            className="btn btn--sm"
+                            disabled={busy !== null}
+                            aria-label={`Change decision: ${finding.title}`}
+                            title="Codex decided this. Overrule it with your own decision; the automatic one stays in the history."
+                            onClick={() => setChanging((current) => ({ ...current, [finding.id]: true }))}
+                          >
+                            Change decision
+                          </button>
+                        </div>
+                      )
+                    ) : null}
+                  </>
                 ) : (
                   <>
                     <AutoFindingStatus
                       facts={{
-                        queue: queue.stateOf(finding.id),
+                        queue: autoStateOf(finding.id),
                         decided: null,
                         needsUser: stop ? { reason: stop.reason, evidenceRef: stop.evidenceRef, confidence: stop.confidence } : null,
                         operatorChoice: null
@@ -415,7 +474,7 @@ export function CodeReviewPanel({
                         </Field>
                       </div>
                       <AutoDecideButton
-                        state={queue.stateOf(finding.id)}
+                        state={autoStateOf(finding.id)}
                         findingLabel={finding.title}
                         disabled={!integrationEnabled || busy !== null}
                         blockedReason={

@@ -260,6 +260,8 @@ describe('plan review: per-finding Auto decide', () => {
     const first = value.service.autoDecide(task.id, request(gate, 0));
     await Promise.resolve();
 
+    // The detail read reports what is running, so a reloaded screen can show it and not offer a second click.
+    expect(value.claims.analyzingFindings(task.id)).toEqual([0]);
     await expect(value.service.autoDecide(task.id, request(gate, 0))).rejects.toMatchObject({ code: 'BUSY' });
     await expect(value.service.review(task.id)).rejects.toMatchObject({ code: 'BUSY' });
     await expect(
@@ -270,6 +272,7 @@ describe('plan review: per-finding Auto decide', () => {
 
     release.resolve(undefined);
     await first;
+    expect(value.claims.analyzingFindings(task.id)).toEqual([]);
   });
 
   it('fails safe against another round: a stale round identity persists nothing', async () => {

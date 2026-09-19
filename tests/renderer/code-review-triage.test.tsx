@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { Task } from '../../src/shared/domain/models';
 import type { CodeReviewDetail, IpcResult } from '../../src/shared/ipc';
 import type {
@@ -145,6 +145,8 @@ class Server {
   decisions: Record<string, CodeReviewDecision> = {};
   recommendations: Parameters<typeof triageRecord>[1][number][] = [];
   statusOverrides: Record<string, CodeRequirementStatus> = {};
+  /** Findings the main process is analyzing right now (what a reloaded panel is told). */
+  analyzing: string[] = [];
   subject: CodeReviewSubject = subject();
 
   constructor(count: number, titles: readonly string[] = ['Finding A', 'Finding B', 'Finding C']) {
@@ -170,7 +172,8 @@ class Server {
       totalFindingsEverRecorded: this.findings.length,
       identityProblem: null,
       triage: this.recommendations.length > 0 ? triageRecord(snapshot, this.recommendations) : null,
-      correctionRequirements: requirements
+      correctionRequirements: requirements,
+      analyzing: this.analyzing
     };
   }
 
@@ -199,6 +202,14 @@ class Server {
       confidence: 'low'
     };
     return ok<'codeReview:autoDecide'>({ detail: this.detail(), outcome });
+  }
+
+  /** The operator's own decision: recorded after whatever was there, and the one in force. */
+  operatorDecided(id: string, action: 'accept' | 'reject', reason: string) {
+    const target = this.findings.find((entry) => entry.id === id)!;
+    this.decisions = { ...this.decisions, [id]: decisionRecord(target, action, { reason, actor: 'operator', source: 'test' }) };
+    this.findings = this.findings.map((entry) => (entry.id === id ? { ...entry, revision: entry.revision + 1 } : entry));
+    return ok<'codeReview:decide'>(this.detail());
   }
 
   /** Someone else decided it first: the durable decision stays and Codex's answer is dropped. */
@@ -372,6 +383,35 @@ describe('code review: Auto decide beside every Decision', () => {
     await screen.findByText(/Decided: accept/);
     expect(screen.queryByRole('alert')).toBeNull();
     expect(autoCalls().map((call) => call.findingId)).toEqual(['f-1', 'f-1']);
+  });
+
+  it('after a reload, still shows an analysis the main process is running, offers no second click, and picks up its result', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    serve(2);
+    server.analyzing = ['f-1'];
+    renderPanel();
+
+    const first = await screen.findByRole('button', { name: 'Auto decide: Finding A' });
+    expect(first.textContent).toContain('Analyzing…');
+    expect(first).toHaveProperty('disabled', true);
+    expect(within(first.closest('.finding') as HTMLElement).getByRole('status').textContent).toContain('Analyzing…');
+    fireEvent.click(first);
+    expect(autoCalls()).toHaveLength(0);
+    // "All undecided" leaves the running one alone.
+    fireEvent.click(screen.getByRole('button', { name: /Auto decide all undecided/ }));
+    await waitFor(() => expect(autoCalls().map((call) => call.findingId)).toEqual(['f-2']));
+
+    // The request finishes in the main process; the next read shows its durable decision.
+    server.autoDecided('f-1', 'accept');
+    server.analyzing = [];
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_100);
+    });
+    // Finding A's OWN card now carries the decision (finding B was decided by the bulk run).
+    await waitFor(() =>
+      expect((screen.getAllByText('Finding A')[0]!.closest('.finding') as HTMLElement).textContent).toContain('Decided: accept')
+    );
+    expect(autoCalls().map((call) => call.findingId)).toEqual(['f-2']);
   });
 
   it('will not analyze a finding the operator has already chosen or typed for, so a draft can never be buried', async () => {
@@ -671,6 +711,71 @@ describe('code review: manual decisions keep working beside Auto decide', () => 
       action: 'accept',
       reason: 'Yes, it is valid.'
     });
+  });
+});
+
+describe('code review: Codex can be wrong, so its decision can be overruled', () => {
+  it('offers “Change decision” only on a decision Codex made, never on the operator’s own', async () => {
+    serve(2);
+    server.autoDecided('f-1', 'accept');
+    server.operatorDecided('f-2', 'reject', 'Mine.');
+    renderPanel();
+
+    expect(await screen.findByRole('button', { name: 'Change decision: Finding A' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Change decision: Finding B' })).toBeNull();
+    // Nothing is offered until the operator asks for it.
+    expect(screen.queryByLabelText(/Why reject it instead/)).toBeNull();
+  });
+
+  it('overrules a wrong automatic accept: needs a reason, submits the finding’s own revision, and the requirement goes away', async () => {
+    serve(2);
+    server.autoDecided('f-1', 'accept', 'Codex thought it valid.');
+    bridge.set('codeReview:decide', (input) => {
+      const { findingId, action, reason } = input as { findingId: string; action: 'accept' | 'reject'; reason: string };
+      return server.operatorDecided(findingId, action, reason);
+    });
+    renderPanel();
+    expect(await screen.findByLabelText('Correction requirements')).toBeTruthy();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Change decision: Finding A' }));
+    const submit = screen.getByRole('button', { name: 'Reject instead: Finding A' });
+    expect(submit).toHaveProperty('disabled', true);
+    fireEvent.change(screen.getByLabelText(/Why reject it instead/), { target: { value: 'The premise is wrong.' } });
+    expect(submit).toHaveProperty('disabled', false);
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(1));
+    expect(bridge.callsTo('codeReview:decide')[0]?.input).toEqual({
+      taskId: 'task-1',
+      findingId: 'f-1',
+      expectedRevision: 1,
+      action: 'reject',
+      reason: 'The premise is wrong.'
+    });
+    const decided = await screen.findByText(/Decided: reject/);
+    const card = decided.closest('.finding') as HTMLElement;
+    expect(card.textContent).toContain('The premise is wrong.');
+    // Now it is the operator's decision: not labelled automatic, and no longer overrulable.
+    expect(card.textContent).not.toContain('auto-decided');
+    expect(within(card).queryByRole('button', { name: /Change decision/ })).toBeNull();
+    // A rejected finding is not a correction still owed.
+    expect(screen.queryByLabelText('Correction requirements')).toBeNull();
+    // The automatic decision is still in the history: the operator's was appended after it.
+    expect(server.decisions['f-1']!.actor).toBe('operator');
+  });
+
+  it('lets the operator back out without recording anything', async () => {
+    serve(1);
+    server.autoDecided('f-1', 'reject');
+    renderPanel();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Change decision: Finding A' }));
+    expect(screen.getByRole('button', { name: 'Accept instead: Finding A' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(screen.queryByLabelText(/Why accept it instead/)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Change decision: Finding A' })).toBeTruthy();
+    expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
   });
 });
 

@@ -545,7 +545,12 @@ automatic decision is never analyzed again: a repeated request (a refresh, a sec
 window, a click after a lost answer) returns the saved decision with no Codex call, and
 an answer that finishes after another writer saved one is dropped in its favour, so the
 first saved answer stands and a repeat can never contradict it. The operator's own
-draft always wins over a saved decision.
+draft always wins over a saved decision, and a finding with a typed draft cannot be
+analyzed at all (its Auto decide button is disabled), so a draft is never replaced.
+The detail read (`planReview:get`, `codeReview:get`) also reports `analyzing`, the
+findings whose analysis is running in the main process right now, so a panel that was
+reloaded mid-analysis still shows it, offers no second click, and reads the round back
+every two seconds until the result arrives.
 A stored decision is not a resolution: the round stays `awaiting_resolve` until the
 operator resolves it. Plan review has no per-finding durable decision, so this
 stands in for one, keyed by the round it answers so a new round can never inherit it.
@@ -588,8 +593,10 @@ freezes what Codex was given (`accepted_json`). Codex must answer with the compl
 revised specification AND, for every accepted finding, the specification field in which
 it was addressed and what changed there (`addressed_json`, stored with the completion
 and shown in the panel). Before anything is committed the service checks that every
-accepted finding is named, that none is named that was not accepted, and that every
-claimed field really differs from the specification being revised; otherwise the
+accepted finding is named, that none is named that was not accepted, that every
+claimed field really differs from the specification being revised, and that no field
+changed without being tied to an accepted finding (an unrequested rewrite of a
+constraint, the scope or the implementation prompt is refused); otherwise the
 correction is marked `failed`, nothing is stored, and the same row is retried. This
 does not prove a finding is fixed — only the fresh independent review can — but a
 revision that changed something unrelated, or ignored a finding, is refused instead of
@@ -602,11 +609,17 @@ as `interrupted` when no loop is alive in this process. `task_specification_vers
 is append-only, enforced by an `UPDATE` trigger; the first version is recorded
 lazily in the transaction that opens the first correction. Every revised
 specification is a new hash, so the existing gate-per-hash rule gives it a fresh
-rule-evidence binding and a fresh Coai session round.
+rule-evidence binding and a fresh Coai session round. That gate is created carrying
+the previous round's contract fingerprint, and a gate for the revised specification
+that already exists (prepared by an earlier attempt or from another screen) has the
+fingerprint carried onto it, so a provider whose tool contract changed between rounds
+is flagged, never adopted.
 
 The loop stops, and says why, on: `needs_user` findings (Auto decide stops on
 purpose), a verdict that needs a human, Coai's contract fingerprint changing, a gate
-that needs reconciliation, the correction budget, a stale revision or concurrent
+that needs reconciliation, the correction budget (checked BEFORE accepted decisions
+are sent to the external reviewer, so findings the budget cannot revise are never
+recorded as accepted there; the round stays open), a stale revision or concurrent
 mutation, or a Codex/validation failure (the row is marked `failed` and nothing is
 changed). It never approves the specification and never advances past an accepted
 finding the specification does not yet reflect: approval refuses a specification whose
@@ -626,7 +639,9 @@ closed only by an explicit `resolved` decision, which the service accepts for a
 finding of an older subject only when a completed review round exists on the newest
 subject, and refuses outright for an accepted finding on the current code (it is a
 correction still owed, and the code has not moved). A finding nobody accepted keeps
-the behaviour it always had.
+the behaviour it always had. Codex can be wrong, so a decision it made carries a
+"Change decision" control: the operator's own accept or reject is appended after it
+(the automatic one stays in the history) and is the one in force.
 
 ### Authoritative Run actions and linked continuations
 

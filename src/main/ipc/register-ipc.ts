@@ -134,6 +134,7 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       totalFindingsEverRecorded: all.length,
       identityProblem: identityProblem ?? identity.problem,
       triage: app.codeReviews.getTriage(taskId),
+      analyzing: app.codeReviewClaims.analyzingFindings(taskId),
       correctionRequirements: codeCorrectionRequirements({
         accepted: app.codeReview.acceptedRequirements(taskId),
         liveFindingIds: new Set(live.map((finding) => finding.id)),
@@ -172,6 +173,7 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       ruleEvidenceProblem,
       findingsSha256,
       autoDecisions: gate === null ? [] : parsePlanReviewAutoDecisions(gate.autoDecisionsJson, findingsSha256),
+      analyzing: app.planReviewClaims.analyzingFindings(taskId),
       correction: describePlanCorrection(
         {
           tasks: app.tasks,

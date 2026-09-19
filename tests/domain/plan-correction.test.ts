@@ -111,6 +111,30 @@ describe('revisionAddressesProblem', () => {
     ).toMatch(/"constraints", but that field is unchanged/);
   });
 
+  it('refuses a field that changed without being tied to an accepted finding, even when every finding is covered', () => {
+    const rewritten = makeSpecification({ summary: 'Two', constraints: ['Keep A', 'Dropped the safety rule'] });
+    expect(
+      revisionAddressesProblem({
+        accepted: [{ finding: 0 }],
+        addressed: [{ finding: 0, field: 'summary', change: 'x' }],
+        current,
+        revised: rewritten
+      })
+    ).toMatch(/changed "constraints" without tying the change to an accepted finding/);
+    // Claiming both fields is what makes the same revision acceptable.
+    expect(
+      revisionAddressesProblem({
+        accepted: [{ finding: 0 }],
+        addressed: [
+          { finding: 0, field: 'summary', change: 'x' },
+          { finding: 0, field: 'constraints', change: 'y' }
+        ],
+        current,
+        revised: rewritten
+      })
+    ).toBeNull();
+  });
+
   it('refuses a claim about a finding that was not accepted', () => {
     expect(
       revisionAddressesProblem({

@@ -135,6 +135,18 @@ export function revisionAddressesProblem(input: {
   if (missing.length > 0) {
     return `Codex did not say where it addressed accepted finding${missing.length === 1 ? '' : 's'} ${missing.join(', ')}.`;
   }
+  // A revision may change only what an accepted finding asked for. A field that
+  // changed without being tied to one is an unrequested rewrite — of a constraint,
+  // the scope or the implementation prompt — and is never carried forward.
+  const claimedFields = new Set<string>(input.addressed.map((entry) => entry.field));
+  for (const field of SPECIFICATION_FIELD_NAMES) {
+    if (
+      JSON.stringify(input.current[field]) !== JSON.stringify(input.revised[field]) &&
+      !claimedFields.has(field)
+    ) {
+      return `Codex changed "${field}" without tying the change to an accepted finding.`;
+    }
+  }
   return null;
 }
 

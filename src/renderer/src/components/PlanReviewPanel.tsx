@@ -20,6 +20,7 @@ import {
   AutoDecideSummaryLine,
   AutoFindingStatus,
   DecisionGlossary,
+  useAnalysisState,
   useAutoDecideQueue,
   type AutoDecideKind
 } from './review-findings';
@@ -52,6 +53,7 @@ type DecisionDrafts = {
 const NO_DRAFTS: Record<number, DecisionDraft> = {};
 const NO_PLAN_REVIEW_FINDINGS: PlanReviewDetail['findings'] = [];
 const NO_AUTO_DECISIONS: PlanReviewDetail['autoDecisions'] = [];
+const NO_ANALYZING: readonly number[] = [];
 
 /** Findings analyzed at once. The claim is per finding, so different ones may overlap. */
 const AUTO_DECIDE_CONCURRENCY = 2;
@@ -331,6 +333,7 @@ export function PlanReviewPanel({
     run: runAutoDecide,
     onIdle: () => void refresh()
   });
+  const autoStateOf = useAnalysisState({ queue, analyzing: detail?.analyzing ?? NO_ANALYZING, refresh });
   const startAutoDecide = (indexes: readonly number[], bulk: boolean): void => {
     if (!queue.busy) batchRound.current = detail?.findingsSha256 ?? null;
     queue.start(indexes, { bulk });
@@ -340,7 +343,7 @@ export function PlanReviewPanel({
   const bulkIndexes = findings
     .map((_, index) => index)
     .filter((index) => {
-      const state = queue.stateOf(index);
+      const state = autoStateOf(index);
       return (
         !hasDraft(index) &&
         !autoByFinding.has(index) &&
@@ -938,7 +941,7 @@ export function PlanReviewPanel({
                 <div className="muted selectable" style={{ marginTop: 6 }}>Suggested: {finding.fix}</div>
                 <AutoFindingStatus
                   facts={{
-                    queue: queue.stateOf(index),
+                    queue: autoStateOf(index),
                     decided: saved ? { action: saved.action, confidence: saved.confidence, evidenceRef: saved.evidenceRef } : null,
                     needsUser: stop ? { reason: stop.reason, evidenceRef: stop.evidenceRef, confidence: stop.confidence } : null,
                     operatorChoice: chosen ? chosen : null
@@ -962,7 +965,7 @@ export function PlanReviewPanel({
                     </Field>
                   </div>
                   <AutoDecideButton
-                    state={queue.stateOf(index)}
+                    state={autoStateOf(index)}
                     findingLabel={finding.title}
                     disabled={!integrationEnabled || busy !== null}
                     blockedReason={

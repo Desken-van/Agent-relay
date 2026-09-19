@@ -157,6 +157,8 @@ export interface Application {
    * running correction loop; only the services built here may take a claim.
    */
   readonly planReviewClaims: PlanReviewClaims;
+  /** Exposed for the same reason: the detail read reports the analyses in flight. */
+  readonly codeReviewClaims: CodeReviewClaims;
   readonly taskContinuations: TaskContinuationRepository;
   readonly codeReviews: CodeReviewRepository;
   /**
@@ -561,6 +563,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     planReviewGates,
     planCorrections,
     planReviewClaims,
+    codeReviewClaims,
     taskContinuations,
     codeReviews,
     codeReview,

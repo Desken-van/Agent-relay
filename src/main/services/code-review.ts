@@ -303,6 +303,11 @@ export class CodeReviewClaims {
   isHeld(taskId: string): boolean {
     return this.held.has(taskId) || (this.analyzing.get(taskId)?.size ?? 0) > 0;
   }
+
+  /** The findings being analyzed in this process right now. For the detail read. */
+  analyzingFindings(taskId: string): string[] {
+    return [...(this.analyzing.get(taskId) ?? [])];
+  }
 }
 
 export interface CodeReviewDeps {

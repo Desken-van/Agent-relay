@@ -214,6 +214,12 @@ export interface CodeReviewDetail {
    * `resolved` decision is recorded for it.
    */
   readonly correctionRequirements: readonly CodeCorrectionRequirement[];
+  /**
+   * Ids of the findings Auto decide is analyzing in the main process right now.
+   * Read from the process, not from any screen, so a panel that was reloaded
+   * mid-analysis still shows the truth and does not offer a second click.
+   */
+  readonly analyzing: readonly string[];
 }
 
 export interface PlanReviewDetail {
@@ -269,6 +275,8 @@ export interface PlanReviewDetail {
    * loses nothing Auto decide filled in.
    */
   readonly autoDecisions: readonly PlanReviewAutoDecision[];
+  /** Indexes of the findings Auto decide is analyzing in the main process right now (see `CodeReviewDetail.analyzing`). */
+  readonly analyzing: readonly number[];
   /** The plan-correction workflow: budget, next step, running phase, versions. */
   readonly correction: PlanCorrectionDetail;
 }

@@ -186,17 +186,18 @@ export class FakeCodexAdapter implements CodexAdapter {
       });
     // Honest by default: each accepted finding is reported against the first field
     // that really differs. A test that needs a lie sets `revisionAddressed`.
-    const changedField =
-      SPECIFICATION_FIELD_NAMES.find(
-        (field) => JSON.stringify(request.currentSpecification[field]) !== JSON.stringify(specification[field])
-      ) ?? 'summary';
+    const changedFields = SPECIFICATION_FIELD_NAMES.filter(
+      (field) => JSON.stringify(request.currentSpecification[field]) !== JSON.stringify(specification[field])
+    );
     const addressed =
       this.revisionAddressed ??
-      request.acceptedFindings.map((finding) => ({
-        finding: finding.finding,
-        field: changedField,
-        change: `Reflected "${finding.title}" in ${changedField}.`
-      }));
+      request.acceptedFindings.flatMap((finding) =>
+        (changedFields.length > 0 ? changedFields : (['summary'] as const)).map((field) => ({
+          finding: finding.finding,
+          field,
+          change: `Reflected "${finding.title}" in ${field}.`
+        }))
+      );
     this.revisionAddressed = null;
     return { specification, addressed, rawResponse: JSON.stringify({ specification, addressed }) };
   }

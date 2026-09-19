@@ -140,6 +140,9 @@ export type PlanCorrectionReadDeps = Pick<
   'tasks' | 'gates' | 'corrections' | 'ruleEvidence' | 'settings' | 'claims'
 >;
 
+const budgetSpentMessage = (max: number): string =>
+  `The correction budget of ${max} round(s) is spent, so accepted findings could not be revised.`;
+
 function deriveState(deps: PlanCorrectionReadDeps, taskId: string): DerivedState {
   const task = deps.tasks.findById(taskId);
   if (task === null) throw new AgentRelayError('NOT_FOUND', `No task with id ${taskId}.`);
@@ -292,6 +295,13 @@ export class PlanCorrectionService {
         if (pending !== null) {
           const request = pending;
           pending = null;
+          // Before anything is sent: accepted findings the budget cannot revise
+          // must not be recorded with the external reviewer as if they could be.
+          if (request.decisions.some((decision) => decision.action === 'accept') && state.all.length >= state.max) {
+            throw new AgentRelayError('VALIDATION_FAILED', budgetSpentMessage(state.max), {
+              remediation: 'Reject the findings you do not want revised, or raise the maximum review rounds in Settings, then resolve again.'
+            });
+          }
           this.deps.claims.setLoop(taskId, { phase: 'resolving', round });
           await this.deps.gateService.runResolve(
             taskId,
@@ -332,6 +342,11 @@ export class PlanCorrectionService {
             this.deps.claims.setLoop(taskId, { phase: 'deciding', round });
             const decided = await this.autoDecideRound(taskId, gate, signal);
             if (decided.kind === 'stop') return outcome('needs_user', decided.message);
+            // Same rule as an explicit resolve: never record accepted findings the
+            // budget cannot revise. The round stays open with its decisions saved.
+            if (decided.decisions.some((decision) => decision.action === 'accept') && state.all.length >= state.max) {
+              return outcome('round_limit', `${budgetSpentMessage(state.max)} Nothing was sent to the external reviewer; the round is still waiting for decisions.`);
+            }
             const fresh = this.deps.gates.findByTask(taskId) as PlanReviewGate;
             this.deps.claims.setLoop(taskId, { phase: 'resolving', round });
             await this.deps.gateService.runResolve(

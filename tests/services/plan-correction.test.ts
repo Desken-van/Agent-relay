@@ -326,6 +326,54 @@ describe('plan correction loop: stop conditions', () => {
     expect(value.harness.codex.triageCalls).toHaveLength(0);
   });
 
+  it('carries the previous fingerprint onto a gate for the revised specification that was prepared earlier, so drift is still caught', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change']), roundWith(value, [], 'proceed')];
+    value.reviewer.resolutionQueue = [revise(value)];
+    await value.gateService.review(task.id);
+    const awaitingGate = currentGate(value, task.id);
+    await value.gateService.resolve(task.id, {
+      gateId: awaitingGate.id,
+      expectedRevision: awaitingGate.revision,
+      decisions: decide([0, 'reject', 'Not valid.'])
+    });
+    const first = currentGate(value, task.id);
+    expect(first.contractFingerprint).not.toBeNull();
+    // The specification is revised and another screen prepares its gate BEFORE the loop reaches the review.
+    value.harness.tasks.update(task.id, {
+      specificationJson: JSON.stringify(makeSpecification({ summary: 'Revised elsewhere' }))
+    });
+    const preparedElsewhere = value.gateService.prepare(task.id);
+    expect(preparedElsewhere.contractFingerprint).toBeNull();
+
+    const prepared = value.gateService.prepare(task.id, { inheritContractFrom: first });
+
+    // The very same row, now bound to the fingerprint the previous round was reviewed under.
+    expect(prepared.id).toBe(preparedElsewhere.id);
+    expect(prepared.contractFingerprint).toBe(first.contractFingerprint);
+    const drifted = 'e'.repeat(64);
+    value.reviewer.session = { ...value.reviewer.session, contractFingerprint: drifted };
+    value.reviewer.roundQueue[0] = { ...value.reviewer.roundQueue[0]!, contractFingerprint: drifted };
+    const reviewed = await value.gateService.review(task.id);
+    expect(reviewed.contractMismatchAt).not.toBeNull();
+  });
+
+  it('never rewrites the fingerprint of a gate that has already started', async () => {
+    const value = setup();
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['Needs a change'])];
+    await value.gateService.review(task.id);
+    const settled = currentGate(value, task.id);
+
+    const again = value.gateService.prepare(task.id, {
+      inheritContractFrom: { ...settled, contractFingerprint: 'c'.repeat(64) }
+    });
+
+    expect(again.id).toBe(settled.id);
+    expect(again.contractFingerprint).toBe(settled.contractFingerprint);
+  });
+
   it('stops at the configured maximum with accepted findings left uncorrected, and cannot be approved', async () => {
     const value = setup({ maxReviewRounds: 1 });
     const task = await ready(value);
@@ -337,12 +385,41 @@ describe('plan correction loop: stop conditions', () => {
     const outcome = await value.loop.continueCorrection(task.id, { autoContinue: true });
 
     expect(outcome.stopped).toBe('round_limit');
+    expect(outcome.message).toMatch(/Nothing was sent to the external reviewer/);
     expect(outcome.correctionsRun).toBe(1);
     expect(value.harness.codex.revisionCalls).toHaveLength(1);
-    expect(value.loop.detail(task.id)).toMatchObject({ used: 1, max: 1, nextStep: 'round_limit', acceptedPending: 1 });
-    // Either refusal is right: the round is not `proceeded`, and it accepted findings the plan does not reflect.
+    // The second round's accepted finding was NOT recorded with the reviewer: it stays open, decisions saved.
+    expect(value.reviewer.resolveCalls).toHaveLength(1);
+    expect(currentGate(value, task.id).status).toBe('awaiting_resolve');
+    expect(value.loop.detail(task.id)).toMatchObject({ used: 1, max: 1, nextStep: 'decide', acceptedPending: 0 });
     expect(() => value.harness.orchestrator.approveSpecification(task.id)).toThrow(/external plan review/i);
     expect(value.harness.tasks.findById(task.id)?.specificationApprovedAt).toBeNull();
+  });
+
+  it('refuses an explicit "resolve and revise" with an accepted finding once the budget is spent, sending nothing', async () => {
+    const value = setup({ maxReviewRounds: 1 });
+    const task = await ready(value);
+    value.reviewer.roundQueue = [roundWith(value, ['First']), roundWith(value, ['Second'])];
+    value.reviewer.resolutionQueue = [revise(value), revise(value)];
+    await value.gateService.review(task.id);
+    await resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']));
+    const gate = currentGate(value, task.id);
+    expect(gate.status).toBe('awaiting_resolve');
+    const resolvesBefore = value.reviewer.resolveCalls.length;
+
+    await expect(resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes again.']))).rejects.toThrow(
+      /correction budget of 1 round\(s\) is spent/i
+    );
+
+    // Nothing reached the provider and the round is exactly as it was.
+    expect(value.reviewer.resolveCalls).toHaveLength(resolvesBefore);
+    expect(currentGate(value, task.id)).toMatchObject({ id: gate.id, status: 'awaiting_resolve', revision: gate.revision });
+    expect(value.harness.codex.revisionCalls).toHaveLength(1);
+
+    // Rejecting is still possible: a round with nothing accepted needs no revision.
+    const outcome = await resolveAndRevise(value, task.id, decide([0, 'reject', 'Not valid.']));
+    expect(outcome.stopped).toBe('settled');
+    expect(currentGate(value, task.id).status).toBe('changes_requested');
   });
 
   it('refuses a stale round before anything is sent anywhere', async () => {
@@ -498,9 +575,9 @@ describe('plan correction loop: the Codex revision', () => {
 
       const [correction] = value.corrections.listByTask(task.id);
       expect(correction?.status).toBe('completed');
-      expect(parsePlanRevisionAddressed(correction?.addressedJson ?? null).map((entry) => entry.finding)).toEqual([0, 1]);
+      expect([...new Set(parsePlanRevisionAddressed(correction?.addressedJson ?? null).map((entry) => entry.finding))]).toEqual([0, 1]);
       const detail = value.loop.detail(task.id);
-      expect(detail.latest?.addressed.map((entry) => entry.finding)).toEqual([0, 1]);
+      expect([...new Set(detail.latest?.addressed.map((entry) => entry.finding))]).toEqual([0, 1]);
     });
 
     it('refuses a revision that says nothing about one of the accepted findings, and stores nothing', async () => {
@@ -521,6 +598,21 @@ describe('plan correction loop: the Codex revision', () => {
       ];
 
       await expect(resolveAndRevise(value, task.id, both)).rejects.toThrow(/"constraints", but that field is unchanged/i);
+
+      nothingStored(value, task.id, original);
+    });
+
+    it('refuses a revision that rewrote a field it never tied to an accepted finding', async () => {
+      const { value, task, original } = await twoAccepted();
+      // The default revision changes both the summary and the acceptance criteria; only the summary is claimed.
+      value.harness.codex.revisionAddressed = [
+        { finding: 0, field: 'summary', change: 'Real.' },
+        { finding: 1, field: 'summary', change: 'Real.' }
+      ];
+
+      await expect(resolveAndRevise(value, task.id, both)).rejects.toThrow(
+        /changed "acceptanceCriteria" without tying the change to an accepted finding/i
+      );
 
       nothingStored(value, task.id, original);
     });
