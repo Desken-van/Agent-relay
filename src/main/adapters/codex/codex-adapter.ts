@@ -190,7 +190,7 @@ function assertTriageRefsMatchKind(request: CodexTriageRequest): void {
   }
   const isDeclaredKind = (ref: unknown): boolean =>
     request.refKind === 'index'
-      ? typeof ref === 'number' && Number.isInteger(ref) && ref >= 0
+      ? typeof ref === 'number' && Number.isSafeInteger(ref) && ref >= 0
       : typeof ref === 'string' && ref.length >= 1 && ref.length <= 100;
 
   const findings: readonly TriageableFinding[] = request.findings;

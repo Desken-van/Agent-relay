@@ -237,8 +237,9 @@ describe('CodexSdkAdapter.triageFindings — fails closed before any provider ca
     expectNothingDispatched();
   });
 
-  it('rejects an index that is not a non-negative integer, and an id that is empty or too long', async () => {
-    for (const bad of [-1, 1.5, Number.NaN]) {
+  it('rejects an index that is not a non-negative safe integer, and an id that is empty or too long', async () => {
+    // Unsafe integers cannot be named by the answer schema, so they could only be dispatched to be refused.
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, Number.MAX_VALUE]) {
       expect((await rejection(unsound({ ...planRequest(), findings: [finding(bad)] }))).code).toBe('VALIDATION_FAILED');
     }
     for (const bad of ['', 'x'.repeat(101)]) {
