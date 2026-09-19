@@ -657,6 +657,30 @@ describe('the external code-review panel — progress and failure of an analysis
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
+  it('keeps the failure on screen even after the operator decides the last undecided finding by hand', async () => {
+    let current = live({ findings: [f1] });
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(current));
+    bridge.set('codeReview:triage', () => fail('Codex failed.', 'TOOL_FAILED'));
+    bridge.set('codeReview:decide', () => {
+      current = live({ findings: [f1], latestDecisions: { 'f-1': decisionRecord('f-1') } });
+      return ok<'codeReview:decide'>(current);
+    });
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+    await screen.findByRole('button', { name: /Analyze undecided findings/i });
+    fireEvent.click(analyzeButton());
+    await screen.findByRole('alert');
+
+    fireEvent.change(screen.getByLabelText('Decision'), { target: { value: 'accept' } });
+    fireEvent.change(screen.getByLabelText(/^Reason/), { target: { value: 'Decided by hand.' } });
+    fireEvent.click(screen.getByRole('button', { name: /Submit decision/i }));
+
+    expect(await screen.findByText('All live findings have decisions recorded.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Analyze undecided findings/i })).toBeNull();
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain('Codex failed.');
+    expect(alert.textContent).toContain('No decisions were changed or applied');
+  });
+
   it('shows the summary and the apply controls on success without deciding anything, needs_user included', async () => {
     let current = live();
     bridge.set('codeReview:get', () => ok<'codeReview:get'>(current));

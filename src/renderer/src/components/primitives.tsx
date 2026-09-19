@@ -122,7 +122,7 @@ export function TriageFeedback({
         <div className="stack stack--tight">
           <strong>Analysis failed. No decisions were changed or applied.</strong>
           <span className="selectable">{error}</span>
-          <span>You can analyze again, or decide each finding yourself.</span>
+          <span>You can decide each finding yourself, or analyze again if any are still undecided.</span>
         </div>
       </Notice>
     );

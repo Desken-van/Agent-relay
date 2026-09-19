@@ -1074,20 +1074,25 @@ export function PlanReviewPanel({
         setDirtyPrompt(caught.message + (caught.details ? `\n\n${caught.details}` : ''));
       } else {
         setError(caught instanceof Error ? caught.message : String(caught));
-        // A failed `review` or `resolve` is the one case where the screen is now
-        // lying. Both write their durable phase before they dispatch, so a lost
-        // answer leaves the gate at `reviewing` or `resolving` in the main
-        // process while this panel still holds the `prepared` or
-        // `awaiting_resolve` it rendered before the click. One read-only
-        // read-back fixes the display — never the operation itself, since
-        // `review` and `resolve` are not idempotent and may already have
-        // taken effect.
-        if (key === 'review' || key === 'resolve') {
-          try {
-            setDetail(await expect('planReview:get', { taskId: task.id }));
-          } catch {
-            // Nothing to add: the operator already has the failure that matters.
-          }
+      }
+      // A failed `review` or `resolve` is the one case where the screen is now
+      // lying. Both write their durable phase before they dispatch, so a lost
+      // answer leaves the gate at `reviewing` or `resolving` in the main
+      // process while this panel still holds the `prepared` or
+      // `awaiting_resolve` it rendered before the click. One read-only
+      // read-back fixes the display — never the operation itself, since
+      // `review` and `resolve` are not idempotent and may already have
+      // taken effect.
+      //
+      // A failed `triage` needs it for another reason: it is refused when the
+      // round moved while it ran (or before), and the next click would send
+      // the same stale revision and be refused the same way until the panel
+      // was remounted. Reading the gate back makes "analyze again" true.
+      if (key === 'review' || key === 'resolve' || key === 'triage') {
+        try {
+          setDetail(await expect('planReview:get', { taskId: task.id }));
+        } catch {
+          // Nothing to add: the operator already has the failure that matters.
         }
       }
     } finally {
@@ -1852,7 +1857,7 @@ export function CodeReviewPanel({
           </button>
         ) : null}
       </div>
-      <TriageFeedback pending={busy === 'triage'} error={undecidedIds.length > 0 ? triageError : null} />
+      <TriageFeedback pending={busy === 'triage'} error={triageError} />
 
       {latestRound ? (
         <div className="kv">

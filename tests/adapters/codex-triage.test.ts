@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentRunContext, CodexTriageRequest, TriageableDecision, TriageableFinding } from '../../src/main/ports';
 import type { ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { CodexSdkAdapter } from '../../src/main/adapters/codex/codex-adapter';
+import { MAX_TRIAGE_FINDINGS } from '../../src/shared/schemas/codex';
 import { makeSpecification } from '../helpers/fakes';
 
 /**
@@ -243,6 +244,23 @@ describe('CodexSdkAdapter.triageFindings — fails closed before any provider ca
     expect((await rejection(planRequest({ findings: [] }))).code).toBe('VALIDATION_FAILED');
     expect((await rejection(codeRequest({ findings: [] }))).code).toBe('VALIDATION_FAILED');
     expectNothingDispatched();
+  });
+
+  it('rejects more findings than one answer can hold, but dispatches exactly that many', async () => {
+    const refs = (count: number): number[] => Array.from({ length: count }, (_, index) => index);
+
+    const error = await rejection(planRequest({ findings: refs(MAX_TRIAGE_FINDINGS + 1).map((ref) => finding(ref)) }));
+    expect(error.code).toBe('VALIDATION_FAILED');
+    expect(error.message).toContain(String(MAX_TRIAGE_FINDINGS + 1));
+    expectNothingDispatched();
+
+    sdk.answer = answer(...refs(MAX_TRIAGE_FINDINGS));
+    const outcome = await new CodexSdkAdapter(runner).triageFindings(
+      planRequest({ findings: refs(MAX_TRIAGE_FINDINGS).map((ref) => finding(ref)) }),
+      context()
+    );
+    expect(outcome.recommendations).toHaveLength(MAX_TRIAGE_FINDINGS);
+    expect(sdk.runs).toHaveLength(1);
   });
 
   it('accepts prior decisions of the request kind', async () => {

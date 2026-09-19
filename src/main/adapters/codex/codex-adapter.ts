@@ -26,6 +26,7 @@ import { Codex, type ThreadEvent, type ThreadItem, type ThreadOptions } from '@o
 import type { ToolDiagnostic } from '../../../shared/domain/diagnostics';
 import { AgentRelayError } from '../../../shared/domain/errors';
 import {
+  MAX_TRIAGE_FINDINGS,
   codexReviewResultJsonSchema,
   findingTriageResultJsonSchema,
   parseCodexReviewResult,
@@ -167,8 +168,9 @@ export function openThread<TThread>(
 }
 
 /**
- * Fails closed, before dispatch, on a triage request that is empty or whose
- * finding or prior-decision references are not all of the kind it declared.
+ * Fails closed, before dispatch, on a triage request that is empty or larger
+ * than one answer can cover, or whose finding or prior-decision references are
+ * not all of the kind it declared.
  *
  * Mixed reference kinds are not a supported request: plan review only has
  * indexes, code review only ids, and one response can only be held to one
@@ -185,6 +187,13 @@ function assertTriageRefsMatchKind(request: CodexTriageRequest): void {
   const findings: readonly TriageableFinding[] = request.findings;
   if (findings.length === 0) {
     throw new AgentRelayError('VALIDATION_FAILED', 'There are no findings to triage.');
+  }
+  if (findings.length > MAX_TRIAGE_FINDINGS) {
+    throw new AgentRelayError(
+      'VALIDATION_FAILED',
+      `${findings.length} findings are too many to analyze at once (the limit is ${MAX_TRIAGE_FINDINGS}), so nothing was sent to Codex.`,
+      { remediation: 'Decide some findings by hand, then analyze the rest.' }
+    );
   }
   const refs: readonly unknown[] = [
     ...findings.map((finding) => finding.ref),

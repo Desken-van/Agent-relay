@@ -576,6 +576,41 @@ describe('the external plan-review panel', () => {
         expect((screen.getAllByLabelText(/^Reason/)[0] as HTMLInputElement).value).toBe('Already covered by the invariant.');
         expect((decisions[1] as HTMLSelectElement).value).toBe('');
         expect(bridge.callsTo('planReview:resolve')).toHaveLength(0);
+
+        // Following the banner's own advice — deciding by hand — does not erase it.
+        fireEvent.change(decisions[1]!, { target: { value: 'accept' } });
+        expect((decisions[1] as HTMLSelectElement).value).toBe('accept');
+        expect(screen.getByRole('alert').textContent).toContain('No decisions were changed or applied');
+      });
+
+      it('reads the gate back after a refused analysis, so that analyzing again uses the current revision', async () => {
+        const stale = twoFindingGate();
+        const current = twoFindingGate({ revision: 3 });
+        bridge.set('planReview:get', () => ok<'planReview:get'>(stale));
+        bridge.set('planReview:triage', () => {
+          // The round moved elsewhere: from now on the current gate is the newer one.
+          bridge.set('planReview:get', () => ok<'planReview:get'>(current));
+          return fail('That plan-review round is no longer the current one.', 'VALIDATION_FAILED');
+        });
+        render(
+          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+        );
+        const decisions = await screen.findAllByLabelText('Decision');
+        fireEvent.change(decisions[0]!, { target: { value: 'accept' } });
+
+        fireEvent.click(analyzeButton());
+        await screen.findByRole('alert');
+        await waitFor(() => expect(bridge.callsTo('planReview:get')).toHaveLength(2));
+
+        bridge.set('planReview:triage', () => ok<'planReview:triage'>(analyzed(current)));
+        fireEvent.click(analyzeButton());
+        expect(await screen.findByText(/Recommended: accept/)).toBeTruthy();
+
+        const inputs = bridge.callsTo('planReview:triage').map((entry) => entry.input);
+        expect(inputs[0]).toMatchObject({ expectedRevision: 0 });
+        expect(inputs[1]).toMatchObject({ expectedRevision: 3 });
+        // The round's findings did not change, so the operator's draft is still there.
+        expect((decisions[0] as HTMLSelectElement).value).toBe('accept');
       });
 
       it('recovers from a timeout-coded failure and from a call that throws, each time re-enabling a retry', async () => {

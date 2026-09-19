@@ -141,6 +141,14 @@ export type TriageConfidence = (typeof TRIAGE_CONFIDENCES)[number];
 export const TRIAGE_REF_KINDS = ['index', 'id'] as const;
 export type TriageRefKind = (typeof TRIAGE_REF_KINDS)[number];
 
+/**
+ * The most findings one triage call can answer: the answer schema holds one
+ * recommendation per finding and stops at this many. A larger request is
+ * refused before dispatch, because sending it could only end in a full
+ * provider call whose answer the schema then rejects.
+ */
+export const MAX_TRIAGE_FINDINGS = 256;
+
 const TRIAGE_REF_SCHEMAS = {
   index: z
     .number()
@@ -175,7 +183,7 @@ function triageResultSchemaFor<Ref extends z.ZodType<number | string>>(findingRe
       confidence: z.enum(TRIAGE_CONFIDENCES)
     })
     .strict();
-  return z.object({ results: z.array(recommendation).min(1).max(256) }).strict();
+  return z.object({ results: z.array(recommendation).min(1).max(MAX_TRIAGE_FINDINGS) }).strict();
 }
 
 const TRIAGE_RESULT_SCHEMAS = {
