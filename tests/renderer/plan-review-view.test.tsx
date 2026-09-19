@@ -660,6 +660,31 @@ describe('the external plan-review panel', () => {
         expect(bridge.callsTo('planReview:triage')).toHaveLength(1);
       });
 
+      it('reports a failed analysis at once, and stops saying it is running, while the read-back that follows is still pending', async () => {
+        const detail = twoFindingGate();
+        bridge.set('planReview:get', () => ok<'planReview:get'>(detail));
+        const readBack = deferred<IpcResult<PlanReviewDetail>>();
+        bridge.set('planReview:triage', () => {
+          bridge.set('planReview:get', () => readBack.promise);
+          return fail('Codex failed.', 'TOOL_FAILED');
+        });
+        render(
+          <PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />
+        );
+        await screen.findByRole('button', { name: /Analyze undecided findings/i });
+        fireEvent.click(analyzeButton());
+
+        const alert = await screen.findByRole('alert');
+        expect(alert.textContent).toContain('Codex failed.');
+        expect(screen.queryByRole('status')).toBeNull();
+        // Still refreshing itself, so the action stays disabled: a retry must not go out with the old revision.
+        expect(analyzeButton()).toHaveProperty('disabled', true);
+
+        await deliver(readBack, ok<'planReview:get'>(detail));
+        expect(analyzeButton()).toHaveProperty('disabled', false);
+        expect(screen.getByRole('alert').textContent).toContain('Codex failed.');
+      });
+
       it('passes on the backend’s own next step, not only what went wrong', async () => {
         const detail = twoFindingGate();
         bridge.set('planReview:get', () => ok<'planReview:get'>(detail));

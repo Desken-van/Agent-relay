@@ -657,6 +657,27 @@ describe('the external code-review panel — progress and failure of an analysis
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
+  it('reports a failed analysis at once, and stops saying it is running, while the re-read that follows is still pending', async () => {
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
+    const reread = deferred<IpcResult<CodeReviewDetail>>();
+    bridge.set('codeReview:triage', () => {
+      bridge.set('codeReview:get', () => reread.promise);
+      return fail('Codex failed.', 'TOOL_FAILED');
+    });
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+    await screen.findByRole('button', { name: /Analyze undecided findings/i });
+    fireEvent.click(analyzeButton());
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Codex failed.');
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(analyzeButton()).toHaveProperty('disabled', true);
+
+    await deliver(reread, ok<'codeReview:get'>(live()));
+    expect(analyzeButton()).toHaveProperty('disabled', false);
+    expect(screen.getByRole('alert').textContent).toContain('Codex failed.');
+  });
+
   it('passes on the backend’s own next step, not only what went wrong', async () => {
     bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
     bridge.set('codeReview:triage', () =>

@@ -95,6 +95,12 @@ export function Notice({
  *
  * A failure says outright that no decision was changed: analysis only ever
  * produces recommendations, and the operator's own decisions are untouched.
+ *
+ * The failure wins over `pending`. A panel stays busy for a moment after a
+ * failed analysis while it reads its own state back, and during that moment an
+ * analysis that has already failed must not keep saying that it is running.
+ * (A new analysis clears the previous failure before it starts, so the two
+ * never describe different runs.)
  */
 export function TriageFeedback({
   pending,
@@ -103,6 +109,17 @@ export function TriageFeedback({
   pending: boolean;
   error: string | null;
 }): React.JSX.Element | null {
+  if (error !== null) {
+    return (
+      <Notice tone="error" role="alert">
+        <div className="stack stack--tight">
+          <strong>Analysis failed. No decisions were changed or applied.</strong>
+          <span className="selectable">{error}</span>
+          <span>You can decide each finding yourself, or analyze again if any are still undecided.</span>
+        </div>
+      </Notice>
+    );
+  }
   if (pending) {
     return (
       <Notice tone="info" role="status">
@@ -112,17 +129,6 @@ export function TriageFeedback({
           <span>
             This can take a minute or more. Nothing changes until you apply a recommendation.
           </span>
-        </div>
-      </Notice>
-    );
-  }
-  if (error !== null) {
-    return (
-      <Notice tone="error" role="alert">
-        <div className="stack stack--tight">
-          <strong>Analysis failed. No decisions were changed or applied.</strong>
-          <span className="selectable">{error}</span>
-          <span>You can decide each finding yourself, or analyze again if any are still undecided.</span>
         </div>
       </Notice>
     );
