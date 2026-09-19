@@ -8,7 +8,7 @@
 
 import type { GitChangeSet } from '../../../shared/domain/git';
 import type { VerificationRecord } from '../../../shared/domain/verification';
-import type { CodexReviewResult, TaskSpecification } from '../../../shared/schemas/codex';
+import type { CodexReviewResult, TaskSpecification, TriageRefKind } from '../../../shared/schemas/codex';
 import type { TriageableDecision, TriageableFinding } from '../../ports';
 
 /* -------------------------------------------------------------------------- */
@@ -417,6 +417,8 @@ resolved, which you disputed and why, and the test results after your changes.`;
 /* -------------------------------------------------------------------------- */
 
 export interface TriagePromptInput {
+  /** The one kind of reference every finding below is named by. */
+  readonly refKind: TriageRefKind;
   readonly specification: TaskSpecification;
   readonly ruleEvidence?: string;
   readonly findings: readonly TriageableFinding[];
@@ -438,6 +440,13 @@ function renderTriageDecision(decision: TriageableDecision): string {
   return `  - ref=${JSON.stringify(decision.findingRef)}: ${decision.action}${decision.reason ? ` — ${decision.reason}` : ''}`;
 }
 
+/** The type a "findingRef" must have, stated to the model as well as enforced by the schema. */
+const TRIAGE_REF_INSTRUCTION: Record<TriageRefKind, string> = {
+  index:
+    'Every "findingRef" is a JSON NUMBER: the integer after "ref=" (for example 0), written without quotes — never a string such as "0".',
+  id: 'Every "findingRef" is a JSON STRING: the quoted id after "ref=", copied exactly as written and never as a number.'
+};
+
 export function buildTriagePrompt(input: TriagePromptInput): string {
   const { specification } = input;
   return `You are an independent TRIAGE analyst in a multi-agent relay. You are in READ-ONLY
@@ -445,6 +454,7 @@ mode: you must not modify, create, or delete any file, and you must not run any 
 that changes state. Your entire output is a single JSON object matching the required
 schema, with exactly one recommendation for every finding listed below — no more, no
 fewer, and every "findingRef" must be copied EXACTLY from a "Finding ref=" line below.
+${TRIAGE_REF_INSTRUCTION[input.refKind]}
 
 You are not the original reviewer and did not produce these findings. Your job is to
 independently judge, for each one, whether it should be accepted, rejected, or left for

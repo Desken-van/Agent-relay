@@ -1696,6 +1696,65 @@ describe('durable external plan review gate', () => {
       expect(reread.triageForFindings).toBe(result.triageForFindings);
     });
 
+    it('triages a plan gate by numeric finding indexes: declares the index kind and returns the updated gate at once', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      value.codex.triageQueue.push([
+        { findingRef: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+        { findingRef: 1, recommendation: 'reject', reason: 'r', evidenceRef: 'e', confidence: 'medium' }
+      ]);
+
+      const result = await value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision });
+
+      const request = value.codex.triageCalls[0]!;
+      expect(request.refKind).toBe('index');
+      expect(request.findings.map((entry) => entry.ref)).toEqual([0, 1]);
+      // The returned gate already carries the persisted result.
+      expect(result.triageJson).not.toBeNull();
+      expect(JSON.parse(result.triageJson!).recommendations.map((entry: { finding: number }) => entry.finding)).toEqual([0, 1]);
+      expect(value.harness.planReviewGates.findByTask(task.id)!.triageJson).toBe(result.triageJson);
+    });
+
+    it('rejects the string references a provider once returned for a plan gate, persisting no part of them', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      value.codex.triageQueue.push([
+        // A plan gate is named by numbers; strings are the representation that lost a real result.
+        { findingRef: '0', recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+        { findingRef: '1', recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+      ]);
+
+      await expect(
+        value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision })
+      ).rejects.toMatchObject({ code: 'PARSE_FAILED' });
+
+      const current = value.harness.planReviewGates.findByTask(task.id)!;
+      expect(current.triageJson).toBeNull();
+      expect(current.triageForFindings).toBeNull();
+      expect(current.revision).toBe(gate.revision);
+    });
+
+    it('persists nothing when the provider call fails, and releases the claim so an explicit retry can succeed', async () => {
+      const value = setup();
+      const { task, gate } = await awaitingTwoFindings(value);
+      value.codex.triageError = new AgentRelayError('TIMEOUT', 'The Codex process timeout expired.');
+
+      await expect(
+        value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision })
+      ).rejects.toMatchObject({ code: 'TIMEOUT' });
+      const afterFailure = value.harness.planReviewGates.findByTask(task.id)!;
+      expect(afterFailure.triageJson).toBeNull();
+      expect(afterFailure.revision).toBe(gate.revision);
+
+      value.codex.triageError = null;
+      value.codex.triageQueue.push([
+        { findingRef: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+        { findingRef: 1, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+      ]);
+      const retried = await value.service.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision });
+      expect(retried.triageJson).not.toBeNull();
+    });
+
     it('keeps a stored recommendation current after an unrelated write bumps the gate revision', async () => {
       // A revision-based staleness check would break this: ANY later write to
       // the row (including one wholly unrelated to the findings) bumps

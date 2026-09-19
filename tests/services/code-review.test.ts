@@ -2817,6 +2817,27 @@ describe('code-review automatic finding triage', () => {
     }
   });
 
+  it('triages by stable string ids: declares the id kind and accepts a complete string-ref answer', async () => {
+    const { value, codex, triageService, findings } = await withTwoLiveFindings();
+    const recommendations = await triageService.triage(value.task.id);
+
+    expect(codex.triageCalls[0]?.refKind).toBe('id');
+    expect(codex.triageCalls[0]?.findings.every((f) => typeof f.ref === 'string')).toBe(true);
+    expect(recommendations.map((r) => r.findingRef).sort()).toEqual(findings.map((f) => f.id).sort());
+    expect(parseCodeReviewTriage(value.reviews.getTriage(value.task.id)!.triageJson)?.recommendations).toHaveLength(2);
+  });
+
+  it('rejects numeric references, which are not finding ids, and persists nothing', async () => {
+    const { value, codex, triageService } = await withTwoLiveFindings();
+    codex.triageQueue.push([
+      { findingRef: 0, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' },
+      { findingRef: 1, recommendation: 'accept', reason: 'r', evidenceRef: 'e', confidence: 'high' }
+    ]);
+
+    await expect(triageService.triage(value.task.id)).rejects.toThrow(/not requested/i);
+    expect(value.reviews.getTriage(value.task.id)).toBeNull();
+  });
+
   it('analyzes only the requested subset when findingIds is given', async () => {
     const { value, codex, triageService, findings } = await withTwoLiveFindings();
     await triageService.triage(value.task.id, { findingIds: [findings[0]!.id] });

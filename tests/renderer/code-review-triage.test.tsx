@@ -3,10 +3,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { Task } from '../../src/shared/domain/models';
-import type { CodeReviewDetail } from '../../src/shared/ipc';
+import type { CodeReviewDetail, IpcResult } from '../../src/shared/ipc';
 import type { CodeReviewFinding, CodeReviewSubject, CodeReviewTriage } from '../../src/shared/domain/code-review';
 import { CodeReviewPanel } from '../../src/renderer/src/components/RunView';
-import { burstClick, fail, installBridge, ok, type Bridge } from './harness';
+import { burstClick, deferred, deliver, fail, installBridge, ok, type Bridge } from './harness';
 
 const SUBJECT_SHA = 'a'.repeat(64);
 const OTHER_SUBJECT_SHA = 'b'.repeat(64);
@@ -540,5 +540,214 @@ describe('the external code-review panel — automatic finding triage', () => {
     render(<CodeReviewPanel task={task()} integrationEnabled={false} />);
     await waitFor(() => expect(bridge.callsTo('codeReview:get')).toHaveLength(1));
     expect(screen.queryByText('External code review')).toBeNull();
+  });
+});
+
+describe('the external code-review panel — progress and failure of an analysis, beside its action', () => {
+  const f1 = finding({ id: 'f-1' });
+  const f2 = finding({ id: 'f-2', title: 'Second finding' });
+  const live = (overrides: Partial<CodeReviewDetail> = {}): CodeReviewDetail =>
+    detail({ subject: subject(), subjectIdentity: 'current', findings: [f1, f2], ...overrides });
+  const decisionRecord = (findingId: string): CodeReviewDetail['latestDecisions'][string] => ({
+    id: `d-${findingId}`, findingId, subjectSha256: SUBJECT_SHA, action: 'accept',
+    reason: 'Decided by hand.', actor: 'operator', source: 'test', findingRevision: 0,
+    decidedAt: '2026-09-06T00:00:00.000Z', createdAt: '2026-09-06T00:00:00.000Z'
+  });
+  const analyzeButton = (): HTMLElement => screen.getByRole('button', { name: /Analyze undecided findings/i });
+  /** The row of buttons that holds the trigger; the feedback must sit directly under it. */
+  const controls = (): Element => analyzeButton().closest('.row')!;
+
+  it('says, right under the action, that Codex is analyzing, and keeps the action disabled meanwhile', async () => {
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
+    const answer = deferred<IpcResult<{ recommendations: never[]; detail: CodeReviewDetail }>>();
+    bridge.set('codeReview:triage', () => answer.promise);
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+
+    expect(screen.queryByRole('status')).toBeNull();
+    await screen.findByRole('button', { name: /Analyze undecided findings/i });
+    fireEvent.click(analyzeButton());
+
+    const status = await screen.findByRole('status');
+    expect(status.textContent).toContain('Analyzing findings with Codex…');
+    expect(status.textContent).toMatch(/nothing changes until you apply a recommendation/i);
+    expect(controls().nextElementSibling).toBe(status);
+    expect(analyzeButton()).toHaveProperty('disabled', true);
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    await deliver(answer, ok<'codeReview:triage'>({ recommendations: [], detail: live() }));
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(analyzeButton()).toHaveProperty('disabled', false);
+  });
+
+  it('shows a failed analysis beside the action, says no decision changed, and keeps the operator’s drafts', async () => {
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
+    bridge.set('codeReview:triage', () =>
+      fail('Codex returned recommendations that do not match the expected shape.', 'PARSE_FAILED')
+    );
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+
+    const decisions = await screen.findAllByLabelText('Decision');
+    fireEvent.change(decisions[0]!, { target: { value: 'reject' } });
+    fireEvent.change(screen.getAllByLabelText(/^Reason/)[0]!, { target: { value: 'Already covered.' } });
+    fireEvent.click(analyzeButton());
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Analysis failed');
+    expect(alert.textContent).toMatch(/No decisions were changed or applied/);
+    expect(alert.textContent).toContain('do not match the expected shape');
+    // Directly under the trigger — and reported once, not also at the top of the panel.
+    expect(controls().nextElementSibling).toBe(alert);
+    expect(screen.getAllByText(/do not match the expected shape/)).toHaveLength(1);
+    expect(screen.queryByRole('status')).toBeNull();
+
+    expect(analyzeButton()).toHaveProperty('disabled', false);
+    expect((decisions[0] as HTMLSelectElement).value).toBe('reject');
+    expect((screen.getAllByLabelText(/^Reason/)[0] as HTMLInputElement).value).toBe('Already covered.');
+    expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
+  });
+
+  it('recovers from a timeout-coded failure and from a call that throws, each time re-enabling a retry', async () => {
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
+    bridge.set('codeReview:triage', () => fail('The Codex process timeout expired.', 'TIMEOUT'));
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+
+    await screen.findByRole('button', { name: /Analyze undecided findings/i });
+    fireEvent.click(analyzeButton());
+    expect((await screen.findByRole('alert')).textContent).toContain('The Codex process timeout expired.');
+    expect(analyzeButton()).toHaveProperty('disabled', false);
+
+    bridge.set('codeReview:triage', () => {
+      throw new Error('The bridge went away.');
+    });
+    fireEvent.click(analyzeButton());
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('The bridge went away.'));
+    expect(screen.getByRole('alert').textContent).not.toContain('timeout expired');
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(analyzeButton()).toHaveProperty('disabled', false);
+  });
+
+  it('keeps a failure on screen while the operator decides findings by hand, and replaces it on the next analysis', async () => {
+    let current = live();
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(current));
+    bridge.set('codeReview:triage', () => fail('Codex failed.', 'TOOL_FAILED'));
+    bridge.set('codeReview:decide', () => {
+      current = live({ latestDecisions: { 'f-1': decisionRecord('f-1') } });
+      return ok<'codeReview:decide'>(current);
+    });
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+    await screen.findByRole('button', { name: /Analyze undecided findings/i });
+    fireEvent.click(analyzeButton());
+    await screen.findByRole('alert');
+
+    // "Decide each finding yourself" is the guidance shown; following it must not erase it.
+    fireEvent.change(screen.getAllByLabelText('Decision')[0]!, { target: { value: 'accept' } });
+    fireEvent.change(screen.getAllByLabelText(/^Reason/)[0]!, { target: { value: 'Decided by hand.' } });
+    fireEvent.click(screen.getAllByRole('button', { name: /Submit decision/i })[0]!);
+    await waitFor(() => expect(bridge.callsTo('codeReview:decide')).toHaveLength(1));
+    await screen.findByText(/Decided: accept/);
+    expect(screen.getByRole('alert').textContent).toContain('Codex failed.');
+
+    // A new analysis replaces it: pending first, then the result.
+    const answer = deferred<IpcResult<{ recommendations: never[]; detail: CodeReviewDetail }>>();
+    bridge.set('codeReview:triage', () => answer.promise);
+    fireEvent.click(analyzeButton());
+    await screen.findByRole('status');
+    expect(screen.queryByRole('alert')).toBeNull();
+    await deliver(answer, ok<'codeReview:triage'>({ recommendations: [], detail: current }));
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('reports a failed analysis at once, and stops saying it is running, while the re-read that follows is still pending', async () => {
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
+    const reread = deferred<IpcResult<CodeReviewDetail>>();
+    bridge.set('codeReview:triage', () => {
+      bridge.set('codeReview:get', () => reread.promise);
+      return fail('Codex failed.', 'TOOL_FAILED');
+    });
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+    await screen.findByRole('button', { name: /Analyze undecided findings/i });
+    fireEvent.click(analyzeButton());
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Codex failed.');
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(analyzeButton()).toHaveProperty('disabled', true);
+
+    await deliver(reread, ok<'codeReview:get'>(live()));
+    expect(analyzeButton()).toHaveProperty('disabled', false);
+    expect(screen.getByRole('alert').textContent).toContain('Codex failed.');
+  });
+
+  it('passes on the backend’s own next step, not only what went wrong', async () => {
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(live()));
+    bridge.set('codeReview:triage', () =>
+      fail('300 findings are too many to analyze at once.', 'VALIDATION_FAILED', 'Decide some findings by hand, then analyze the rest.')
+    );
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+    await screen.findByRole('button', { name: /Analyze undecided findings/i });
+    fireEvent.click(analyzeButton());
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('300 findings are too many to analyze at once.');
+    expect(alert.textContent).toContain('Decide some findings by hand, then analyze the rest.');
+  });
+
+  it('keeps the failure on screen even after the operator decides the last undecided finding by hand', async () => {
+    let current = live({ findings: [f1] });
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(current));
+    bridge.set('codeReview:triage', () => fail('Codex failed.', 'TOOL_FAILED'));
+    bridge.set('codeReview:decide', () => {
+      current = live({ findings: [f1], latestDecisions: { 'f-1': decisionRecord('f-1') } });
+      return ok<'codeReview:decide'>(current);
+    });
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+    await screen.findByRole('button', { name: /Analyze undecided findings/i });
+    fireEvent.click(analyzeButton());
+    await screen.findByRole('alert');
+
+    fireEvent.change(screen.getByLabelText('Decision'), { target: { value: 'accept' } });
+    fireEvent.change(screen.getByLabelText(/^Reason/), { target: { value: 'Decided by hand.' } });
+    fireEvent.click(screen.getByRole('button', { name: /Submit decision/i }));
+
+    expect(await screen.findByText('All live findings have decisions recorded.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Analyze undecided findings/i })).toBeNull();
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain('Codex failed.');
+    expect(alert.textContent).toContain('No decisions were changed or applied');
+  });
+
+  it('shows the summary and the apply controls on success without deciding anything, needs_user included', async () => {
+    let current = live();
+    bridge.set('codeReview:get', () => ok<'codeReview:get'>(current));
+    bridge.set('codeReview:triage', () => {
+      current = live({
+        triage: triageRecord(
+          [['f-1', 0], ['f-2', 0]],
+          [
+            { findingId: 'f-1', recommendation: 'accept', reason: 'Matches criterion 1.', evidenceRef: 'src/service.ts:42', confidence: 'high' },
+            { findingId: 'f-2', recommendation: 'needs_user', reason: 'Genuine uncertainty.', evidenceRef: 'src/service.ts:50', confidence: 'low' }
+          ]
+        )
+      });
+      return ok<'codeReview:triage'>({ recommendations: [], detail: current });
+    });
+    render(<CodeReviewPanel task={task()} integrationEnabled />);
+
+    // A draft typed by hand for the needs-a-human finding survives the analysis.
+    const decisions = await screen.findAllByLabelText('Decision');
+    fireEvent.change(decisions[1]!, { target: { value: 'reject' } });
+    fireEvent.change(screen.getAllByLabelText(/^Reason/)[1]!, { target: { value: 'My own reason.' } });
+    fireEvent.click(analyzeButton());
+
+    expect(await screen.findByText(/1 recommended accept/)).toBeTruthy();
+    expect(screen.getByText(/1 need a human/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Apply all recommendations to undecided findings/i })).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: /^Apply recommendation$/ })).toHaveLength(1);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
+
+    expect((decisions[1] as HTMLSelectElement).value).toBe('reject');
+    expect((screen.getAllByLabelText(/^Reason/)[1] as HTMLInputElement).value).toBe('My own reason.');
+    expect(bridge.callsTo('codeReview:decide')).toHaveLength(0);
   });
 });

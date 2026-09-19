@@ -26,6 +26,8 @@ import { Codex, type ThreadEvent, type ThreadItem, type ThreadOptions } from '@o
 import type { ToolDiagnostic } from '../../../shared/domain/diagnostics';
 import { AgentRelayError } from '../../../shared/domain/errors';
 import {
+  MAX_TRIAGE_FINDINGS,
+  TRIAGE_REF_KINDS,
   codexReviewResultJsonSchema,
   findingTriageResultJsonSchema,
   parseCodexReviewResult,
@@ -42,7 +44,8 @@ import type {
   CodexSpecificationRequest,
   CodexSpecificationResult,
   CodexTriageOutcome,
-  CodexTriageRequest
+  CodexTriageRequest,
+  TriageableFinding
 } from '../../ports';
 import { locateExecutable } from '../process/executable-locator';
 import type { ProcessRunner } from '../process/process-runner';
@@ -163,6 +166,56 @@ export function openThread<TThread>(
   options: ThreadOptions
 ): TThread {
   return threadId === null ? client.startThread(options) : client.resumeThread(threadId, options);
+}
+
+/**
+ * Fails closed, before dispatch, on a triage request that is empty or larger
+ * than one answer can cover, that names no known reference kind, or whose
+ * finding or prior-decision references are not all of the kind it declared.
+ *
+ * Mixed reference kinds are not a supported request: plan review only has
+ * indexes, code review only ids, and one response can only be held to one
+ * schema. The service that built the request declared which it meant, so a
+ * disagreement is that service's bug — reported here rather than discovered
+ * after a provider call, as a rejected response.
+ */
+function assertTriageRefsMatchKind(request: CodexTriageRequest): void {
+  // The type says this cannot happen; a caller that got round it would
+  // otherwise fail later, with an incidental TypeError instead of this.
+  if (!(TRIAGE_REF_KINDS as readonly unknown[]).includes(request.refKind)) {
+    throw new AgentRelayError(
+      'VALIDATION_FAILED',
+      `Unknown finding reference kind ${JSON.stringify(request.refKind)}, so nothing was sent to Codex.`
+    );
+  }
+  const isDeclaredKind = (ref: unknown): boolean =>
+    request.refKind === 'index'
+      ? typeof ref === 'number' && Number.isSafeInteger(ref) && ref >= 0
+      : typeof ref === 'string' && ref.length >= 1 && ref.length <= 100;
+
+  const findings: readonly TriageableFinding[] = request.findings;
+  if (findings.length === 0) {
+    throw new AgentRelayError('VALIDATION_FAILED', 'There are no findings to triage.');
+  }
+  if (findings.length > MAX_TRIAGE_FINDINGS) {
+    throw new AgentRelayError(
+      'VALIDATION_FAILED',
+      `${findings.length} findings are too many to analyze at once (the limit is ${MAX_TRIAGE_FINDINGS}), so nothing was sent to Codex.`,
+      { remediation: 'Decide some findings by hand, then analyze the rest.' }
+    );
+  }
+  const refs: readonly unknown[] = [
+    ...findings.map((finding) => finding.ref),
+    ...request.priorDecisions.map((decision) => decision.findingRef)
+  ];
+  if (!refs.every(isDeclaredKind)) {
+    throw new AgentRelayError(
+      'VALIDATION_FAILED',
+      `Every finding reference in a triage request must be a ${
+        request.refKind === 'index' ? 'non-negative integer index' : 'non-empty string id'
+      }; the request mixed reference kinds or disagreed with its declared kind, so nothing was sent to Codex.`
+    );
+  }
 }
 
 export class CodexSdkAdapter implements CodexAdapter {
@@ -470,7 +523,12 @@ export class CodexSdkAdapter implements CodexAdapter {
     request: CodexTriageRequest,
     context: AgentRunContext
   ): Promise<CodexTriageOutcome> {
+    // Before a prompt is built or a client exists: a request whose references
+    // disagree with its declared kind must cost nothing and reach no provider.
+    assertTriageRefsMatchKind(request);
+
     const prompt = buildTriagePrompt({
+      refKind: request.refKind,
       specification: request.specification,
       ruleEvidence: request.ruleEvidence,
       findings: request.findings,
@@ -490,11 +548,13 @@ export class CodexSdkAdapter implements CodexAdapter {
         approvalPolicy: 'never',
         networkAccessEnabled: false
       }),
-      findingTriageResultJsonSchema(),
+      // The model is constrained to, and its answer validated against, the
+      // reference kind of THIS call — never a `number | string` it could pick from.
+      findingTriageResultJsonSchema(request.refKind),
       context
     );
 
-    const parsed = parseFindingTriageResult(outcome.finalResponse);
+    const parsed = parseFindingTriageResult(outcome.finalResponse, request.refKind);
     if (!parsed.ok || !parsed.value) {
       throw new AgentRelayError(
         'PARSE_FAILED',
