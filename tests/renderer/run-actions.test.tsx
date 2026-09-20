@@ -97,9 +97,7 @@ describe('what the task badge says while the specification has no approval', () 
     rerender(<StatusBadge status="READY_FOR_IMPLEMENTATION" specificationApprovedAt="2026-09-20T00:00:00.000Z" />);
     expect(container.textContent).toBe('Ready for implementation');
 
-    // A caller that does not know the approval shows the plain status, as before.
-    rerender(<StatusBadge status="READY_FOR_IMPLEMENTATION" />);
-    expect(container.textContent).toBe('Ready for implementation');
+    // Every other status reads as it always did, approved or not.
     rerender(<StatusBadge status="IMPLEMENTING" specificationApprovedAt={null} />);
     expect(container.textContent).toBe('Implementing');
   });

@@ -123,8 +123,7 @@ describe('what the task’s status is called', () => {
     );
   });
 
-  it('leaves every other status, and a caller that does not know the approval, as it was', () => {
-    expect(statusLabel({ status: 'READY_FOR_IMPLEMENTATION' })).toBe('Ready for implementation');
+  it('leaves every other status as it was', () => {
     expect(statusLabel({ status: 'DRAFT', specificationApprovedAt: null })).toBe('Draft');
     expect(statusLabel({ status: 'IMPLEMENTING', specificationApprovedAt: null })).toBe('Implementing');
   });

@@ -684,7 +684,9 @@ branch, its worktree and the user's checkout are never written; the only Git com
   replaced — only a read-back may settle it. The loop never retries by itself in either case.
 - Recovery. A gate that cannot count (`planReviewRecovery`, derived from the task's own rows) is shown as
   such, the loop's next step is `recover_review`, and the one action is "Retry in a fresh review session"
-  (`planReview:retryFreshSession`): `retryInFreshSession` makes a review identity, then in ONE transaction
+  (`planReview:retryFreshSession`, which replaces and nothing else; the replacement is an ordinary current
+  `prepared` gate, so reviewing it is the usual separate "Run external plan review" — these calls are never
+  chained): `retryInFreshSession` makes a review identity, then in ONE transaction
   writes a new gate for the SAME specification and rule evidence and marks the old attempt
   `superseded_by` it (its status, session and error text untouched), withdraws an approval that rested
   on the discarded evidence, and sends nothing to the provider; the review is a separate, explicit call.

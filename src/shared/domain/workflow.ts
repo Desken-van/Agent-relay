@@ -313,7 +313,8 @@ export function assertPublishable(
  */
 export function statusLabel(task: {
   readonly status: TaskStatus;
-  readonly specificationApprovedAt?: string | null;
+  /** Required, not optional: a caller that leaves it out could not tell an unapproved plan from an approved one. */
+  readonly specificationApprovedAt: string | null;
 }): string {
   if (task.status === 'READY_FOR_IMPLEMENTATION' && task.specificationApprovedAt === null) {
     return 'Specification awaiting approval';

@@ -39,16 +39,16 @@ const BUSY: ReadonlySet<TaskStatus> = new Set([
 ]);
 
 /**
- * `specificationApprovedAt` is passed wherever the task is at hand: a task that has a
- * specification but no approval is not "ready for implementation", whatever its internal
- * status is called. Omitted, the badge shows the plain status.
+ * `specificationApprovedAt` is required: a task that has a specification but no approval is
+ * not "ready for implementation", whatever its internal status is called, and a caller that
+ * could leave it out could silently bring the misleading label back.
  */
 export function StatusBadge({
   status,
   specificationApprovedAt
 }: {
   status: TaskStatus;
-  specificationApprovedAt?: string | null;
+  specificationApprovedAt: string | null;
 }): React.JSX.Element {
   return (
     <span className={`status status--${STATUS_CLASS[status]}${BUSY.has(status) ? ' status--busy' : ''}`}>

@@ -45,6 +45,7 @@
 
 import { AgentRelayError } from '../../../shared/domain/errors';
 import { redactSecrets } from '../../../shared/util/redact';
+import { isValidBranchName } from '../../../shared/util/slug';
 import type { PlanReviewSubjectFactory, PlanReviewSubjectRequest } from '../../ports';
 import { locateExecutable } from '../process/executable-locator';
 import type { ProcessResult, ProcessRunner } from '../process/process-runner';
@@ -131,7 +132,10 @@ export class GitPlanReviewSubjectFactory implements PlanReviewSubjectFactory {
     if (!SAFE_ID.test(gateId) || !SHA256.test(specificationSha256)) {
       throw new AgentRelayError('VALIDATION_FAILED', 'The plan-review subject request is malformed.');
     }
-    if (branch.length === 0 || branch.startsWith('-') || branch.includes('\0')) {
+    // A branch NAME, not a revision expression: `refs/heads/x~1^{commit}` resolves to an ancestor of
+    // `x`, so a value carrying ~ ^ : @{ .. and the like would build the subject from the wrong tree.
+    // The project's own validator is the one that decided this name was acceptable in the first place.
+    if (!isValidBranchName(branch)) {
       throw new AgentRelayError('VALIDATION_FAILED', 'The task branch name cannot be used to build a review subject.');
     }
     const epoch = Math.floor(Date.parse(createdAt) / 1_000);

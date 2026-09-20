@@ -446,9 +446,10 @@ export const ipcInputSchemas = {
     .strict(),
   'planReview:review': byTask,
   'planReview:reconcile': byTask,
-  // Replace a review that cannot count with a new attempt under a fresh review identity, and
-  // run it. Takes no round identity: it acts on the task's latest attempt, and refuses one
-  // whose call has an unknown outcome (that is reconciled, never repeated).
+  // Replace a review that cannot count with a new attempt under a fresh review identity. It
+  // replaces only: reviewing the replacement is the ordinary, separate "review" call. Takes no
+  // round identity: it acts on the task's latest attempt, and refuses one whose call has an
+  // unknown outcome (that is reconciled, never repeated).
   'planReview:retryFreshSession': byTask,
 
   // Code review (INT-D-A). Identifiers and typed decisions only.

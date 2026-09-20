@@ -1032,8 +1032,9 @@ export class PlanReviewGateService {
    *   and its hash are not touched — with a review ref no other gate has, and marks the old
    *   attempt superseded in the same transaction. The old row keeps its status, session and
    *   error text untouched: it is evidence.
-   * - It sends nothing to the provider. Reviewing is a separate, explicit step, so recovery
-   *   can never start a round, and never starts implementation.
+   * - It sends nothing to the provider. Reviewing is a separate, explicit step (the ordinary
+   *   "Run external plan review" on the replacement, which is a current `prepared` gate), so
+   *   recovery can never start a round, and never starts implementation.
    * - If the old attempt had led to an approval, the approval is withdrawn: it rested on a
    *   review that has just been discarded.
    */

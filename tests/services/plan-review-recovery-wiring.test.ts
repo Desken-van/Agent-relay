@@ -252,6 +252,25 @@ describe('a gate an earlier build left stuck, through the IPC boundary', () => {
     expect(await ipc('workflow:implement', { taskId: task.id })).toMatchObject({ ok: false, error: { code: 'APPROVAL_REQUIRED' } });
   });
 
+  it('recovers through the IPC channel by replacing the attempt ONLY: no review is dispatched, and the next action is the ordinary one', async () => {
+    const { app, task } = world();
+    // External plan review is enabled, and pointed at an executable that does not exist: any attempt to
+    // reach the provider would fail loudly, so a chained review cannot go unnoticed.
+    app.settings.update({ externalPlanReviewEnabled: true, coaiMcpExecutablePath: 'C:\\tools\\never-started.exe' });
+
+    const result = await ipc('planReview:retryFreshSession', { taskId: task.id });
+
+    expect(result).toMatchObject({ ok: true });
+    const detail = (result as { ok: true; data: Record<string, any> }).data;
+    // The replacement is an ordinary current `prepared` gate: nothing was opened, sent or recorded.
+    expect(detail.gate).toMatchObject({ status: 'prepared', sessionId: null, failureKind: null, lastError: null });
+    expect(detail.recovery).toBeNull();
+    expect(detail.correction.nextStep).toBe('run_review');
+    expect(app.planReviewGates.findById('gate-2')).toMatchObject({ supersededBy: detail.gate.id });
+    expect(app.tasks.findById(task.id)?.status).toBe('READY_FOR_IMPLEMENTATION');
+    expect(app.runs.listByTask(task.id)).toEqual([]);
+  });
+
   it('refuses the retry channel when there is nothing to recover, without touching the repository', async () => {
     const { app, task, repository } = world();
     app.planReviewGates.update('gate-2', { status: 'awaiting_resolve', sessionId: 'session-2', verdict: 'revise', findingsJson: '[]', gatingCount: 0, threshold: 1 });

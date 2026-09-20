@@ -170,6 +170,26 @@ describe.runIf(gitAvailable)('an isolated plan-review subject', () => {
     expect(git(repo.path, 'count-objects', '-v')).toBeTruthy();
   });
 
+  it('refuses revision syntax in a branch value, so it can never build the subject from an ancestor of the task branch', async () => {
+    const repo = makeRepository('revision-syntax');
+    // `refs/heads/agent/task~1^{commit}` IS the branch's ancestor: Git reads ~ as revision syntax.
+    expect(git(repo.path, 'rev-parse', '--verify', 'refs/heads/agent/task~1^{commit}').trim()).not.toBe(repo.head);
+    const refsBefore = git(repo.path, 'for-each-ref');
+
+    for (const branch of ['agent/task~1', 'agent/task^', 'agent/task^{tree}', 'agent/task@{1}', 'agent/task:file', 'agent/../task', 'agent//task', 'agent/task/', 'agent/task.lock', 'agent/task*', 'agent/ task']) {
+      await expect(factory.createIsolatedSubject(request(repo.path, { branch })), branch).rejects.toMatchObject({
+        code: 'VALIDATION_FAILED'
+      });
+    }
+    // The genuine branch, and one with the project's own naming, still work.
+    git(repo.path, 'branch', 'agent-relay/1a2b3c4d-add-health-endpoint', 'agent/task');
+    const refsWithBranch = git(repo.path, 'for-each-ref');
+    expect(refsWithBranch).not.toBe(refsBefore);
+    await expect(factory.createIsolatedSubject(request(repo.path, { branch: 'agent-relay/1a2b3c4d-add-health-endpoint' }))).resolves.toMatch(/^[0-9a-f]{40}$/);
+    // Making the subject added no ref of its own.
+    expect(git(repo.path, 'for-each-ref')).toBe(refsWithBranch);
+  });
+
   it.each([
     ['a branch that would be read as an option', { branch: '--upload-pack=evil' }],
     ['a branch with a NUL', { branch: 'agent/task\0x' }],

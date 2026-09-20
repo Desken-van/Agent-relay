@@ -322,12 +322,11 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       return planReviewDetail(input.taskId);
     },
     'planReview:retryFreshSession': async (input) => {
-      const service = planReviewService();
-      // Two explicit steps: replace the attempt, THEN review it. The first sends nothing to the
-      // provider and never starts implementation; a failure of the second leaves a normal,
-      // recoverable gate for the new attempt.
-      await service.retryInFreshSession(input.taskId);
-      await service.review(input.taskId);
+      // Replaces the attempt and NOTHING else: no provider is contacted and nothing is started.
+      // The replacement is an ordinary current `prepared` gate, so the next action is the usual
+      // "Run external plan review" — plan-review preparation, review, reconciliation and
+      // resolution are separate calls and are never chained.
+      await planReviewService().retryInFreshSession(input.taskId);
       return planReviewDetail(input.taskId);
     },
     'planReview:reconcile': async (input) => {
