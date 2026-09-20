@@ -54,6 +54,7 @@ import {
 } from '../../shared/util/provider-text';
 import { CodeReviewNotDispatchedError } from './code-review-provider';
 import { specificationIdentity } from './specification-identity';
+import { runAsOperation, type TaskOperationKind, type TaskOperationRegistry } from './task-operations';
 import {
   hashSnapshotFile,
   nodeSnapshotFileOps,
@@ -224,6 +225,23 @@ const RECONCILE_ATTESTATION =
 const CHECKOUT_MISMATCH =
   'The task worktree does not match what this task records. Nothing was dispatched and nothing was written.';
 
+/**
+ * What a stop reports, by how far the operation had got when it landed.
+ *
+ * Each says the same true thing in the terms of that step. None claims the
+ * provider did not run: a call that had gone out is not undone by Stop, only its
+ * answer is refused. The task is closed by then, so nothing here promises that the
+ * outcome can be reconciled later.
+ */
+const STOPPED_BEFORE_WRITE = 'The task was stopped before anything further was sent or recorded.';
+const STOPPED_DURING_OPERATION = 'The task was stopped while this operation was running. No result was recorded.';
+const STOPPED_REVIEW_OUTCOME_UNKNOWN =
+  'The task was stopped while the external review call was in flight. Its outcome is unknown and was not recorded, and the task is closed, so nothing further will be applied to this round.';
+const STOPPED_BEFORE_DISPATCH =
+  'The task was stopped while the round was being reserved, so no review was dispatched and none ran. The round is closed as failed.';
+const STOPPED_READ_BACK = 'The task was stopped while the round was being read back. Nothing from the answer was recorded.';
+const STOPPED_ANALYSIS = 'The task was stopped while the analysis was running. Nothing from it was recorded.';
+
 const REVIEWER_CANNOT_SEE_SUBJECT =
   'This subject includes uncommitted or untracked work, and the configured reviewer reads only committed refs. It would review a different state of the code and return a verdict about it, so the round was refused rather than dispatched.';
 
@@ -317,6 +335,13 @@ export interface CodeReviewDeps {
   readonly snapshots: CodeSnapshotSource;
   readonly reviewer: ExternalCodeReviewer;
   readonly claims: CodeReviewClaims;
+  /**
+   * The process-wide register `Orchestrator.stop()` reads. Required rather than
+   * optional: a service built without it would run its provider calls invisibly to
+   * Stop, which is the defect this exists to close. The composition root hands every
+   * service the same instance.
+   */
+  readonly operations: TaskOperationRegistry;
   readonly clock: Clock;
   readonly ids: IdGenerator;
   readonly limits?: CodeSnapshotLimits;
@@ -499,6 +524,10 @@ export class CodeReviewService {
     const snapshot = await this.buildSnapshot(worktreePath, baseBranch);
     const canonical = canonicalCodeSnapshot(snapshot);
 
+    // Reading the working tree takes a while, and Stop can land in it. A subject is
+    // the ground every later round and decision stands on, so it is not stored for
+    // a task that has been closed since.
+    this.assertStillActive(taskId, undefined, STOPPED_BEFORE_WRITE);
     return this.deps.reviews.createSubject({
       id: this.deps.ids.next(),
       taskId: task.id,
@@ -804,18 +833,19 @@ export class CodeReviewService {
    */
   async review(taskId: string, signal?: AbortSignal): Promise<CodeReviewRoundOutcome> {
     this.assertMutableTask(taskId);
-    const release = this.deps.claims.acquire(taskId, 'review');
-    try {
-      return await this.runReview(taskId, signal);
-    } finally {
-      release();
-    }
+    // Registered before anything is read or dispatched, so Stop can reach every
+    // step below and a refusal costs a caller nothing.
+    return this.underOperation(
+      taskId,
+      'code_review',
+      true,
+      () => this.deps.claims.acquire(taskId, 'review'),
+      signal,
+      (effective) => this.runReview(taskId, effective)
+    );
   }
 
-  private async runReview(
-    taskId: string,
-    signal?: AbortSignal
-  ): Promise<CodeReviewRoundOutcome> {
+  private async runReview(taskId: string, signal: AbortSignal): Promise<CodeReviewRoundOutcome> {
     const { task, worktreePath } = this.requireReviewableTask(taskId);
 
     // Is this even the right checkout? Read before any durable write and before
@@ -898,6 +928,10 @@ export class CodeReviewService {
 
     // ---- Everything above this line is provably free of external effect. ----
     //
+    // A stop that landed while the checks above were running ends the operation
+    // here, before a round exists: no row, no reservation, nothing to reconcile.
+    this.assertStillActive(taskId, signal, STOPPED_BEFORE_WRITE);
+
     // Durable intent, written BEFORE anything leaves the process. If the
     // machine dies on the next line, the row already says a round was about to
     // go out, and nothing will silently start a second one.
@@ -967,6 +1001,10 @@ export class CodeReviewService {
       if (locator.providerId !== this.deps.reviewer.providerId) {
         throw new AgentRelayError('PARSE_FAILED', LOCATOR_INVALID);
       }
+      // The reservation took a while and Stop can land in it. Nothing has been
+      // dispatched yet, so ending here leaves a round that provably reviewed
+      // nothing, closed below like any other failed reservation.
+      this.assertStillActive(taskId, signal, STOPPED_BEFORE_DISPATCH);
     } catch (error) {
       // Still above the non-idempotent call, so the round is closed as a
       // refusal that provably reviewed nothing.
@@ -981,7 +1019,10 @@ export class CodeReviewService {
       // not designed here.
       this.deps.reviews.updateRound(round.id, {
         status: 'failed',
-        lastError: redactAndTruncate(RESERVATION_FAILED, 10_000)
+        lastError: redactAndTruncate(
+          this.wasStopped(taskId, signal) ? STOPPED_BEFORE_DISPATCH : RESERVATION_FAILED,
+          10_000
+        )
       });
       // Rethrown untouched: the caller that asked for this review is entitled
       // to the code and the sentence. Only the DURABLE copy is Agent Relay's.
@@ -1023,12 +1064,27 @@ export class CodeReviewService {
       // Everything else: the phase stays at `reviewing`, because the request
       // left this process and only its answer was lost. Writing `failed` here
       // would assert the call had no effect, which nothing on this side knows.
+      //
+      // A call that ended because the task was stopped is the same case with a
+      // known reason, and says so: what the provider threw for a killed call is
+      // up to its adapter, and is not what this round should be remembered by.
+      if (this.wasStopped(taskId, signal)) {
+        this.deps.reviews.updateRound(dispatched.id, {
+          lastError: redactAndTruncate(STOPPED_REVIEW_OUTCOME_UNKNOWN, 10_000)
+        });
+        throw new AgentRelayError('CANCELLED', STOPPED_REVIEW_OUTCOME_UNKNOWN, { cause: error });
+      }
       this.deps.reviews.updateRound(dispatched.id, {
         lastError: redactAndTruncate(DISPATCH_UNCONFIRMED, 10_000)
       });
       // Rethrown untouched, for the same reason as the reservation above.
       throw error;
     }
+
+    // The provider answered — perhaps only because it was being stopped. The call
+    // went out, so if Stop landed its outcome is unknown; that is written on the
+    // round, and the answer is not read.
+    this.assertAnswerStillWanted(taskId, signal, dispatched.id);
 
     // Validated at this boundary as well as the adapter's: the port is an
     // interface, and reviewer prose is data that must never reach storage
@@ -1069,6 +1125,9 @@ export class CodeReviewService {
     // tell" as proof the code had changed — a claim made from an absence.
     const after = await this.subjectIdentity(taskId);
 
+    // Re-read the working tree took another await, and Stop can land in it. This
+    // is the last check before the round is completed and its findings stored.
+    this.assertAnswerStillWanted(taskId, signal, dispatched.id);
     const applied = this.persistCompletion(dispatched.id, subject, answer, validated, after);
 
     return {
@@ -1080,6 +1139,24 @@ export class CodeReviewService {
       repeatedFindings: applied.findings.length - applied.created,
       subjectAfter: after.identity
     };
+  }
+
+  /**
+   * After a dispatched call: refuse to apply its answer when the task was stopped.
+   *
+   * The round keeps the phase it had when the call went out (`reviewing`), which is
+   * exactly the evidence of a call whose outcome is unknown, and gains a note that
+   * says why nothing was recorded. A task that ended some other way is refused
+   * without a note, as any other write to a closed task is.
+   */
+  private assertAnswerStillWanted(taskId: string, signal: AbortSignal, roundId: string): void {
+    if (this.wasStopped(taskId, signal)) {
+      this.deps.reviews.updateRound(roundId, {
+        lastError: redactAndTruncate(STOPPED_REVIEW_OUTCOME_UNKNOWN, 10_000)
+      });
+      throw new AgentRelayError('CANCELLED', STOPPED_REVIEW_OUTCOME_UNKNOWN);
+    }
+    this.assertMutableTask(taskId);
   }
 
   /**
@@ -1336,18 +1413,17 @@ export class CodeReviewService {
    */
   async reconcile(taskId: string, signal?: AbortSignal): Promise<CodeReviewRoundOutcome> {
     this.assertMutableTask(taskId);
-    const release = this.deps.claims.acquire(taskId, 'reconcile');
-    try {
-      return await this.runReconcile(taskId, signal);
-    } finally {
-      release();
-    }
+    return this.underOperation(
+      taskId,
+      'code_reconcile',
+      true,
+      () => this.deps.claims.acquire(taskId, 'reconcile'),
+      signal,
+      (effective) => this.runReconcile(taskId, effective)
+    );
   }
 
-  private async runReconcile(
-    taskId: string,
-    signal?: AbortSignal
-  ): Promise<CodeReviewRoundOutcome> {
+  private async runReconcile(taskId: string, signal: AbortSignal): Promise<CodeReviewRoundOutcome> {
     const { worktreePath } = this.requireReviewableTask(taskId);
 
     const round = this.deps.reviews.latestRound(taskId);
@@ -1406,6 +1482,11 @@ export class CodeReviewService {
       },
       signal
     );
+
+    // The read-back is read-only towards the provider, so a stop that landed in it
+    // leaves nothing to undo — but nothing it reported may be written to a task
+    // that has been closed, and the round keeps the note it already had.
+    this.assertStillActive(taskId, signal, STOPPED_READ_BACK);
 
     if (status.kind === 'running') {
       // Still executing. The round keeps its phase, and nothing may start
@@ -1478,6 +1559,9 @@ export class CodeReviewService {
 
     const validated = this.validateAnswer(status.round, subject, round.id);
     const after = await this.subjectIdentity(taskId);
+    // The working tree was read again, and Stop can land in that: the last check
+    // before the round is completed and its findings stored.
+    this.assertStillActive(taskId, signal, STOPPED_READ_BACK);
     const applied = this.persistCompletion(round.id, subject, status.round, validated, after);
     return {
       round: applied.round,
@@ -1544,7 +1628,9 @@ export class CodeReviewService {
    */
   async decide(
     taskId: string,
-    request: DecideCodeFindingRequest
+    request: DecideCodeFindingRequest,
+    /** The operation this decision is part of (Auto decide), when there is one. A manual decision has none. */
+    signal?: AbortSignal
   ): Promise<{ finding: CodeReviewFinding; action: CodeReviewDecisionAction }> {
     this.assertMutableTask(taskId);
     const reason = request.reason.trim();
@@ -1622,6 +1708,11 @@ export class CodeReviewService {
       }
     }
 
+    // Reading the working tree above was the only await, and Stop can land in it.
+    // The check is immediately before the write, so a decision is never recorded
+    // for a task that was stopped: the conditional write below protects a finding
+    // from a stale screen, this protects the task from a late one.
+    this.assertStillActive(taskId, signal, STOPPED_BEFORE_WRITE);
     const applied = this.deps.reviews.appendDecisionIfUnchanged(
       {
         id: this.deps.ids.next(),
@@ -1672,18 +1763,21 @@ export class CodeReviewService {
     request: CodeReviewTriageRequest = {},
     signal?: AbortSignal
   ): Promise<readonly FindingTriageRecommendation[]> {
-    const release = this.deps.claims.acquire(taskId, 'triage');
-    try {
-      return await this.runTriage(taskId, request, signal);
-    } finally {
-      release();
-    }
+    this.assertMutableTask(taskId);
+    return this.underOperation(
+      taskId,
+      'code_triage',
+      true,
+      () => this.deps.claims.acquire(taskId, 'triage'),
+      signal,
+      (effective) => this.runTriage(taskId, request, effective)
+    );
   }
 
   private async runTriage(
     taskId: string,
     request: CodeReviewTriageRequest,
-    signal?: AbortSignal
+    signal: AbortSignal
   ): Promise<readonly FindingTriageRecommendation[]> {
     if (!this.deps.codex || !this.deps.settings) {
       throw new AgentRelayError('TOOL_MISSING', 'Automatic finding triage is not configured in this build.');
@@ -1761,11 +1855,17 @@ export class CodeReviewService {
       .map((d) => ({ findingRef: d.findingId, action: d.action, reason: d.reason }));
 
     const settings = this.deps.settings.get();
+    // The operation's own signal — the one Stop aborts — and never one made here:
+    // a private controller would be a call Stop cannot reach.
     const context: AgentRunContext = {
-      signal: signal ?? new AbortController().signal,
+      signal,
       timeoutMs: settings.processTimeoutMs,
       onProgress: () => undefined
     };
+
+    // The read above was an await, and Stop can land in it. Codex is not started
+    // for a task that has already been stopped.
+    this.assertStillActive(taskId, signal, STOPPED_BEFORE_WRITE);
 
     const outcome = await this.deps.codex.triageFindings(
       {
@@ -1780,12 +1880,18 @@ export class CodeReviewService {
       context
     );
 
+    // Codex answered — perhaps only because it was being stopped. An analysis
+    // that arrives for a task that was stopped is dropped unread.
+    this.assertStillActive(taskId, signal, STOPPED_ANALYSIS);
     const validated = this.validateTriageCoverage(outcome.recommendations, requestedIds);
 
     // Refused if the subject or any targeted finding moved while the
     // (potentially long-running) Codex call was in flight — the read-only
     // analogue of `resolve`'s conditional write.
     const after = await this.subjectIdentity(taskId);
+    // Another await, and another chance for Stop: the last check before the
+    // recommendations are stored.
+    this.assertStillActive(taskId, signal, STOPPED_ANALYSIS);
     if (after.identity !== 'current' || after.stored === null || after.stored.subjectSha256 !== subjectSha256) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
@@ -1896,18 +2002,24 @@ export class CodeReviewService {
     request: { readonly findingId: string },
     signal?: AbortSignal
   ): Promise<CodeAutoDecideOutcome> {
-    const release = this.deps.claims.acquireFinding(taskId, request.findingId);
-    try {
-      return await this.runAutoDecide(taskId, request.findingId, signal);
-    } finally {
-      release();
-    }
+    this.assertMutableTask(taskId);
+    // Shared, not exclusive: the analysis of one finding is read-only towards the
+    // provider, so several different findings may run at once — and one Stop
+    // reaches every one of them.
+    return this.underOperation(
+      taskId,
+      'code_auto_decide',
+      false,
+      () => this.deps.claims.acquireFinding(taskId, request.findingId),
+      signal,
+      (effective) => this.runAutoDecide(taskId, request.findingId, effective)
+    );
   }
 
   private async runAutoDecide(
     taskId: string,
     findingId: string,
-    signal?: AbortSignal
+    signal: AbortSignal
   ): Promise<CodeAutoDecideOutcome> {
     const finding = this.deps.reviews.findFindingById(findingId);
     if (finding === null || finding.taskId !== taskId) {
@@ -1965,14 +2077,20 @@ export class CodeReviewService {
 
     const reason = `Auto-decided by Codex triage (${recommendation.confidence} confidence): ${recommendation.reason} Evidence: ${recommendation.evidenceRef}`;
     try {
-      await this.decide(taskId, {
-        findingId,
-        action: recommendation.recommendation,
-        reason,
-        expectedRevision: finding.revision,
-        actor: 'system',
-        source: 'codeReview:autoDecide'
-      });
+      await this.decide(
+        taskId,
+        {
+          findingId,
+          action: recommendation.recommendation,
+          reason,
+          expectedRevision: finding.revision,
+          actor: 'system',
+          source: 'codeReview:autoDecide'
+        },
+        // The operation's own signal, so a stop that lands between the analysis
+        // and this write is refused at the write itself.
+        signal
+      );
     } catch (error) {
       const raced = alreadyDecided();
       if (raced !== null) return raced;
@@ -2015,6 +2133,54 @@ export class CodeReviewService {
       );
     }
     return task;
+  }
+
+  /**
+   * Run `body` as a registered, stoppable operation: Stop reaches it through the
+   * shared register, the overlap claim keeps two of them from running together, and
+   * both are released whatever happens.
+   */
+  private underOperation<T>(
+    taskId: string,
+    kind: TaskOperationKind,
+    exclusive: boolean,
+    claim: () => () => void,
+    signal: AbortSignal | undefined,
+    body: (effective: AbortSignal) => Promise<T>
+  ): Promise<T> {
+    return runAsOperation(
+      this.deps.operations,
+      taskId,
+      kind,
+      { exclusive, signal, claim, stoppedMessage: STOPPED_DURING_OPERATION },
+      body
+    );
+  }
+
+  /**
+   * Refuse to go on when the task was stopped or is no longer open.
+   *
+   * Called after every awaited external call and immediately before the durable
+   * write that follows it, with nothing awaited in between: Stop writes the task's
+   * status and aborts the operation in one synchronous step, and the database
+   * writes here are synchronous too, so a write that passes this check cannot be
+   * overtaken by a stop. The signal is checked as well as the status because a stop
+   * that lands while an agent run is in flight aborts first and writes the status
+   * later.
+   *
+   * `signal` is absent for a caller that holds no operation of its own (a manual
+   * decision, a capture); for those the task's status is the whole check.
+   */
+  private assertStillActive(taskId: string, signal: AbortSignal | undefined, stoppedMessage: string): void {
+    if (signal?.aborted === true || this.deps.tasks.findById(taskId)?.status === 'CANCELLED') {
+      throw new AgentRelayError('CANCELLED', stoppedMessage);
+    }
+    this.assertMutableTask(taskId);
+  }
+
+  /** Whether the task was stopped, by either of the two signs Stop leaves. */
+  private wasStopped(taskId: string, signal: AbortSignal): boolean {
+    return signal.aborted || this.deps.tasks.findById(taskId)?.status === 'CANCELLED';
   }
 
   /**

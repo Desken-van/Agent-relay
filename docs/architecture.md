@@ -685,6 +685,42 @@ the behaviour it always had. Codex can be wrong, so a decision it made carries a
 "Change decision" control: the operator's own accept or reject is appended after it
 (the automatic one stays in the history) and is the one in force.
 
+**Stopping a code review.** `Stop task` reaches a code-review round, a reconciliation, a
+whole-set analysis and one finding's Auto decide through the SAME `TaskOperationRegistry` the
+plan side uses: `CodeReviewService` takes `operations` as a required dependency and the
+composition root hands it the instance the orchestrator's `stop()` reads, so there is no second
+registry and no private controller. `review`, `reconcile` and `triage` register as exclusive
+operations, a finding's Auto decide as a shared one (different findings still run together, and
+one Stop reaches all of them), each before its first read or provider call and released in a
+`finally`; `runAsOperation` is the one helper both services use for that. The operation's own
+signal goes to every provider call that takes one: the reviewer's `availability`, `beginRound`,
+`reviewCode` and `roundStatus`, and Codex `triageFindings`.
+- After every awaited external call, again after the local re-read of the working tree that
+  follows it, and immediately before the write it guards with nothing awaited in between, the
+  service checks that the signal is not aborted and the task is neither stopped nor closed. The
+  database writes are synchronous and `stop()` is synchronous, so a write that passes the check
+  cannot be overtaken by a stop. What it guards: creating the round, marking it dispatched,
+  completing it and storing its findings (`persistCompletion`, live or by reconciliation), storing
+  the analysis (`upsertTriage`), recording a decision (manual, or Auto decide's through the same
+  `decide`) and storing a captured subject. Codex is not started for a task that was stopped while
+  it was being prepared, and a new operation for a stopped task is refused before it reads anything.
+- Honesty about outcomes: a stop while `reviewCode` is in flight leaves the round `reviewing`
+  with a note saying its outcome is unknown and was not recorded — never `completed`, never
+  `failed`, and never with findings; a stop while the round is being reserved closes it as `failed`
+  (nothing was dispatched); a stop during a read-back changes nothing (a read-only call learned
+  nothing that may be written). The task is closed by then, so the outcome cannot be reconciled
+  from Agent Relay afterwards: the provider's own record is the place to look. In a batch stopped
+  part-way, decisions written before the stop stay recorded, the rest are refused, and every call
+  that did not finish reports the stop instead of a success.
+- Concurrent operations: an exclusive operation is refused (`BUSY`) while anything else is
+  registered for the task, and a second Auto decide for the SAME finding is refused by its claim.
+  A manual decision made while Auto decide analyzes the same finding keeps its compare-and-swap on
+  the finding's revision (the automatic result is dropped as `already_decided`), and a decision on
+  a stopped task is refused whoever asks. An agent run is refused while any of these is
+  registered, and `Stop task` during an agent run signals them too.
+- The panel says the task was stopped and reads the review back once; a bulk Auto decide that was
+  stopped part-way reports the findings it did not analyze as failures, never as a success.
+
 ### Authoritative Run actions and linked continuations
 
 `runGuidance` is the authoritative projection for **Run → Actions**. It maps the

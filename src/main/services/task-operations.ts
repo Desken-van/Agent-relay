@@ -3,15 +3,17 @@
  * be stopped.
  *
  * `Orchestrator.stop()` used to know only its own agent runs, so an operation
- * that lives elsewhere — the plan-correction loop, an external plan-review call —
- * was invisible to it: Stop moved the task to CANCELLED and the operation carried
- * on in the background, free to write the specification or start another provider
- * call for a task that had already ended. This registry is what Stop consults for
+ * that lives elsewhere — the plan-correction loop, an external plan-review call, a
+ * code-review round, an analysis or an Auto decide — was invisible to it: Stop moved
+ * the task to CANCELLED and the operation carried on in the background, free to
+ * write a specification, a review result or a decision, or to start another provider
+ * call, for a task that had already ended. This registry is what Stop consults for
  * everything that is not an agent run.
  *
  * It is built ONCE, in the composition root, and handed to the orchestrator and to
- * every service the IPC layer builds per call. A per-call instance would give each
- * invocation a private map and stop nothing. In memory on purpose: an entry means
+ * every service that runs an external call for a task, however that service is
+ * built. A per-call instance would give each invocation a private map and stop
+ * nothing. In memory on purpose: an entry means
  * "a call is in flight in this process right now", which is only ever true of a
  * live process; what survives a crash is the durable status of the rows.
  *
@@ -28,7 +30,11 @@ export type TaskOperationKind =
   | 'plan_reconcile'
   | 'plan_resolve'
   | 'plan_triage'
-  | 'plan_auto_decide';
+  | 'plan_auto_decide'
+  | 'code_review'
+  | 'code_reconcile'
+  | 'code_triage'
+  | 'code_auto_decide';
 
 export interface TaskOperation {
   readonly kind: TaskOperationKind;
@@ -57,6 +63,49 @@ export function asStopped(error: unknown, signal: AbortSignal | undefined, messa
   if (signal?.aborted !== true) return error;
   if (error instanceof AgentRelayError && error.code === 'CANCELLED') return error;
   return new AgentRelayError('CANCELLED', message, { cause: error });
+}
+
+/**
+ * Run `body` as a registered, stoppable operation: register it (so Stop can reach
+ * it), take the caller's overlap claim, and release both whatever happens.
+ *
+ * The registration comes first because a refusal there costs nothing, and the
+ * claim is released before the registration so a task is never visible as
+ * stoppable with nothing behind it. Whatever `body` throws after its signal was
+ * aborted is reported as a stop (see {@link asStopped}); an ordinary failure is
+ * reported as itself.
+ *
+ * Shared by every service that runs an external call for a task — the plan gate and
+ * the code-review service — so there is one registration discipline and not two that
+ * drift.
+ */
+export async function runAsOperation<T>(
+  operations: TaskOperationRegistry,
+  taskId: string,
+  kind: TaskOperationKind,
+  options: {
+    readonly exclusive: boolean;
+    readonly signal?: AbortSignal;
+    /** Takes the caller's own overlap claim once registered, and returns its release. */
+    readonly claim: () => () => void;
+    /** What a body that ends after the stop is reported as. */
+    readonly stoppedMessage: string;
+  },
+  body: (signal: AbortSignal) => Promise<T>
+): Promise<T> {
+  const operation = operations.begin(taskId, kind, { exclusive: options.exclusive, signal: options.signal });
+  try {
+    const release = options.claim();
+    try {
+      return await body(operation.signal);
+    } catch (error) {
+      throw asStopped(error, operation.signal, options.stoppedMessage);
+    } finally {
+      release();
+    }
+  } finally {
+    operation.release();
+  }
 }
 
 export class TaskOperationRegistry {

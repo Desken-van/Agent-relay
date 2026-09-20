@@ -9,14 +9,9 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { SqliteCodeReviewRepository } from '../../src/main/db/repositories/code-review-repository';
-import {
-  CodeReviewClaims,
-  CodeReviewService,
-  type CodeReviewDeps,
-  type CodeReviewRoundOutcome
-} from '../../src/main/services/code-review';
+import { CodeReviewClaims, CodeReviewService } from '../../src/main/services/code-review';
 import {
   CodeReviewNotDispatchedError,
   SettingsBoundCodeReviewer,
@@ -25,23 +20,13 @@ import {
 import { defaultSettings } from '../../src/main/container';
 import type { Settings } from '../../src/shared/domain/models';
 import type {
-  CodeReviewerAvailability,
-  ExternalCodeRoundLocator,
-  ExternalCodeRoundStatus,
-  RawCodeSnapshotFingerprint,
-  CodeSnapshotRequest,
-  CodeSnapshotSource,
-  ExternalCodeReviewer,
   ExternalCodeReviewRound,
-  ExternalCodeReviewSubject,
   ExternalMcpCallResult,
   ExternalMcpClient,
   ExternalMcpDiscovery,
   ExternalMcpServerConfig,
   ExternalMcpTool,
-  RawCheckoutIdentity,
-  RawCodeSnapshot,
-  RawCodeSnapshotFile
+  RawCheckoutIdentity
 } from '../../src/main/ports';
 import {
   nodeSnapshotFileOps,
@@ -50,8 +35,7 @@ import {
 import {
   codeCorrectionRequirements,
   codeReviewCurrentTriageRecommendations,
-  parseCodeReviewTriage,
-  type ProviderCodeFinding
+  parseCodeReviewTriage
 } from '../../src/shared/domain/code-review';
 import { AgentRelayError } from '../../src/shared/domain/errors';
 import { CoaiCodeReviewer } from '../../src/main/adapters/mcp/coai-code-reviewer';
@@ -60,13 +44,9 @@ import {
   COAI_CODE_REVIEW_TOOLS,
   COAI_PROVIDER_ID
 } from '../../src/main/adapters/mcp/coai-profiles';
-import { createHarness, type Harness } from '../helpers/harness';
-import { FakeCodexAdapter, makeSpecification } from '../helpers/fakes';
-
-const BASE = '1'.repeat(40);
-
-/** A fixed, valid-shaped contract fingerprint — its value is asserted on only where a test names it. */
-const FINGERPRINT = 'f'.repeat(64);
+import { codeReviewScenario, disposeScenariosAfterEach, reviewOnce } from '../helpers/code-review-scenario';
+import { FakeCodexAdapter } from '../helpers/fakes';
+import { FINGERPRINT, finding } from '../helpers/fake-code-review';
 
 const ESCAPE = String.fromCharCode(27);
 
@@ -92,267 +72,8 @@ const LEAKS = [
   'ghp_A1b2C3d4E5f6G7h8I9j0'
 ];
 
-/**
- * A snapshot source whose answer the test controls file by file.
- *
- * `content` is what would be on disk; the fake writes it into a temporary
- * worktree so the service's own file reading and hashing are exercised rather
- * than stubbed.
- */
-class FakeSnapshotSource implements CodeSnapshotSource {
-  readonly calls: CodeSnapshotRequest[] = [];
-  readonly checkoutCalls: string[] = [];
-  headCommit = '2'.repeat(40);
-  files: RawCodeSnapshotFile[] = [];
-  truncated = false;
-  hasUncommittedState = false;
-  error: Error | null = null;
-  /**
-   * What the stability fingerprint reports, per call.
-   *
-   * The default is a constant, so an ordinary capture is stable. A test that
-   * wants to model the tree moving mid-capture returns a different value on the
-   * later reads.
-   */
-  fingerprints: RawCodeSnapshotFingerprint[] = [];
-  readonly fingerprintCalls: number[] = [];
-  /** What `describeCheckout` reports, keyed by the path it is asked about. */
-  checkouts = new Map<string, RawCheckoutIdentity>();
-  defaultCheckout: RawCheckoutIdentity = {
-    commonDir: 'C:/repo/.git',
-    branch: 'agent/task-1',
-    detached: false
-  };
-
-  async describeCheckout(worktreePath: string): Promise<RawCheckoutIdentity> {
-    this.checkoutCalls.push(worktreePath);
-    return this.checkouts.get(worktreePath) ?? this.defaultCheckout;
-  }
-
-  private nextFingerprint(): RawCodeSnapshotFingerprint {
-    const index = this.fingerprintCalls.length;
-    this.fingerprintCalls.push(index);
-    return (
-      this.fingerprints[index] ??
-      this.fingerprints[this.fingerprints.length - 1] ?? {
-        headCommit: this.headCommit,
-        branch: 'agent/task-1',
-        status: '',
-        changeSet: ''
-      }
-    );
-  }
-
-  async fingerprint(): Promise<RawCodeSnapshotFingerprint> {
-    if (this.error) throw this.error;
-    return this.nextFingerprint();
-  }
-
-  async capture(request: CodeSnapshotRequest): Promise<RawCodeSnapshot> {
-    this.calls.push(request);
-    if (this.error) throw this.error;
-    return {
-      baseCommit: BASE,
-      headCommit: this.headCommit,
-      branch: 'agent/task-1',
-      files: this.files,
-      truncated: this.truncated,
-      hasUncommittedState: this.hasUncommittedState,
-      fingerprint: this.nextFingerprint()
-    };
-  }
-}
-
-class FakeCodeReviewer implements ExternalCodeReviewer {
-  readsUncommittedWorktreeState = true;
-  /** Who this reviewer is. Tests change it to model a reconfigured build. */
-  providerId = 'coai';
-  /** What the typed preflight answers. Tests make it refuse. */
-  available: CodeReviewerAvailability = { available: true, reason: null };
-  readonly availabilityCalls: number[] = [];
-  /**
-   * What the reviewer attests it read.
-   *
-   * `undefined` means "echo the dispatched subject", which is what an honest
-   * adapter does; a test sets it to something else to forge a mismatch.
-   */
-  attest: string | null | undefined = undefined;
-  readonly calls: {
-    locator: ExternalCodeRoundLocator;
-    subject: ExternalCodeReviewSubject;
-    scopeText: string;
-  }[] = [];
-  /**
-   * The locators `beginRound` hands out, in order.
-   *
-   * A fresh one per call by default, because a real provider opens a new round
-   * each time; a test that wants two rounds to collide sets them explicitly.
-   */
-  locators: ExternalCodeRoundLocator[] = [];
-  readonly beginCalls: ExternalCodeReviewSubject[] = [];
-  /** The idempotency key each reservation was asked for. */
-  readonly beginTokens: string[] = [];
-  beginError: Error | null = null;
-  /** Runs at the moment the round is opened, before a locator is returned. */
-  onBegin: (() => void) | null = null;
-  /**
-   * What the answer claims to be, when it is not simply the dispatched locator.
-   *
-   * `undefined` means "echo the locator it was called with", which is what an
-   * honest adapter does; a test sets it to forge an answer from another round.
-   */
-  answerLocator: ExternalCodeRoundLocator | undefined = undefined;
-  /** Runs at the moment the call is dispatched, before it answers. */
-  onCall: (() => void) | null = null;
-  error: Error | null = null;
-  answer: ExternalCodeReviewRound = {
-    locator: { providerId: 'coai', sessionId: 'session-1', roundId: 'round-1' },
-    reviewedSubjectSha256: null,
-    verdict: 'revise',
-    gatingCount: 1,
-    threshold: 0,
-    reviewers: 'all 3 reviewers answered',
-    findings: [],
-    instruction: 'resolve every finding',
-    serverName: 'coai-mcp',
-    serverVersion: '1.2.3',
-    contractFingerprint: FINGERPRINT,
-    tokensIn: 100,
-    tokensOut: 20
-  };
-
-  /** What the read-only round read-back reports. */
-  roundStatusAnswer: ExternalCodeRoundStatus = {
-    kind: 'unknown',
-    reason: 'not configured',
-    contractFingerprint: null
-  };
-  /**
-   * What each read-back was asked about.
-   *
-   * Both halves are recorded because the point of the locator is that the
-   * subject alone is not enough to name a round.
-   */
-  readonly roundStatusCalls: {
-    locator: ExternalCodeRoundLocator;
-    subject: ExternalCodeReviewSubject;
-  }[] = [];
-
-  async availability(): Promise<CodeReviewerAvailability> {
-    this.availabilityCalls.push(this.calls.length);
-    return this.available;
-  }
-
-  async beginRound(
-    subject: ExternalCodeReviewSubject,
-    clientToken: string
-  ): Promise<ExternalCodeRoundLocator> {
-    this.beginCalls.push(subject);
-    this.beginTokens.push(clientToken);
-    this.onBegin?.();
-    if (this.beginError) throw this.beginError;
-    const index = this.beginCalls.length - 1;
-    return (
-      this.locators[index] ?? {
-        providerId: this.providerId,
-        sessionId: `session-${index + 1}`,
-        roundId: `round-${index + 1}`,
-        contractFingerprint: FINGERPRINT
-      }
-    );
-  }
-
-  async roundStatus(
-    locator: ExternalCodeRoundLocator,
-    subject: ExternalCodeReviewSubject
-  ): Promise<ExternalCodeRoundStatus> {
-    this.roundStatusCalls.push({ locator, subject });
-    return this.roundStatusAnswer;
-  }
-
-  async reviewCode(
-    locator: ExternalCodeRoundLocator,
-    subject: ExternalCodeReviewSubject,
-    scopeText: string
-  ): Promise<ExternalCodeReviewRound> {
-    this.calls.push({ locator, subject, scopeText });
-    this.onCall?.();
-    if (this.error) throw this.error;
-    return {
-      ...this.answer,
-      locator: this.answerLocator ?? locator,
-      reviewedSubjectSha256:
-        this.attest === undefined ? subject.subjectSha256 : this.attest
-    };
-  }
-}
-
-function finding(overrides: Partial<ProviderCodeFinding> = {}): ProviderCodeFinding {
-  return {
-    severity: 'major',
-    category: 'reliability',
-    gating: true,
-    title: 'The retry is ambiguous',
-    body: 'A lost response may repeat work.',
-    fix: 'Persist the intent before calling out.',
-    file: 'src/service.ts',
-    line: 42,
-    provider: 'codex',
-    role: 'SecurityReliability',
-    ...overrides
-  };
-}
-
-const harnesses: Harness[] = [];
-
-afterEach(() => {
-  for (const harness of harnesses.splice(0)) harness.dispose();
-});
-
-function setup() {
-  const harness = createHarness();
-  harnesses.push(harness);
-  const reviews = new SqliteCodeReviewRepository(harness.db, harness.clock);
-  const snapshots = new FakeSnapshotSource();
-  const reviewer = new FakeCodeReviewer();
-  const claims = new CodeReviewClaims();
-  const build = (extra: Partial<CodeReviewDeps> = {}): CodeReviewService =>
-    new CodeReviewService({
-      tasks: harness.tasks,
-      projects: harness.projects,
-      reviews,
-      snapshots,
-      reviewer,
-      claims,
-      clock: harness.clock,
-      ids: harness.ids,
-      ...extra
-    });
-
-  const project = harness.createProject();
-  const task = harness.createTask(project.id, {
-    status: 'READY_FOR_IMPLEMENTATION',
-    worktreePath: harness.worktreesRoot,
-    branchName: 'agent/task-1',
-    baseBranch: 'main',
-    specificationJson: JSON.stringify(makeSpecification())
-  });
-  // The worktree and the project share one repository by default, and the
-  // worktree sits on the branch the task records. Tests that care make them
-  // disagree.
-  snapshots.checkouts.set(project.localPath, {
-    commonDir: 'C:/repo/.git',
-    branch: 'main',
-    detached: false
-  });
-
-  return { harness, reviews, snapshots, reviewer, claims, service: build(), build, task };
-}
-
-async function reviewOnce(value: ReturnType<typeof setup>): Promise<CodeReviewRoundOutcome> {
-  await value.service.captureSubject(value.task.id);
-  return value.service.review(value.task.id);
-}
+disposeScenariosAfterEach();
+const setup = codeReviewScenario;
 
 describe('the code-review subject', () => {
   it('keeps terminal task review history readable but refuses every mutating IPC operation', async () => {
@@ -570,6 +291,7 @@ describe('the code-review round', () => {
       snapshots: value.snapshots,
       reviewer: new UnconfiguredCodeReviewer(),
       claims: new CodeReviewClaims(),
+      operations: value.harness.operations,
       clock: value.harness.clock,
       ids: value.harness.ids
     });

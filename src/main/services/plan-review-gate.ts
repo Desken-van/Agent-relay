@@ -40,7 +40,7 @@ import type {
   TriageableFinding
 } from '../ports';
 import type { PlanReviewClaims } from './plan-review-claims';
-import { asStopped, type TaskOperationKind, type TaskOperationRegistry } from './task-operations';
+import { asStopped, runAsOperation, type TaskOperationKind, type TaskOperationRegistry } from './task-operations';
 import { renderRuleEvidence, validateRuleEvidenceSnapshot } from './rule-evidence';
 
 const MAX_PLAN_BYTES = 1_500_000;
@@ -672,21 +672,13 @@ export class PlanReviewGateService {
     signal: AbortSignal | undefined,
     body: (effective: AbortSignal | undefined) => Promise<T>
   ): Promise<T> {
-    const operation = this.deps.operations.begin(taskId, kind, { exclusive, signal });
-    try {
-      const release = claim();
-      try {
-        return await body(operation.signal);
-      } catch (error) {
-        // Whatever the provider threw when the stop killed its call, this ended
-        // because it was stopped.
-        throw asStopped(error, operation.signal, STOPPED_DURING_OPERATION);
-      } finally {
-        release();
-      }
-    } finally {
-      operation.release();
-    }
+    return runAsOperation(
+      this.deps.operations,
+      taskId,
+      kind,
+      { exclusive, signal, claim, stoppedMessage: STOPPED_DURING_OPERATION },
+      body
+    );
   }
 
   /**

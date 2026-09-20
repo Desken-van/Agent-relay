@@ -379,6 +379,9 @@ export function buildApplication(options: BuildApplicationOptions): Application 
       )
     }),
     claims: codeReviewClaims,
+    // The same register the orchestrator's stop() reads, so Stop reaches a review,
+    // a reconciliation, an analysis or an Auto decide that is in flight.
+    operations: taskOperations,
     codex: adapters.codex,
     settings,
     clock,

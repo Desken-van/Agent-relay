@@ -927,3 +927,42 @@ describe('code review: panel visibility', () => {
     expect(await screen.findByText('The evidence database is locked.')).toBeTruthy();
   });
 });
+
+describe('code review: Stop task while findings are being analyzed', () => {
+  it('reports a batch that was stopped part-way as a failure, keeps what was recorded and never as a full success', async () => {
+    const stopped = 'The task was stopped before anything further was sent or recorded.';
+    // The first answer lands, and the task is stopped before the rest are analyzed.
+    serve(3, (id, s) => (id === 'f-1' ? s.autoDecided(id, 'accept') : fail(stopped, 'CANCELLED')));
+    renderPanel();
+    await screen.findByText('Finding A');
+
+    fireEvent.click(bulkButton());
+
+    await screen.findByText(/Auto decide finished with failures/);
+    // What was written before the stop stays, and is shown as recorded.
+    expect(Object.keys(server.decisions)).toEqual(['f-1']);
+    const summary = screen.getByText(/analyzed/).closest('.autodecide-summary') as HTMLElement;
+    expect(summary.textContent).toMatch(/1 analyzed · 1 accepted · 0 rejected · 0 need you · 2 failed/);
+    // The reason is the backend's own, shown inside the findings that were not analyzed.
+    expect(screen.getAllByRole('alert').map((alert) => alert.textContent)).toEqual([
+      expect.stringContaining(stopped),
+      expect.stringContaining(stopped)
+    ]);
+  });
+
+  it('says the task was stopped, and reads the review back once so it describes what was really recorded', async () => {
+    serve(2);
+    const view = renderPanel({ task: task({ status: 'READY_FOR_REVIEW' }) });
+    await screen.findByText('Finding A');
+    expect(screen.queryByText(/The task was stopped. Nothing further will be recorded/)).toBeNull();
+    const before = bridge.callsTo('codeReview:get').length;
+
+    // Stop task: the task the screen holds arrives as CANCELLED.
+    view.rerender(
+      <CodeReviewPanel task={task({ status: 'CANCELLED' })} integrationEnabled latestClaudeResult={null} />
+    );
+
+    expect(await screen.findByText(/The task was stopped. Nothing further will be recorded/)).toBeTruthy();
+    await waitFor(() => expect(bridge.callsTo('codeReview:get')).toHaveLength(before + 1));
+  });
+});

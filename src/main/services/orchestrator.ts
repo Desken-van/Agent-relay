@@ -309,8 +309,9 @@ export class Orchestrator {
 
   /**
    * Refuse to start an agent run while something else is running for the task,
-   * and say WHICH: an agent run, or a plan-review operation (the correction loop, a
-   * review, a resolve) that has no run of its own to point at.
+   * and say WHICH: an agent run, or a review operation (the plan-correction loop, a
+   * plan or code review, a reconciliation, an analysis) that has no run of its own
+   * to point at.
    */
   private assertNothingRunning(taskId: string): void {
     if (this.inFlight.has(taskId)) {
@@ -322,7 +323,7 @@ export class Orchestrator {
     if (this.deps.operations?.isActive(taskId)) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
-        'This task already has a plan-review operation running. Wait for it to finish, or stop the task, before starting an agent.'
+        'This task already has a review operation running. Wait for it to finish, or stop the task, before starting an agent.'
       );
     }
   }
@@ -1673,6 +1674,11 @@ export class Orchestrator {
 
     if (controller) {
       controller.abort();
+      // Anything else registered for the task is told to stop in the same breath:
+      // a review or an analysis running beside an agent run has no catch block of
+      // its own that would notice. Each of them re-checks its signal before it
+      // writes, so they end even before the agent's catch block records CANCELLED.
+      this.deps.operations?.abort(taskId);
       // The in-flight operation's own catch block writes the CANCELLED state and
       // closes its run record; returning the current task avoids racing it.
       return task;

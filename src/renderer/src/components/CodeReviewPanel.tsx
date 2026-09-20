@@ -118,6 +118,21 @@ export function CodeReviewPanel({
     };
   }, [task.id]);
 
+  // Stop task ends whatever this panel had running. The task's own status is the
+  // signal (it arrives with the task the screen holds), and the review is read back
+  // once so nothing here goes on describing work that no longer exists.
+  const cancelled = task.status === 'CANCELLED';
+  useEffect(() => {
+    if (!cancelled) return undefined;
+    let active = true;
+    void call('codeReview:get', { taskId: task.id }).then((result) => {
+      if (active && result.ok) setDetail(result.data);
+    });
+    return () => {
+      active = false;
+    };
+  }, [cancelled, task.id]);
+
   const findings = detail?.findings ?? NO_CODE_FINDINGS;
   // Keyed on the subject alone — never on any property of the live findings
   // themselves. Drafts are already stored per finding id, so an individual
@@ -278,6 +293,12 @@ export function CodeReviewPanel({
         <Notice tone="warn">This task is bound to external code-review evidence. Re-enable the integration in Settings to continue it.</Notice>
       ) : null}
       {error ? <Notice tone="error">{error}</Notice> : null}
+      {cancelled ? (
+        <Notice tone="info">
+          The task was stopped. Nothing further will be recorded for this review. A review call that was already in
+          flight has an unknown outcome and was not recorded; what was recorded before the stop is kept.
+        </Notice>
+      ) : null}
       {detail?.identityProblem ? <Notice tone="warn">{detail.identityProblem}</Notice> : null}
 
       {subject ? (

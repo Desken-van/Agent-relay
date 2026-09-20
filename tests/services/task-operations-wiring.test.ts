@@ -101,9 +101,26 @@ describe('composition-root wiring of the task-operation register', () => {
       code: 'BUSY'
     });
     await expect(app.createPlanReviewGate(CONFIG).review(task.id)).rejects.toMatchObject({ code: 'BUSY' });
-    await expect(app.orchestrator.generateSpecification(task.id)).rejects.toThrow(/already has a plan-review operation running/i);
+    await expect(app.orchestrator.generateSpecification(task.id)).rejects.toThrow(/already has a review operation running/i);
 
     operation.release();
+  });
+
+  it('is the register the code-review service reads: every one of its operations is refused while another is registered', async () => {
+    const app = build();
+    const task = taskIn(app);
+    // One operation registered by the plan-correction side …
+    const operation = app.taskOperations.begin(task.id, 'plan_correction', { exclusive: true });
+
+    // … is seen by the singleton code-review service, which refuses before it reads, reserves or calls anything.
+    await expect(app.codeReview.review(task.id)).rejects.toMatchObject({ code: 'BUSY' });
+    await expect(app.codeReview.reconcile(task.id)).rejects.toMatchObject({ code: 'BUSY' });
+    await expect(app.codeReview.triage(task.id)).rejects.toMatchObject({ code: 'BUSY' });
+    await expect(app.codeReview.autoDecide(task.id, { findingId: 'finding-1' })).rejects.toMatchObject({ code: 'BUSY' });
+
+    // And it leaves nothing behind of its own once refused.
+    operation.release();
+    expect(app.taskOperations.isActive(task.id)).toBe(false);
   });
 
   it('hands out the same register every time, and a fresh service instance every call', () => {

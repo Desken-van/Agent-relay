@@ -441,7 +441,7 @@ describe('the cancellation register is process-wide', () => {
       second.gateService.autoDecide(task.id, { gateId: gate.id, findingsSha256: 'a'.repeat(64), findingIndex: 0 })
     ).rejects.toMatchObject({ code: 'BUSY' });
     // An agent run is refused too, by the orchestrator, for the same reason.
-    await expect(value.harness.orchestrator.generateSpecification(task.id)).rejects.toThrow(/already has a plan-review operation running/i);
+    await expect(value.harness.orchestrator.generateSpecification(task.id)).rejects.toThrow(/already has a review operation running/i);
     expect(value.harness.codex.revisionCalls).toHaveLength(1);
 
     release.resolve(undefined);
