@@ -238,13 +238,20 @@ export function planCorrectionNextStep(input: {
    * that reads the gate's own status: a gate stuck in `reviewing` on a session that
    * belongs to another review would otherwise be sent to `reconcile`, which can only
    * read that other review back.
+   *
+   * It is a next step only while the gate describes the CURRENT specification. For a gate
+   * of an earlier one (`obsolete`) the retry would be refused — it never replaces a review
+   * for a specification that has moved — so such a gate is treated as settled and the
+   * ordinary path (prepare and review the current specification) applies; it is also never
+   * reconciled, because what the provider says about its session is about another review.
    */
   readonly recovery?: PlanReviewRecoveryReason | null;
 }): PlanCorrectionNextStep {
   const { gate } = input;
   if (gate === null) return 'none';
-  if (input.recovery !== undefined && input.recovery !== null) return 'recover_review';
-  if (RECONCILE_STATUSES.includes(gate.status)) return 'reconcile';
+  const cannotCount = input.recovery !== undefined && input.recovery !== null;
+  if (cannotCount && input.identity === 'current') return 'recover_review';
+  if (!cannotCount && RECONCILE_STATUSES.includes(gate.status)) return 'reconcile';
   if (gate.status === 'awaiting_resolve') return 'decide';
 
   if (input.identity === 'unknown' || input.identity === 'no_gate') return 'none';

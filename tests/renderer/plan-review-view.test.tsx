@@ -819,6 +819,36 @@ describe('the external plan-review panel', () => {
     }
   );
 
+  it.each(['reviewing', 'prepared', 'proceeded'] as const)(
+    'does not offer the fresh-session retry — which would be refused — for a %s gate of an EARLIER specification: it offers to prepare the current one',
+    async (status) => {
+      bridge.set('planReview:get', () =>
+        ok<'planReview:get'>({
+          ...gateWith(status, { sessionId: 'session-1', failureKind: status === 'prepared' ? 'not_dispatched' : null, reconciledAt: status === 'proceeded' ? '2026-09-20T00:00:00.000Z' : null }, 'obsolete'),
+          recovery: { reason: 'foreign_session', message: 'Recovery: retry in a fresh review session.' }
+        })
+      );
+      const onGuidanceStateChanged = vi.fn();
+      render(
+        <PlanReviewPanel
+          task={task('READY_FOR_IMPLEMENTATION')}
+          integrationEnabled
+          onChanged={async () => undefined}
+          onGuidanceStateChanged={onGuidanceStateChanged}
+        />
+      );
+
+      const prepare = await screen.findByRole('button', { name: /Prepare isolated review branch/i });
+      await waitFor(() => expect(onGuidanceStateChanged).toHaveBeenLastCalledWith('prepare_review'));
+      expect(prepare.className).toContain('btn--recommended');
+      // Nothing that would be refused, and nothing that reads another review back.
+      expect(screen.queryByRole('button', { name: /Retry in a fresh review session/i })).toBeNull();
+      expect(screen.queryByRole('button', { name: /Reconcile external state/i })).toBeNull();
+      expect(screen.queryByText(/The current plan has no successful review/i)).toBeNull();
+      expect(screen.queryByText(/still outstanding/i)).toBeNull();
+    }
+  );
+
   it('still offers Reconcile, and no fresh-session retry, for a call whose outcome is unknown on a session of its own', async () => {
     bridge.set('planReview:get', () =>
       ok<'planReview:get'>({ ...gateWith('reviewing', { sessionId: 'session-2', lastError: 'The Coai call timed out.' }), recovery: null })

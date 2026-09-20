@@ -34,6 +34,7 @@ import type {
   ExternalPlanReviewStatus,
   ExternalPlanReviewSubject,
   IdGenerator,
+  NewPlanReviewGate,
   PlanReviewGatePatch,
   PlanReviewGateRepository,
   PlanReviewSubjectFactory,
@@ -1096,7 +1097,7 @@ export class PlanReviewGateService {
       signal
     );
     this.assertStillActive(taskId, signal, false);
-    const fresh = this.deps.gates.supersede(gate.id, {
+    const replacement: NewPlanReviewGate = {
       id,
       taskId,
       specificationSha256: gate.specificationSha256,
@@ -1123,12 +1124,13 @@ export class PlanReviewGateService {
       roundsAtOpen: null,
       failureKind: null,
       supersededBy: null
+    };
+    // An approval that rested on the attempt being discarded rests on nothing. It is withdrawn in
+    // the SAME transaction as the replacement, so no committed state has a fresh gate beside it —
+    // a crash between two writes would let it authorize implementation once the new review passes.
+    return this.deps.gates.supersede(gate.id, replacement, {
+      withdrawApproval: task.specificationApprovedAt !== null
     });
-    // An approval that rested on the attempt just discarded rests on nothing.
-    if (task.specificationApprovedAt !== null) {
-      this.deps.tasks.update(taskId, { specificationApprovedAt: null });
-    }
-    return fresh;
   }
 
   /**

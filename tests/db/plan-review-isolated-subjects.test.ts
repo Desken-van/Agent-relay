@@ -229,6 +229,55 @@ describe('the gate repository’s new columns', () => {
     expect(gates.findById('gate-3')!.supersededBy).toBeNull();
   });
 
+  describe('withdrawing the approval that rested on the replaced attempt', () => {
+    const approval = (repo: SqlitePlanReviewGateRepository) => {
+      const row = (repo as unknown as { db: Db }).db
+        .prepare('SELECT specification_approved_at AS approved FROM tasks WHERE id = ?')
+        .get('task-1') as { approved: string | null };
+      return row.approved;
+    };
+    const approve = (repo: SqlitePlanReviewGateRepository) =>
+      (repo as unknown as { db: Db }).db
+        .prepare("UPDATE tasks SET specification_approved_at = '2026-09-20T00:00:00.000Z' WHERE id = 'task-1'")
+        .run();
+
+    it('clears the approval in the same transaction as the replacement', () => {
+      const gates = repository();
+      approve(gates);
+      const base = gates.findById('gate-2')!;
+
+      gates.supersede('gate-2', { ...base, id: 'gate-3', status: 'prepared', sessionId: null, supersededBy: null }, { withdrawApproval: true });
+
+      expect(approval(gates)).toBeNull();
+      expect(gates.findByTask('task-1')!.id).toBe('gate-3');
+    });
+
+    it('leaves the approval alone unless asked, so a replacement that is not discarding evidence changes nothing else', () => {
+      const gates = repository();
+      approve(gates);
+      const base = gates.findById('gate-2')!;
+
+      gates.supersede('gate-2', { ...base, id: 'gate-3', status: 'prepared', sessionId: null, supersededBy: null });
+
+      expect(approval(gates)).toBe('2026-09-20T00:00:00.000Z');
+    });
+
+    it('rolls the approval back with everything else when the replacement cannot be written', () => {
+      const gates = repository();
+      approve(gates);
+      const base = gates.findById('gate-2')!;
+
+      // A duplicate id fails the insert, after the approval would have been cleared in a non-atomic version.
+      expect(() =>
+        gates.supersede('gate-2', { ...base, id: 'gate-1', status: 'prepared', sessionId: null, supersededBy: null }, { withdrawApproval: true })
+      ).toThrow();
+
+      expect(approval(gates)).toBe('2026-09-20T00:00:00.000Z');
+      expect(gates.findById('gate-2')!.supersededBy).toBeNull();
+      expect(gates.findByTask('task-1')!.id).toBe('gate-2');
+    });
+  });
+
   it('bumps the replaced attempt’s revision, so a decision made against it earlier is discarded', () => {
     const gates = repository();
     const before = gates.findById('gate-2')!;

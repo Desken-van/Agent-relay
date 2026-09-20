@@ -348,6 +348,101 @@ describe('a provider refusal that says nothing ran', () => {
   });
 });
 
+describe('a first review whose task-branch session is already used', () => {
+  it('is refused before anything is sent and recovered under a fresh identity, exactly like a later gate', async () => {
+    const value = coaiScenario();
+    const task = await ready(value);
+    // The task's branch already has a finished plan round in the provider (a reused branch, another client).
+    value.reviewer.seed(taskSubject(value, task.id), { rounds: ['done'] });
+
+    const refused = await outcomeOf(value.gateService.review(task.id));
+
+    expect(refused).toBeInstanceOf(PlanReviewNotDispatchedError);
+    expect(value.reviewer.reviewCalls).toHaveLength(0);
+    const spent = currentGate(value, task.id);
+    expect(spent).toMatchObject({ status: 'prepared', failureKind: 'not_dispatched', sessionId: null });
+    expect(planReviewRecovery(spent, gatesOf(value, task.id).reverse())).toBe('refused_before_dispatch');
+
+    // The retry is allowed — the marker, not a recorded session, is what makes the identity spent.
+    const fresh = await value.gateService.retryInFreshSession(task.id);
+    expect(fresh.reviewSubject).not.toBe(taskSubject(value, task.id).branch);
+    expect(fresh.specificationSha256).toBe(spent.specificationSha256);
+    value.reviewer.roundQueue = [roundOf(value, ['A finding'])];
+
+    const reviewed = await value.gateService.review(task.id);
+
+    expect(reviewed.status).toBe('awaiting_resolve');
+    expect(value.reviewer.reviewCalls).toHaveLength(1);
+    expect(value.reviewer.reviewCalls[0]!.subject.branch).toBe(fresh.reviewSubject);
+  });
+});
+
+describe('a review subject the provider can no longer resolve', () => {
+  it('is a known non-dispatch: the gate is marked spent and offered the fresh-session retry, not looped through reconcile', async () => {
+    const value = coaiScenario();
+    const task = await afterFirstReview(value);
+    // The corrected gate is prepared, and Git has pruned its subject before its first dispatch.
+    const before = taskSubject(value, task.id);
+    value.reviewer.knownRefs = new Set([before.branch]);
+
+    const error = await outcomeOf(drive(value, task.id));
+
+    expect(error).toBeInstanceOf(PlanReviewNotDispatchedError);
+    expect((error as PlanReviewNotDispatchedError).reason).toBe('unresolvable_subject');
+    const [, refused] = gatesOf(value, task.id) as [PlanReviewGate, PlanReviewGate];
+    expect(refused).toMatchObject({ status: 'prepared', failureKind: 'not_dispatched', sessionId: null });
+    expect(value.reviewer.reviewCalls).toHaveLength(1);
+    // The loop stops for a person instead of retrying, and reconcile is not offered for it.
+    expect((await drive(value, task.id)).stopped).toBe('recovery_required');
+    expect(value.reviewer.openCalls).toHaveLength(2);
+
+    // The retry makes a new subject the provider can resolve, and the review then passes under it.
+    const fresh = await value.gateService.retryInFreshSession(task.id);
+    value.reviewer.knownRefs.add(fresh.reviewSubject as string);
+    value.reviewer.roundQueue = [roundOf(value, [], 'proceed')];
+    const reviewed = await value.gateService.review(task.id);
+    expect(reviewed.status).toBe('awaiting_resolve');
+    expect(reviewed.reviewSubject).toBe(fresh.reviewSubject);
+    expect(reviewed.specificationSha256).toBe(refused.specificationSha256);
+  });
+});
+
+describe('a gate that cannot count for an EARLIER specification', () => {
+  async function stuckThenRegenerated(value: CoaiScenario) {
+    const task = await untilCorrectedReview(value);
+    value.reviewer.openError = new Error('the network went away');
+    await expect(drive(value, task.id)).rejects.toThrow();
+    value.reviewer.openError = null;
+    seedLegacyStuckGate(value, task.id);
+    // The specification moves on (regenerated): the stuck gate now describes an earlier one.
+    value.harness.tasks.update(task.id, {
+      specificationJson: JSON.stringify({ ...JSON.parse(specOf(value, task.id)), summary: 'Regenerated.' }),
+      specificationApprovedAt: null
+    });
+    return task;
+  }
+
+  it('is not offered as recovery — the retry would be refused — and is not reconciled: the current specification is prepared instead', async () => {
+    const value = coaiScenario();
+    const task = await stuckThenRegenerated(value);
+    const stuck = currentGate(value, task.id);
+    expect(planReviewRecovery(stuck, gatesOf(value, task.id).reverse())).not.toBeNull();
+
+    // What the loop and the screen derive from: identity is obsolete, so it is the ordinary path.
+    expect(value.loop.detail(task.id).nextStep).toBe('none');
+    expect((await drive(value, task.id)).stopped).toBe('none');
+    await expect(value.gateService.retryInFreshSession(task.id)).rejects.toThrow(/specification changed/);
+
+    // Preparing the current specification works over it, and its review runs in a session of its own.
+    const prepared = value.gateService.prepare(task.id);
+    expect(prepared.status).toBe('prepared');
+    value.reviewer.roundQueue = [roundOf(value, [], 'proceed')];
+    const reviewed = await value.gateService.review(task.id);
+    expect(reviewed.status).toBe('awaiting_resolve');
+    expect(reviewed.sessionId).not.toBe(stuck.sessionId);
+  });
+});
+
 describe('a transport failure while the corrected plan is being reviewed', () => {
   async function timedOut(value: CoaiScenario) {
     const task = await afterFirstReview(value);

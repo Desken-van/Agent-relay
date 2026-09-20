@@ -96,9 +96,13 @@ function planReviewPreparationState(input: {
   if (gate === null) return 'prepare_review';
   // Ahead of every reading of the gate's own status: an attempt that cannot count is not
   // reconciled (that would read another review back) and not run again (that would ask the
-  // same session the same question). It is replaced.
-  if (detail.recovery !== null) return 'recover_review';
-  if (['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status)) return 'reconcile';
+  // same session the same question). It is replaced — but only while it describes the CURRENT
+  // specification; for an earlier one the retry would be refused, and the ordinary
+  // "prepare a review of the current specification" path below applies.
+  if (detail.recovery !== null && detail.gateIdentity === 'current') return 'recover_review';
+  if (detail.recovery === null && ['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status)) {
+    return 'reconcile';
+  }
   if (gate.status === 'awaiting_resolve') {
     if (!resolutionReady) return 'resolve_blocked';
     return acceptedPresent ? 'resolve_and_revise' : 'resolve';
@@ -119,7 +123,8 @@ function planReviewPreparationState(input: {
     if (gate.status === 'proceeded') return 'passed';
   }
   if (detail.gateIdentity === 'obsolete' &&
-      !['opening', 'reviewing', 'awaiting_resolve', 'resolving', 'failed'].includes(gate.status)) {
+      (detail.recovery !== null ||
+        !['opening', 'reviewing', 'awaiting_resolve', 'resolving', 'failed'].includes(gate.status))) {
     return 'prepare_review';
   }
   return 'unavailable';
@@ -543,16 +548,21 @@ export function PlanReviewPanel({
   const corrupt = detail?.ruleEvidenceProblem ?? null;
   if (!integrationEnabled && !detail?.ruleEvidence && corrupt === null) return null;
 
-  const recovery = detail?.recovery ?? null;
-  // A gate that must be replaced is not an unknown outcome to reconcile: whatever the
-  // provider says about its session is about another review.
-  const unknownOutcome =
-    recovery === null && gate !== null && ['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status);
-
   const identity = detail?.gateIdentity ?? 'no_gate';
+  // This attempt cannot count, whatever specification it belonged to: nothing about it is an
+  // unknown outcome to reconcile, because what the provider says about its session is about
+  // another review.
+  const cannotCount = detail?.recovery ?? null;
+  // Actionable only for the current specification: the retry never replaces a review for one
+  // that has moved, so an earlier gate is prepared over the ordinary way instead.
+  const recovery = identity === 'current' ? cannotCount : null;
+  const unknownOutcome =
+    cannotCount === null && gate !== null && ['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status);
+
   const obsolete = gate !== null && identity === 'obsolete';
   const obsoleteBlocking =
     obsolete &&
+    cannotCount === null &&
     ['opening', 'reviewing', 'awaiting_resolve', 'resolving', 'failed'].includes(gate.status);
   const obsoleteSettled = obsolete && !obsoleteBlocking;
   const identityUnknown = gate !== null && identity === 'unknown';

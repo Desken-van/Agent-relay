@@ -34,6 +34,14 @@ import type {
  */
 export const COAI_TOOL_ALLOWLIST = COAI_PLAN_REVIEW_TOOLS;
 
+/**
+ * How many recorded rounds a session may report. A session's history includes every stage's
+ * rounds, and a bound that is too tight would turn a long-lived session into a parse failure
+ * on `open` — which never read the list before. The transport's own message-size cap is the
+ * real limit; this only keeps a hostile answer from being unbounded in memory.
+ */
+const MAX_REPORTED_ROUNDS = 1_024;
+
 const stageSchema = z.enum(['PlanReview', 'CodeReview', 'Done']);
 
 function lowerEnum<const T extends readonly [string, ...string[]]>(values: T) {
@@ -110,7 +118,7 @@ const sessionSchema = z
     // The provider's `open` reports the session's rounds, which is what proves a session
     // fresh. Optional here, not defaulted: an absent list must reach the gate as
     // "not known" and never as "no round has run".
-    rounds: z.array(statusRoundSchema).max(64).optional()
+    rounds: z.array(statusRoundSchema).max(MAX_REPORTED_ROUNDS).optional()
   })
   .passthrough();
 
@@ -129,7 +137,7 @@ const statusSchema = z
     stage: stageSchema,
     awaitingResolve: z.boolean(),
     planProceeded: z.boolean(),
-    rounds: z.array(statusRoundSchema).max(64)
+    rounds: z.array(statusRoundSchema).max(MAX_REPORTED_ROUNDS)
   })
   .passthrough();
 
@@ -149,7 +157,11 @@ const NO_SESSION_REFUSAL = 'no session for this repo+branch — call open first'
  */
 const NOT_DISPATCHED_REFUSALS: readonly { readonly reason: PlanReviewRefusalReason; readonly test: (message: string) => boolean }[] = [
   { reason: 'plan_stage_over', test: (message) => message.startsWith('the plan stage is over for this session') },
-  { reason: 'no_session', test: (message) => message === NO_SESSION_REFUSAL }
+  { reason: 'no_session', test: (message) => message === NO_SESSION_REFUSAL },
+  // Verified against the real server: `open` (and so any dispatch) for a ref Git cannot resolve —
+  // an unreachable subject after Git pruned it — is refused with this sentence, before any
+  // session or round exists. `status` is not affected: it looks the session up by key.
+  { reason: 'unresolvable_subject', test: (message) => /^git rev-parse: cannot resolve '[^']{1,200}': fatal: /.test(message) }
 ];
 
 /** The text of an error envelope (`{"error": "..."}`), or null when the result is not one. */
@@ -246,6 +258,16 @@ export class CoaiPlanReviewer implements ExternalPlanReviewer {
       { repoPath: subject.repositoryPath, branch: subject.branch },
       signal
     );
+    // A subject the provider cannot resolve is refused before anything exists; that is a fact
+    // about this call, and travels as one so the gate can be replaced under a fresh identity.
+    const refusal = errorEnvelope(result);
+    const unresolved =
+      refusal === null
+        ? undefined
+        : NOT_DISPATCHED_REFUSALS.find((entry) => entry.reason === 'unresolvable_subject' && entry.test(refusal));
+    if (unresolved !== undefined) {
+      throw new PlanReviewNotDispatchedError(unresolved.reason, `Coai refused the request: ${refusal}`);
+    }
     const value = parseCall(result, sessionSchema);
     return {
       sessionId: value.sessionId,

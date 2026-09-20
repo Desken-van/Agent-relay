@@ -729,8 +729,12 @@ export interface PlanReviewGateRepository {
    * Writes `next` and marks `id` as superseded by it in ONE transaction, and refuses
    * an attempt that was already replaced. The replaced row keeps every column it had —
    * its status, its session and its error text — so the failed attempt stays evidence.
+   *
+   * `withdrawApproval` clears the task's specification approval in the SAME transaction: an
+   * approval that rested on the attempt being discarded must not outlive it, and a crash
+   * between two separate writes would leave a replacement gate beside that stale approval.
    */
-  supersede(id: string, next: NewPlanReviewGate): PlanReviewGate;
+  supersede(id: string, next: NewPlanReviewGate, options?: { readonly withdrawApproval?: boolean }): PlanReviewGate;
 }
 
 /**

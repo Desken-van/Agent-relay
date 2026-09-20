@@ -648,13 +648,19 @@ The provider resolves the ref with `git rev-parse` and documents a commit id as 
 id is a fresh identity. Nothing is checked out, staged, created as a ref or pushed, and the task
 branch, its worktree and the user's checkout are never written; the only Git commands are
 `rev-parse` and `commit-tree` (signing forced off, fixed author and timestamps).
-- Lifecycle: the commit is fixed by its inputs, so a crash between making it and recording its id
-  names the same object on retry, and no two gates can share one (the gate id is in the message).
-  The id is the gate's `review_subject`, used by every provider call for that gate — `open`,
-  `review_plan`, `status`, `resolve`. There is nothing to delete: an unreachable object is
-  removed by Git's own `gc` after `gc.pruneExpire` (two weeks by default) and Agent Relay creates no
-  ref that would keep it. A gate still waiting on the provider after that finds its identity
-  unresolvable; that surfaces as the provider's own refusal and is recovered like any spent identity.
+- Lifecycle: the commit is fixed by its inputs, and no two gates can share one (the gate id is in
+  the message). For a gate whose row already exists (the loop's review of a revised specification) a
+  crash between making it and recording its id names the same object on retry; a recovery retry is a
+  new gate with a new id, so an interrupted one leaves one more unreferenced object that nothing points
+  at. The id is the gate's `review_subject`, used by every provider call for that gate — `open`,
+  `review_plan`, `status`, `resolve`. There is nothing to delete: an unreachable object is removed
+  by Git's own `gc` after `gc.pruneExpire` (two weeks by default) and Agent Relay creates no ref that
+  would keep it (a ref would show in `git branch`/`for-each-ref` and be pushed by a mirror push).
+  After that, on the real server, `status` still answers for a session already opened under the pruned
+  id (it looks the session up by key), so a dispatched gate remains reconcilable; a new `open` is
+  refused with `git rev-parse: cannot resolve '<id>' ...`. The adapter types exactly that refusal as a
+  known non-dispatch (`unresolvable_subject`), so an undispatched gate is marked spent and offered
+  the fresh-session retry instead of looping through reconcile.
 - `open` proves nothing by returning, so before the non-idempotent `review_plan` the service checks
   the session it got: it is not another gate's, it is the one this gate recorded, it is at PlanReview
   and not awaiting a resolution, and — for a first dispatch — it is provably empty (the adapter reports

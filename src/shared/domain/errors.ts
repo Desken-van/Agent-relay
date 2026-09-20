@@ -72,6 +72,9 @@ export class AgentRelayError extends Error {
  *   plan stage, so it can run no further plan round.
  * - `no_session`: the provider holds no session for the repository and ref it was asked
  *   about, so nothing could have run.
+ * - `unresolvable_subject`: the provider could not resolve the ref it was given (`git
+ *   rev-parse` refused it) — a subject Git has since pruned, or a branch that is gone. It is
+ *   refused before any session or round is created, so nothing ran.
  *
  * Raised by the gate service, from what `open` returned, BEFORE any round was sent:
  * - `session_foreign`: the session was already used by another plan review of the task.
@@ -82,6 +85,7 @@ export class AgentRelayError extends Error {
 export type PlanReviewRefusalReason =
   | 'plan_stage_over'
   | 'no_session'
+  | 'unresolvable_subject'
   | 'session_foreign'
   | 'session_not_fresh'
   | 'session_changed';

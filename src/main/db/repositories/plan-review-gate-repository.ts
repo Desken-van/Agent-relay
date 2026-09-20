@@ -142,7 +142,7 @@ export class SqlitePlanReviewGateRepository implements PlanReviewGateRepository 
     return { ...gate, revision: 0, createdAt: now, updatedAt: now };
   }
 
-  supersede(id: string, next: NewPlanReviewGate): PlanReviewGate {
+  supersede(id: string, next: NewPlanReviewGate, options: { readonly withdrawApproval?: boolean } = {}): PlanReviewGate {
     let created: PlanReviewGate | null = null;
     // One transaction: a replacement that exists without the old attempt pointing at
     // it, or a pointer at a replacement that was never written, would each leave the
@@ -165,6 +165,15 @@ export class SqlitePlanReviewGateRepository implements PlanReviewGateRepository 
         .run({ by: next.id, now: this.clock.nowIso(), id });
       if (Number(marked.changes) !== 1) {
         throw new AgentRelayError('INTERNAL', `Plan review gate ${id} changed while it was being replaced.`);
+      }
+      if (options.withdrawApproval === true) {
+        // Same transaction: the approval and the review it rested on go together or not at all.
+        this.db
+          .prepare(
+            `UPDATE tasks SET specification_approved_at = NULL, updated_at = @now
+              WHERE id = @taskId AND specification_approved_at IS NOT NULL`
+          )
+          .run({ taskId: next.taskId, now: this.clock.nowIso() });
       }
     });
     apply();

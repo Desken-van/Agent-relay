@@ -139,8 +139,9 @@ export class FakeCoaiPlanReviewer implements ExternalPlanReviewer {
 
   private ensure(subject: ExternalPlanReviewSubject): SessionState {
     if (this.knownRefs !== null && !this.knownRefs.has(subject.branch)) {
-      throw new AgentRelayError(
-        'TOOL_FAILED',
+      // What the adapter types from the provider's documented refusal.
+      throw new PlanReviewNotDispatchedError(
+        'unresolvable_subject',
         `Coai refused the request: git rev-parse: cannot resolve '${subject.branch}': fatal: Needed a single revision`
       );
     }

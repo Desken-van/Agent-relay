@@ -46,6 +46,30 @@ describe('planCorrectionNextStep: an attempt that cannot count is replaced first
     }
   );
 
+  it('is not recovery for a gate of an EARLIER specification: the retry would be refused, so the ordinary path applies', () => {
+    const obsolete = (
+      status: PlanReviewGate['status'],
+      correction: 'completed' | null
+    ) =>
+      planCorrectionNextStep({
+        gate: { status, decisionsJson: null },
+        identity: 'obsolete',
+        correctionForGate: correction === null ? null : { status: correction },
+        used: 0,
+        max: 3,
+        recovery: 'foreign_session'
+      });
+
+    // Never reconciled either: what the provider says about that session is about another review.
+    expect(obsolete('reviewing', null)).toBe('none');
+    expect(obsolete('opening', null)).toBe('none');
+    expect(obsolete('reviewing', 'completed')).toBe('run_review');
+    // Unknown identity is still not judged.
+    expect(
+      planCorrectionNextStep({ gate: { status: 'reviewing', decisionsJson: null }, identity: 'unknown', correctionForGate: null, used: 0, max: 3, recovery: 'foreign_session' })
+    ).toBe('none');
+  });
+
   it('changes nothing for a gate with no recovery, so a stuck call is still reconciled and a prepared gate still reviewed', () => {
     expect(withRecovery('reviewing', null)).toBe('reconcile');
     expect(withRecovery('prepared', null)).toBe('run_review');

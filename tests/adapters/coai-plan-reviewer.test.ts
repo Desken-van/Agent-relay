@@ -440,6 +440,51 @@ describe('Coai plan reviewer adapter: proving a session fresh and telling a refu
     expect(failure).not.toBeInstanceOf(PlanReviewNotDispatchedError);
   });
 
+  it('types a subject the provider cannot resolve — a pruned commit — as a refusal before anything existed', async () => {
+    const client = new FakeMcpClient();
+    const words = `git rev-parse: cannot resolve '${subject.branch}': fatal: Needed a single revision`;
+    client.responses.push(result('open', { error: words }), result('review_plan', { error: words }));
+    const reviewer = new CoaiPlanReviewer(client, config);
+
+    const opened = await reviewer.open(subject).catch((error: unknown) => error);
+    const reviewed = await reviewer.reviewPlan(subject, 'plan').catch((error: unknown) => error);
+
+    for (const failure of [opened, reviewed]) {
+      expect(failure).toBeInstanceOf(PlanReviewNotDispatchedError);
+      expect(failure).toMatchObject({ reason: 'unresolvable_subject', code: 'TOOL_FAILED' });
+      expect((failure as Error).message).toContain(words);
+    }
+  });
+
+  it('does not type other refusals of open — only the documented unresolvable-ref sentence', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('open', { error: 'no session budget' }),
+      result('open', { error: 'git rev-parse: something else entirely' }),
+      result('open', {}, { isError: true })
+    );
+    const reviewer = new CoaiPlanReviewer(client, config);
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const failure = await reviewer.open(subject).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(AgentRelayError);
+      expect(failure).not.toBeInstanceOf(PlanReviewNotDispatchedError);
+    }
+  });
+
+  it('reads a long round history in full rather than failing on it', async () => {
+    const client = new FakeMcpClient();
+    const rounds = Array.from({ length: 200 }, (_, index) => ({
+      stage: index % 2 === 0 ? 'PlanReview' : 'CodeReview',
+      status: 'done'
+    }));
+    client.responses.push(result('open', session({ rounds })), result('status', { sessionId: 'abc123', stage: 'CodeReview', awaitingResolve: false, planProceeded: true, rounds }));
+    const reviewer = new CoaiPlanReviewer(client, config);
+
+    expect((await reviewer.open(subject)).planRounds).toEqual({ total: 100, running: 0, done: 100, interrupted: 0 });
+    expect((await reviewer.status(subject)).planRounds).toEqual({ total: 100, running: 0, done: 100, interrupted: 0 });
+  });
+
   it('types the refusal only for review_plan: the same words from any other tool stay ordinary', async () => {
     const client = new FakeMcpClient();
     client.responses.push(result('resolve', { error: 'the plan stage is over for this session (stage: CodeReview); open a new session for a new plan' }));

@@ -22,11 +22,14 @@
  *
  * ## Lifecycle and cleanup
  *
- * - **Deterministic.** Author, committer, both timestamps, parent, tree and message are
- *   fixed by the request, so the same request always names the same commit. A crash
- *   between creating it and recording its id therefore leaves nothing to clean up: the
- *   retry names the same object, and a second gate cannot receive it (the gate id is in
- *   the message).
+ * - **Deterministic per request.** Author, committer, both timestamps, parent, tree and
+ *   message are fixed by the request, so the same request always names the same commit,
+ *   and a second gate cannot receive it (the gate id is in the message). For a gate whose
+ *   row already exists — the loop's review of a revised specification — a crash between
+ *   creating the object and recording its id therefore leaves nothing to clean up: the
+ *   retry names the same object. A recovery retry (`retryInFreshSession`) is a NEW gate
+ *   with a new id each time, so an interrupted one leaves one more unreferenced object,
+ *   which nothing points at and Git prunes with the rest.
  * - **Cleaned up by Git.** An unreachable object is pruned by `git gc` once it is older
  *   than `gc.pruneExpire` (two weeks by default); Agent Relay creates no ref that would
  *   keep it and deletes nothing. A gate that still waits on the provider after that finds
