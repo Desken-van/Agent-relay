@@ -89,6 +89,16 @@ describe('the single workflow primary control', () => {
   });
 });
 
+describe('the scope marker of the recovery action', () => {
+  it('is local: it writes a Git object and database rows and reaches no provider', () => {
+    const projected = guidance('retry_plan_review', 'Retry in a fresh review session');
+    const { container } = render(<PrimaryActionButton action={projected.action!} pending={false} blocked={false} onClick={() => undefined} />);
+
+    expect(container.querySelector('.btn__scope--local')).not.toBeNull();
+    expect(container.querySelector('.btn__scope--read')).toBeNull();
+  });
+});
+
 describe('what the task badge says while the specification has no approval', () => {
   it('does not call an unapproved specification ready for implementation — nowhere the badge is shown', () => {
     const { container, rerender } = render(<StatusBadge status="READY_FOR_IMPLEMENTATION" specificationApprovedAt={null} />);

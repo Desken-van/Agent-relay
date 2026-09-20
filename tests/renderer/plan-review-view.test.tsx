@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { Task } from '../../src/shared/domain/models';
+import type { RunActionKey } from '../../src/shared/domain/run-guidance';
 import type { IpcResult, PlanReviewDetail } from '../../src/shared/ipc';
 import { PlanReviewPanel } from '../../src/renderer/src/components/RunView';
 import { burstClick, deferred, deliver, fail, installBridge, ok, type Bridge } from './harness';
@@ -799,6 +800,9 @@ describe('the external plan-review panel', () => {
 
       const retry = await screen.findByRole('button', { name: /Retry in a fresh review session/i });
       expect(retry.className).toContain('btn--recommended');
+      // It writes a local Git object and database rows and contacts no provider: amber, not blue.
+      expect(retry.querySelector('.btn__scope--local')).not.toBeNull();
+      expect(retry.querySelector('.btn__scope--read')).toBeNull();
       await waitFor(() => expect(onGuidanceStateChanged).toHaveBeenLastCalledWith('recover_review'));
       // What is wrong, in plain words, and the provider's own refusal beside it.
       expect(screen.getByText(/The current plan has no successful review/i)).toBeTruthy();
@@ -848,6 +852,36 @@ describe('the external plan-review panel', () => {
       expect(screen.queryByText(/still outstanding/i)).toBeNull();
     }
   );
+
+  it('runs the retry from the run screen’s primary action too: the dispatcher the panel registers handles it', async () => {
+    bridge.set('planReview:get', () =>
+      ok<'planReview:get'>({
+        ...gateWith('prepared', { failureKind: 'not_dispatched', lastError: 'refused' }),
+        recovery: { reason: 'refused_before_dispatch', message: 'Retry.' }
+      })
+    );
+    let dispatch: ((key: RunActionKey) => void) | null = null;
+    render(
+      <PlanReviewPanel
+        task={task('READY_FOR_IMPLEMENTATION')}
+        integrationEnabled
+        onChanged={async () => undefined}
+        renderPrimary={false}
+        onDispatchReady={(dispatcher) => {
+          dispatch = dispatcher;
+        }}
+      />
+    );
+    await waitFor(() => expect(dispatch).not.toBeNull());
+    // No button of the panel's own is rendered: the run screen's primary action is the only control.
+    expect(screen.queryByRole('button', { name: /Retry in a fresh review session/i })).toBeNull();
+
+    dispatch!('retry_plan_review');
+
+    await waitFor(() => expect(bridge.callsTo('planReview:retryFreshSession')).toHaveLength(1));
+    expect(bridge.callsTo('planReview:retryFreshSession')[0]?.input).toEqual({ taskId: 'task-1' });
+    expect(bridge.callsTo('planReview:review')).toHaveLength(0);
+  });
 
   it('still offers Reconcile, and no fresh-session retry, for a call whose outcome is unknown on a session of its own', async () => {
     bridge.set('planReview:get', () =>

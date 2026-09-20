@@ -69,7 +69,8 @@ const ACTION_SCOPE: Record<RunActionKey, 'read' | 'local' | 'remote'> = {
   prepare_plan_review: 'local',
   run_plan_review: 'read',
   reconcile_plan_review: 'read',
-  retry_plan_review: 'read',
+  // Writes a local Git object and database rows; contacts no provider.
+  retry_plan_review: 'local',
   resolve_plan_review: 'read',
   continue_plan_correction: 'read',
   approve_specification: 'read',

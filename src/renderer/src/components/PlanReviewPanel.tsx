@@ -778,7 +778,7 @@ export function PlanReviewPanel({
             disabled={!integrationEnabled || busy !== null || task.status !== 'READY_FOR_IMPLEMENTATION'}
             onClick={() => dispatchPlanPrimary('retry_plan_review')}
           >
-            {busy === 'retry' ? <Spinner /> : <Scope kind="read" />} Retry in a fresh review session
+            {busy === 'retry' ? <Spinner /> : <Scope kind="local" />} Retry in a fresh review session
           </button> : null}
         </div>
       ) : null}
