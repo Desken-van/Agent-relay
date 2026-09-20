@@ -53,6 +53,8 @@ import {
 import type { CodexReviewResult, FindingTriageRecommendation, TaskSpecification } from './schemas/codex';
 import {
   CODE_REVIEW_DECISION_ACTIONS,
+  type CodeAutoDecideOutcome,
+  type CodeCorrectionRequirement,
   type CodeReviewDecision,
   type CodeReviewFinding,
   type CodeReviewRound,
@@ -62,10 +64,16 @@ import {
 } from './domain/code-review';
 import {
   planReviewDecisionSchema,
+  type PlanReviewAutoDecision,
   type PlanReviewFinding,
   type PlanReviewGate,
   type PlanReviewGateIdentity
 } from './domain/plan-review';
+import type {
+  PlanAdvanceOutcome,
+  PlanAutoDecideOutcome,
+  PlanCorrectionDetail
+} from './domain/plan-correction';
 import type {
   RuleEvidenceOmission,
   RuleEvidenceSource
@@ -199,6 +207,19 @@ export interface CodeReviewDetail {
    * rather than duplicated as a second, potentially disagreeing filter.
    */
   readonly triage: CodeReviewTriage | null;
+  /**
+   * Findings that were accepted and have not been shown to be fixed, across
+   * every subject the task has had, oldest first. Accepting a finding says it is
+   * valid; it never says the code changed, so nothing here disappears until a
+   * `resolved` decision is recorded for it.
+   */
+  readonly correctionRequirements: readonly CodeCorrectionRequirement[];
+  /**
+   * Ids of the findings Auto decide is analyzing in the main process right now.
+   * Read from the process, not from any screen, so a panel that was reloaded
+   * mid-analysis still shows the truth and does not offer a second click.
+   */
+  readonly analyzing: readonly string[];
 }
 
 export interface PlanReviewDetail {
@@ -241,6 +262,23 @@ export interface PlanReviewDetail {
    */
   readonly gateIdentity: PlanReviewGateIdentity;
   readonly findings: readonly PlanReviewFinding[];
+  /**
+   * SHA-256 of the current round's stored findings — the round's content
+   * identity. Every per-finding request carries it, so an answer computed for
+   * one round can never be merged into another.
+   */
+  readonly findingsSha256: string | null;
+  /**
+   * The decisions Auto decide already made for THIS round's findings, as stored.
+   * Empty for any other round. The renderer shows them in the Decision fields
+   * unless the operator has chosen something else, so a refresh or a restart
+   * loses nothing Auto decide filled in.
+   */
+  readonly autoDecisions: readonly PlanReviewAutoDecision[];
+  /** Indexes of the findings Auto decide is analyzing in the main process right now (see `CodeReviewDetail.analyzing`). */
+  readonly analyzing: readonly number[];
+  /** The plan-correction workflow: budget, next step, running phase, versions. */
+  readonly correction: PlanCorrectionDetail;
 }
 
 /** Push payload delivered on the `agent-relay:event` channel. */
@@ -465,6 +503,45 @@ export const ipcInputSchemas = {
     })
     .strict(),
 
+  // Auto decide, ONE finding of ONE round. `findingsSha256` is the round's
+  // content identity (see `PlanReviewDetail.findingsSha256`): together with
+  // `gateId` it names exactly the findings the caller is looking at, so an
+  // answer can never be applied to a different round. Nothing else is accepted —
+  // no prompt, no recommendation, no decision text: the analysis and the reason
+  // stored come from Codex triage in the main process.
+  'planReview:autoDecide': z
+    .object({
+      taskId: z.string().min(1),
+      gateId: z.string().min(1),
+      findingsSha256: z.string().regex(/^[0-9a-f]{64}$/),
+      findingIndex: z.number().int().nonnegative().max(255)
+    })
+    .strict(),
+  // Resolve the round with these decisions and carry them through: when any is
+  // an accept, Codex revises the specification and a fresh external review of
+  // it starts. `autoContinue` keeps going while every finding of the next round
+  // can be auto-decided. Same round identity as `planReview:resolve`.
+  'planReview:resolveAndRevise': z
+    .object({
+      taskId: z.string().min(1),
+      gateId: z.string().min(1),
+      expectedRevision: z.number().int().nonnegative(),
+      decisions: z.array(planReviewDecisionSchema).max(256),
+      autoContinue: z.boolean()
+    })
+    .strict(),
+  // Resume the loop from durable state (a failed or interrupted correction, or
+  // the review a completed correction is waiting for). Takes no round identity:
+  // it derives what to do from what is recorded.
+  'planReview:continueCorrection': z
+    .object({ taskId: z.string().min(1), autoContinue: z.boolean() })
+    .strict(),
+  // Auto decide, ONE code-review finding, by its stable id. The decision, if
+  // there is one, is recorded through the same durable path as an operator's.
+  'codeReview:autoDecide': z
+    .object({ taskId: z.string().min(1), findingId: z.string().min(1) })
+    .strict(),
+
   'git:changes': z.object({ taskId: z.string().min(1), refresh: z.boolean().optional() }).strict(),
   'git:repositoryInfo': z.object({ projectId: z.string().min(1) }).strict(),
 
@@ -589,6 +666,10 @@ export interface IpcResponseMap {
   'planReview:reconcile': PlanReviewDetail;
   'planReview:resolve': PlanReviewDetail;
   'planReview:triage': PlanReviewDetail;
+  'planReview:autoDecide': { readonly detail: PlanReviewDetail; readonly outcome: PlanAutoDecideOutcome };
+  'planReview:resolveAndRevise': { readonly detail: PlanReviewDetail; readonly outcome: PlanAdvanceOutcome };
+  'planReview:continueCorrection': { readonly detail: PlanReviewDetail; readonly outcome: PlanAdvanceOutcome };
+  'codeReview:autoDecide': { readonly outcome: CodeAutoDecideOutcome; readonly detail: CodeReviewDetail };
   'codeReview:get': CodeReviewDetail;
   'codeReview:capture': CodeReviewDetail;
   'codeReview:review': CodeReviewDetail;

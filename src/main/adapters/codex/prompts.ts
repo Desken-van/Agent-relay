@@ -7,6 +7,7 @@
  */
 
 import type { GitChangeSet } from '../../../shared/domain/git';
+import type { AcceptedPlanFinding } from '../../../shared/domain/plan-correction';
 import type { VerificationRecord } from '../../../shared/domain/verification';
 import type { CodexReviewResult, TaskSpecification, TriageRefKind } from '../../../shared/schemas/codex';
 import type { TriageableDecision, TriageableFinding } from '../../ports';
@@ -65,6 +66,95 @@ Produce a single JSON object matching the required schema, with these rules:
 
 Scope discipline: specify the change the user asked for. Do not add refactors, upgrades,
 or "while we're here" improvements.
+
+Return only the JSON object.`;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Codex: specification revision from accepted plan-review findings           */
+/* -------------------------------------------------------------------------- */
+
+export interface SpecificationRevisionPromptInput {
+  readonly projectPath: string;
+  readonly taskTitle: string;
+  readonly originalRequest: string;
+  readonly currentSpecification: TaskSpecification;
+  readonly acceptedFindings: readonly AcceptedPlanFinding[];
+  readonly ruleEvidence?: string;
+  readonly round: number;
+  readonly maxRounds: number;
+}
+
+function renderAcceptedFinding(finding: AcceptedPlanFinding): string {
+  const location = finding.file
+    ? `${finding.file}${finding.line > 0 ? `:${finding.line}` : ''}`
+    : '(no specific location)';
+  // Named by the round's own number, which is what the answer must use to say
+  // where each one was addressed.
+  return `Finding ${finding.finding}. [${finding.severity} · ${finding.category}] ${finding.title}
+   Location: ${location}
+   Why it matters: ${finding.why}
+   Required correction: ${finding.fix}${
+     finding.operatorNote.trim().length > 0 ? `\n   Operator note: ${finding.operatorNote.trim()}` : ''
+   }`;
+}
+
+/**
+ * The revision prompt. Everything the model may use is in it: the original
+ * request, the specification being revised, the immutable rule evidence and the
+ * ACCEPTED findings. Rejected findings are never included, and the model is told
+ * so, because "revise the plan" must not become "rewrite the plan".
+ */
+export function buildSpecificationRevisionPrompt(input: SpecificationRevisionPromptInput): string {
+  return `You are the SPECIFIER in a two-agent relay, revising a specification you wrote earlier.
+An independent external reviewer read it and raised findings. The operator ACCEPTED the
+findings listed below as valid correction requirements. You are in READ-ONLY mode: you
+must not modify, create, or delete any file, and you must not run a command that changes
+state. You may read the repository to make the revision accurate.
+
+Repository under discussion: ${input.projectPath}
+This is correction round ${input.round} of at most ${input.maxRounds}.
+
+TASK TITLE
+${input.taskTitle}
+
+USER'S ORIGINAL REQUEST (verbatim) — the revision must stay faithful to this
+${input.originalRequest}
+
+${input.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${input.ruleEvidence}\n` : ''}
+
+=== THE CURRENT SPECIFICATION (revise this; do not start over) ===
+${JSON.stringify(input.currentSpecification, null, 2)}
+
+=== ACCEPTED FINDINGS — the ONLY corrections you are asked to make ===
+${input.acceptedFindings.map(renderAcceptedFinding).join('\n\n')}
+
+Produce a single JSON object matching the required schema, with two parts:
+- "specification": the COMPLETE revised specification, every field present.
+- "addressed": one entry for EACH accepted finding above — its number exactly as listed
+  ("Finding N" is N), the specification field in which you addressed it, and one or two
+  sentences saying what you changed there. That field must really differ from the current
+  specification: a finding you claim but did not change is refused, and so is an accepted
+  finding you do not mention. List EVERY field you changed: a field that differs from the
+  current specification but is not tied to an accepted finding is an unrequested change and
+  the whole revision is refused.
+
+Rules for the revision:
+
+- Address every accepted finding in the specification itself — in the summary, the
+  acceptance criteria, the constraints, the suggested tests and, above all, the
+  "implementationPrompt", which is handed verbatim to the coding agent. A finding that is
+  only mentioned but not reflected in what the implementer will be told is not addressed.
+- Change only what the accepted findings require. Keep every other part of the
+  specification, including its wording, unless a finding makes it wrong. Do not add
+  refactors, upgrades or "while we're here" improvements, and do not act on findings that
+  are not listed above — other findings were rejected on purpose.
+- Preserve the user's original intent and every project rule above. A correction must never
+  relax a constraint, widen the scope beyond the original request, or remove an acceptance
+  criterion the user's request depends on.
+- Acceptance criteria stay objectively checkable.
+- "scopedFilePaths" must always be present, following the same rule as before: a small
+  explicit list only when the whole implementation is confidently confined to it, else [].
 
 Return only the JSON object.`;
 }

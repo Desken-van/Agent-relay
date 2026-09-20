@@ -197,7 +197,15 @@ export function assessmentPublishRefusal(
  * was the evidence that fell short — so calling that "send corrections" would
  * describe work nobody asked for.
  */
-export type CorrectionActionKind = 'corrections' | 'retry_verification' | 'unavailable';
+export type CorrectionActionKind =
+  | 'corrections'
+  | 'retry_verification'
+  /**
+   * Corrections whose only source is findings the operator accepted from an
+   * external code review, offered where no internal review asked for changes.
+   */
+  | 'external_corrections'
+  | 'unavailable';
 
 export interface CorrectionAction {
   readonly kind: CorrectionActionKind;
@@ -220,6 +228,12 @@ export interface CorrectionActionInput {
    * orchestrator and the publish gate all read the same round.
    */
   readonly latestClaudeStructuredResult: string | null;
+  /**
+   * Whether the operator has accepted external code-review findings that nobody
+   * has shown to be fixed. Accepting a finding says it is valid, not that the
+   * code changed, so these are corrections still owed.
+   */
+  readonly externalRequirementsOpen?: boolean;
 }
 
 /** The shape of a run, as much of it as choosing the latest round needs. */
@@ -292,13 +306,29 @@ export function correctionAction(input: CorrectionActionInput): CorrectionAction
     const refusal = assessmentPublishRefusal(
       readClaudeAssessment(input.latestClaudeStructuredResult)
     );
-    if (!refusal.blocked) {
-      return { kind: 'unavailable', label: 'Send corrections', enabled: false, disabledReason: null };
+    if (refusal.blocked) {
+      return {
+        kind: 'retry_verification',
+        label: 'Retry verification',
+        enabled: !budgetSpent,
+        disabledReason: budgetSpent ? ROUND_BUDGET_SPENT : null
+      };
     }
+  }
 
+  // Accepted external findings are corrections still owed, wherever the task is
+  // in its review cycle: they go through the SAME correction round (provider,
+  // budget, verification, review) as any other, from any state that has a way
+  // into IMPLEMENTING.
+  if (
+    input.externalRequirementsOpen === true &&
+    (input.status === 'READY_FOR_REVIEW' ||
+      input.status === 'APPROVED' ||
+      input.status === 'READY_TO_PUBLISH')
+  ) {
     return {
-      kind: 'retry_verification',
-      label: 'Retry verification',
+      kind: 'external_corrections',
+      label: 'Send accepted findings as corrections',
       enabled: !budgetSpent,
       disabledReason: budgetSpent ? ROUND_BUDGET_SPENT : null
     };

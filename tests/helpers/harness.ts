@@ -21,7 +21,7 @@ import { SqliteTransactionRunner } from '../../src/main/db/transaction-runner';
 import { FixedClock, SequentialIdGenerator } from '../../src/main/infra/clock';
 import { InMemoryEventPublisher } from '../../src/main/services/event-bus';
 import { ContinuationService } from '../../src/main/services/continuation-service';
-import { Orchestrator } from '../../src/main/services/orchestrator';
+import { Orchestrator, type OrchestratorDeps } from '../../src/main/services/orchestrator';
 import type { VerificationExecutor } from '../../src/main/services/worktree-verification';
 import type { WorktreeDependencyInstaller, WorktreeDependencyPreparer } from '../../src/main/services/worktree-dependencies';
 import { ProjectService } from '../../src/main/services/project-service';
@@ -31,6 +31,7 @@ import { defaultSettings } from '../../src/main/container';
 import type { OrnithInferenceLeaseService } from '../../src/main/ports';
 import type { OrnithImplementationService } from '../../src/main/services/ornith-implementation';
 import type { ProcessRunner } from '../../src/main/adapters/process/process-runner';
+import { TaskOperationRegistry } from '../../src/main/services/task-operations';
 import type { Project, Settings, Task } from '../../src/shared/domain/models';
 import {
   FakeClaudeAdapter,
@@ -61,6 +62,8 @@ export interface Harness {
   readonly approvals: SqliteApprovalRepository;
   readonly settings: SqliteSettingsRepository;
   readonly orchestrator: Orchestrator;
+  /** The process-wide register of stoppable operations, shared with `orchestrator.stop()`. */
+  readonly operations: TaskOperationRegistry;
   readonly publishService: PublishService;
   readonly continuationService: ContinuationService;
   readonly projectService: ProjectService;
@@ -82,6 +85,8 @@ export function createHarness(
     ornith?: OrnithImplementationService;
     ornithLease?: OrnithInferenceLeaseService;
     processRunner?: ProcessRunner;
+    /** Findings accepted from an external code review; absent in every test that is not about them. */
+    externalCodeRequirements?: OrchestratorDeps['externalCodeRequirements'];
   } = {}
 ): Harness {
   const tempRoot = mkdtempSync(join(tmpdir(), 'agent-relay-test-'));
@@ -120,6 +125,9 @@ export function createHarness(
   const confirmation = new RecordingConfirmationService(options.confirmAnswer ?? true);
 
   const runtime: { orchestrator?: Orchestrator } = {};
+  // The one process-wide register, exactly as the composition root builds it: the
+  // orchestrator's stop() and every plan-review service a test builds share it.
+  const operations = new TaskOperationRegistry();
   const continuationService = new ContinuationService({
     tasks,
     projects,
@@ -154,6 +162,7 @@ export function createHarness(
     ruleEvidence: taskRuleEvidence,
     planReviews: planReviewGates,
     continuations: taskContinuations,
+    externalCodeRequirements: options.externalCodeRequirements,
     continuationGuard: {
       prepareFirstAction: (...args) => continuationService.prepareFirstAction(...args),
       retargetFirstActionToVerification: (...args) =>
@@ -162,7 +171,8 @@ export function createHarness(
     },
     ornith: options.ornith,
     ornithLease: options.ornithLease,
-    processRunner: options.processRunner
+    processRunner: options.processRunner,
+    operations
   });
 
   const publishService = new PublishService({
@@ -226,6 +236,7 @@ export function createHarness(
     approvals,
     settings,
     orchestrator,
+    operations,
     publishService,
     continuationService,
     projectService,

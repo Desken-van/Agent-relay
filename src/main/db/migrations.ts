@@ -1080,6 +1080,81 @@ export const MIGRATIONS: readonly Migration[] = [
         );
       `);
     }
+  },
+  {
+    version: 19,
+    name: 'plan-auto-decisions-and-corrections',
+    up(db) {
+      // 1. Decisions that Codex triage made AND applied, per plan-review
+      //    round. Not a resolution: only `resolve` sends decisions to the
+      //    provider. Keyed inside the JSON by the SHA-256 of the exact
+      //    findings they answer, so a new round can never inherit them.
+      //    Plain ALTER TABLE: a nullable addition with no new CHECK.
+      //
+      // 2. `plan_review_corrections`: one row per plan-review gate whose
+      //    accepted findings were sent to Codex to revise the specification.
+      //    UNIQUE(source_gate_id) is the idempotency key — a retry reopens the
+      //    same row, so no second correction, version or review round can be
+      //    created for one gate. `accepted_json` freezes what Codex was given.
+      //
+      // 3. `task_specification_versions`: append-only history of the
+      //    specification text. Until now the reviewed text lived only in
+      //    `tasks.specification_json`, so regenerating or revising it lost the
+      //    text a gate had reviewed (the gate kept just its hash). Uniqueness
+      //    is (task_id, version) ONLY: a correction may legitimately produce
+      //    content equal to an older version, and that must be recorded as a
+      //    new version, never refused. The UPDATE trigger makes a row
+      //    immutable even to code that tries; deletion still cascades with the
+      //    task. The first version of a task is recorded lazily, in the same
+      //    transaction that opens its first correction, because the canonical
+      //    hash lives in application code, not in SQL.
+      db.exec(`
+        ALTER TABLE plan_review_gates ADD COLUMN auto_decisions_json TEXT;
+
+        CREATE TABLE plan_review_corrections (
+          id                         TEXT PRIMARY KEY,
+          task_id                    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          source_gate_id             TEXT NOT NULL UNIQUE REFERENCES plan_review_gates(id) ON DELETE CASCADE,
+          round                      INTEGER NOT NULL CHECK (round >= 1),
+          from_specification_sha256  TEXT NOT NULL CHECK (length(from_specification_sha256) = 64),
+          accepted_json              TEXT NOT NULL,
+          status                     TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+          attempts                   INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+          to_specification_sha256    TEXT CHECK (to_specification_sha256 IS NULL OR length(to_specification_sha256) = 64),
+          to_version                 INTEGER CHECK (to_version IS NULL OR to_version >= 1),
+          -- What Codex said it changed for each accepted finding (checked before
+          -- the revision was committed). Set with the completion, never before.
+          addressed_json             TEXT,
+          last_error                 TEXT,
+          revision                   INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+          created_at                 TEXT NOT NULL,
+          updated_at                 TEXT NOT NULL,
+          UNIQUE (task_id, round)
+        );
+        CREATE INDEX idx_plan_review_corrections_task ON plan_review_corrections(task_id, round);
+
+        CREATE TABLE task_specification_versions (
+          id                    TEXT PRIMARY KEY,
+          task_id               TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          version               INTEGER NOT NULL CHECK (version >= 1),
+          specification_sha256  TEXT NOT NULL CHECK (length(specification_sha256) = 64),
+          specification_json    TEXT NOT NULL,
+          origin                TEXT NOT NULL CHECK (origin IN ('generated', 'plan_correction')),
+          -- Deliberately NOT a foreign key: ON DELETE SET NULL would UPDATE the
+          -- row during a task-deletion cascade and trip the immutability trigger.
+          source_correction_id  TEXT,
+          created_at            TEXT NOT NULL,
+          UNIQUE (task_id, version)
+        );
+        CREATE INDEX idx_task_specification_versions_task ON task_specification_versions(task_id, version);
+
+        CREATE TRIGGER task_specification_versions_immutable
+        BEFORE UPDATE ON task_specification_versions
+        BEGIN
+          SELECT RAISE(ABORT, 'A specification version is immutable.');
+        END;
+      `);
+    }
   }
 ];
 

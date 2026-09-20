@@ -28,6 +28,8 @@ import {
   CODE_REVIEW_UNRESOLVED_STATUSES,
   CODE_SNAPSHOT_VERSION,
   providerCodeFindingSchema,
+  type CodeAutoDecideOutcome,
+  type CodeReviewDecision,
   type CodeReviewDecisionAction,
   type CodeReviewActor,
   type CodeReviewFinding,
@@ -52,6 +54,7 @@ import {
 } from '../../shared/util/provider-text';
 import { CodeReviewNotDispatchedError } from './code-review-provider';
 import { specificationIdentity } from './specification-identity';
+import { runAsOperation, type TaskOperationKind, type TaskOperationRegistry } from './task-operations';
 import {
   hashSnapshotFile,
   nodeSnapshotFileOps,
@@ -222,6 +225,23 @@ const RECONCILE_ATTESTATION =
 const CHECKOUT_MISMATCH =
   'The task worktree does not match what this task records. Nothing was dispatched and nothing was written.';
 
+/**
+ * What a stop reports, by how far the operation had got when it landed.
+ *
+ * Each says the same true thing in the terms of that step. None claims the
+ * provider did not run: a call that had gone out is not undone by Stop, only its
+ * answer is refused. The task is closed by then, so nothing here promises that the
+ * outcome can be reconciled later.
+ */
+const STOPPED_BEFORE_WRITE = 'The task was stopped before anything further was sent or recorded.';
+const STOPPED_DURING_OPERATION = 'The task was stopped while this operation was running. No result was recorded.';
+const STOPPED_REVIEW_OUTCOME_UNKNOWN =
+  'The task was stopped while the external review call was in flight. Its outcome is unknown and was not recorded, and the task is closed, so nothing further will be applied to this round.';
+const STOPPED_BEFORE_DISPATCH =
+  'The task was stopped while the round was being reserved, so no review was dispatched and none ran. The round is closed as failed.';
+const STOPPED_READ_BACK = 'The task was stopped while the round was being read back. Nothing from the answer was recorded.';
+const STOPPED_ANALYSIS = 'The task was stopped while the analysis was running. Nothing from it was recorded.';
+
 const REVIEWER_CANNOT_SEE_SUBJECT =
   'This subject includes uncommitted or untracked work, and the configured reviewer reads only committed refs. It would review a different state of the code and return a verdict about it, so the round was refused rather than dispatched.';
 
@@ -250,9 +270,16 @@ export type CodeReviewOperation = 'review' | 'reconcile' | 'triage';
 
 export class CodeReviewClaims {
   private readonly held = new Map<string, CodeReviewOperation>();
+  /**
+   * Findings being auto-decided right now, per task. Analysing one finding is
+   * read-only towards the provider, so several DIFFERENT findings may run at
+   * once; a round dispatch, a reconciliation or a whole-set triage excludes them
+   * all, and is excluded by them.
+   */
+  private readonly analyzing = new Map<string, Set<string>>();
 
   acquire(taskId: string, operation: CodeReviewOperation): () => void {
-    const current = this.held.get(taskId);
+    const current = this.held.get(taskId) ?? ((this.analyzing.get(taskId)?.size ?? 0) > 0 ? 'triage' : undefined);
     if (current !== undefined) {
       throw new AgentRelayError('BUSY', `A code review ${current} is already running for this task.`, {
         remediation: 'Wait for the operation in flight to finish, then read the review again.'
@@ -267,8 +294,37 @@ export class CodeReviewClaims {
     };
   }
 
+  /** A shared claim on ONE finding's analysis; refused for the same finding twice or while an exclusive operation holds the task. */
+  acquireFinding(taskId: string, findingId: string): () => void {
+    const exclusive = this.held.get(taskId);
+    if (exclusive !== undefined) {
+      throw new AgentRelayError('BUSY', `A code review ${exclusive} is already running for this task.`, {
+        remediation: 'Wait for the operation in flight to finish, then read the review again.'
+      });
+    }
+    const set = this.analyzing.get(taskId) ?? new Set<string>();
+    if (set.has(findingId)) {
+      throw new AgentRelayError('BUSY', 'This finding is already being analyzed.', { remediation: 'Wait for its result.' });
+    }
+    set.add(findingId);
+    this.analyzing.set(taskId, set);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const current = this.analyzing.get(taskId);
+      current?.delete(findingId);
+      if (current !== undefined && current.size === 0) this.analyzing.delete(taskId);
+    };
+  }
+
   isHeld(taskId: string): boolean {
-    return this.held.has(taskId);
+    return this.held.has(taskId) || (this.analyzing.get(taskId)?.size ?? 0) > 0;
+  }
+
+  /** The findings being analyzed in this process right now. For the detail read. */
+  analyzingFindings(taskId: string): string[] {
+    return [...(this.analyzing.get(taskId) ?? [])];
   }
 }
 
@@ -279,6 +335,13 @@ export interface CodeReviewDeps {
   readonly snapshots: CodeSnapshotSource;
   readonly reviewer: ExternalCodeReviewer;
   readonly claims: CodeReviewClaims;
+  /**
+   * The process-wide register `Orchestrator.stop()` reads. Required rather than
+   * optional: a service built without it would run its provider calls invisibly to
+   * Stop, which is the defect this exists to close. The composition root hands every
+   * service the same instance.
+   */
+  readonly operations: TaskOperationRegistry;
   readonly clock: Clock;
   readonly ids: IdGenerator;
   readonly limits?: CodeSnapshotLimits;
@@ -461,6 +524,10 @@ export class CodeReviewService {
     const snapshot = await this.buildSnapshot(worktreePath, baseBranch);
     const canonical = canonicalCodeSnapshot(snapshot);
 
+    // Reading the working tree takes a while, and Stop can land in it. A subject is
+    // the ground every later round and decision stands on, so it is not stored for
+    // a task that has been closed since.
+    this.assertStillActive(taskId, undefined, STOPPED_BEFORE_WRITE);
     return this.deps.reviews.createSubject({
       id: this.deps.ids.next(),
       taskId: task.id,
@@ -766,18 +833,19 @@ export class CodeReviewService {
    */
   async review(taskId: string, signal?: AbortSignal): Promise<CodeReviewRoundOutcome> {
     this.assertMutableTask(taskId);
-    const release = this.deps.claims.acquire(taskId, 'review');
-    try {
-      return await this.runReview(taskId, signal);
-    } finally {
-      release();
-    }
+    // Registered before anything is read or dispatched, so Stop can reach every
+    // step below and a refusal costs a caller nothing.
+    return this.underOperation(
+      taskId,
+      'code_review',
+      true,
+      () => this.deps.claims.acquire(taskId, 'review'),
+      signal,
+      (effective) => this.runReview(taskId, effective)
+    );
   }
 
-  private async runReview(
-    taskId: string,
-    signal?: AbortSignal
-  ): Promise<CodeReviewRoundOutcome> {
+  private async runReview(taskId: string, signal: AbortSignal): Promise<CodeReviewRoundOutcome> {
     const { task, worktreePath } = this.requireReviewableTask(taskId);
 
     // Is this even the right checkout? Read before any durable write and before
@@ -860,6 +928,10 @@ export class CodeReviewService {
 
     // ---- Everything above this line is provably free of external effect. ----
     //
+    // A stop that landed while the checks above were running ends the operation
+    // here, before a round exists: no row, no reservation, nothing to reconcile.
+    this.assertStillActive(taskId, signal, STOPPED_BEFORE_WRITE);
+
     // Durable intent, written BEFORE anything leaves the process. If the
     // machine dies on the next line, the row already says a round was about to
     // go out, and nothing will silently start a second one.
@@ -929,6 +1001,10 @@ export class CodeReviewService {
       if (locator.providerId !== this.deps.reviewer.providerId) {
         throw new AgentRelayError('PARSE_FAILED', LOCATOR_INVALID);
       }
+      // The reservation took a while and Stop can land in it. Nothing has been
+      // dispatched yet, so ending here leaves a round that provably reviewed
+      // nothing, closed below like any other failed reservation.
+      this.assertStillActive(taskId, signal, STOPPED_BEFORE_DISPATCH);
     } catch (error) {
       // Still above the non-idempotent call, so the round is closed as a
       // refusal that provably reviewed nothing.
@@ -943,7 +1019,10 @@ export class CodeReviewService {
       // not designed here.
       this.deps.reviews.updateRound(round.id, {
         status: 'failed',
-        lastError: redactAndTruncate(RESERVATION_FAILED, 10_000)
+        lastError: redactAndTruncate(
+          this.wasStopped(taskId, signal) ? STOPPED_BEFORE_DISPATCH : RESERVATION_FAILED,
+          10_000
+        )
       });
       // Rethrown untouched: the caller that asked for this review is entitled
       // to the code and the sentence. Only the DURABLE copy is Agent Relay's.
@@ -985,12 +1064,27 @@ export class CodeReviewService {
       // Everything else: the phase stays at `reviewing`, because the request
       // left this process and only its answer was lost. Writing `failed` here
       // would assert the call had no effect, which nothing on this side knows.
+      //
+      // A call that ended because the task was stopped is the same case with a
+      // known reason, and says so: what the provider threw for a killed call is
+      // up to its adapter, and is not what this round should be remembered by.
+      if (this.wasStopped(taskId, signal)) {
+        this.deps.reviews.updateRound(dispatched.id, {
+          lastError: redactAndTruncate(STOPPED_REVIEW_OUTCOME_UNKNOWN, 10_000)
+        });
+        throw new AgentRelayError('CANCELLED', STOPPED_REVIEW_OUTCOME_UNKNOWN, { cause: error });
+      }
       this.deps.reviews.updateRound(dispatched.id, {
         lastError: redactAndTruncate(DISPATCH_UNCONFIRMED, 10_000)
       });
       // Rethrown untouched, for the same reason as the reservation above.
       throw error;
     }
+
+    // The provider answered — perhaps only because it was being stopped. The call
+    // went out, so if Stop landed its outcome is unknown; that is written on the
+    // round, and the answer is not read.
+    this.assertAnswerStillWanted(taskId, signal, dispatched.id);
 
     // Validated at this boundary as well as the adapter's: the port is an
     // interface, and reviewer prose is data that must never reach storage
@@ -1031,6 +1125,9 @@ export class CodeReviewService {
     // tell" as proof the code had changed — a claim made from an absence.
     const after = await this.subjectIdentity(taskId);
 
+    // Re-read the working tree took another await, and Stop can land in it. This
+    // is the last check before the round is completed and its findings stored.
+    this.assertAnswerStillWanted(taskId, signal, dispatched.id);
     const applied = this.persistCompletion(dispatched.id, subject, answer, validated, after);
 
     return {
@@ -1042,6 +1139,24 @@ export class CodeReviewService {
       repeatedFindings: applied.findings.length - applied.created,
       subjectAfter: after.identity
     };
+  }
+
+  /**
+   * After a dispatched call: refuse to apply its answer when the task was stopped.
+   *
+   * The round keeps the phase it had when the call went out (`reviewing`), which is
+   * exactly the evidence of a call whose outcome is unknown, and gains a note that
+   * says why nothing was recorded. A task that ended some other way is refused
+   * without a note, as any other write to a closed task is.
+   */
+  private assertAnswerStillWanted(taskId: string, signal: AbortSignal, roundId: string): void {
+    if (this.wasStopped(taskId, signal)) {
+      this.deps.reviews.updateRound(roundId, {
+        lastError: redactAndTruncate(STOPPED_REVIEW_OUTCOME_UNKNOWN, 10_000)
+      });
+      throw new AgentRelayError('CANCELLED', STOPPED_REVIEW_OUTCOME_UNKNOWN);
+    }
+    this.assertMutableTask(taskId);
   }
 
   /**
@@ -1298,18 +1413,17 @@ export class CodeReviewService {
    */
   async reconcile(taskId: string, signal?: AbortSignal): Promise<CodeReviewRoundOutcome> {
     this.assertMutableTask(taskId);
-    const release = this.deps.claims.acquire(taskId, 'reconcile');
-    try {
-      return await this.runReconcile(taskId, signal);
-    } finally {
-      release();
-    }
+    return this.underOperation(
+      taskId,
+      'code_reconcile',
+      true,
+      () => this.deps.claims.acquire(taskId, 'reconcile'),
+      signal,
+      (effective) => this.runReconcile(taskId, effective)
+    );
   }
 
-  private async runReconcile(
-    taskId: string,
-    signal?: AbortSignal
-  ): Promise<CodeReviewRoundOutcome> {
+  private async runReconcile(taskId: string, signal: AbortSignal): Promise<CodeReviewRoundOutcome> {
     const { worktreePath } = this.requireReviewableTask(taskId);
 
     const round = this.deps.reviews.latestRound(taskId);
@@ -1368,6 +1482,11 @@ export class CodeReviewService {
       },
       signal
     );
+
+    // The read-back is read-only towards the provider, so a stop that landed in it
+    // leaves nothing to undo — but nothing it reported may be written to a task
+    // that has been closed, and the round keeps the note it already had.
+    this.assertStillActive(taskId, signal, STOPPED_READ_BACK);
 
     if (status.kind === 'running') {
       // Still executing. The round keeps its phase, and nothing may start
@@ -1440,6 +1559,9 @@ export class CodeReviewService {
 
     const validated = this.validateAnswer(status.round, subject, round.id);
     const after = await this.subjectIdentity(taskId);
+    // The working tree was read again, and Stop can land in that: the last check
+    // before the round is completed and its findings stored.
+    this.assertStillActive(taskId, signal, STOPPED_READ_BACK);
     const applied = this.persistCompletion(round.id, subject, status.round, validated, after);
     return {
       round: applied.round,
@@ -1506,7 +1628,9 @@ export class CodeReviewService {
    */
   async decide(
     taskId: string,
-    request: DecideCodeFindingRequest
+    request: DecideCodeFindingRequest,
+    /** The operation this decision is part of (Auto decide), when there is one. A manual decision has none. */
+    signal?: AbortSignal
   ): Promise<{ finding: CodeReviewFinding; action: CodeReviewDecisionAction }> {
     this.assertMutableTask(taskId);
     const reason = request.reason.trim();
@@ -1528,27 +1652,67 @@ export class CodeReviewService {
       throw new AgentRelayError('NOT_FOUND', 'No such code review finding for this task.');
     }
 
-    const identity = await this.subjectIdentity(taskId);
-    if (identity.identity === 'incomplete') {
-      throw new AgentRelayError('VALIDATION_FAILED', SUBJECT_INCOMPLETE, {
-        remediation: 'Capture an exact subject before deciding its findings.'
-      });
-    }
-    if (identity.identity !== 'current' || identity.stored === null) {
-      throw new AgentRelayError(
-        'VALIDATION_FAILED',
-        'The reviewed code no longer matches the captured subject, so its findings cannot be decided.',
-        { remediation: 'Capture the subject again and run a fresh round before deciding.' }
-      );
-    }
-    if (finding.subjectSha256 !== identity.stored.subjectSha256) {
-      throw new AgentRelayError(
-        'VALIDATION_FAILED',
-        'This finding belongs to an earlier snapshot of the code and cannot be decided against the current one.',
-        { remediation: 'Decide the findings of the current round.' }
-      );
+    // `resolved` says "the code has moved on". For a finding of an EARLIER
+    // subject, a newer captured subject is not enough to say it: the operator
+    // would be judging code they were never shown a review of. What proves the
+    // claim is a COMPLETED round on the newest subject — a fresh external review
+    // of the corrected artifact, whose findings are on screen next to this one.
+    // Without it the finding stays history (see the "earlier snapshot" refusal
+    // below), exactly as before. This is the only decision an earlier subject's
+    // finding can ever receive: accepting or rejecting it would be a statement
+    // about code the task no longer has.
+    const newest = this.deps.reviews.latestSubject(taskId);
+    const movedOn =
+      request.action === 'resolved' &&
+      newest !== null &&
+      finding.subjectSha256 !== newest.subjectSha256 &&
+      this.deps.reviews
+        .listRounds(taskId)
+        .some((round) => round.subjectSha256 === newest.subjectSha256 && round.status === 'completed');
+
+    if (!movedOn) {
+      const identity = await this.subjectIdentity(taskId);
+      if (identity.identity === 'incomplete') {
+        throw new AgentRelayError('VALIDATION_FAILED', SUBJECT_INCOMPLETE, {
+          remediation: 'Capture an exact subject before deciding its findings.'
+        });
+      }
+      if (identity.identity !== 'current' || identity.stored === null) {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'The reviewed code no longer matches the captured subject, so its findings cannot be decided.',
+          { remediation: 'Capture the subject again and run a fresh round before deciding.' }
+        );
+      }
+      if (finding.subjectSha256 !== identity.stored.subjectSha256) {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'This finding belongs to an earlier snapshot of the code and cannot be decided against the current one.',
+          { remediation: 'Decide the findings of the current round.' }
+        );
+      }
+      // An ACCEPTED finding on the current code is a correction still owed:
+      // accepting says it is valid, not that anything was fixed, and the code has
+      // not moved. Only the proof above can close it. The panel never offers this
+      // earlier, and the service refuses it too, so no other caller — a stale
+      // screen, a script — can close a requirement on code that has not changed.
+      if (request.action === 'resolved') {
+        const latest = this.deps.reviews.latestDecision(finding.id);
+        if (latest !== null && latest.action === 'accept') {
+          throw new AgentRelayError(
+            'VALIDATION_FAILED',
+            'This finding was accepted, so it is a correction still owed. It can be marked resolved only after the code was corrected and a fresh external review of the corrected code has completed.',
+            { remediation: 'Send the accepted findings as corrections, capture the corrected code and run a fresh review.' }
+          );
+        }
+      }
     }
 
+    // Reading the working tree above was the only await, and Stop can land in it.
+    // The check is immediately before the write, so a decision is never recorded
+    // for a task that was stopped: the conditional write below protects a finding
+    // from a stale screen, this protects the task from a late one.
+    this.assertStillActive(taskId, signal, STOPPED_BEFORE_WRITE);
     const applied = this.deps.reviews.appendDecisionIfUnchanged(
       {
         id: this.deps.ids.next(),
@@ -1599,18 +1763,21 @@ export class CodeReviewService {
     request: CodeReviewTriageRequest = {},
     signal?: AbortSignal
   ): Promise<readonly FindingTriageRecommendation[]> {
-    const release = this.deps.claims.acquire(taskId, 'triage');
-    try {
-      return await this.runTriage(taskId, request, signal);
-    } finally {
-      release();
-    }
+    this.assertMutableTask(taskId);
+    return this.underOperation(
+      taskId,
+      'code_triage',
+      true,
+      () => this.deps.claims.acquire(taskId, 'triage'),
+      signal,
+      (effective) => this.runTriage(taskId, request, effective)
+    );
   }
 
   private async runTriage(
     taskId: string,
     request: CodeReviewTriageRequest,
-    signal?: AbortSignal
+    signal: AbortSignal
   ): Promise<readonly FindingTriageRecommendation[]> {
     if (!this.deps.codex || !this.deps.settings) {
       throw new AgentRelayError('TOOL_MISSING', 'Automatic finding triage is not configured in this build.');
@@ -1688,11 +1855,17 @@ export class CodeReviewService {
       .map((d) => ({ findingRef: d.findingId, action: d.action, reason: d.reason }));
 
     const settings = this.deps.settings.get();
+    // The operation's own signal — the one Stop aborts — and never one made here:
+    // a private controller would be a call Stop cannot reach.
     const context: AgentRunContext = {
-      signal: signal ?? new AbortController().signal,
+      signal,
       timeoutMs: settings.processTimeoutMs,
       onProgress: () => undefined
     };
+
+    // The read above was an await, and Stop can land in it. Codex is not started
+    // for a task that has already been stopped.
+    this.assertStillActive(taskId, signal, STOPPED_BEFORE_WRITE);
 
     const outcome = await this.deps.codex.triageFindings(
       {
@@ -1707,12 +1880,18 @@ export class CodeReviewService {
       context
     );
 
+    // Codex answered — perhaps only because it was being stopped. An analysis
+    // that arrives for a task that was stopped is dropped unread.
+    this.assertStillActive(taskId, signal, STOPPED_ANALYSIS);
     const validated = this.validateTriageCoverage(outcome.recommendations, requestedIds);
 
     // Refused if the subject or any targeted finding moved while the
     // (potentially long-running) Codex call was in flight — the read-only
     // analogue of `resolve`'s conditional write.
     const after = await this.subjectIdentity(taskId);
+    // Another await, and another chance for Stop: the last check before the
+    // recommendations are stored.
+    this.assertStillActive(taskId, signal, STOPPED_ANALYSIS);
     if (after.identity !== 'current' || after.stored === null || after.stored.subjectSha256 !== subjectSha256) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
@@ -1803,6 +1982,144 @@ export class CodeReviewService {
   }
 
   /* ------------------------------------------------------------------------ */
+  /* Auto decide and correction requirements                                   */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Analyze ONE finding with Codex and, for accept/reject, record the decision
+   * durably — one click, no second "apply" step.
+   *
+   * The decision goes through the same {@link decide} every operator decision
+   * goes through, so the subject identity check, the credential-shape refusal
+   * and the conditional write on the finding's revision all still apply; only
+   * the actor (`system`) and source (`codeReview:autoDecide`) tell an audit
+   * reader it was automatic. A finding that already has a decision — or gets
+   * one while Codex is thinking — is reported `already_decided` and is never
+   * overwritten. `needs_user` records nothing.
+   */
+  async autoDecide(
+    taskId: string,
+    request: { readonly findingId: string },
+    signal?: AbortSignal
+  ): Promise<CodeAutoDecideOutcome> {
+    this.assertMutableTask(taskId);
+    // Shared, not exclusive: the analysis of one finding is read-only towards the
+    // provider, so several different findings may run at once — and one Stop
+    // reaches every one of them.
+    return this.underOperation(
+      taskId,
+      'code_auto_decide',
+      false,
+      () => this.deps.claims.acquireFinding(taskId, request.findingId),
+      signal,
+      (effective) => this.runAutoDecide(taskId, request.findingId, effective)
+    );
+  }
+
+  private async runAutoDecide(
+    taskId: string,
+    findingId: string,
+    signal: AbortSignal
+  ): Promise<CodeAutoDecideOutcome> {
+    const finding = this.deps.reviews.findFindingById(findingId);
+    if (finding === null || finding.taskId !== taskId) {
+      throw new AgentRelayError('NOT_FOUND', 'No such code review finding for this task.');
+    }
+    const alreadyDecided = (): CodeAutoDecideOutcome | null => {
+      const existing = this.deps.reviews.latestDecision(findingId);
+      return existing === null ? null : { kind: 'already_decided', action: existing.action };
+    };
+    const before = alreadyDecided();
+    if (before !== null) return before;
+    // A stop automation already made for this finding, on this code, is not asked
+    // about again: asking twice must not be a way to turn "needs a person" into an
+    // automatic decision. The stored answer is reported as it was.
+    const newest = this.deps.reviews.latestSubject(taskId);
+    const stopped = codeReviewCurrentTriageRecommendations(
+      this.deps.reviews.getTriage(taskId),
+      newest?.subjectSha256 ?? null,
+      newest === null
+        ? []
+        : this.deps.reviews.listFindings(taskId).filter((entry) => entry.subjectSha256 === newest.subjectSha256)
+    ).find((entry) => entry.findingId === findingId && entry.recommendation === 'needs_user');
+    if (stopped !== undefined) {
+      return {
+        kind: 'needs_user',
+        reason: stopped.reason,
+        evidenceRef: stopped.evidenceRef,
+        confidence: stopped.confidence
+      };
+    }
+
+    let recommendation: FindingTriageRecommendation | undefined;
+    try {
+      const recommendations = await this.runTriage(taskId, { findingIds: [findingId] }, signal);
+      recommendation = recommendations.find((entry) => entry.findingRef === findingId);
+    } catch (error) {
+      // Triage refuses to persist an answer for a finding that was decided while
+      // it ran. That is not a failure of the analysis: the finding is simply no
+      // longer ours to decide.
+      const raced = alreadyDecided();
+      if (raced !== null) return raced;
+      throw error;
+    }
+    if (recommendation === undefined) {
+      throw new AgentRelayError('PARSE_FAILED', 'Codex did not return a recommendation for the finding.');
+    }
+    if (recommendation.recommendation === 'needs_user') {
+      return {
+        kind: 'needs_user',
+        reason: recommendation.reason,
+        evidenceRef: recommendation.evidenceRef,
+        confidence: recommendation.confidence
+      };
+    }
+
+    const reason = `Auto-decided by Codex triage (${recommendation.confidence} confidence): ${recommendation.reason} Evidence: ${recommendation.evidenceRef}`;
+    try {
+      await this.decide(
+        taskId,
+        {
+          findingId,
+          action: recommendation.recommendation,
+          reason,
+          expectedRevision: finding.revision,
+          actor: 'system',
+          source: 'codeReview:autoDecide'
+        },
+        // The operation's own signal, so a stop that lands between the analysis
+        // and this write is refused at the write itself.
+        signal
+      );
+    } catch (error) {
+      const raced = alreadyDecided();
+      if (raced !== null) return raced;
+      throw error;
+    }
+    return {
+      kind: 'decided',
+      action: recommendation.recommendation,
+      reason,
+      confidence: recommendation.confidence
+    };
+  }
+
+  /**
+   * The findings someone accepted and nobody has yet shown to be fixed, across
+   * every subject, oldest first. Read from the repository only — no working
+   * tree is touched — so it is cheap enough to ask for on every detail read and
+   * for every correction request.
+   */
+  acceptedRequirements(taskId: string): { finding: CodeReviewFinding; decision: CodeReviewDecision }[] {
+    const accepted: { finding: CodeReviewFinding; decision: CodeReviewDecision }[] = [];
+    for (const finding of this.deps.reviews.listFindings(taskId)) {
+      const decision = this.deps.reviews.latestDecision(finding.id);
+      if (decision !== null && decision.action === 'accept') accepted.push({ finding, decision });
+    }
+    return accepted;
+  }
+
+  /* ------------------------------------------------------------------------ */
   /* Helpers                                                                   */
   /* ------------------------------------------------------------------------ */
 
@@ -1816,6 +2133,54 @@ export class CodeReviewService {
       );
     }
     return task;
+  }
+
+  /**
+   * Run `body` as a registered, stoppable operation: Stop reaches it through the
+   * shared register, the overlap claim keeps two of them from running together, and
+   * both are released whatever happens.
+   */
+  private underOperation<T>(
+    taskId: string,
+    kind: TaskOperationKind,
+    exclusive: boolean,
+    claim: () => () => void,
+    signal: AbortSignal | undefined,
+    body: (effective: AbortSignal) => Promise<T>
+  ): Promise<T> {
+    return runAsOperation(
+      this.deps.operations,
+      taskId,
+      kind,
+      { exclusive, signal, claim, stoppedMessage: STOPPED_DURING_OPERATION },
+      body
+    );
+  }
+
+  /**
+   * Refuse to go on when the task was stopped or is no longer open.
+   *
+   * Called after every awaited external call and immediately before the durable
+   * write that follows it, with nothing awaited in between: Stop writes the task's
+   * status and aborts the operation in one synchronous step, and the database
+   * writes here are synchronous too, so a write that passes this check cannot be
+   * overtaken by a stop. The signal is checked as well as the status because a stop
+   * that lands while an agent run is in flight aborts first and writes the status
+   * later.
+   *
+   * `signal` is absent for a caller that holds no operation of its own (a manual
+   * decision, a capture); for those the task's status is the whole check.
+   */
+  private assertStillActive(taskId: string, signal: AbortSignal | undefined, stoppedMessage: string): void {
+    if (signal?.aborted === true || this.deps.tasks.findById(taskId)?.status === 'CANCELLED') {
+      throw new AgentRelayError('CANCELLED', stoppedMessage);
+    }
+    this.assertMutableTask(taskId);
+  }
+
+  /** Whether the task was stopped, by either of the two signs Stop leaves. */
+  private wasStopped(taskId: string, signal: AbortSignal): boolean {
+    return signal.aborted || this.deps.tasks.findById(taskId)?.status === 'CANCELLED';
   }
 
   /**

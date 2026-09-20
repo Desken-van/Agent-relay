@@ -9,7 +9,13 @@
 import type { ToolDiagnostic } from '../../src/shared/domain/diagnostics';
 import type { GitChangeSet, RepositoryInfo, WorktreeInfo } from '../../src/shared/domain/git';
 import type { PublishConfirmation } from '../../src/shared/ipc';
-import type { CodexReviewResult, FindingTriageRecommendation, TaskSpecification } from '../../src/shared/schemas/codex';
+import {
+  SPECIFICATION_FIELD_NAMES,
+  type CodexReviewResult,
+  type FindingTriageRecommendation,
+  type SpecificationRevisionAddressed,
+  type TaskSpecification
+} from '../../src/shared/schemas/codex';
 import type {
   AgentRunContext,
   ClaudeAdapter,
@@ -21,6 +27,8 @@ import type {
   CodexAdapter,
   CodexReviewOutcome,
   CodexReviewRequest,
+  CodexRevisionOutcome,
+  CodexRevisionRequest,
   CodexSpecificationRequest,
   CodexSpecificationResult,
   CodexTriageOutcome,
@@ -125,6 +133,10 @@ export class FakeCodexAdapter implements CodexAdapter {
   }
 
   triageCalls: CodexTriageRequest[] = [];
+  /** The run context of every triage call, so a test can see which signal reached the provider. */
+  triageContexts: AgentRunContext[] = [];
+  /** The same for revisions. */
+  revisionContexts: AgentRunContext[] = [];
   /** Queue of recommendation sets, consumed one per `triageFindings` call. */
   triageQueue: FindingTriageRecommendation[][] = [];
   triageError: Error | null = null;
@@ -136,6 +148,7 @@ export class FakeCodexAdapter implements CodexAdapter {
     context: AgentRunContext
   ): Promise<CodexTriageOutcome> {
     this.triageCalls.push(request);
+    this.triageContexts.push(context);
     context.onProgress({ type: 'progress', text: 'fake codex: triaging' });
     if (this.triageGate) await this.triageGate;
     if (this.triageError) throw this.triageError;
@@ -148,6 +161,55 @@ export class FakeCodexAdapter implements CodexAdapter {
     }));
     return { recommendations, rawResponse: JSON.stringify({ results: recommendations }) };
   }
+
+  revisionCalls: CodexRevisionRequest[] = [];
+  /** Specifications returned by `reviseSpecification`, one per call, in order. */
+  revisionQueue: TaskSpecification[] = [];
+  revisionError: Error | null = null;
+  /** Held open until resolved, so a test can observe state while a revision is in flight. */
+  revisionGate: Promise<unknown> | null = null;
+
+  async reviseSpecification(
+    request: CodexRevisionRequest,
+    context: AgentRunContext
+  ): Promise<CodexRevisionOutcome> {
+    this.revisionCalls.push(request);
+    this.revisionContexts.push(context);
+    context.onProgress({ type: 'progress', text: 'fake codex: revising specification' });
+    if (this.revisionGate) await this.revisionGate;
+    if (this.revisionError) throw this.revisionError;
+    // By default a genuinely different specification that reflects every accepted
+    // finding, so a loop test does not have to hand-write each revision.
+    const specification =
+      this.revisionQueue.shift() ??
+      makeSpecification({
+        ...request.currentSpecification,
+        summary: `${request.currentSpecification.summary} (revised in correction round ${request.round})`,
+        acceptanceCriteria: [
+          ...request.currentSpecification.acceptanceCriteria,
+          ...request.acceptedFindings.map((finding) => `Addresses: ${finding.title}`)
+        ]
+      });
+    // Honest by default: each accepted finding is reported against the first field
+    // that really differs. A test that needs a lie sets `revisionAddressed`.
+    const changedFields = SPECIFICATION_FIELD_NAMES.filter(
+      (field) => JSON.stringify(request.currentSpecification[field]) !== JSON.stringify(specification[field])
+    );
+    const addressed =
+      this.revisionAddressed ??
+      request.acceptedFindings.flatMap((finding) =>
+        (changedFields.length > 0 ? changedFields : (['summary'] as const)).map((field) => ({
+          finding: finding.finding,
+          field,
+          change: `Reflected "${finding.title}" in ${field}.`
+        }))
+      );
+    this.revisionAddressed = null;
+    return { specification, addressed, rawResponse: JSON.stringify({ specification, addressed }) };
+  }
+
+  /** Overrides what the next revision claims to have addressed (consumed by one call). */
+  revisionAddressed: SpecificationRevisionAddressed[] | null = null;
 
   async diagnose(): Promise<ToolDiagnostic> {
     return okDiagnostic('codex');

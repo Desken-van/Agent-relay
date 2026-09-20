@@ -458,6 +458,30 @@ describe('concurrency and cancellation', () => {
     expect(harness.runs.listByTask(task.id).at(-1)?.status).toBe('cancelled');
   });
 
+  it('signals the stoppable operations registered beside an agent run in the same Stop', async () => {
+    const project = harness.createProject();
+    const task = harness.createTask(project.id);
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const original = harness.codex.createSpecification.bind(harness.codex);
+    harness.codex.createSpecification = async (request, context) => {
+      await gate;
+      return original(request, context);
+    };
+    const running = harness.orchestrator.generateSpecification(task.id);
+    // A review operation that started after the agent run, as the shared register allows.
+    const operation = harness.operations.begin(task.id, 'code_auto_decide', { exclusive: false });
+
+    harness.orchestrator.stop(task.id);
+
+    expect(operation.signal.aborted).toBe(true);
+    operation.release();
+    release?.();
+    await running.catch(() => undefined);
+  });
+
   it('stops a task that has no run in flight', () => {
     const project = harness.createProject();
     const task = harness.createTask(project.id);

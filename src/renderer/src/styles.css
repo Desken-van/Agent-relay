@@ -1275,6 +1275,69 @@ pre,
   overflow-wrap: anywhere;
 }
 
+/* The Decision row: the Decision select, its Auto decide button and the Reason,
+   on one line that wraps on a narrow panel. Auto decide is part of the row, not
+   a control somewhere else on the page. */
+.decision-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+}
+.decision-row__decision {
+  flex: 0 0 210px;
+}
+.decision-row__reason {
+  flex: 1 1 260px;
+  min-width: 200px;
+}
+.decision-row__auto {
+  flex: 0 0 auto;
+  align-self: flex-end;
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* One finding's own status line: progress, result and failure live inside the
+   finding they are about. */
+.finding-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+.finding-status--working {
+  color: #a8c8f5;
+}
+.finding-status--decided strong {
+  color: #a7e8bd;
+}
+
+/* The bulk action's live counts, right beside the button. */
+.autodecide-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  font-size: 12px;
+}
+
+.review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+}
+
 .sev {
   font-size: 9.5px;
   font-weight: 700;

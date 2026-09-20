@@ -9,14 +9,9 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { SqliteCodeReviewRepository } from '../../src/main/db/repositories/code-review-repository';
-import {
-  CodeReviewClaims,
-  CodeReviewService,
-  type CodeReviewDeps,
-  type CodeReviewRoundOutcome
-} from '../../src/main/services/code-review';
+import { CodeReviewClaims, CodeReviewService } from '../../src/main/services/code-review';
 import {
   CodeReviewNotDispatchedError,
   SettingsBoundCodeReviewer,
@@ -25,32 +20,22 @@ import {
 import { defaultSettings } from '../../src/main/container';
 import type { Settings } from '../../src/shared/domain/models';
 import type {
-  CodeReviewerAvailability,
-  ExternalCodeRoundLocator,
-  ExternalCodeRoundStatus,
-  RawCodeSnapshotFingerprint,
-  CodeSnapshotRequest,
-  CodeSnapshotSource,
-  ExternalCodeReviewer,
   ExternalCodeReviewRound,
-  ExternalCodeReviewSubject,
   ExternalMcpCallResult,
   ExternalMcpClient,
   ExternalMcpDiscovery,
   ExternalMcpServerConfig,
   ExternalMcpTool,
-  RawCheckoutIdentity,
-  RawCodeSnapshot,
-  RawCodeSnapshotFile
+  RawCheckoutIdentity
 } from '../../src/main/ports';
 import {
   nodeSnapshotFileOps,
   type SnapshotFileOps
 } from '../../src/main/adapters/git/git-code-snapshot';
 import {
+  codeCorrectionRequirements,
   codeReviewCurrentTriageRecommendations,
-  parseCodeReviewTriage,
-  type ProviderCodeFinding
+  parseCodeReviewTriage
 } from '../../src/shared/domain/code-review';
 import { AgentRelayError } from '../../src/shared/domain/errors';
 import { CoaiCodeReviewer } from '../../src/main/adapters/mcp/coai-code-reviewer';
@@ -59,13 +44,9 @@ import {
   COAI_CODE_REVIEW_TOOLS,
   COAI_PROVIDER_ID
 } from '../../src/main/adapters/mcp/coai-profiles';
-import { createHarness, type Harness } from '../helpers/harness';
-import { FakeCodexAdapter, makeSpecification } from '../helpers/fakes';
-
-const BASE = '1'.repeat(40);
-
-/** A fixed, valid-shaped contract fingerprint — its value is asserted on only where a test names it. */
-const FINGERPRINT = 'f'.repeat(64);
+import { codeReviewScenario, disposeScenariosAfterEach, reviewOnce } from '../helpers/code-review-scenario';
+import { FakeCodexAdapter } from '../helpers/fakes';
+import { FINGERPRINT, finding } from '../helpers/fake-code-review';
 
 const ESCAPE = String.fromCharCode(27);
 
@@ -91,267 +72,8 @@ const LEAKS = [
   'ghp_A1b2C3d4E5f6G7h8I9j0'
 ];
 
-/**
- * A snapshot source whose answer the test controls file by file.
- *
- * `content` is what would be on disk; the fake writes it into a temporary
- * worktree so the service's own file reading and hashing are exercised rather
- * than stubbed.
- */
-class FakeSnapshotSource implements CodeSnapshotSource {
-  readonly calls: CodeSnapshotRequest[] = [];
-  readonly checkoutCalls: string[] = [];
-  headCommit = '2'.repeat(40);
-  files: RawCodeSnapshotFile[] = [];
-  truncated = false;
-  hasUncommittedState = false;
-  error: Error | null = null;
-  /**
-   * What the stability fingerprint reports, per call.
-   *
-   * The default is a constant, so an ordinary capture is stable. A test that
-   * wants to model the tree moving mid-capture returns a different value on the
-   * later reads.
-   */
-  fingerprints: RawCodeSnapshotFingerprint[] = [];
-  readonly fingerprintCalls: number[] = [];
-  /** What `describeCheckout` reports, keyed by the path it is asked about. */
-  checkouts = new Map<string, RawCheckoutIdentity>();
-  defaultCheckout: RawCheckoutIdentity = {
-    commonDir: 'C:/repo/.git',
-    branch: 'agent/task-1',
-    detached: false
-  };
-
-  async describeCheckout(worktreePath: string): Promise<RawCheckoutIdentity> {
-    this.checkoutCalls.push(worktreePath);
-    return this.checkouts.get(worktreePath) ?? this.defaultCheckout;
-  }
-
-  private nextFingerprint(): RawCodeSnapshotFingerprint {
-    const index = this.fingerprintCalls.length;
-    this.fingerprintCalls.push(index);
-    return (
-      this.fingerprints[index] ??
-      this.fingerprints[this.fingerprints.length - 1] ?? {
-        headCommit: this.headCommit,
-        branch: 'agent/task-1',
-        status: '',
-        changeSet: ''
-      }
-    );
-  }
-
-  async fingerprint(): Promise<RawCodeSnapshotFingerprint> {
-    if (this.error) throw this.error;
-    return this.nextFingerprint();
-  }
-
-  async capture(request: CodeSnapshotRequest): Promise<RawCodeSnapshot> {
-    this.calls.push(request);
-    if (this.error) throw this.error;
-    return {
-      baseCommit: BASE,
-      headCommit: this.headCommit,
-      branch: 'agent/task-1',
-      files: this.files,
-      truncated: this.truncated,
-      hasUncommittedState: this.hasUncommittedState,
-      fingerprint: this.nextFingerprint()
-    };
-  }
-}
-
-class FakeCodeReviewer implements ExternalCodeReviewer {
-  readsUncommittedWorktreeState = true;
-  /** Who this reviewer is. Tests change it to model a reconfigured build. */
-  providerId = 'coai';
-  /** What the typed preflight answers. Tests make it refuse. */
-  available: CodeReviewerAvailability = { available: true, reason: null };
-  readonly availabilityCalls: number[] = [];
-  /**
-   * What the reviewer attests it read.
-   *
-   * `undefined` means "echo the dispatched subject", which is what an honest
-   * adapter does; a test sets it to something else to forge a mismatch.
-   */
-  attest: string | null | undefined = undefined;
-  readonly calls: {
-    locator: ExternalCodeRoundLocator;
-    subject: ExternalCodeReviewSubject;
-    scopeText: string;
-  }[] = [];
-  /**
-   * The locators `beginRound` hands out, in order.
-   *
-   * A fresh one per call by default, because a real provider opens a new round
-   * each time; a test that wants two rounds to collide sets them explicitly.
-   */
-  locators: ExternalCodeRoundLocator[] = [];
-  readonly beginCalls: ExternalCodeReviewSubject[] = [];
-  /** The idempotency key each reservation was asked for. */
-  readonly beginTokens: string[] = [];
-  beginError: Error | null = null;
-  /** Runs at the moment the round is opened, before a locator is returned. */
-  onBegin: (() => void) | null = null;
-  /**
-   * What the answer claims to be, when it is not simply the dispatched locator.
-   *
-   * `undefined` means "echo the locator it was called with", which is what an
-   * honest adapter does; a test sets it to forge an answer from another round.
-   */
-  answerLocator: ExternalCodeRoundLocator | undefined = undefined;
-  /** Runs at the moment the call is dispatched, before it answers. */
-  onCall: (() => void) | null = null;
-  error: Error | null = null;
-  answer: ExternalCodeReviewRound = {
-    locator: { providerId: 'coai', sessionId: 'session-1', roundId: 'round-1' },
-    reviewedSubjectSha256: null,
-    verdict: 'revise',
-    gatingCount: 1,
-    threshold: 0,
-    reviewers: 'all 3 reviewers answered',
-    findings: [],
-    instruction: 'resolve every finding',
-    serverName: 'coai-mcp',
-    serverVersion: '1.2.3',
-    contractFingerprint: FINGERPRINT,
-    tokensIn: 100,
-    tokensOut: 20
-  };
-
-  /** What the read-only round read-back reports. */
-  roundStatusAnswer: ExternalCodeRoundStatus = {
-    kind: 'unknown',
-    reason: 'not configured',
-    contractFingerprint: null
-  };
-  /**
-   * What each read-back was asked about.
-   *
-   * Both halves are recorded because the point of the locator is that the
-   * subject alone is not enough to name a round.
-   */
-  readonly roundStatusCalls: {
-    locator: ExternalCodeRoundLocator;
-    subject: ExternalCodeReviewSubject;
-  }[] = [];
-
-  async availability(): Promise<CodeReviewerAvailability> {
-    this.availabilityCalls.push(this.calls.length);
-    return this.available;
-  }
-
-  async beginRound(
-    subject: ExternalCodeReviewSubject,
-    clientToken: string
-  ): Promise<ExternalCodeRoundLocator> {
-    this.beginCalls.push(subject);
-    this.beginTokens.push(clientToken);
-    this.onBegin?.();
-    if (this.beginError) throw this.beginError;
-    const index = this.beginCalls.length - 1;
-    return (
-      this.locators[index] ?? {
-        providerId: this.providerId,
-        sessionId: `session-${index + 1}`,
-        roundId: `round-${index + 1}`,
-        contractFingerprint: FINGERPRINT
-      }
-    );
-  }
-
-  async roundStatus(
-    locator: ExternalCodeRoundLocator,
-    subject: ExternalCodeReviewSubject
-  ): Promise<ExternalCodeRoundStatus> {
-    this.roundStatusCalls.push({ locator, subject });
-    return this.roundStatusAnswer;
-  }
-
-  async reviewCode(
-    locator: ExternalCodeRoundLocator,
-    subject: ExternalCodeReviewSubject,
-    scopeText: string
-  ): Promise<ExternalCodeReviewRound> {
-    this.calls.push({ locator, subject, scopeText });
-    this.onCall?.();
-    if (this.error) throw this.error;
-    return {
-      ...this.answer,
-      locator: this.answerLocator ?? locator,
-      reviewedSubjectSha256:
-        this.attest === undefined ? subject.subjectSha256 : this.attest
-    };
-  }
-}
-
-function finding(overrides: Partial<ProviderCodeFinding> = {}): ProviderCodeFinding {
-  return {
-    severity: 'major',
-    category: 'reliability',
-    gating: true,
-    title: 'The retry is ambiguous',
-    body: 'A lost response may repeat work.',
-    fix: 'Persist the intent before calling out.',
-    file: 'src/service.ts',
-    line: 42,
-    provider: 'codex',
-    role: 'SecurityReliability',
-    ...overrides
-  };
-}
-
-const harnesses: Harness[] = [];
-
-afterEach(() => {
-  for (const harness of harnesses.splice(0)) harness.dispose();
-});
-
-function setup() {
-  const harness = createHarness();
-  harnesses.push(harness);
-  const reviews = new SqliteCodeReviewRepository(harness.db, harness.clock);
-  const snapshots = new FakeSnapshotSource();
-  const reviewer = new FakeCodeReviewer();
-  const claims = new CodeReviewClaims();
-  const build = (extra: Partial<CodeReviewDeps> = {}): CodeReviewService =>
-    new CodeReviewService({
-      tasks: harness.tasks,
-      projects: harness.projects,
-      reviews,
-      snapshots,
-      reviewer,
-      claims,
-      clock: harness.clock,
-      ids: harness.ids,
-      ...extra
-    });
-
-  const project = harness.createProject();
-  const task = harness.createTask(project.id, {
-    status: 'READY_FOR_IMPLEMENTATION',
-    worktreePath: harness.worktreesRoot,
-    branchName: 'agent/task-1',
-    baseBranch: 'main',
-    specificationJson: JSON.stringify(makeSpecification())
-  });
-  // The worktree and the project share one repository by default, and the
-  // worktree sits on the branch the task records. Tests that care make them
-  // disagree.
-  snapshots.checkouts.set(project.localPath, {
-    commonDir: 'C:/repo/.git',
-    branch: 'main',
-    detached: false
-  });
-
-  return { harness, reviews, snapshots, reviewer, claims, service: build(), build, task };
-}
-
-async function reviewOnce(value: ReturnType<typeof setup>): Promise<CodeReviewRoundOutcome> {
-  await value.service.captureSubject(value.task.id);
-  return value.service.review(value.task.id);
-}
+disposeScenariosAfterEach();
+const setup = codeReviewScenario;
 
 describe('the code-review subject', () => {
   it('keeps terminal task review history readable but refuses every mutating IPC operation', async () => {
@@ -569,6 +291,7 @@ describe('the code-review round', () => {
       snapshots: value.snapshots,
       reviewer: new UnconfiguredCodeReviewer(),
       claims: new CodeReviewClaims(),
+      operations: value.harness.operations,
       clock: value.harness.clock,
       ids: value.harness.ids
     });
@@ -3087,5 +2810,310 @@ describe('code-review automatic finding triage', () => {
     expect(identity.currentSha256).toBe(stored.subjectSha256);
     const current = codeReviewCurrentTriageRecommendations(stored, identity.currentSha256, liveNow);
     expect(current.map((r) => r.findingId)).toEqual([findings[1]!.id]);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Auto decide                                                                 */
+/* -------------------------------------------------------------------------- */
+
+describe('code-review Auto decide', () => {
+  async function withFindings(titles: readonly string[] = ['First finding', 'Second finding', 'Third finding']) {
+    const value = setup();
+    const codex = new FakeCodexAdapter();
+    const service = value.build({ codex, settings: value.harness.settings });
+    value.reviewer.answer = { ...value.reviewer.answer, findings: titles.map((title) => finding({ title })) };
+    const outcome = await reviewOnce(value);
+    return { value, codex, service, findings: outcome.findings };
+  }
+  const recommend = (
+    findingRef: string,
+    recommendation: 'accept' | 'reject' | 'needs_user',
+    reason = 'Because.'
+  ) => ({ findingRef, recommendation, reason, evidenceRef: 'src/service.ts:42', confidence: 'high' as const });
+
+  it('sends only the named finding, by its stable id', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageQueue.push([recommend(findings[1]!.id, 'accept')]);
+
+    await service.autoDecide(value.task.id, { findingId: findings[1]!.id });
+
+    expect(codex.triageCalls).toHaveLength(1);
+    expect(codex.triageCalls[0]?.refKind).toBe('id');
+    expect(codex.triageCalls[0]?.findings.map((entry) => entry.ref)).toEqual([findings[1]!.id]);
+  });
+
+  it('records an accept durably at once — no second "apply" step — as an automatic decision', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    const target = findings[0]!;
+    codex.triageQueue.push([recommend(target.id, 'accept', 'Matches criterion 1.')]);
+
+    const outcome = await service.autoDecide(value.task.id, { findingId: target.id });
+
+    expect(outcome).toMatchObject({ kind: 'decided', action: 'accept', confidence: 'high' });
+    const stored = value.reviews.latestDecision(target.id)!;
+    expect(stored).toMatchObject({ action: 'accept', actor: 'system', source: 'codeReview:autoDecide' });
+    expect(stored.reason).toContain('Matches criterion 1.');
+    expect(stored.reason).toContain('src/service.ts:42');
+    expect(value.reviews.findFindingById(target.id)?.revision).toBe(target.revision + 1);
+    // Only this finding was touched.
+    expect(value.reviews.latestDecision(findings[1]!.id)).toBeNull();
+  });
+
+  it('records a reject durably with its reason', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageQueue.push([recommend(findings[2]!.id, 'reject', 'The premise is contradicted.')]);
+
+    await service.autoDecide(value.task.id, { findingId: findings[2]!.id });
+
+    expect(value.reviews.latestDecision(findings[2]!.id)).toMatchObject({ action: 'reject', actor: 'system' });
+    expect(value.reviews.latestDecision(findings[2]!.id)?.reason).toContain('contradicted');
+  });
+
+  it('never decides a needs_user finding, and keeps the explanation', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageQueue.push([recommend(findings[0]!.id, 'needs_user', 'A product choice.')]);
+
+    const outcome = await service.autoDecide(value.task.id, { findingId: findings[0]!.id });
+
+    expect(outcome).toMatchObject({ kind: 'needs_user', reason: 'A product choice.' });
+    expect(value.reviews.latestDecision(findings[0]!.id)).toBeNull();
+    expect(value.reviews.listDecisions(findings[0]!.id)).toEqual([]);
+    expect(value.reviews.getTriage(value.task.id)?.triageJson).toContain('A product choice.');
+  });
+
+  it('a stop is sticky for that code: asking again reports it and never turns it into an automatic decision', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    // The second answer would accept: it must never be asked for.
+    codex.triageQueue.push([recommend(findings[0]!.id, 'needs_user', 'A product choice.')], [recommend(findings[0]!.id, 'accept', 'Clear now.')]);
+
+    const first = await service.autoDecide(value.task.id, { findingId: findings[0]!.id });
+    const second = await service.autoDecide(value.task.id, { findingId: findings[0]!.id });
+
+    expect(first).toMatchObject({ kind: 'needs_user', reason: 'A product choice.' });
+    expect(second).toEqual(first);
+    expect(codex.triageCalls).toHaveLength(1);
+    expect(value.reviews.latestDecision(findings[0]!.id)).toBeNull();
+  });
+
+  it('never overwrites a durable decision, and does not even ask Codex', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    await value.service.decide(value.task.id, {
+      findingId: findings[0]!.id,
+      action: 'reject',
+      reason: 'Operator says no.',
+      expectedRevision: findings[0]!.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+
+    const outcome = await service.autoDecide(value.task.id, { findingId: findings[0]!.id });
+
+    expect(outcome).toEqual({ kind: 'already_decided', action: 'reject' });
+    expect(codex.triageCalls).toHaveLength(0);
+    expect(value.reviews.listDecisions(findings[0]!.id)).toHaveLength(1);
+  });
+
+  it('never overwrites a decision that arrives while Codex is analyzing', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    const target = findings[0]!;
+    let release!: (value: unknown) => void;
+    codex.triageGate = new Promise((resolve) => {
+      release = resolve;
+    });
+    codex.triageQueue.push([recommend(target.id, 'accept', 'Auto says yes.')]);
+
+    const running = service.autoDecide(value.task.id, { findingId: target.id });
+    await Promise.resolve();
+    await value.service.decide(value.task.id, {
+      findingId: target.id,
+      action: 'reject',
+      reason: 'The operator got there first.',
+      expectedRevision: target.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+    release(undefined);
+
+    expect(await running).toEqual({ kind: 'already_decided', action: 'reject' });
+    const decisions = value.reviews.listDecisions(target.id);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({ action: 'reject', actor: 'operator' });
+  });
+
+  it('analyzes different findings at once, refuses the same one twice, and excludes a round dispatch', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    let release!: (value: unknown) => void;
+    codex.triageGate = new Promise((resolve) => {
+      release = resolve;
+    });
+    codex.triageQueue.push([recommend(findings[0]!.id, 'accept')], [recommend(findings[1]!.id, 'reject')]);
+
+    const first = service.autoDecide(value.task.id, { findingId: findings[0]!.id });
+    const second = service.autoDecide(value.task.id, { findingId: findings[1]!.id });
+    await Promise.resolve();
+
+    // The detail read reports exactly what is running, so a reloaded screen can show it.
+    expect([...value.claims.analyzingFindings(value.task.id)].sort()).toEqual([findings[0]!.id, findings[1]!.id].sort());
+    await expect(service.autoDecide(value.task.id, { findingId: findings[0]!.id })).rejects.toMatchObject({ code: 'BUSY' });
+    await expect(service.review(value.task.id)).rejects.toMatchObject({ code: 'BUSY' });
+    await expect(service.triage(value.task.id)).rejects.toMatchObject({ code: 'BUSY' });
+
+    release(undefined);
+    await Promise.all([first, second]);
+    expect(value.claims.analyzingFindings(value.task.id)).toEqual([]);
+    expect(value.reviews.latestDecision(findings[0]!.id)?.action).toBe('accept');
+    expect(value.reviews.latestDecision(findings[1]!.id)?.action).toBe('reject');
+    // Both recommendations survive in the durable triage record: results merge, they do not replace.
+    const stored = value.reviews.getTriage(value.task.id)!.triageJson;
+    expect(stored).toContain(findings[0]!.id);
+    expect(stored).toContain(findings[1]!.id);
+  });
+
+  it('keeps a failed analysis local: nothing is decided, and an explicit retry succeeds', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageError = new Error('Codex timed out.');
+
+    await expect(service.autoDecide(value.task.id, { findingId: findings[0]!.id })).rejects.toThrow(/timed out/i);
+    expect(value.reviews.latestDecision(findings[0]!.id)).toBeNull();
+
+    codex.triageError = null;
+    codex.triageQueue.push([recommend(findings[0]!.id, 'accept')]);
+    expect(await service.autoDecide(value.task.id, { findingId: findings[0]!.id })).toMatchObject({ kind: 'decided' });
+  });
+
+  it('decides nothing about code that has moved on since it was reviewed', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageQueue.push([recommend(findings[0]!.id, 'accept')]);
+    value.snapshots.headCommit = '9'.repeat(40);
+
+    await expect(service.autoDecide(value.task.id, { findingId: findings[0]!.id })).rejects.toThrow(/no longer matches/i);
+    expect(value.reviews.latestDecision(findings[0]!.id)).toBeNull();
+  });
+
+  it('refuses a credential-shaped analysis and stores nothing of it', async () => {
+    const { value, codex, service, findings } = await withFindings();
+    codex.triageQueue.push([recommend(findings[0]!.id, 'accept', 'Use the key sk-abcdefghijklmnopqrstuvwxyz123456.')]);
+
+    await expect(service.autoDecide(value.task.id, { findingId: findings[0]!.id })).rejects.toThrow(/credential-shaped/i);
+    expect(value.reviews.latestDecision(findings[0]!.id)).toBeNull();
+  });
+
+  it('refuses a finding of another task or an unknown one', async () => {
+    const { value, service } = await withFindings();
+    await expect(service.autoDecide(value.task.id, { findingId: 'missing' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+});
+
+describe('code-review accepted findings as correction requirements', () => {
+  async function withAccepted() {
+    const value = setup();
+    value.reviewer.answer = {
+      ...value.reviewer.answer,
+      findings: [finding({ title: 'Accepted one' }), finding({ title: 'Rejected one' }), finding({ title: 'Undecided one' })]
+    };
+    const outcome = await reviewOnce(value);
+    const [accepted, rejected] = outcome.findings;
+    const decide = (target: typeof accepted, action: 'accept' | 'reject' | 'resolved') =>
+      value.service.decide(value.task.id, {
+        findingId: target!.id,
+        action,
+        reason: `${action} by the operator.`,
+        expectedRevision: value.reviews.findFindingById(target!.id)!.revision,
+        actor: 'operator',
+        source: 'test'
+      });
+    await decide(accepted, 'accept');
+    await decide(rejected, 'reject');
+    return { value, accepted: accepted!, decide };
+  }
+
+  it('collects exactly the accepted findings, not the rejected or undecided ones', async () => {
+    const { value, accepted } = await withAccepted();
+
+    expect(value.service.acceptedRequirements(value.task.id).map((entry) => entry.finding.title)).toEqual([accepted.title]);
+  });
+
+  it('keeps an accepted finding open until a completed round on a NEW subject exists, and never resolves it by itself', async () => {
+    const { value, accepted, decide } = await withAccepted();
+    const requirementsStatus = async () => {
+      const identity = await value.service.subjectIdentity(value.task.id);
+      const live =
+        identity.identity === 'current' && identity.stored !== null
+          ? value.reviews.listFindings(value.task.id).filter((entry) => entry.subjectSha256 === identity.stored!.subjectSha256)
+          : [];
+      return codeCorrectionRequirements({
+        accepted: value.service.acceptedRequirements(value.task.id),
+        liveFindingIds: new Set(live.map((entry) => entry.id)),
+        newestSubjectSha256: value.reviews.latestSubject(value.task.id)?.subjectSha256 ?? null,
+        reviewedSubjectSha256s: new Set(
+          value.reviews.listRounds(value.task.id).filter((round) => round.status === 'completed').map((round) => round.subjectSha256)
+        )
+      }).map((entry) => entry.status);
+    };
+
+    // Same code: the accepted finding is simply open.
+    expect(await requirementsStatus()).toEqual(['open']);
+
+    // The code moves on and is captured — but no review has run against it yet.
+    value.snapshots.headCommit = '9'.repeat(40);
+    await value.service.captureSubject(value.task.id);
+    expect(await requirementsStatus()).toEqual(['awaiting_fresh_review']);
+    // The operator is refused: they have not been shown a review of this code.
+    await expect(decide(accepted, 'resolved')).rejects.toThrow(/earlier snapshot/i);
+    expect(value.service.acceptedRequirements(value.task.id)).toHaveLength(1);
+
+    // A fresh round on the new subject runs: only now is the evidence there.
+    const fresh = await value.service.review(value.task.id);
+    expect(fresh.round.subjectSha256).toBe(value.reviews.latestSubject(value.task.id)!.subjectSha256);
+    expect(fresh.findings.every((entry) => entry.subjectSha256 === fresh.round.subjectSha256)).toBe(true);
+    expect(await requirementsStatus()).toEqual(['fresh_review_done']);
+    // Nothing resolved it by itself.
+    expect(value.reviews.latestDecision(accepted.id)?.action).toBe('accept');
+
+    // Now the operator may say the code moved on — and only then does the requirement close.
+    await decide(accepted, 'resolved');
+    expect(value.reviews.latestDecision(accepted.id)?.action).toBe('resolved');
+    expect(value.service.acceptedRequirements(value.task.id)).toEqual([]);
+  });
+
+  it('lets the operator overrule an accepted finding with a rejection, keeping both decisions in the history', async () => {
+    const { value, accepted, decide } = await withAccepted();
+
+    await decide(accepted, 'reject');
+
+    expect(value.reviews.latestDecision(accepted.id)?.action).toBe('reject');
+    expect(value.reviews.listDecisions(accepted.id).map((entry) => entry.action)).toEqual(['accept', 'reject']);
+    expect(value.service.acceptedRequirements(value.task.id)).toEqual([]);
+  });
+
+  it('refuses to close an accepted finding on the SAME code, however the request arrives', async () => {
+    const { value, accepted, decide } = await withAccepted();
+
+    // No code has moved and no fresh review exists: the finding is still owed.
+    await expect(decide(accepted, 'resolved')).rejects.toThrow(/correction still owed/i);
+    expect(value.reviews.latestDecision(accepted.id)?.action).toBe('accept');
+    expect(value.service.acceptedRequirements(value.task.id)).toHaveLength(1);
+    // A finding nobody accepted keeps the behaviour it always had: the operator may say it is resolved.
+    const [, , untouched] = value.reviews.listFindings(value.task.id);
+    await value.service.decide(value.task.id, {
+      findingId: untouched!.id,
+      action: 'resolved',
+      reason: 'Already fixed before the review ran.',
+      expectedRevision: untouched!.revision,
+      actor: 'operator',
+      source: 'test'
+    });
+    expect(value.reviews.latestDecision(untouched!.id)?.action).toBe('resolved');
+  });
+
+  it('does not offer accept or reject on an earlier subject, even after a fresh round', async () => {
+    const { value, accepted, decide } = await withAccepted();
+    value.snapshots.headCommit = '9'.repeat(40);
+    await value.service.captureSubject(value.task.id);
+    await value.service.review(value.task.id);
+
+    await expect(decide(accepted, 'reject')).rejects.toThrow(/earlier snapshot/i);
+    await expect(decide(accepted, 'accept')).rejects.toThrow(/earlier snapshot/i);
   });
 });

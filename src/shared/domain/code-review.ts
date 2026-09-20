@@ -687,3 +687,85 @@ export function codeReviewCurrentTriageRecommendations(
     return analyzedAt !== undefined && liveNow !== undefined && analyzedAt === liveNow;
   });
 }
+
+/* -------------------------------------------------------------------------- */
+/* Auto decide and correction requirements                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What Auto decide made of ONE code-review finding.
+ *
+ * `decided` means the decision is already durable — it went through the same
+ * `decide` every operator decision goes through. `already_decided` is not a
+ * failure: something else (the operator, or another window) decided the finding
+ * first, and Auto decide never overwrites a decision.
+ */
+export type CodeAutoDecideOutcome =
+  | {
+      readonly kind: 'decided';
+      readonly action: 'accept' | 'reject';
+      readonly reason: string;
+      readonly confidence: 'high' | 'medium' | 'low' | 'uncertain';
+    }
+  | {
+      readonly kind: 'needs_user';
+      readonly reason: string;
+      readonly evidenceRef: string;
+      readonly confidence: 'high' | 'medium' | 'low' | 'uncertain';
+    }
+  | { readonly kind: 'already_decided'; readonly action: CodeReviewDecisionAction };
+
+/**
+ * Where an accepted finding stands. Accepting says the finding is valid; it
+ * never says the code changed, so nothing here is "fixed" — the most a status
+ * can say is that the evidence that could show it has been produced.
+ *
+ * - `open`                  the code is exactly what was reviewed when it was
+ *                           accepted: nothing has changed yet.
+ * - `awaiting_fresh_review` the code (or its captured subject) has moved on, but
+ *                           no completed review has been run against the newest
+ *                           subject, so nothing has been shown either way.
+ * - `fresh_review_done`     a completed round exists on the newest subject. The
+ *                           operator can compare it with this finding and mark
+ *                           it resolved — the one decision an earlier subject's
+ *                           finding accepts, and only in this status.
+ */
+export const CODE_REQUIREMENT_STATUSES = ['open', 'awaiting_fresh_review', 'fresh_review_done'] as const;
+export type CodeRequirementStatus = (typeof CODE_REQUIREMENT_STATUSES)[number];
+
+export interface CodeCorrectionRequirement {
+  readonly finding: CodeReviewFinding;
+  readonly decision: CodeReviewDecision;
+  readonly status: CodeRequirementStatus;
+}
+
+/**
+ * Classify accepted findings. `liveFindingIds` is empty unless the subject is
+ * proven current, so a stale, unreadable or partial capture can never make an
+ * accepted finding look either resolved or still-open-on-current-code.
+ */
+export function codeCorrectionRequirements(input: {
+  readonly accepted: readonly { readonly finding: CodeReviewFinding; readonly decision: CodeReviewDecision }[];
+  /** Ids of the findings that are live right now. */
+  readonly liveFindingIds: ReadonlySet<string>;
+  /** The newest captured subject, if any. */
+  readonly newestSubjectSha256: string | null;
+  /** Subjects that have at least one COMPLETED round. */
+  readonly reviewedSubjectSha256s: ReadonlySet<string>;
+}): CodeCorrectionRequirement[] {
+  return input.accepted.map(({ finding, decision }) => {
+    let status: CodeRequirementStatus;
+    if (input.liveFindingIds.has(finding.id)) {
+      status = 'open';
+    } else if (
+      input.newestSubjectSha256 !== null &&
+      finding.subjectSha256 !== input.newestSubjectSha256 &&
+      input.reviewedSubjectSha256s.has(input.newestSubjectSha256)
+    ) {
+      status = 'fresh_review_done';
+    } else {
+      status = 'awaiting_fresh_review';
+    }
+    return { finding, decision, status };
+  });
+}

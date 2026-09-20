@@ -111,6 +111,7 @@ import {
 import type { VerificationExecutor } from './worktree-verification';
 import type { WorktreeDependencyInstaller, WorktreeDependencyPreparer } from './worktree-dependencies';
 import type { ProtectedContinuationAction } from './continuation-service';
+import type { TaskOperationRegistry } from './task-operations';
 import { redactAndTruncate, redactSecrets } from '../../shared/util/redact';
 import { ORNITH_LIMITS, ornithRelativePathSchema, redactAbsoluteMachinePaths } from '../../shared/domain/ornith';
 
@@ -155,11 +156,23 @@ export interface OrchestratorDeps {
   readonly planReviews: PlanReviewGateRepository;
   readonly continuationGuard?: ContinuationActionGuard;
   readonly continuations?: TaskContinuationRepository;
+  /**
+   * Findings accepted from an external code review that nobody has shown to be
+   * fixed. Absent in builds without code review; then no correction ever
+   * carries one.
+   */
+  readonly externalCodeRequirements?: (taskId: string) => readonly ExternalCodeRequirement[];
   /** Present only when Ornith is wired; absent build configurations simply cannot select it. */
   readonly ornith?: OrnithImplementationService;
   readonly ornithLease?: OrnithInferenceLeaseService;
   /** Used only to invoke fixed, read-only Git argv for the Ornith worktree tools. */
   readonly processRunner?: ProcessRunner;
+  /**
+   * The process-wide register of stoppable operations that are not agent runs
+   * (the plan-correction loop, external plan-review calls). `stop()` aborts them.
+   * Absent only in builds and tests that never start one.
+   */
+  readonly operations?: TaskOperationRegistry;
 }
 
 export class Orchestrator {
@@ -294,13 +307,29 @@ export class Orchestrator {
     return updated;
   }
 
-  private beginExclusive(taskId: string): AbortController {
+  /**
+   * Refuse to start an agent run while something else is running for the task,
+   * and say WHICH: an agent run, or a review operation (the plan-correction loop, a
+   * plan or code review, a reconciliation, an analysis) that has no run of its own
+   * to point at.
+   */
+  private assertNothingRunning(taskId: string): void {
     if (this.inFlight.has(taskId)) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
         'This task already has an agent running. Stop it before starting another operation.'
       );
     }
+    if (this.deps.operations?.isActive(taskId)) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'This task already has a review operation running. Wait for it to finish, or stop the task, before starting an agent.'
+      );
+    }
+  }
+
+  private beginExclusive(taskId: string): AbortController {
+    this.assertNothingRunning(taskId);
     const controller = new AbortController();
     this.inFlight.set(taskId, controller);
     return controller;
@@ -496,12 +525,7 @@ export class Orchestrator {
 
   async generateSpecification(taskId: string): Promise<Task> {
     let task = this.requireTask(taskId);
-    if (this.inFlight.has(taskId)) {
-      throw new AgentRelayError(
-        'VALIDATION_FAILED',
-        'This task already has an agent running. Stop it before starting another operation.'
-      );
-    }
+    this.assertNothingRunning(taskId);
     if (task.status !== 'DRAFT' && task.status !== 'READY_FOR_IMPLEMENTATION') {
       throw new InvalidTransitionError(task.status, 'specification_started');
     }
@@ -859,6 +883,10 @@ export class Orchestrator {
     let task = this.requireTask(taskId);
     const settings = this.deps.settings.get();
 
+    // Findings the operator accepted from an external code review are
+    // corrections still owed. They travel through THIS round, not a parallel one.
+    const external = this.deps.externalCodeRequirements?.(taskId) ?? [];
+
     // The same decision the button makes, from the same function. Asking it
     // here is what makes it a rule rather than a UI convenience: a renderer is
     // not a domain boundary, and this entry point is reachable without one.
@@ -866,7 +894,8 @@ export class Orchestrator {
       status: task.status,
       currentRound: task.currentRound,
       maxRounds: task.maxRounds,
-      latestClaudeStructuredResult: latestClaudeRoundResult(this.deps.runs.listByTask(taskId))
+      latestClaudeStructuredResult: latestClaudeRoundResult(this.deps.runs.listByTask(taskId)),
+      externalRequirementsOpen: external.length > 0
     });
 
     if (action.kind === 'unavailable') {
@@ -888,7 +917,7 @@ export class Orchestrator {
     // configuration must not reach the point of writing a run row.
     this.assertImplementationConfigured(task, settings);
 
-    const review = readReview(task);
+    const review = mergeExternalRequirements(readReview(task), external);
     if (!review && !recovering) {
       throw new AgentRelayError('VALIDATION_FAILED', 'There is no review to send corrections from.');
     }
@@ -1645,12 +1674,25 @@ export class Orchestrator {
 
     if (controller) {
       controller.abort();
+      // Anything else registered for the task is told to stop in the same breath:
+      // a review or an analysis running beside an agent run has no catch block of
+      // its own that would notice. Each of them re-checks its signal before it
+      // writes, so they end even before the agent's catch block records CANCELLED.
+      this.deps.operations?.abort(taskId);
       // The in-flight operation's own catch block writes the CANCELLED state and
       // closes its run record; returning the current task avoids racing it.
       return task;
     }
 
     const stopped = this.applyEvent(task, 'cancelled', { lastError: 'Stopped by the user.' });
+    // Operations that are not agent runs (the plan-correction loop, external
+    // plan-review calls) have no run record and no catch block that would write
+    // CANCELLED for them, so the state is written here, synchronously, and THEN
+    // they are told to stop. In that order, and in the same tick, nothing they do
+    // after their next await can find the task still eligible: every durable
+    // write they make re-reads the task, and the specification swap itself refuses
+    // a task that is no longer in the status it was started in.
+    this.deps.operations?.abort(taskId);
     const continuation = this.deps.continuations?.findByContinuation(taskId);
     if (continuation) this.deps.continuations?.deleteClaim(continuation.sourceTaskId);
     return stopped;
@@ -1724,6 +1766,54 @@ export function readReview(task: Task): CodexReviewResult | null {
   if (!task.lastReviewJson) return null;
   const parsed = codexReviewResultSchema.safeParse(JSON.parse(task.lastReviewJson));
   return parsed.success ? parsed.data : null;
+}
+
+/** A finding the operator accepted from an external code review, as a correction requirement. */
+export interface ExternalCodeRequirement {
+  readonly title: string;
+  readonly body: string;
+  readonly fix: string;
+  readonly severity: 'blocking' | 'major' | 'minor' | 'nit';
+  readonly file: string;
+  readonly line: number;
+}
+
+const EXTERNAL_SEVERITY: Record<ExternalCodeRequirement['severity'], CodexReviewResult['findings'][number]['severity']> = {
+  blocking: 'critical',
+  major: 'high',
+  minor: 'medium',
+  nit: 'low'
+};
+
+/**
+ * The review a correction round is built from: the internal review's findings
+ * plus every accepted external finding, so the existing correction prompt (and
+ * Ornith's structured rendering) carry them without a second code path. With no
+ * internal review the external findings ARE the review. Returns the internal
+ * review untouched when nothing external is owed.
+ */
+export function mergeExternalRequirements(
+  review: CodexReviewResult | null,
+  external: readonly ExternalCodeRequirement[]
+): CodexReviewResult | null {
+  if (external.length === 0) return review;
+  const findings = external.map((requirement) => ({
+    severity: EXTERNAL_SEVERITY[requirement.severity],
+    title: `External code review: ${requirement.title}`,
+    description: requirement.fix.trim().length > 0
+      ? `${requirement.body}\nAccepted correction: ${requirement.fix}`
+      : requirement.body,
+    file: requirement.file.length > 0 ? requirement.file : null,
+    line: requirement.line > 0 ? requirement.line : null
+  }));
+  const note = `The operator accepted ${external.length} finding(s) from an external code review; they are corrections still owed.`;
+  return {
+    verdict: 'changes_requested',
+    summary: review ? `${review.summary}\n\n${note}` : note,
+    findings: [...(review?.findings ?? []), ...findings],
+    followUpPrompt: review?.followUpPrompt ?? '',
+    suggestedTests: review?.suggestedTests ?? []
+  };
 }
 
 /**

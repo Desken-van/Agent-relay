@@ -30,10 +30,12 @@ import {
 import { IPC_INVOKE_CHANNEL } from '../../shared/ipc-channels';
 import type { Application } from '../container';
 import { assertKnownPath } from '../services/path-safety';
-import { parsePlanReviewFindings } from '../../shared/domain/plan-review';
-import type { CodeReviewDecision } from '../../shared/domain/code-review';
+import { parsePlanReviewAutoDecisions, parsePlanReviewFindings } from '../../shared/domain/plan-review';
+import { codeCorrectionRequirements, type CodeReviewDecision } from '../../shared/domain/code-review';
 import { redactAndTruncate } from '../../shared/util/redact';
+import { describePlanCorrection } from '../services/plan-correction';
 import {
+  planFindingsSha256,
   planReviewGateIdentity,
   readBoundRuleEvidence
 } from '../services/plan-review-gate';
@@ -76,6 +78,7 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
   };
 
   const planReviewService = () => app.createPlanReviewGate(externalPlanReviewConfig(app.settings.get()));
+  const planCorrectionService = () => app.createPlanCorrection(externalPlanReviewConfig(app.settings.get()));
 
   const codeReviewDetail = async (taskId: string): Promise<IpcResponseMap['codeReview:get']> => {
     const task = app.tasks.findById(taskId);
@@ -130,7 +133,19 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       latestDecisions,
       totalFindingsEverRecorded: all.length,
       identityProblem: identityProblem ?? identity.problem,
-      triage: app.codeReviews.getTriage(taskId)
+      triage: app.codeReviews.getTriage(taskId),
+      analyzing: app.codeReviewClaims.analyzingFindings(taskId),
+      correctionRequirements: codeCorrectionRequirements({
+        accepted: app.codeReview.acceptedRequirements(taskId),
+        liveFindingIds: new Set(live.map((finding) => finding.id)),
+        newestSubjectSha256: identity.stored?.subjectSha256 ?? null,
+        reviewedSubjectSha256s: new Set(
+          app.codeReviews
+            .listRounds(taskId)
+            .filter((round) => round.status === 'completed')
+            .map((round) => round.subjectSha256)
+        )
+      })
     };
   };
   const planReviewDetail = (taskId: string): IpcResponseMap['planReview:get'] => {
@@ -153,8 +168,23 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       }
     }
     const gate = app.planReviewGates.findByTask(taskId);
+    const findingsSha256 = gate?.findingsJson ? planFindingsSha256(gate.findingsJson) : null;
     return {
       ruleEvidenceProblem,
+      findingsSha256,
+      autoDecisions: gate === null ? [] : parsePlanReviewAutoDecisions(gate.autoDecisionsJson, findingsSha256),
+      analyzing: app.planReviewClaims.analyzingFindings(taskId),
+      correction: describePlanCorrection(
+        {
+          tasks: app.tasks,
+          gates: app.planReviewGates,
+          corrections: app.planCorrections,
+          ruleEvidence: app.taskRuleEvidence,
+          settings: app.settings,
+          claims: app.planReviewClaims
+        },
+        taskId
+      ),
       gateIdentity: planReviewGateIdentity({ task, gate, ruleEvidence: app.taskRuleEvidence }),
       ruleEvidence: binding === null || snapshot === null ? null : {
         snapshotSha256: binding.snapshotSha256,
@@ -346,6 +376,33 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
         findingIndexes: input.findingIndexes
       });
       return planReviewDetail(input.taskId);
+    },
+    'planReview:autoDecide': async (input) => {
+      const { outcome } = await planReviewService().autoDecide(input.taskId, {
+        gateId: input.gateId,
+        findingsSha256: input.findingsSha256,
+        findingIndex: input.findingIndex
+      });
+      return { detail: planReviewDetail(input.taskId), outcome };
+    },
+    'planReview:resolveAndRevise': async (input) => {
+      const outcome = await planCorrectionService().resolveAndRevise(input.taskId, {
+        gateId: input.gateId,
+        expectedRevision: input.expectedRevision,
+        decisions: input.decisions,
+        autoContinue: input.autoContinue
+      });
+      return { detail: planReviewDetail(input.taskId), outcome };
+    },
+    'planReview:continueCorrection': async (input) => {
+      const outcome = await planCorrectionService().continueCorrection(input.taskId, {
+        autoContinue: input.autoContinue
+      });
+      return { detail: planReviewDetail(input.taskId), outcome };
+    },
+    'codeReview:autoDecide': async (input) => {
+      const outcome = await app.codeReview.autoDecide(input.taskId, { findingId: input.findingId });
+      return { outcome, detail: await codeReviewDetail(input.taskId) };
     },
 
     'git:changes': (input) => app.orchestrator.collectChanges(input.taskId),

@@ -1,16 +1,22 @@
 /** Optional, durable external plan-review gate. */
 
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { AgentRelayError } from '../../shared/domain/errors';
 import type { Task } from '../../shared/domain/models';
+import { gateHasAcceptedDecisions, type PlanAutoDecideOutcome } from '../../shared/domain/plan-correction';
 import {
+  parsePlanReviewAutoDecisions,
   parsePlanReviewFindings,
+  parsePlanReviewTriage,
   planReviewDecisionSchema,
   planReviewTriageResultSchema,
   taskRuleEvidenceBindingSchema,
+  type PlanReviewAutoDecision,
   type PlanReviewDecision,
   type PlanReviewGate,
   type PlanReviewGateIdentity,
+  type PlanReviewTriageRecommendation,
   type PlanReviewTriageResult
 } from '../../shared/domain/plan-review';
 import type { RuleEvidenceSnapshot } from '../../shared/domain/rule-evidence';
@@ -34,6 +40,7 @@ import type {
   TriageableFinding
 } from '../ports';
 import type { PlanReviewClaims } from './plan-review-claims';
+import { asStopped, runAsOperation, type TaskOperationKind, type TaskOperationRegistry } from './task-operations';
 import { renderRuleEvidence, validateRuleEvidenceSnapshot } from './rule-evidence';
 
 const MAX_PLAN_BYTES = 1_500_000;
@@ -101,6 +108,10 @@ const SUPERSEDE_BLOCKING = [
 const NO_TERMINAL_EVIDENCE =
   'The provider records no plan round for this session, which is not proof that the round already dispatched from here was refused: an empty list is equally consistent with a request the provider has accepted and not yet recorded. Nothing was repeated and no new round may start. Resolve or close the round in the provider, or reconcile again once it appears.';
 
+const STOPPED_OUTCOME_UNKNOWN =
+  'The task was stopped while an external call was in flight, so its outcome is unknown and was not recorded. Reconcile the round before repeating anything.';
+const STOPPED_BEFORE_WRITE = 'The task was stopped before anything further was sent or written.';
+const STOPPED_DURING_OPERATION = 'The task was stopped while this operation was running. Nothing further was changed.';
 const STALE_ROUND =
   'These decisions were taken against a plan-review round that is no longer the current one, so nothing was sent to the provider. Re-read the round and decide its findings again.';
 
@@ -243,6 +254,63 @@ export interface PlanReviewResolveRequest {
   readonly gateId: string;
   readonly expectedRevision: number;
   readonly decisions: readonly PlanReviewDecision[];
+  /**
+   * Internal to the correction loop; the IPC schema cannot express it.
+   *
+   * A round with an accepted finding may only be resolved by the loop that then
+   * revises the specification. Without this a caller could record "accept and
+   * address", let the provider move on, and carry the unchanged specification
+   * forward — the exact defect the loop exists to remove.
+   */
+  readonly allowAccepted?: boolean;
+}
+
+const CORRECTION_REQUIRED =
+  'This round accepts at least one finding, so it must be resolved together with a revision of the plan. Resolving it alone would leave the accepted findings out of the specification.';
+
+/**
+ * The identity of one round's findings: the SHA-256 of the exact stored text.
+ *
+ * Every per-finding request and every merge is pinned by it, because a finding
+ * is only identified by its index within one round. It is the round's content
+ * identity, so it does not move when an unrelated column of the gate is written.
+ */
+export function planFindingsSha256(findingsJson: string): string {
+  return createHash('sha256').update(findingsJson).digest('hex');
+}
+
+/**
+ * The stored recommendations that still describe this gate's findings, with
+ * `incoming` written over any earlier ones for the same findings.
+ *
+ * Merged BY FINDING INDEX rather than replaced: a per-finding analysis knows
+ * nothing about its siblings, and replacing would erase what they already
+ * learned. A stored set for other findings (a previous round) is dropped.
+ */
+export function mergeRecommendations(
+  gate: Pick<PlanReviewGate, 'triageJson' | 'triageForFindings' | 'findingsJson'>,
+  incoming: readonly PlanReviewTriageRecommendation[]
+): PlanReviewTriageRecommendation[] {
+  const existing =
+    gate.triageForFindings !== null && gate.triageForFindings === gate.findingsJson
+      ? (parsePlanReviewTriage(gate.triageJson)?.recommendations ?? [])
+      : [];
+  const replaced = new Set(incoming.map((entry) => entry.finding));
+  return [...existing.filter((entry) => !replaced.has(entry.finding)), ...incoming].sort(
+    (a, b) => a.finding - b.finding
+  );
+}
+
+/** Names exactly one finding of exactly one round. */
+export interface PlanReviewAutoDecideRequest {
+  readonly gateId: string;
+  readonly findingsSha256: string;
+  readonly findingIndex: number;
+}
+
+export interface PlanReviewAutoDecideResult {
+  readonly gate: PlanReviewGate;
+  readonly outcome: PlanAutoDecideOutcome;
 }
 
 export interface PlanReviewGateDeps {
@@ -261,6 +329,15 @@ export interface PlanReviewGateDeps {
    * contend for the same claim rather than each holding their own.
    */
   readonly claims: PlanReviewClaims;
+  /**
+   * The process-wide register `Orchestrator.stop()` consults. Every claim-taking
+   * entry point below registers here, so Stop reaches an operation started by any
+   * IPC call, not only one that happens to share this service instance.
+   * Required, not optional: a service built without it would start provider calls
+   * that Stop cannot reach, silently bringing the defect back, so omitting the
+   * wiring is a compile-time error.
+   */
+  readonly operations: TaskOperationRegistry;
   /** For `triage()` only — a fresh, read-only, independent analysis call. Optional
    *  so existing tests that never exercise triage need not fake it. */
   readonly codex?: Pick<CodexAdapter, 'triageFindings'>;
@@ -369,6 +446,22 @@ export function assertPlanReviewAllowsApproval(input: {
       { remediation: 'Complete the plan review and resolve every finding before approving the specification.' }
     );
   }
+  // Accepting a finding says it is valid; it does not put it into the
+  // specification. A round that accepted something and still describes THIS
+  // specification has passed with its own accepted findings uncorrected, and
+  // approving it would carry them forward unaddressed.
+  if (gateHasAcceptedDecisions(gate)) {
+    throw new AgentRelayError(
+      'APPROVAL_REQUIRED',
+      'The external plan review accepted findings that the specification does not yet reflect.',
+      { remediation: 'Use "Resolve and revise plan" (or "Continue correction") so the plan is revised and reviewed again before approval.' }
+    );
+  }
+}
+
+/** A recorded stop, reported the way a fresh one is. */
+function stoppedOutcome(stop: PlanReviewTriageRecommendation): PlanAutoDecideOutcome {
+  return { kind: 'needs_user', reason: stop.reason, evidenceRef: stop.evidenceRef, confidence: stop.confidence };
 }
 
 function planText(specification: TaskSpecification, snapshot: RuleEvidenceSnapshot): string {
@@ -503,9 +596,29 @@ export class PlanReviewGateService {
     this.preparable(taskId);
   }
 
-  prepare(taskId: string): PlanReviewGate {
+  /**
+   * The gate for the task's current specification identity, created if needed.
+   *
+   * `inheritContractFrom` is for the correction loop: a gate for a REVISED
+   * specification is a new row, and starting it without a fingerprint would let
+   * a provider whose contract changed between rounds be adopted silently. The
+   * previous row's fingerprint is carried over so `open` compares against it and
+   * flags a difference exactly as it does for a re-opened row.
+   */
+  prepare(taskId: string, options: { inheritContractFrom?: PlanReviewGate | null } = {}): PlanReviewGate {
     const { snapshot, specificationSha256, reusable } = this.preparable(taskId);
-    if (reusable !== null) return reusable;
+    if (reusable !== null) {
+      // A gate for this specification may already exist — prepared by an earlier
+      // attempt or from another screen before the loop got here — without a
+      // fingerprint. Reusing it as it is would let the review adopt whatever
+      // contract the provider now has; the previous round's fingerprint is
+      // carried onto it, so `open` compares against it as it would for a new row.
+      const inherited = options.inheritContractFrom?.contractFingerprint ?? null;
+      if (inherited !== null && reusable.status === 'prepared' && reusable.contractFingerprint === null) {
+        return this.deps.gates.update(reusable.id, { contractFingerprint: inherited });
+      }
+      return reusable;
+    }
     return this.deps.gates.create({
       id: this.deps.ids.next(),
       taskId,
@@ -514,7 +627,7 @@ export class PlanReviewGateService {
       sessionId: null,
       serverName: null,
       serverVersion: null,
-      contractFingerprint: null,
+      contractFingerprint: options.inheritContractFrom?.contractFingerprint ?? null,
       contractMismatchAt: null,
       status: 'prepared',
       verdict: null,
@@ -526,22 +639,87 @@ export class PlanReviewGateService {
       lastError: null,
       reconciledAt: null,
       triageJson: null,
-      triageForFindings: null
+      triageForFindings: null,
+      autoDecisionsJson: null
     });
   }
 
   async review(taskId: string, signal?: AbortSignal): Promise<PlanReviewGate> {
     // Taken before anything is read or dispatched, so a refusal costs a caller
     // nothing and reaches no provider.
-    const release = this.deps.claims.acquire(taskId, 'review');
-    try {
-      return await this.runReview(taskId, signal);
-    } finally {
-      release();
-    }
+    return this.underOperation(
+      taskId,
+      'plan_review',
+      true,
+      () => this.deps.claims.acquire(taskId, 'review'),
+      signal,
+      (effective) => this.runReview(taskId, effective)
+    );
   }
 
-  private async runReview(taskId: string, signal?: AbortSignal): Promise<PlanReviewGate> {
+  /**
+   * Run `body` as a registered, stoppable operation: register it (so Stop can
+   * reach it), take the plan-review claim (so it cannot overlap), and release both
+   * whatever happens. The registration comes first because a refusal there costs
+   * nothing, and the claim is released before the registration so a task is never
+   * visible as stoppable with nothing behind it.
+   */
+  private async underOperation<T>(
+    taskId: string,
+    kind: TaskOperationKind,
+    exclusive: boolean,
+    claim: () => () => void,
+    signal: AbortSignal | undefined,
+    body: (effective: AbortSignal | undefined) => Promise<T>
+  ): Promise<T> {
+    return runAsOperation(
+      this.deps.operations,
+      taskId,
+      kind,
+      { exclusive, signal, claim, stoppedMessage: STOPPED_DURING_OPERATION },
+      body
+    );
+  }
+
+  /**
+   * Refuse to go on when the task was stopped or is no longer where this
+   * operation started. Called before every durable write that follows an awaited
+   * provider call, because the signal alone is not enough: Stop writes the task's
+   * status first, and a write that re-reads the task cannot outlive it.
+   *
+   * `dispatched` says whether an external call had already gone out. If it had,
+   * its outcome is UNKNOWN and is deliberately not recorded here — the gate keeps
+   * the phase it wrote before the call (`opening`, `reviewing`, `resolving`), which
+   * is exactly the evidence reconciliation reads, and the message says so.
+   */
+  private assertStillActive(taskId: string, signal: AbortSignal | undefined, dispatched: boolean): void {
+    const task = this.deps.tasks.findById(taskId);
+    if (signal?.aborted === true || task?.status === 'CANCELLED') {
+      throw new AgentRelayError('CANCELLED', dispatched ? STOPPED_OUTCOME_UNKNOWN : STOPPED_BEFORE_WRITE);
+    }
+    this.requireReadyTask(taskId);
+  }
+
+  /**
+   * The note kept on a gate whose call ended with an error. When the operation was
+   * stopped, what the provider threw for it is beside the point — a killed process
+   * or request can throw anything — so the note says the outcome is unknown and
+   * keeps the provider's own words after it.
+   */
+  private failureNote(error: unknown, signal: AbortSignal | undefined): string {
+    const raw = error instanceof Error ? error.message : String(error);
+    if (signal?.aborted === true && !raw.startsWith(STOPPED_OUTCOME_UNKNOWN)) {
+      return redactAndTruncate(`${STOPPED_OUTCOME_UNKNOWN} (${raw})`, 10_000);
+    }
+    return redactAndTruncate(raw, 10_000);
+  }
+
+  /**
+   * The unclaimed body of {@link review}. Public only for the correction loop,
+   * which holds the task's exclusive claim for its whole run; any other caller
+   * must use {@link review}, which takes the claim itself.
+   */
+  async runReview(taskId: string, signal?: AbortSignal): Promise<PlanReviewGate> {
     const task = this.requireReadyTask(taskId);
     const project = this.deps.projects.findById(task.projectId);
     if (project === null) throw new AgentRelayError('NOT_FOUND', `No project with id ${task.projectId}.`);
@@ -565,6 +743,9 @@ export class PlanReviewGateService {
     // or credential-shaped rule text — leaves the gate exactly where it was,
     // and provably without any external effect.
     const text = planText(specification.specification, snapshot);
+    // Before the first write: a stop that already happened must leave the gate
+    // exactly as it was, not in an `opening` phase for a call that never went out.
+    this.assertStillActive(taskId, signal, false);
 
     try {
       // The round that is starting owns this row from here on. Whatever the
@@ -585,11 +766,17 @@ export class PlanReviewGateService {
         gatingCount: null,
         threshold: null,
         // A new round means new findings; a triage of the previous round's
-        // findings describes rows that no longer exist.
+        // findings describes rows that no longer exist. So do the decisions
+        // Auto decide derived from it.
         triageJson: null,
-        triageForFindings: null
+        triageForFindings: null,
+        autoDecisionsJson: null
       });
       const session = await this.deps.reviewer.open(reviewSubject, signal);
+      // Stopped while `open` was in flight: nothing further is dispatched and
+      // nothing is recorded from it. The gate stays `opening`, which is the true
+      // state of knowledge, and reconciliation reads the session back.
+      this.assertStillActive(taskId, signal, true);
       gate = this.deps.gates.update(gate.id, {
         sessionId: session.sessionId,
         serverName: session.serverName,
@@ -602,6 +789,10 @@ export class PlanReviewGateService {
         status: 'reviewing'
       });
       const round = await this.deps.reviewer.reviewPlan(reviewSubject, text, signal);
+      // Stopped while the round ran: the round may well have completed at the
+      // provider, so its findings are neither applied nor called a failure. The
+      // gate keeps `reviewing` — an unknown outcome to be reconciled.
+      this.assertStillActive(taskId, signal, true);
       if (containsSecretShape(JSON.stringify(round))) {
         throw new AgentRelayError(
           'PARSE_FAILED',
@@ -638,10 +829,8 @@ export class PlanReviewGateService {
       // take effect, and nothing on this side can know that: the request left
       // the process and only its answer was lost. The phase is the evidence,
       // and reconciliation is what turns it back into knowledge.
-      this.deps.gates.update(gate.id, {
-        lastError: redactAndTruncate(error instanceof Error ? error.message : String(error), 10_000)
-      });
-      throw error;
+      this.deps.gates.update(gate.id, { lastError: this.failureNote(error, signal) });
+      throw asStopped(error, signal, STOPPED_OUTCOME_UNKNOWN);
     }
   }
 
@@ -655,12 +844,14 @@ export class PlanReviewGateService {
    * operator is told which fact is missing.
    */
   async reconcile(taskId: string, signal?: AbortSignal): Promise<PlanReviewGate> {
-    const release = this.deps.claims.acquire(taskId, 'reconcile');
-    try {
-      return await this.runReconcile(taskId, signal);
-    } finally {
-      release();
-    }
+    return this.underOperation(
+      taskId,
+      'plan_reconcile',
+      true,
+      () => this.deps.claims.acquire(taskId, 'reconcile'),
+      signal,
+      (effective) => this.runReconcile(taskId, effective)
+    );
   }
 
   private async runReconcile(taskId: string, signal?: AbortSignal): Promise<PlanReviewGate> {
@@ -712,10 +903,14 @@ export class PlanReviewGateService {
       // plan round. The same answer after `reviewing` or `resolving` proves no
       // such thing and is deliberately rethrown.
       if (gate.status === 'opening' && error instanceof AgentRelayError && error.code === 'NOT_FOUND') {
+        this.assertStillActive(taskId, signal, false);
         return settle({ status: 'prepared', lastError: null });
       }
       throw error;
     }
+    // A reading that arrives after a stop settles nothing: the gate keeps the
+    // unknown phase it had, and the next reconciliation reads it again.
+    this.assertStillActive(taskId, signal, false);
 
     // Classified before anything is taken from the answer, because "evidence of
     // nothing" has to include the identity the answer claims to speak for. A
@@ -848,15 +1043,18 @@ export class PlanReviewGateService {
     request: PlanReviewResolveRequest,
     signal?: AbortSignal
   ): Promise<PlanReviewGate> {
-    const release = this.deps.claims.acquire(taskId, 'resolve');
-    try {
-      return await this.runResolve(taskId, request, signal);
-    } finally {
-      release();
-    }
+    return this.underOperation(
+      taskId,
+      'plan_resolve',
+      true,
+      () => this.deps.claims.acquire(taskId, 'resolve'),
+      signal,
+      (effective) => this.runResolve(taskId, request, effective)
+    );
   }
 
-  private async runResolve(
+  /** The unclaimed body of {@link resolve}; see {@link runReview} for who may call it. */
+  async runResolve(
     taskId: string,
     request: PlanReviewResolveRequest,
     signal?: AbortSignal
@@ -897,11 +1095,21 @@ export class PlanReviewGateService {
         'Resolve requires exactly one decision for every finding index.'
       );
     }
+    // Before anything is written or dispatched: an accepted finding may only be
+    // resolved by the loop that also revises the specification.
+    if (request.allowAccepted !== true && decisions.some((decision) => decision.action === 'accept')) {
+      throw new AgentRelayError('VALIDATION_FAILED', CORRECTION_REQUIRED, {
+        remediation: 'Use "Resolve and revise plan".'
+      });
+    }
 
     // Conditional, and the last thing before the provider is touched. The
     // check above is what gives the caller a clear reason; this is what closes
     // the window between that check and the write, so no `resolve` can be
     // dispatched for a round that stopped being current in between.
+    // A stop that already happened is honoured first: no `resolving` phase is
+    // written for a call that will not be made.
+    this.assertStillActive(taskId, signal, false);
     const resolving = this.deps.gates.updateIfUnchanged(
       gate.id,
       { status: 'resolving', decisionsJson, lastError: null },
@@ -918,6 +1126,10 @@ export class PlanReviewGateService {
         decisions,
         signal
       );
+      // Stopped while the resolve was in flight: it may already have been applied
+      // at the provider. It is neither recorded as settled nor called a failure;
+      // `resolving` stays, and reconciliation reads the truth back.
+      this.assertStillActive(taskId, signal, true);
       const status = settledStatus(result.stage, result.awaitingResolve);
       if (status === null) {
         // The call was made and may well have been applied; only its meaning is
@@ -949,10 +1161,8 @@ export class PlanReviewGateService {
       // `resolving` is kept for the same reason `reviewing` is: the decisions
       // were dispatched, and a lost answer is not evidence that they were
       // refused. Calling this "failed" would be a claim, not a fact.
-      this.deps.gates.update(resolving.id, {
-        lastError: redactAndTruncate(error instanceof Error ? error.message : String(error), 10_000)
-      });
-      throw error;
+      this.deps.gates.update(resolving.id, { lastError: this.failureNote(error, signal) });
+      throw asStopped(error, signal, STOPPED_OUTCOME_UNKNOWN);
     }
   }
 
@@ -963,12 +1173,14 @@ export class PlanReviewGateService {
    * implementation session or tool access is reused or granted.
    */
   async triage(taskId: string, request: PlanReviewTriageRequest, signal?: AbortSignal): Promise<PlanReviewGate> {
-    const release = this.deps.claims.acquire(taskId, 'triage');
-    try {
-      return await this.runTriage(taskId, request, signal);
-    } finally {
-      release();
-    }
+    return this.underOperation(
+      taskId,
+      'plan_triage',
+      true,
+      () => this.deps.claims.acquire(taskId, 'triage'),
+      signal,
+      (effective) => this.runTriage(taskId, request, effective)
+    );
   }
 
   private async runTriage(
@@ -1001,7 +1213,56 @@ export class PlanReviewGateService {
       throw new AgentRelayError('VALIDATION_FAILED', 'One or more requested finding indexes do not exist in the current round.');
     }
 
-    const snapshot = readBoundRuleEvidence(taskId, this.deps.ruleEvidence);
+    const validated = await this.analyzeFindings(task, project.localPath, findings, requestedIndexes, signal);
+    // A result that arrives after a stop is discarded, not stored.
+    this.assertStillActive(taskId, signal, false);
+
+    // `triageForFindings` is set to the exact `findingsJson` this analysis
+    // was computed against — captured before the Codex call, and never a
+    // revision number: `revision` bumps on every durable write to this row,
+    // including this one, so predicting a post-write value would couple this
+    // service to the repository's own bump-by-one implementation, and any
+    // OTHER field changing later would make a still-valid result look stale.
+    // The conditional write itself still guards against the gate moving
+    // (another decision, a new round, a resolve) while the Codex call was in
+    // flight — if it did, `gate.revision` is no longer current and the write
+    // is refused, discarding the analysis rather than applying it to
+    // evidence that may no longer describe the current round.
+    const applied = this.deps.gates.updateIfUnchanged(
+      gate.id,
+      {
+        triageJson: JSON.stringify({
+          recommendations: mergeRecommendations(gate, validated.recommendations)
+        }),
+        triageForFindings: gate.findingsJson
+      },
+      gate.revision
+    );
+    if (applied === null) {
+      throw new AgentRelayError('VALIDATION_FAILED', STALE_ROUND, {
+        remediation: 'The round changed while the analysis was running. Reload and try again.'
+      });
+    }
+    return applied;
+  }
+
+  /**
+   * One fresh, read-only Codex analysis of the named findings, validated.
+   *
+   * Reads everything it sends from durable state; the caller supplies only which
+   * findings. Returns the validated recommendations — nothing is written here.
+   */
+  private async analyzeFindings(
+    task: Task,
+    projectPath: string,
+    findings: ReturnType<typeof parsePlanReviewFindings>,
+    requestedIndexes: readonly number[],
+    signal?: AbortSignal
+  ): Promise<PlanReviewTriageResult> {
+    if (!this.deps.codex || !this.deps.settings) {
+      throw new AgentRelayError('TOOL_MISSING', 'Automatic finding triage is not configured in this build.');
+    }
+    const snapshot = readBoundRuleEvidence(task.id, this.deps.ruleEvidence);
     if (snapshot === null) throw new AgentRelayError('VALIDATION_FAILED', 'No rule evidence is bound.');
     const specification = specificationIdentity(task.specificationJson);
 
@@ -1031,7 +1292,7 @@ export class PlanReviewGateService {
         // A plan gate's findings are named by index, so the model is held to
         // JSON numbers; a string reference would fail `validateTriageOutcome`.
         refKind: 'index',
-        worktreePath: project.localPath,
+        worktreePath: projectPath,
         specification: specification.specification,
         ruleEvidence: renderRuleEvidence(snapshot),
         findings: triageableFindings,
@@ -1041,30 +1302,192 @@ export class PlanReviewGateService {
       context
     );
 
-    const validated = this.validateTriageOutcome(outcome.recommendations, requestedIndexes);
+    return this.validateTriageOutcome(outcome.recommendations, requestedIndexes);
+  }
 
-    // `triageForFindings` is set to the exact `findingsJson` this analysis
-    // was computed against — captured before the Codex call, and never a
-    // revision number: `revision` bumps on every durable write to this row,
-    // including this one, so predicting a post-write value would couple this
-    // service to the repository's own bump-by-one implementation, and any
-    // OTHER field changing later would make a still-valid result look stale.
-    // The conditional write itself still guards against the gate moving
-    // (another decision, a new round, a resolve) while the Codex call was in
-    // flight — if it did, `gate.revision` is no longer current and the write
-    // is refused, discarding the analysis rather than applying it to
-    // evidence that may no longer describe the current round.
-    const applied = this.deps.gates.updateIfUnchanged(
-      gate.id,
-      { triageJson: JSON.stringify(validated), triageForFindings: gate.findingsJson },
-      gate.revision
+  /**
+   * Analyze ONE finding with Codex and, for accept/reject, put the decision
+   * into the round's durable draft — one click, no second "apply" step.
+   *
+   * It never resolves anything: only `resolve` sends decisions to the provider.
+   * Several different findings may be analyzed at once (the claim is per
+   * finding); the same finding twice, or any dispatching operation, is refused.
+   */
+  async autoDecide(
+    taskId: string,
+    request: PlanReviewAutoDecideRequest,
+    signal?: AbortSignal
+  ): Promise<PlanReviewAutoDecideResult> {
+    // Shared, like its claim: several different findings may be analyzed at once,
+    // and a stop reaches every one of them.
+    return this.underOperation(
+      taskId,
+      'plan_auto_decide',
+      false,
+      () => this.deps.claims.acquireFinding(taskId, request.findingIndex),
+      signal,
+      (effective) => this.runAutoDecide(taskId, request, effective)
     );
-    if (applied === null) {
+  }
+
+  /** The unclaimed body of {@link autoDecide}; the caller holds a claim that excludes overlap. */
+  async runAutoDecide(
+    taskId: string,
+    request: PlanReviewAutoDecideRequest,
+    signal?: AbortSignal
+  ): Promise<PlanReviewAutoDecideResult> {
+    if (!this.deps.codex || !this.deps.settings) {
+      throw new AgentRelayError('TOOL_MISSING', 'Automatic finding triage is not configured in this build.');
+    }
+    const task = this.requireReadyTask(taskId);
+    const project = this.deps.projects.findById(task.projectId);
+    if (project === null) throw new AgentRelayError('NOT_FOUND', `No project with id ${task.projectId}.`);
+    const gate = this.deps.gates.findByTask(taskId);
+    if (gate === null || gate.status !== 'awaiting_resolve') {
+      throw new AgentRelayError('VALIDATION_FAILED', 'No completed plan-review round awaits decisions.');
+    }
+    this.assertSameRound(gate, request);
+    const findings = parsePlanReviewFindings(gate.findingsJson);
+    if (
+      !Number.isInteger(request.findingIndex) ||
+      request.findingIndex < 0 ||
+      request.findingIndex >= findings.length
+    ) {
+      throw new AgentRelayError('VALIDATION_FAILED', 'That finding does not exist in the current round.');
+    }
+
+    // A request repeated after the first one committed — a refresh, a second
+    // window, a click after a lost answer — must not run a second analysis that
+    // could contradict the saved one. The saved decision is the answer; the
+    // operator overrides it by deciding the finding themselves, not by asking again.
+    const saved = this.savedAutoDecision(gate, request.findingIndex);
+    if (saved !== null) return { gate, outcome: { kind: 'decided', decision: saved } };
+    // Likewise a stop: once automation has stopped on a finding of this round because
+    // it needs a person, asking again cannot turn that into an automatic decision.
+    // The operator decides it; nothing is re-analyzed on their behalf.
+    const stopped = this.savedStop(gate, request.findingIndex);
+    if (stopped !== null) return { gate, outcome: stoppedOutcome(stopped) };
+
+    // A stopped task dispatches nothing, and a result that arrives after a stop is
+    // dropped: no automatic decision or stop is recorded for a task that has ended.
+    this.assertStillActive(taskId, signal, false);
+    const validated = await this.analyzeFindings(task, project.localPath, findings, [request.findingIndex], signal);
+    this.assertStillActive(taskId, signal, false);
+    const recommendation = validated.recommendations[0]!;
+
+    // Persisted in ONE synchronous read-modify-write: nothing here awaits, so
+    // two per-finding results finishing together cannot interleave inside this
+    // process, and the round identity (not the revision, which every sibling's
+    // result bumps) is what decides whether the answer still applies. Another
+    // process writing between the read and the conditional write makes it
+    // return null, and the merge is simply redone against the newer row.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = this.deps.gates.findByTask(taskId);
+      if (current === null || current.status !== 'awaiting_resolve') break;
+      try {
+        this.assertSameRound(current, request);
+      } catch {
+        break;
+      }
+      // Written by another process while this analysis ran: the first saved answer stands.
+      const winner = this.savedAutoDecision(current, request.findingIndex);
+      if (winner !== null) return { gate: current, outcome: { kind: 'decided', decision: winner } };
+      const halted = this.savedStop(current, request.findingIndex);
+      if (halted !== null) return { gate: current, outcome: stoppedOutcome(halted) };
+      const merged = this.mergeAutoResult(current, recommendation);
+      const applied = this.deps.gates.updateIfUnchanged(current.id, merged.patch, current.revision);
+      if (applied !== null) return { gate: applied, outcome: merged.outcome };
+    }
+    throw new AgentRelayError('VALIDATION_FAILED', STALE_ROUND, {
+      remediation: 'The round changed while the analysis was running. Reload and analyze the current round.'
+    });
+  }
+
+  /** The automatic decision already saved for this finding of this round, if any. */
+  private savedAutoDecision(gate: PlanReviewGate, findingIndex: number): PlanReviewAutoDecision | null {
+    if (gate.findingsJson === null) return null;
+    return (
+      parsePlanReviewAutoDecisions(gate.autoDecisionsJson, planFindingsSha256(gate.findingsJson)).find(
+        (decision) => decision.finding === findingIndex
+      ) ?? null
+    );
+  }
+
+  /** The stop Auto decide already recorded for this finding of this round, if any. */
+  private savedStop(gate: PlanReviewGate, findingIndex: number): PlanReviewTriageRecommendation | null {
+    if (gate.findingsJson === null || gate.triageForFindings !== gate.findingsJson) return null;
+    return (
+      parsePlanReviewTriage(gate.triageJson)?.recommendations.find(
+        (entry) => entry.finding === findingIndex && entry.recommendation === 'needs_user'
+      ) ?? null
+    );
+  }
+
+  /** The gate is the round the caller named: same row, same findings. */
+  private assertSameRound(gate: PlanReviewGate, request: PlanReviewAutoDecideRequest): void {
+    if (
+      gate.id !== request.gateId ||
+      gate.findingsJson === null ||
+      planFindingsSha256(gate.findingsJson) !== request.findingsSha256
+    ) {
       throw new AgentRelayError('VALIDATION_FAILED', STALE_ROUND, {
-        remediation: 'The round changed while the analysis was running. Reload and try again.'
+        remediation: 'Reload the plan review and analyze the findings of the current round.'
       });
     }
-    return applied;
+  }
+
+  /**
+   * Fold one recommendation into a gate's stored triage and auto decisions,
+   * without disturbing what other findings already have.
+   */
+  private mergeAutoResult(
+    gate: PlanReviewGate,
+    recommendation: PlanReviewTriageRecommendation
+  ): { patch: PlanReviewGatePatch; outcome: PlanAutoDecideOutcome } {
+    const findingsJson = gate.findingsJson as string;
+    const sha = planFindingsSha256(findingsJson);
+    const retained = parsePlanReviewAutoDecisions(gate.autoDecisionsJson, sha).filter(
+      (decision) => decision.finding !== recommendation.finding
+    );
+
+    let decisions = retained;
+    let outcome: PlanAutoDecideOutcome;
+    if (recommendation.recommendation === 'needs_user') {
+      // Only reached for a finding with no saved decision (see `savedAutoDecision`),
+      // so nothing is lost: the analysis stopped on purpose and says so.
+      outcome = {
+        kind: 'needs_user',
+        reason: recommendation.reason,
+        evidenceRef: recommendation.evidenceRef,
+        confidence: recommendation.confidence
+      };
+    } else {
+      const decision: PlanReviewAutoDecision = {
+        finding: recommendation.finding,
+        action: recommendation.recommendation,
+        reason: `Auto-decided by Codex triage (${recommendation.confidence} confidence): ${recommendation.reason} Evidence: ${recommendation.evidenceRef}`,
+        evidenceRef: recommendation.evidenceRef,
+        confidence: recommendation.confidence,
+        decidedAt: this.deps.clock.nowIso()
+      };
+      if (containsSecretShape(JSON.stringify(decision))) {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          'The analysis contained credential-shaped text and was not stored.'
+        );
+      }
+      decisions = [...retained, decision].sort((a, b) => a.finding - b.finding);
+      outcome = { kind: 'decided', decision };
+    }
+
+    return {
+      outcome,
+      patch: {
+        triageJson: JSON.stringify({ recommendations: mergeRecommendations(gate, [recommendation]) }),
+        triageForFindings: findingsJson,
+        autoDecisionsJson: JSON.stringify({ forFindingsSha256: sha, decisions })
+      }
+    };
   }
 
   /**

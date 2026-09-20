@@ -112,6 +112,20 @@ window.agentRelay.onEvent(listener)        // read-only push subscription
   model/provider identity, a path, a URL, host/port, repository data, argv or
   a command; it can only ever ask for one manual test completion.
   Configuration can change only through the validated Settings contract.
+* The review-automation channels ask for work, they do not carry it.
+  `planReview:autoDecide` accepts only `taskId`, `gateId`, `findingsSha256` and a
+  finding index; `codeReview:autoDecide` only `taskId` and `findingId`. Neither
+  accepts a decision, a recommendation, a reason, a prompt or a specification: the
+  main process re-reads the round, refuses when the named round is no longer the
+  current one, and derives the decision from Codex's answer to a prompt it builds
+  itself. `planReview:resolveAndRevise` accepts the operator's typed decisions plus a
+  boolean, and `planReview:continueCorrection` only a task id and that boolean; the
+  revised specification is produced by Codex in the main process, validated against
+  the same schema and secret-shape checks as any specification, required to account
+  for every accepted finding in a field that really changed, and committed only
+  by a compare-and-swap on the text the correction started from. No channel can
+  approve a specification, and none can settle a round that accepted a finding
+  without the revision that puts it into the plan.
 
 ---
 

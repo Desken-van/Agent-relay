@@ -37,6 +37,7 @@ import { SqliteTransactionRunner } from './db/transaction-runner';
 import { SqliteApprovalRepository } from './db/repositories/approval-repository';
 import { SqliteOperationDiagnosticRepository } from './db/repositories/operation-diagnostic-repository';
 import { SqliteOperationTargetRepository } from './db/repositories/operation-target-repository';
+import { SqlitePlanCorrectionRepository } from './db/repositories/plan-correction-repository';
 import { SqlitePlanReviewGateRepository } from './db/repositories/plan-review-gate-repository';
 import { SqliteProjectRepository } from './db/repositories/project-repository';
 import { SqliteRunEventRepository } from './db/repositories/run-event-repository';
@@ -61,6 +62,7 @@ import type {
   GitHubAdapter,
   IdGenerator,
   CodeReviewRepository,
+  PlanCorrectionRepository,
   PlanReviewGateRepository,
   ProjectRepository,
   RunEventRepository,
@@ -88,6 +90,8 @@ import { GitCodeSnapshotSource } from './adapters/git/git-code-snapshot';
 import { CodeReviewClaims, CodeReviewService } from './services/code-review';
 import { SettingsBoundCodeReviewer } from './services/code-review-provider';
 import { PlanReviewClaims } from './services/plan-review-claims';
+import { TaskOperationRegistry } from './services/task-operations';
+import { PlanCorrectionService } from './services/plan-correction';
 import { PlanReviewGateService } from './services/plan-review-gate';
 import { RuleEvidenceService } from './services/rule-evidence';
 import {
@@ -147,6 +151,17 @@ export interface Application {
   readonly approvals: ApprovalRepository;
   readonly taskRuleEvidence: TaskRuleEvidenceRepository;
   readonly planReviewGates: PlanReviewGateRepository;
+  /** Specification history and the plan-correction lifecycle. */
+  readonly planCorrections: PlanCorrectionRepository;
+  /**
+   * The process-wide plan-review claims. Exposed so the detail read can report a
+   * running correction loop; only the services built here may take a claim.
+   */
+  readonly planReviewClaims: PlanReviewClaims;
+  /** Exposed for the same reason: the detail read reports the analyses in flight. */
+  readonly codeReviewClaims: CodeReviewClaims;
+  /** The process-wide register of stoppable operations; `orchestrator.stop()` reads the same instance. */
+  readonly taskOperations: TaskOperationRegistry;
   readonly taskContinuations: TaskContinuationRepository;
   readonly codeReviews: CodeReviewRepository;
   /**
@@ -173,6 +188,12 @@ export interface Application {
   /** Read-only Coai connection/capability diagnostic for Settings. Never calls a tool. */
   readonly coaiCapability: CoaiCapabilityService;
   createPlanReviewGate(config: ExternalMcpServerConfig): PlanReviewGateService;
+  /**
+   * The plan-correction loop and the gate service it drives, built over ONE
+   * claims object so the loop's exclusive claim really excludes the gate
+   * service's own operations.
+   */
+  createPlanCorrection(config: ExternalMcpServerConfig): PlanCorrectionService;
   /**
    * What startup reconciliation corrected, if anything.
    *
@@ -249,6 +270,7 @@ function lateBound(factories: ReturnType<typeof adapterFactories>): {
       reviewImplementation: (request, context) =>
         factories.codex().reviewImplementation(request, context),
       triageFindings: (request, context) => factories.codex().triageFindings(request, context),
+      reviseSpecification: (request, context) => factories.codex().reviseSpecification(request, context),
       diagnose: () => factories.codex().diagnose()
     },
     claude: {
@@ -307,8 +329,13 @@ export function buildApplication(options: BuildApplicationOptions): Application 
   const approvals = new SqliteApprovalRepository(db);
   const taskRuleEvidence = new SqliteTaskRuleEvidenceRepository(db);
   const planReviewGates = new SqlitePlanReviewGateRepository(db, clock);
+  const planCorrections = new SqlitePlanCorrectionRepository(db, clock);
   const taskContinuations = new SqliteTaskContinuationRepository(db, clock);
   const planReviewClaims = new PlanReviewClaims();
+  // Built ONCE, here. The orchestrator's `stop()` and every plan-review service the
+  // IPC layer builds per call read this same instance; a per-call registry would
+  // give each invocation a private map and stop nothing.
+  const taskOperations = new TaskOperationRegistry();
   const codeReviews = new SqliteCodeReviewRepository(db, clock);
   const codeReviewClaims = new CodeReviewClaims();
   const operationTargets = new SqliteOperationTargetRepository(db, clock);
@@ -352,6 +379,9 @@ export function buildApplication(options: BuildApplicationOptions): Application 
       )
     }),
     claims: codeReviewClaims,
+    // The same register the orchestrator's stop() reads, so Stop reaches a review,
+    // a reconciliation, an analysis or an Auto decide that is in flight.
+    operations: taskOperations,
     codex: adapters.codex,
     settings,
     clock,
@@ -417,6 +447,16 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     ruleEvidence: taskRuleEvidence,
     planReviews: planReviewGates,
     continuations: taskContinuations,
+    // Accepted external code-review findings ride the ordinary correction round.
+    externalCodeRequirements: (taskId) =>
+      codeReview.acceptedRequirements(taskId).map(({ finding }) => ({
+        title: finding.title,
+        body: finding.body,
+        fix: finding.fix,
+        severity: finding.severity,
+        file: finding.file,
+        line: finding.line
+      })),
     continuationGuard: {
       prepareFirstAction: (...args) => continuationService.prepareFirstAction(...args),
       retargetFirstActionToVerification: (...args) =>
@@ -428,7 +468,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     // here is a separate, non-IPC interface — see `OrnithInferenceLeaseService`.
     ornith: new OrnithImplementationService(),
     ornithLease: localInference,
-    processRunner: runner
+    processRunner: runner,
+    operations: taskOperations
   });
 
   runtime.orchestrator = orchestrator;
@@ -498,6 +539,29 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     )
   });
 
+  // Built once per call, over the process-wide claims defined above: a per-call
+  // instance of the CLAIMS would give each invocation a private map and
+  // arbitrate nothing, but the service around them is cheap and stateless.
+  const buildPlanReviewGate = (config: ExternalMcpServerConfig): PlanReviewGateService =>
+    new PlanReviewGateService({
+      tasks,
+      projects,
+      ruleEvidence: taskRuleEvidence,
+      gates: planReviewGates,
+      claims: planReviewClaims,
+      operations: taskOperations,
+      reviewer: new CoaiPlanReviewer(
+        new StdioMcpClient(
+          runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner()
+        ),
+        config
+      ),
+      codex: adapters.codex,
+      settings,
+      clock,
+      ids
+    });
+
   return {
     db,
     settings,
@@ -509,6 +573,10 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     approvals,
     taskRuleEvidence,
     planReviewGates,
+    planCorrections,
+    planReviewClaims,
+    codeReviewClaims,
+    taskOperations,
     taskContinuations,
     codeReviews,
     codeReview,
@@ -528,23 +596,22 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     // Built once, here, and closed over by every service the factory makes.
     // A per-call instance would give each IPC invocation its own private map
     // and arbitrate nothing, which is the whole failure this guards against.
-    createPlanReviewGate: (config) =>
-      new PlanReviewGateService({
+    createPlanReviewGate: (config) => buildPlanReviewGate(config),
+    createPlanCorrection: (config) =>
+      new PlanCorrectionService({
         tasks,
         projects,
         ruleEvidence: taskRuleEvidence,
         gates: planReviewGates,
-        claims: planReviewClaims,
-        reviewer: new CoaiPlanReviewer(
-          new StdioMcpClient(
-            runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner()
-          ),
-          config
-        ),
+        corrections: planCorrections,
+        gateService: buildPlanReviewGate(config),
         codex: adapters.codex,
         settings,
+        claims: planReviewClaims,
+        operations: taskOperations,
         clock,
-        ids
+        ids,
+        events: options.events
       }),
     reconciliation,
     close: () => closeDatabase(db)

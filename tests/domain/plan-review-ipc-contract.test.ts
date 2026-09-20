@@ -8,8 +8,13 @@ const PLAN_REVIEW_CHANNELS = [
   'planReview:review',
   'planReview:resolve',
   'planReview:reconcile',
-  'planReview:triage'
+  'planReview:triage',
+  'planReview:autoDecide',
+  'planReview:resolveAndRevise',
+  'planReview:continueCorrection'
 ] as const;
+
+const SHA = 'a'.repeat(64);
 
 describe('the external plan-review IPC contract', () => {
   it('will not resolve without naming the round the decisions answer', () => {
@@ -52,7 +57,7 @@ describe('the external plan-review IPC contract', () => {
     expect(schema.safeParse({}).success).toBe(false);
   });
 
-  it('registers exactly the seven bounded operations', () => {
+  it('registers exactly the ten bounded operations', () => {
     expect(IPC_CHANNELS.filter((channel) => channel.startsWith('planReview:')).sort()).toEqual(
       [...PLAN_REVIEW_CHANNELS].sort()
     );
@@ -78,9 +83,15 @@ describe('the external plan-review IPC contract', () => {
         const base =
           channel === 'planReview:resolve'
             ? { taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0, decisions: [] }
-            : channel === 'planReview:triage'
-              ? { taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0 }
-              : { taskId: 'task-1' };
+            : channel === 'planReview:resolveAndRevise'
+              ? { taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0, decisions: [], autoContinue: false }
+              : channel === 'planReview:triage'
+                ? { taskId: 'task-1', gateId: 'gate-1', expectedRevision: 0 }
+                : channel === 'planReview:autoDecide'
+                  ? { taskId: 'task-1', gateId: 'gate-1', findingsSha256: SHA, findingIndex: 0 }
+                  : channel === 'planReview:continueCorrection'
+                    ? { taskId: 'task-1', autoContinue: true }
+                    : { taskId: 'task-1' };
         expect(ipcInputSchemas[channel].safeParse({ ...base, ...extra }).success).toBe(false);
       }
     }
@@ -103,6 +114,61 @@ describe('the external plan-review IPC contract', () => {
     ]) {
       expect(schema.safeParse(invalid).success).toBe(false);
     }
+  });
+
+  it('auto-decides exactly one finding of exactly one round, and accepts no answer of its own', () => {
+    const schema = ipcInputSchemas['planReview:autoDecide'];
+    const valid = { taskId: 'task-1', gateId: 'gate-1', findingsSha256: SHA, findingIndex: 2 };
+    expect(schema.safeParse(valid).success).toBe(true);
+    for (const invalid of [
+      { ...valid, findingsSha256: 'not-a-hash' },
+      { ...valid, findingsSha256: SHA.toUpperCase() },
+      { ...valid, findingIndex: -1 },
+      { ...valid, findingIndex: 1.5 },
+      { ...valid, findingIndex: 256 },
+      { taskId: 'task-1', gateId: 'gate-1', findingIndex: 0 },
+      { taskId: 'task-1', findingsSha256: SHA, findingIndex: 0 },
+      // The renderer may not supply the decision, the recommendation or its reason.
+      { ...valid, action: 'accept' },
+      { ...valid, recommendation: 'accept', reason: 'trust me' },
+      { ...valid, findingIndexes: [0, 1] }
+    ]) {
+      expect(schema.safeParse(invalid).success).toBe(false);
+    }
+  });
+
+  it('resolves and revises only against a named round, and can never smuggle in the internal accepted-findings permission', () => {
+    const schema = ipcInputSchemas['planReview:resolveAndRevise'];
+    const valid = {
+      taskId: 'task-1',
+      gateId: 'gate-1',
+      expectedRevision: 3,
+      decisions: [{ finding: 0, action: 'accept' as const, reason: '' }],
+      autoContinue: true
+    };
+    expect(schema.safeParse(valid).success).toBe(true);
+    for (const invalid of [
+      { ...valid, gateId: undefined },
+      { ...valid, expectedRevision: undefined },
+      { ...valid, expectedRevision: -1 },
+      { ...valid, autoContinue: undefined },
+      { ...valid, autoContinue: 'yes' },
+      { ...valid, decisions: [{ finding: 0, action: 'reject', reason: '' }] },
+      // The service-internal flag that lets an accepted round be resolved by the loop.
+      { ...valid, allowAccepted: true },
+      // Nor a specification, findings text or a prompt to revise with.
+      { ...valid, specification: '{}' },
+      { ...valid, acceptedFindings: [] }
+    ]) {
+      expect(schema.safeParse(invalid).success).toBe(false);
+    }
+  });
+
+  it('continues a correction from durable state alone', () => {
+    const schema = ipcInputSchemas['planReview:continueCorrection'];
+    expect(schema.safeParse({ taskId: 'task-1', autoContinue: false }).success).toBe(true);
+    expect(schema.safeParse({ taskId: 'task-1' }).success).toBe(false);
+    expect(schema.safeParse({ taskId: 'task-1', autoContinue: true, gateId: 'gate-1' }).success).toBe(false);
   });
 
   it('allows the dirty-checkout acknowledgement only on preparation', () => {
