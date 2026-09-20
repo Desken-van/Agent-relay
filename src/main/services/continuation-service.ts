@@ -670,7 +670,14 @@ export class ContinuationService {
       // long since resolved for a `proceeded` gate; nothing carries forward.
       triageJson: null,
       triageForFindings: null,
-      autoDecisionsJson: null
+      autoDecisionsJson: null,
+      // Byte-identical evidence, including which review identity it was run under.
+      // Only a settled, valid gate is ever cloned, so it carries no failure and was
+      // never replaced.
+      reviewSubject: gate.reviewSubject,
+      roundsAtOpen: gate.roundsAtOpen,
+      failureKind: null,
+      supersededBy: null
     });
   }
 }

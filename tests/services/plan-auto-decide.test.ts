@@ -8,6 +8,7 @@ import { parsePlanReviewAutoDecisions, parsePlanReviewTriage } from '../../src/s
 import type { PlanReviewGate } from '../../src/shared/domain/plan-review';
 import { deferred, FakePlanReviewer, finding, snapshot } from '../helpers/fake-plan-reviewer';
 import { createHarness, type Harness } from '../helpers/harness';
+import { FakePlanReviewSubjects } from '../helpers/fake-plan-review-subjects';
 
 const harnesses: Harness[] = [];
 afterEach(() => {
@@ -21,6 +22,7 @@ function setup() {
   const claims = new PlanReviewClaims();
   const build = (): PlanReviewGateService =>
     new PlanReviewGateService({
+      subjects: new FakePlanReviewSubjects(),
       tasks: harness.tasks,
       projects: harness.projects,
       ruleEvidence: harness.taskRuleEvidence,

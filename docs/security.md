@@ -237,6 +237,19 @@ containment, so `…/worktrees-evil` is not inside `…/worktrees`), not equal t
 inside the repository, and not a filesystem root. Two live tasks can never share
 a worktree directory.
 
+### A plan-review subject is the one object Agent Relay writes for a review
+
+Reviewing a corrected plan needs a review identity that no earlier review used (see
+"Review identity" in the architecture notes). `GitPlanReviewSubjectFactory` makes it with an
+allowlist of exactly two Git commands — `rev-parse` and `commit-tree` — and nothing else: one commit
+object in the object database, reachable from no ref. It creates no branch or tag, moves no HEAD,
+touches no index or working tree, runs no hook, checks nothing out and pushes nothing. Signing is
+switched off for that one command, the author, committer and timestamps are fixed, and the gate id,
+branch name and hash it puts on the command line or in the message are validated first. The task
+branch is resolved under `refs/heads/`, so a tag or remote of the same name can never be what it reads.
+It never deletes anything: the unreachable object is Git's to prune. The provider is given the commit
+id in place of a branch name; it is data, checked to be 40 or 64 hex digits, and never a path.
+
 ### Destructive Git commands are refused
 
 `CliGitAdapter` rejects these outright, checked against the argv array:

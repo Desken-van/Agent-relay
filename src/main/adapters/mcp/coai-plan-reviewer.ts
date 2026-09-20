@@ -1,7 +1,7 @@
 /** Typed Coai plan-gate adapter over the generic bounded MCP transport. */
 
 import { z } from 'zod';
-import { AgentRelayError } from '../../../shared/domain/errors';
+import { AgentRelayError, PlanReviewNotDispatchedError, type PlanReviewRefusalReason } from '../../../shared/domain/errors';
 import {
   PLAN_FINDING_CATEGORIES,
   PLAN_FINDING_SEVERITIES,
@@ -16,6 +16,7 @@ import type {
   ExternalMcpClient,
   ExternalMcpServerConfig,
   ExternalPlanReviewer,
+  ExternalPlanReviewRoundCounts,
   ExternalPlanReviewResolution,
   ExternalPlanReviewRound,
   ExternalPlanReviewSession,
@@ -68,22 +69,6 @@ const findingSchema = z
     })
   );
 
-const sessionSchema = z.object({
-  sessionId: z.string().min(1).max(128),
-  stage: stageSchema,
-  awaitingResolve: z.boolean(),
-  planProceeded: z.boolean()
-});
-
-const reviewSchema = z.object({
-  verdict: lowerEnum(PLAN_REVIEW_VERDICTS),
-  gatingCount: z.number().int().nonnegative(),
-  threshold: z.number().int().nonnegative(),
-  reviewers: z.string().min(1).max(2_000),
-  findings: z.array(findingSchema).max(256),
-  instruction: z.string().max(20_000)
-});
-
 /**
  * The read-only status surface.
  *
@@ -101,6 +86,42 @@ const statusRoundSchema = z
     status: roundStatusSchema
   })
   .passthrough();
+
+/**
+ * Fold recorded rounds into the tally the gate service reasons about. Only PlanReview
+ * rounds count: rounds of a later stage say nothing about whether a plan round may run.
+ */
+function tallyPlanRounds(rounds: readonly z.infer<typeof statusRoundSchema>[]): ExternalPlanReviewRoundCounts {
+  const plan = rounds.filter((round) => round.stage === 'PlanReview');
+  return {
+    total: plan.length,
+    running: plan.filter((round) => round.status === 'running').length,
+    done: plan.filter((round) => round.status === 'done').length,
+    interrupted: plan.filter((round) => round.status === 'interrupted').length
+  };
+}
+
+const sessionSchema = z
+  .object({
+    sessionId: z.string().min(1).max(128),
+    stage: stageSchema,
+    awaitingResolve: z.boolean(),
+    planProceeded: z.boolean(),
+    // The provider's `open` reports the session's rounds, which is what proves a session
+    // fresh. Optional here, not defaulted: an absent list must reach the gate as
+    // "not known" and never as "no round has run".
+    rounds: z.array(statusRoundSchema).max(64).optional()
+  })
+  .passthrough();
+
+const reviewSchema = z.object({
+  verdict: lowerEnum(PLAN_REVIEW_VERDICTS),
+  gatingCount: z.number().int().nonnegative(),
+  threshold: z.number().int().nonnegative(),
+  reviewers: z.string().min(1).max(2_000),
+  findings: z.array(findingSchema).max(256),
+  instruction: z.string().max(20_000)
+});
 
 const statusSchema = z
   .object({
@@ -122,23 +143,35 @@ const resolutionSchema = z.object({
 const NO_SESSION_REFUSAL = 'no session for this repo+branch — call open first';
 
 /**
+ * The provider's refusals of `review_plan` that are documented to happen BEFORE a round
+ * exists. Matched on the provider's own sentence, here and nowhere else, and only these:
+ * a refusal in any other words is not proof that nothing ran.
+ */
+const NOT_DISPATCHED_REFUSALS: readonly { readonly reason: PlanReviewRefusalReason; readonly test: (message: string) => boolean }[] = [
+  { reason: 'plan_stage_over', test: (message) => message.startsWith('the plan stage is over for this session') },
+  { reason: 'no_session', test: (message) => message === NO_SESSION_REFUSAL }
+];
+
+/** The text of an error envelope (`{"error": "..."}`), or null when the result is not one. */
+function errorEnvelope(result: ExternalMcpCallResult): string | null {
+  if (result.isError || result.content.length !== 1) return null;
+  try {
+    const value: unknown = JSON.parse(result.content[0]!);
+    if (typeof value !== 'object' || value === null || !('error' in value)) return null;
+    const message = (value as { error?: unknown }).error;
+    return typeof message === 'string' && message.length > 0 ? message : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Coai's current status contract represents an absent session as a refusal
  * rather than as a normal status envelope. Recognise only that documented,
  * exact value; every other refusal keeps failing closed through parseCall.
  */
 function isNoSessionRefusal(result: ExternalMcpCallResult): boolean {
-  if (result.isError || result.content.length !== 1) return false;
-  try {
-    const value: unknown = JSON.parse(result.content[0]!);
-    return (
-      typeof value === 'object' &&
-      value !== null &&
-      'error' in value &&
-      (value as { error?: unknown }).error === NO_SESSION_REFUSAL
-    );
-  } catch {
-    return false;
-  }
+  return errorEnvelope(result) === NO_SESSION_REFUSAL;
 }
 
 /**
@@ -215,7 +248,11 @@ export class CoaiPlanReviewer implements ExternalPlanReviewer {
     );
     const value = parseCall(result, sessionSchema);
     return {
-      ...value,
+      sessionId: value.sessionId,
+      stage: value.stage,
+      awaitingResolve: value.awaitingResolve,
+      planProceeded: value.planProceeded,
+      planRounds: value.rounds === undefined ? null : tallyPlanRounds(value.rounds),
       serverName: result.server.name,
       serverVersion: result.server.version,
       contractFingerprint: result.contractFingerprint
@@ -269,6 +306,13 @@ export class CoaiPlanReviewer implements ExternalPlanReviewer {
       { repoPath: subject.repositoryPath, branch: subject.branch, planText },
       signal
     );
+    // A refusal the provider documents as coming before any round exists is a fact about
+    // this call, and travels as one; every other failure stays what it always was.
+    const refusal = errorEnvelope(result);
+    const known = refusal === null ? undefined : NOT_DISPATCHED_REFUSALS.find((entry) => entry.test(refusal));
+    if (known !== undefined) {
+      throw new PlanReviewNotDispatchedError(known.reason, `Coai refused the request: ${refusal}`);
+    }
     const value = parseCall(result, reviewSchema);
     return {
       ...value,

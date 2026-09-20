@@ -2,7 +2,7 @@
 
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { AgentRelayError } from '../../shared/domain/errors';
+import { AgentRelayError, PlanReviewNotDispatchedError } from '../../shared/domain/errors';
 import type { Task } from '../../shared/domain/models';
 import { gateHasAcceptedDecisions, type PlanAutoDecideOutcome } from '../../shared/domain/plan-correction';
 import {
@@ -10,6 +10,8 @@ import {
   parsePlanReviewFindings,
   parsePlanReviewTriage,
   planReviewDecisionSchema,
+  planReviewRecovery,
+  planReviewSessionOwner,
   planReviewTriageResultSchema,
   taskRuleEvidenceBindingSchema,
   type PlanReviewAutoDecision,
@@ -28,11 +30,13 @@ import type {
   Clock,
   CodexAdapter,
   ExternalPlanReviewer,
+  ExternalPlanReviewSession,
   ExternalPlanReviewStatus,
   ExternalPlanReviewSubject,
   IdGenerator,
   PlanReviewGatePatch,
   PlanReviewGateRepository,
+  PlanReviewSubjectFactory,
   ProjectRepository,
   SettingsRepository,
   TaskRepository,
@@ -117,6 +121,34 @@ const STALE_ROUND =
 
 const INTERRUPTED_ROUND =
   'The provider records a plan round that started and never finished. It produced no findings and nothing awaits decisions, so a new round may be started by hand. Nothing was repeated.';
+
+/**
+ * What a gate records when its session belongs to another review. The words are Agent
+ * Relay's own: a session, however it came to be reused, is not evidence about this
+ * gate's specification, and nothing read from it may settle the gate.
+ */
+const SESSION_FOREIGN =
+  'The provider session recorded for this review belongs to a different plan review of this task, so nothing read from it can be evidence about this specification. Nothing was repeated and nothing was assumed. Retry the review in a fresh review session.';
+
+const OPENING_FOUND_ROUNDS =
+  'The provider reports plan rounds in the session this review opened, although this review never sent one. Those rounds belong to something else and cannot be evidence about this specification. Nothing was repeated. Retry the review in a fresh review session.';
+
+const NO_NEW_ROUND =
+  'The provider records no plan round beyond the ones the session already held when this review opened it, so nothing it reports can be this review\'s result. Nothing was repeated and no new round may start. Resolve or close the round in the provider, or reconcile again once it appears.';
+
+const RETRY_IN_FRESH_SESSION = 'Retry the review in a fresh review session.';
+
+/** Why a session the provider handed back cannot host this gate's review. */
+const SESSION_PROBLEMS: Record<'session_foreign' | 'session_not_fresh' | 'session_changed' | 'plan_stage_over', string> = {
+  session_foreign:
+    'The provider handed back a session that another plan review of this task already used, so it cannot host a review of this specification.',
+  session_not_fresh:
+    'The provider handed back a session that already holds plan rounds, or whose state could not be proven empty, so a new review cannot be told apart from what is already there.',
+  session_changed:
+    'The provider answered for a different session than the one this review recorded, so nothing was sent.',
+  plan_stage_over:
+    'The provider handed back a session that is already past the plan stage, so no plan round can run in it.'
+};
 
 /**
  * The Coai tool contract changed between two calls of the SAME live
@@ -338,6 +370,13 @@ export interface PlanReviewGateDeps {
    * wiring is a compile-time error.
    */
   readonly operations: TaskOperationRegistry;
+  /**
+   * Gives a gate that is not the task's first a review identity of its own.
+   * Required, not optional: without it a corrected specification would be reviewed
+   * under the task branch again, in the session the first review already finished —
+   * the defect this exists to close — so omitting the wiring is a compile-time error.
+   */
+  readonly subjects: PlanReviewSubjectFactory;
   /** For `triage()` only — a fresh, read-only, independent analysis call. Optional
    *  so existing tests that never exercise triage need not fake it. */
   readonly codex?: Pick<CodexAdapter, 'triageFindings'>;
@@ -446,6 +485,16 @@ export function assertPlanReviewAllowsApproval(input: {
       { remediation: 'Complete the plan review and resolve every finding before approving the specification.' }
     );
   }
+  // "Proceeded" is only as good as the evidence it was reached from. A gate that was
+  // settled by reading a session that belongs to another review has not reviewed this
+  // specification at all, whatever that session says.
+  if (planReviewRecovery(gate, input.gates.listByTask(input.task.id)) !== null) {
+    throw new AgentRelayError(
+      'APPROVAL_REQUIRED',
+      'The external plan review that passed is not evidence about this specification: it was read back from a provider session that belongs to a different review.',
+      { remediation: 'Retry the plan review in a fresh review session, then approve the specification.' }
+    );
+  }
   // Accepting a finding says it is valid; it does not put it into the
   // specification. A round that accepted something and still describes THIS
   // specification has passed with its own accepted findings uncorrected, and
@@ -492,6 +541,17 @@ function subject(task: Task, repositoryPath: string): ExternalPlanReviewSubject 
     );
   }
   return { repositoryPath, branch: task.branchName };
+}
+
+/**
+ * The identity a gate's review is run under: its own ref once it has one, the task's
+ * branch for a gate that has none (every gate before the ref was recorded, and a task's
+ * first). Every provider call for one gate — open, review, status, resolve — goes
+ * through here, so they cannot disagree about which session they mean.
+ */
+function subjectOf(task: Task, repositoryPath: string, gate: Pick<PlanReviewGate, 'reviewSubject'>): ExternalPlanReviewSubject {
+  const base = subject(task, repositoryPath);
+  return gate.reviewSubject === null ? base : { repositoryPath, branch: gate.reviewSubject };
 }
 
 export class PlanReviewGateService {
@@ -572,7 +632,10 @@ export class PlanReviewGateService {
     if (
       reusable === null &&
       latest !== null &&
-      SUPERSEDE_BLOCKING.includes(latest.status as (typeof SUPERSEDE_BLOCKING)[number])
+      SUPERSEDE_BLOCKING.includes(latest.status as (typeof SUPERSEDE_BLOCKING)[number]) &&
+      // A round that provably belongs to no review of this task is not outstanding: it
+      // hides nothing and doubles nothing, and refusing over it would trap the task.
+      planReviewRecovery(latest, this.deps.gates.listByTask(taskId)) === null
     ) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
@@ -640,7 +703,13 @@ export class PlanReviewGateService {
       reconciledAt: null,
       triageJson: null,
       triageForFindings: null,
-      autoDecisionsJson: null
+      autoDecisionsJson: null,
+      // Assigned when the review is dispatched, not here: making it can take a Git call,
+      // and `prepare` is a synchronous write that must stay one.
+      reviewSubject: null,
+      roundsAtOpen: null,
+      failureKind: null,
+      supersededBy: null
     });
   }
 
@@ -731,12 +800,22 @@ export class PlanReviewGateService {
     // leaves behind a durable `prepared` gate for a review that can never
     // start — a row the screen then offers to run. Every refusal that costs
     // nothing belongs in front of the first write.
-    const reviewSubject = subject(task, project.localPath);
+    subject(task, project.localPath);
     let gate = this.prepare(taskId);
     if (!STARTABLE_STATUSES.includes(gate.status as (typeof STARTABLE_STATUSES)[number])) {
       throw new AgentRelayError(
         'VALIDATION_FAILED',
         `Plan review cannot start while its durable status is "${gate.status}". ${RECONCILE_FIRST}`
+      );
+    }
+    // An attempt whose review identity is spent, or whose session belongs to another
+    // review, is replaced, never re-run: running it again would ask the same session
+    // the same question and be refused the same way — or, worse, be answered.
+    if (planReviewRecovery(gate, this.deps.gates.listByTask(taskId)) !== null) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        `This plan-review attempt cannot be continued. ${RETRY_IN_FRESH_SESSION}`,
+        { remediation: 'Use "Retry in a fresh review session". Nothing is repeated, and the failed attempt stays on record.' }
       );
     }
     // Built before anything is dispatched. A refusal here — an oversized plan
@@ -746,6 +825,16 @@ export class PlanReviewGateService {
     // Before the first write: a stop that already happened must leave the gate
     // exactly as it was, not in an `opening` phase for a call that never went out.
     this.assertStillActive(taskId, signal, false);
+    // The review identity is settled before anything is dispatched, and written down: it
+    // is what every later call for this gate — including a read-back after a crash —
+    // must name. A local Git call at most, so a refusal here costs the provider nothing.
+    const assigned = this.assignReviewSubject(task, project.localPath, gate, signal);
+    // Awaited only when a Git call was needed: the common case is a plain write, and
+    // yielding for it would let another caller in between two steps that were never
+    // meant to be separable.
+    gate = assigned instanceof Promise ? await assigned : assigned;
+    this.assertStillActive(taskId, signal, false);
+    const reviewSubject = subjectOf(task, project.localPath, gate);
 
     try {
       // The round that is starting owns this row from here on. Whatever the
@@ -777,10 +866,19 @@ export class PlanReviewGateService {
       // nothing is recorded from it. The gate stays `opening`, which is the true
       // state of knowledge, and reconciliation reads the session back.
       this.assertStillActive(taskId, signal, true);
+      // `open` is idempotent, so what it returns is not necessarily new. Before the
+      // non-idempotent call, prove the session can host THIS review: not another gate's,
+      // not past the plan stage, and — for a first dispatch — holding no round at all.
+      // Anything short of that is refused here, when nothing has been sent.
+      const problem = this.sessionProblem(gate, session, this.deps.gates.listByTask(taskId));
+      if (problem !== null) throw problem;
       gate = this.deps.gates.update(gate.id, {
         sessionId: session.sessionId,
         serverName: session.serverName,
         serverVersion: session.serverVersion,
+        // What the session held when this dispatch opened it, so a read-back can tell a
+        // round this dispatch made from one that was already there.
+        roundsAtOpen: session.planRounds === null ? null : session.planRounds.total,
         // Compared against whatever the row already held — null for a fresh
         // gate, or a previous round's fingerprint for one being re-opened —
         // so a contract that changed since the last time this task was
@@ -824,6 +922,19 @@ export class PlanReviewGateService {
         lastError: null
       });
     } catch (error) {
+      // Refused BEFORE a round existed — by the provider, in words it documents, or by the
+      // check of the session `open` returned. Nothing was sent, so this is not an unknown
+      // outcome: the attempt goes back to `prepared`, marked as spent, and is replaced by a
+      // fresh identity instead of being repeated. A stop wins over this: a stopped call is
+      // reported as a stop whatever it threw.
+      if (error instanceof PlanReviewNotDispatchedError && signal?.aborted !== true) {
+        this.deps.gates.update(gate.id, {
+          status: 'prepared',
+          failureKind: error.reason === 'session_foreign' ? 'foreign_session' : 'not_dispatched',
+          lastError: this.failureNote(error, signal)
+        });
+        throw error;
+      }
       // The phase stays exactly as far as the dispatch got — `opening` or
       // `reviewing`. Overwriting it with `failed` would assert the call did not
       // take effect, and nothing on this side can know that: the request left
@@ -832,6 +943,192 @@ export class PlanReviewGateService {
       this.deps.gates.update(gate.id, { lastError: this.failureNote(error, signal) });
       throw asStopped(error, signal, STOPPED_OUTCOME_UNKNOWN);
     }
+  }
+
+  /**
+   * The review identity for a gate that has none yet, made and written down.
+   *
+   * A gate that is the task's first keeps the task's branch — the identity every gate
+   * has always had, recorded now so it is no longer implied. A later gate is given a ref
+   * of its own, because the provider's session for the task's branch is the first
+   * gate's, and by now it has been resolved. A gate that was already dispatched under the
+   * old implied identity keeps it: its session is the only place its round exists.
+   */
+  private assignReviewSubject(
+    task: Task,
+    repositoryPath: string,
+    gate: PlanReviewGate,
+    signal: AbortSignal | undefined
+  ): PlanReviewGate | Promise<PlanReviewGate> {
+    if (gate.reviewSubject !== null || gate.sessionId !== null) return gate;
+    const branch = subject(task, repositoryPath).branch;
+    const others = this.deps.gates.listByTask(task.id).filter((entry) => entry.id !== gate.id);
+    if (others.length === 0) return this.deps.gates.update(gate.id, { reviewSubject: branch });
+    return this.deps.subjects
+      .createIsolatedSubject(
+        {
+          repositoryPath,
+          branch,
+          gateId: gate.id,
+          specificationSha256: gate.specificationSha256,
+          // The row's own creation time, so the same gate always names the same subject.
+          createdAt: gate.createdAt
+        },
+        signal
+      )
+      .then((isolated) => {
+        // Re-checked at the write: the Git call was an await, and Stop can land in it.
+        if (signal?.aborted === true) throw new AgentRelayError('CANCELLED', STOPPED_BEFORE_WRITE);
+        return this.deps.gates.update(gate.id, { reviewSubject: isolated });
+      });
+  }
+
+  /**
+   * Can the session `open` returned host THIS gate's round? Null when it can, otherwise
+   * the refusal to raise — before `review_plan`, when nothing has been sent.
+   *
+   * `open` is idempotent per repository and ref, so "the session came back" proves nothing
+   * about it. The order below is from the most specific fact to the least:
+   * it is another review's session; it is not the one this gate recorded; it is past the
+   * plan stage or waiting on a resolution nobody here asked for; and — for a first dispatch —
+   * it must be provably empty, because a round already in it could not be told from this
+   * review's own when read back. A provider that does not report its rounds proves nothing,
+   * and nothing is not accepted as "none".
+   */
+  private sessionProblem(
+    gate: PlanReviewGate,
+    session: ExternalPlanReviewSession,
+    gates: readonly PlanReviewGate[]
+  ): PlanReviewNotDispatchedError | null {
+    const owner = planReviewSessionOwner(
+      gates.filter((entry) => entry.id !== gate.id),
+      session.sessionId
+    );
+    const problem = (reason: keyof typeof SESSION_PROBLEMS): PlanReviewNotDispatchedError =>
+      new PlanReviewNotDispatchedError(reason, `${SESSION_PROBLEMS[reason]} ${RETRY_IN_FRESH_SESSION}`, {
+        remediation: 'Use "Retry in a fresh review session". Nothing was sent, and nothing is repeated.'
+      });
+    if (owner !== null) return problem('session_foreign');
+    if (gate.sessionId !== null && gate.sessionId !== session.sessionId) return problem('session_changed');
+    if (session.stage !== 'PlanReview' || session.planProceeded) return problem('plan_stage_over');
+    if (session.awaitingResolve) return problem('session_not_fresh');
+    if (gate.sessionId === null && (session.planRounds === null || session.planRounds.total > 0)) {
+      return problem('session_not_fresh');
+    }
+    return null;
+  }
+
+  /**
+   * Replace a review whose identity cannot be used again with a new attempt under a fresh
+   * one — the ONLY way out of a gate the provider refused, or one whose session belongs to
+   * another review.
+   *
+   * What it does, and does not do:
+   * - It proves the attempt is one a fresh identity may replace ({@link planReviewRecovery}).
+   *   A gate whose call has an unknown outcome on a session of its own is refused: that is
+   *   reconciled, never repeated.
+   * - It writes ONE new gate for the SAME specification and rule evidence — the specification
+   *   and its hash are not touched — with a review ref no other gate has, and marks the old
+   *   attempt superseded in the same transaction. The old row keeps its status, session and
+   *   error text untouched: it is evidence.
+   * - It sends nothing to the provider. Reviewing is a separate, explicit step, so recovery
+   *   can never start a round, and never starts implementation.
+   * - If the old attempt had led to an approval, the approval is withdrawn: it rested on a
+   *   review that has just been discarded.
+   */
+  async retryInFreshSession(taskId: string, signal?: AbortSignal): Promise<PlanReviewGate> {
+    return this.underOperation(
+      taskId,
+      'plan_review',
+      true,
+      () => this.deps.claims.acquire(taskId, 'review'),
+      signal,
+      (effective) => this.runRetryInFreshSession(taskId, effective)
+    );
+  }
+
+  private async runRetryInFreshSession(taskId: string, signal: AbortSignal | undefined): Promise<PlanReviewGate> {
+    const task = this.requireReadyTask(taskId);
+    const project = this.deps.projects.findById(task.projectId);
+    if (project === null) throw new AgentRelayError('NOT_FOUND', `No project with id ${task.projectId}.`);
+    const snapshot = readBoundRuleEvidence(taskId, this.deps.ruleEvidence);
+    if (snapshot === null) throw new AgentRelayError('VALIDATION_FAILED', 'No rule evidence is bound.');
+    const specification = specificationIdentity(task.specificationJson);
+    const gates = this.deps.gates.listByTask(taskId);
+    const gate = gates[0] ?? null;
+    if (gate === null) {
+      throw new AgentRelayError('VALIDATION_FAILED', 'There is no plan-review attempt to replace.');
+    }
+    const reason = planReviewRecovery(gate, gates);
+    if (reason === null) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        `This plan-review attempt is "${gate.status}", and nothing about it proves its review identity is spent or its session foreign, so a fresh session may not replace it.`,
+        {
+          remediation:
+            gate.status === 'opening' || gate.status === 'reviewing' || gate.status === 'resolving' || gate.status === 'failed'
+              ? 'Reconcile the external state first: the call may already have taken effect.'
+              : 'Nothing needs recovering.'
+        }
+      );
+    }
+    // The specification is not this operation's to change: only a gate for the SAME
+    // specification and rule evidence is replaced. A moved specification is prepared the
+    // ordinary way.
+    if (gate.specificationSha256 !== specification.sha256 || gate.ruleEvidenceSha256 !== snapshot.sha256) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'The specification changed after this review, so a fresh session for it is prepared the ordinary way.',
+        { remediation: 'Prepare the plan review for the current specification.' }
+      );
+    }
+    this.assertStillActive(taskId, signal, false);
+
+    const id = this.deps.ids.next();
+    const isolated = await this.deps.subjects.createIsolatedSubject(
+      {
+        repositoryPath: project.localPath,
+        branch: subject(task, project.localPath).branch,
+        gateId: id,
+        specificationSha256: gate.specificationSha256,
+        createdAt: this.deps.clock.nowIso()
+      },
+      signal
+    );
+    this.assertStillActive(taskId, signal, false);
+    const fresh = this.deps.gates.supersede(gate.id, {
+      id,
+      taskId,
+      specificationSha256: gate.specificationSha256,
+      ruleEvidenceSha256: gate.ruleEvidenceSha256,
+      sessionId: null,
+      serverName: null,
+      serverVersion: null,
+      // Carried over, so a provider whose contract changed since is flagged, not adopted.
+      contractFingerprint: gate.contractFingerprint,
+      contractMismatchAt: null,
+      status: 'prepared',
+      verdict: null,
+      findingsJson: null,
+      decisionsJson: null,
+      reviewers: null,
+      gatingCount: null,
+      threshold: null,
+      lastError: null,
+      reconciledAt: null,
+      triageJson: null,
+      triageForFindings: null,
+      autoDecisionsJson: null,
+      reviewSubject: isolated,
+      roundsAtOpen: null,
+      failureKind: null,
+      supersededBy: null
+    });
+    // An approval that rested on the attempt just discarded rests on nothing.
+    if (task.specificationApprovedAt !== null) {
+      this.deps.tasks.update(taskId, { specificationApprovedAt: null });
+    }
+    return fresh;
   }
 
   /**
@@ -892,9 +1189,21 @@ export class PlanReviewGateService {
       return current ?? gate;
     };
 
+    // A gate whose review cannot count is not read against the provider at all: whatever
+    // the provider says about its session is about another review, and the only useful
+    // thing to record is why. Decided from durable rows, so it costs no call.
+    const gates = this.deps.gates.listByTask(taskId);
+    const known = planReviewRecovery(gate, gates);
+    if (known === 'foreign_session') {
+      return settle({ failureKind: 'foreign_session', lastError: redactAndTruncate(SESSION_FOREIGN, 10_000) });
+    }
+    if (known === 'refused_before_dispatch') {
+      return settle({ failureKind: 'not_dispatched' });
+    }
+
     let state: ExternalPlanReviewStatus;
     try {
-      state = await this.deps.reviewer.status(subject(task, project.localPath), signal);
+      state = await this.deps.reviewer.status(subjectOf(task, project.localPath, gate), signal);
     } catch (error) {
       // `opening` is written before `open` is called. A positive provider answer
       // that no session exists therefore proves both that open did not take
@@ -947,6 +1256,23 @@ export class PlanReviewGateService {
         contractMismatchAt: contractMismatchAt()
       });
     }
+    // Past the identity check above, so a gate that recorded a session of its own and was
+    // answered for another keeps the unknown outcome of ITS session (a mismatch, above) — that
+    // round may well have run, and the gate is not replaced over it.
+    //
+    // What remains: a session another review of this task already used cannot speak for a
+    // gate that recorded none, and neither can rounds a gate never sent. Both fail closed: the
+    // state that was read is not applied, not even to say "proceeded".
+    const answeredFor = planReviewSessionOwner(gates, state.sessionId);
+    if (answeredFor !== null && answeredFor.id !== gate.id) {
+      return settle({ failureKind: 'foreign_session', lastError: redactAndTruncate(SESSION_FOREIGN, 10_000) });
+    }
+    if (gate.status === 'opening' && reading.kind !== 'no-rounds') {
+      // `review_plan` is sent only after `open` returned and `reviewing` was written, so a
+      // gate that never left `opening` never sent a round. Rounds in its session are not its.
+      return settle({ failureKind: 'foreign_session', lastError: redactAndTruncate(OPENING_FOUND_ROUNDS, 10_000) });
+    }
+
     // `serverName`/`serverVersion`/`contractFingerprint` are deliberately
     // ABSENT from this object. `status` is a read-only PROBE of whatever
     // server answers right now — it is not the operation that reviewed this
@@ -959,6 +1285,18 @@ export class PlanReviewGateService {
       sessionId: gate.sessionId ?? state.sessionId,
       contractMismatchAt: contractMismatchAt()
     };
+
+    // A dispatch's result is a round the session did not already hold. If the count did
+    // not go up since this dispatch opened it, everything the read-back describes is older
+    // than the dispatch — a previous round "returned by status" — and settles nothing.
+    if (
+      (gate.status === 'reviewing' || gate.status === 'failed') &&
+      gate.roundsAtOpen !== null &&
+      reading.kind !== 'no-rounds' &&
+      state.planRounds.total <= gate.roundsAtOpen
+    ) {
+      return settle({ ...identity, lastError: NO_NEW_ROUND });
+    }
 
     // A round still executing settles nothing at all, and is the one state in
     // which starting another would double a call that has not finished. The
@@ -1122,7 +1460,7 @@ export class PlanReviewGateService {
     }
     try {
       const result = await this.deps.reviewer.resolve(
-        subject(task, project.localPath),
+        subjectOf(task, project.localPath, gate),
         decisions,
         signal
       );

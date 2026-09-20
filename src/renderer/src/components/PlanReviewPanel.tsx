@@ -94,6 +94,10 @@ function planReviewPreparationState(input: {
 
   const gate = detail.gate;
   if (gate === null) return 'prepare_review';
+  // Ahead of every reading of the gate's own status: an attempt that cannot count is not
+  // reconciled (that would read another review back) and not run again (that would ask the
+  // same session the same question). It is replaced.
+  if (detail.recovery !== null) return 'recover_review';
   if (['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status)) return 'reconcile';
   if (gate.status === 'awaiting_resolve') {
     if (!resolutionReady) return 'resolve_blocked';
@@ -498,6 +502,9 @@ export function PlanReviewPanel({
       case 'reconcile_plan_review':
         void act('reconcile', () => expect('planReview:reconcile', { taskId: task.id }));
         return;
+      case 'retry_plan_review':
+        void act('retry', () => expect('planReview:retryFreshSession', { taskId: task.id }));
+        return;
       case 'continue_plan_correction':
         void advance(() => expect('planReview:continueCorrection', { taskId: task.id, autoContinue }));
         return;
@@ -536,8 +543,11 @@ export function PlanReviewPanel({
   const corrupt = detail?.ruleEvidenceProblem ?? null;
   if (!integrationEnabled && !detail?.ruleEvidence && corrupt === null) return null;
 
+  const recovery = detail?.recovery ?? null;
+  // A gate that must be replaced is not an unknown outcome to reconcile: whatever the
+  // provider says about its session is about another review.
   const unknownOutcome =
-    gate !== null && ['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status);
+    recovery === null && gate !== null && ['opening', 'reviewing', 'resolving', 'failed'].includes(gate.status);
 
   const identity = detail?.gateIdentity ?? 'no_gate';
   const obsolete = gate !== null && identity === 'obsolete';
@@ -740,7 +750,30 @@ export function PlanReviewPanel({
         starting the external review either way, and the distinction is already
         carried by "What happened" and "Result" above.
       */}
-      {renderPrimary && gate && identity === 'current' && ['prepared', 'changes_requested', 'interrupted'].includes(gate.status) ? (
+      {recovery !== null ? (
+        <div className="stack stack--tight" aria-label="Plan review recovery">
+          <Notice tone="error" role="alert">
+            <div className="stack stack--tight" style={{ width: '100%' }}>
+              <strong>The current plan has no successful review.</strong>
+              <span>{recovery.message}</span>
+              <span>
+                The specification cannot be approved, and implementation is not available, until
+                a review of this exact specification passes.
+              </span>
+            </div>
+          </Notice>
+          {renderPrimary ? <button
+            type="button"
+            className="btn btn--wide btn--primary btn--recommended"
+            disabled={!integrationEnabled || busy !== null || task.status !== 'READY_FOR_IMPLEMENTATION'}
+            onClick={() => dispatchPlanPrimary('retry_plan_review')}
+          >
+            {busy === 'retry' ? <Spinner /> : <Scope kind="read" />} Retry in a fresh review session
+          </button> : null}
+        </div>
+      ) : null}
+
+      {renderPrimary && recovery === null && gate && identity === 'current' && ['prepared', 'changes_requested', 'interrupted'].includes(gate.status) ? (
         <button
           type="button"
           className="btn btn--wide btn--primary btn--recommended"

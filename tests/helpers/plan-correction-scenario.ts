@@ -16,7 +16,9 @@ import { PlanReviewGateService, planFindingsSha256 } from '../../src/main/servic
 import { specificationIdentity } from '../../src/main/services/specification-identity';
 import type { Settings } from '../../src/shared/domain/models';
 import type { PlanReviewDecision } from '../../src/shared/domain/plan-review';
-import type { ExternalPlanReviewRound } from '../../src/main/ports';
+import type { ExternalPlanReviewer, ExternalPlanReviewRound } from '../../src/main/ports';
+import { FakeCoaiPlanReviewer } from './fake-coai-plan-reviewer';
+import { FakePlanReviewSubjects } from './fake-plan-review-subjects';
 import { FakePlanReviewer, finding, snapshot } from './fake-plan-reviewer';
 import { createHarness, type Harness } from './harness';
 
@@ -29,14 +31,16 @@ export function disposeScenariosAfterEach(): void {
   });
 }
 
-export function scenario(settings: Partial<Settings> = {}) {
+/** One scenario over any reviewer: the loop, the gate service and the operation register, wired as the container wires them. */
+export function buildScenario<R extends ExternalPlanReviewer>(reviewer: R, settings: Partial<Settings> = {}) {
   const harness = createHarness({ settings });
   harnesses.push(harness);
-  const reviewer = new FakePlanReviewer();
   const claims = new PlanReviewClaims();
+  const subjects = new FakePlanReviewSubjects();
   const corrections = new SqlitePlanCorrectionRepository(harness.db, harness.clock);
   const build = () => {
     const gateService = new PlanReviewGateService({
+      subjects,
       tasks: harness.tasks,
       projects: harness.projects,
       ruleEvidence: harness.taskRuleEvidence,
@@ -66,12 +70,22 @@ export function scenario(settings: Partial<Settings> = {}) {
     return { gateService, loop };
   };
   const { gateService, loop } = build();
-  return { harness, reviewer, claims, corrections, gateService, loop, build };
+  return { harness, reviewer, claims, corrections, gateService, loop, build, subjects };
+}
+
+export function scenario(settings: Partial<Settings> = {}) {
+  return buildScenario(new FakePlanReviewer(), settings);
 }
 export type Scenario = ReturnType<typeof scenario>;
 
+/** The same, over a reviewer that keeps Coai's sessions: one per repository and branch. */
+export function coaiScenario(settings: Partial<Settings> = {}) {
+  return buildScenario(new FakeCoaiPlanReviewer(), settings);
+}
+export type CoaiScenario = ReturnType<typeof coaiScenario>;
+
 /** A task with rule evidence, a generated specification and an isolated branch. */
-export async function ready(value: Scenario) {
+export async function ready(value: Pick<Scenario, 'harness' | 'gateService'>) {
   const project = value.harness.createProject();
   const created = value.harness.createTask(project.id);
   value.gateService.bindRules(created.id, snapshot());
@@ -96,9 +110,9 @@ export const revise = (value: Scenario) => ({ ...value.reviewer.resolution, stag
 /** Coai moves past the plan gate: the gate settles as proceeded. */
 export const proceed = (value: Scenario) => ({ ...value.reviewer.resolution, stage: 'CodeReview', awaitingResolve: false });
 
-export const currentGate = (value: Scenario, taskId: string) => value.harness.planReviewGates.findByTask(taskId)!;
-export const specOf = (value: Scenario, taskId: string) => value.harness.tasks.findById(taskId)!.specificationJson as string;
-export const statusOf = (value: Scenario, taskId: string) => value.harness.tasks.findById(taskId)!.status;
+export const currentGate = (value: Pick<Scenario, 'harness'>, taskId: string) => value.harness.planReviewGates.findByTask(taskId)!;
+export const specOf = (value: Pick<Scenario, 'harness'>, taskId: string) => value.harness.tasks.findById(taskId)!.specificationJson as string;
+export const statusOf = (value: Pick<Scenario, 'harness'>, taskId: string) => value.harness.tasks.findById(taskId)!.status;
 
 export const decide = (
   ...entries: readonly (readonly [number, 'accept' | 'reject', string])[]

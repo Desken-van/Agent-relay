@@ -46,7 +46,7 @@ export function App(): React.JSX.Element {
           {section === 'run' && detail ? (
             <div className="topbar__actions">
               <Rounds used={detail.task.currentRound} max={detail.task.maxRounds} />
-              <StatusBadge status={detail.task.status} />
+              <StatusBadge status={detail.task.status} specificationApprovedAt={detail.task.specificationApprovedAt} />
             </div>
           ) : null}
         </header>

@@ -17,6 +17,7 @@ export type RunActionKey =
   | 'prepare_plan_review'
   | 'run_plan_review'
   | 'reconcile_plan_review'
+  | 'retry_plan_review'
   | 'resolve_plan_review'
   | 'continue_plan_correction'
   | 'approve_specification'
@@ -45,6 +46,12 @@ export type PlanReviewPreparation =
   | 'run_review'
   | 'run_next_review'
   | 'reconcile'
+  /**
+   * The latest review attempt cannot count: the provider refused it before a round existed,
+   * or its session belongs to a different review. The specification has no successful
+   * review, and the one safe action is to retry it under a fresh review identity.
+   */
+  | 'recover_review'
   | 'resolve'
   /** Every finding is decided and at least one is accepted: the plan must be revised, not just resolved. */
   | 'resolve_and_revise'
@@ -328,6 +335,16 @@ export function runGuidance(
             action: action('run_plan_review', 'Run external plan review'),
             activeStep: 0,
             tone: 'active'
+          });
+        }
+        if (planReviewPreparation === 'recover_review') {
+          return acting({
+            happened: 'The external review of the current specification did not happen: the provider refused it, or answered from a session that belongs to a different review.',
+            stage: 'Step 1 of 5 · Plan review needs recovery',
+            result: 'The current specification has no successful review, so it cannot be approved and implementation is not available.',
+            action: action('retry_plan_review', 'Retry in a fresh review session'),
+            activeStep: 0,
+            tone: 'error'
           });
         }
         if (planReviewPreparation === 'reconcile') {

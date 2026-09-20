@@ -98,6 +98,8 @@ export class FakePlanReviewer implements ExternalPlanReviewer {
     stage: 'PlanReview',
     awaitingResolve: false,
     planProceeded: false,
+    // Nothing has run in a session that was just opened.
+    planRounds: planRounds(),
     serverName: 'coai-mcp',
     serverVersion: '1.2.3',
     contractFingerprint: FINGERPRINT
@@ -156,13 +158,35 @@ export class FakePlanReviewer implements ExternalPlanReviewer {
   /** The same, for a resolution that has been dispatched and not yet answered. */
   resolveGate: Promise<unknown> | null = null;
 
+  /**
+   * The refs this reviewer has been asked about, in order of first use.
+   *
+   * Coai keys a session by (repository, ref), so each ref is its own session. The first
+   * keeps the canned session id and every later one gets a distinct id derived from it —
+   * which is how a gate with a review identity of its own is told apart from the first.
+   */
+  private readonly refs: string[] = [];
+
+  private sessionIdFor(subject: ExternalPlanReviewSubject, canned: string): string {
+    let index = this.refs.indexOf(subject.branch);
+    if (index < 0) {
+      this.refs.push(subject.branch);
+      index = this.refs.length - 1;
+    }
+    return index === 0 ? canned : `${canned}#${index + 1}`;
+  }
+
   async status(subject: ExternalPlanReviewSubject, signal?: AbortSignal): Promise<ExternalPlanReviewStatus> {
     const index = this.statusCalls.length;
     this.statusCalls.push(subject);
     this.signals.status.push(signal);
     // Captured before the wait, so a delayed answer describes the session as it
     // was when it was read — which is exactly what a stale answer is.
-    const answer = this.state;
+    // A test that names its own session id (to force a mismatch) gets exactly that id.
+    const answer =
+      this.state.sessionId === this.session.sessionId
+        ? { ...this.state, sessionId: this.sessionIdFor(subject, this.state.sessionId) }
+        : this.state;
     const wait = this.onStatusCall?.(index);
     if (wait) await wait;
     if (this.statusError) throw this.statusError;
@@ -173,7 +197,7 @@ export class FakePlanReviewer implements ExternalPlanReviewer {
     this.openCalls.push(subject);
     this.signals.open.push(signal);
     if (this.openError) throw this.openError;
-    return this.session;
+    return { ...this.session, sessionId: this.sessionIdFor(subject, this.session.sessionId) };
   }
 
   async reviewPlan(

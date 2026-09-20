@@ -128,7 +128,7 @@ export function TasksView(): React.JSX.Element {
                     </div>
                   </div>
                   <Rounds used={task.currentRound} max={task.maxRounds} />
-                  <StatusBadge status={task.status} />
+                  <StatusBadge status={task.status} specificationApprovedAt={task.specificationApprovedAt} />
                 </button>
               ))}
             </div>

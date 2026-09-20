@@ -33,6 +33,23 @@ export const PLAN_REVIEW_VERDICTS = [
   'escalated'
 ] as const;
 
+/**
+ * Why a gate's review cannot count, when that is KNOWN — never a guess.
+ *
+ * - `not_dispatched`: the provider refused the round before it created one, or the
+ *   session it opened proved unfit before anything was sent. Nothing ran, so the
+ *   attempt is safe to replace, but only under a fresh review identity: the identity
+ *   it used is spent.
+ * - `foreign_session`: the provider session this gate recorded belongs to another
+ *   review (another gate's, or one that was already past the plan stage), so nothing
+ *   read from it can be evidence about THIS gate's specification.
+ *
+ * A timeout or a lost answer is deliberately in neither: that is an unknown outcome,
+ * which only a read-back may settle and which is never repeated.
+ */
+export const PLAN_REVIEW_FAILURE_KINDS = ['not_dispatched', 'foreign_session'] as const;
+export type PlanReviewFailureKind = (typeof PLAN_REVIEW_FAILURE_KINDS)[number];
+
 export const PLAN_FINDING_SEVERITIES = ['blocking', 'major', 'minor', 'nit'] as const;
 export const PLAN_FINDING_CATEGORIES = [
   'architecture',
@@ -163,6 +180,24 @@ export const planReviewGateSchema = z
      * decisions to the provider.
      */
     autoDecisionsJson: z.string().nullable(),
+    /**
+     * The ref this gate's review was run under — the provider's session key, with the
+     * repository. Null means the task's own branch, which is what every gate used
+     * before this field existed. A later gate of the same task is given a ref of its
+     * own (see `PlanReviewSubjectFactory`), because the provider hands back the
+     * existing session, however far it has advanced, for a ref it has seen.
+     */
+    reviewSubject: z.string().min(1).max(256).nullable(),
+    /**
+     * How many plan rounds the provider's session already held when this dispatch
+     * opened it. A round counted by a later read-back is this dispatch's only if the
+     * count went up; null when it was not known.
+     */
+    roundsAtOpen: z.number().int().nonnegative().nullable(),
+    /** Why this gate's review cannot count, when that is known. See {@link PLAN_REVIEW_FAILURE_KINDS}. */
+    failureKind: z.enum(PLAN_REVIEW_FAILURE_KINDS).nullable(),
+    /** The gate that replaced this attempt. The attempt and its error stay as they were. */
+    supersededBy: idSchema.nullable(),
     createdAt: isoDateTime,
     updatedAt: isoDateTime
   })
@@ -273,6 +308,98 @@ export function parsePlanReviewAutoDecisions(
 export type PlanReviewGateIdentity = 'no_gate' | 'current' | 'obsolete' | 'unknown';
 export type PlanReviewStatus = (typeof PLAN_REVIEW_STATUSES)[number];
 export type PlanReviewVerdict = (typeof PLAN_REVIEW_VERDICTS)[number];
+
+/**
+ * The gate a provider session belongs to: the FIRST one that recorded it.
+ *
+ * A session is one review. When two gates of a task hold the same session id, the
+ * second did not review anything of its own — the provider handed it the session
+ * the first had already used — so the session can speak for the first and for no one
+ * else. `gates` must be one task's gates in `PlanReviewGateRepository.listByTask`
+ * order (newest first), which is why the earliest is the LAST match.
+ */
+export function planReviewSessionOwner(
+  gates: readonly Pick<PlanReviewGate, 'id' | 'sessionId'>[],
+  sessionId: string
+): Pick<PlanReviewGate, 'id' | 'sessionId'> | null {
+  let owner: Pick<PlanReviewGate, 'id' | 'sessionId'> | null = null;
+  for (const gate of gates) {
+    if (gate.sessionId === sessionId) owner = gate;
+  }
+  return owner;
+}
+
+/** Does this gate's recorded session belong to a different, earlier gate of the task? */
+export function planReviewSessionIsForeign(
+  gate: Pick<PlanReviewGate, 'id' | 'sessionId'>,
+  gates: readonly Pick<PlanReviewGate, 'id' | 'sessionId'>[]
+): boolean {
+  if (gate.sessionId === null) return false;
+  const owner = planReviewSessionOwner(gates, gate.sessionId);
+  return owner !== null && owner.id !== gate.id;
+}
+
+/**
+ * Why a gate's review cannot stand and must be replaced under a fresh review
+ * identity — or null when nothing is wrong with it.
+ *
+ * Derived from durable rows only, so a screen, the correction loop and the backend's
+ * own refusals all read the same answer:
+ *
+ * - `refused_before_dispatch`: the provider refused, or the session it opened proved
+ *   unfit, before any round existed. Nothing ran; the identity is spent.
+ * - `foreign_session`: the session belongs to another gate. For a gate still waiting
+ *   on the provider that is enough by itself — nothing read from that session can be
+ *   about this gate. For one already settled it applies only when the settlement was
+ *   read back from the provider (`reconciledAt`), because that is exactly the
+ *   evidence a shared session cannot supply; a result this side drove — the answer to
+ *   its own `review_plan` and `resolve` — is attributed by the call, not by the session.
+ *
+ * Deliberately absent: a timeout or a lost answer on a session that is the gate's
+ * own. That is an unknown outcome, settled only by a read-back and never repeated.
+ */
+export type PlanReviewRecoveryReason = 'refused_before_dispatch' | 'foreign_session';
+
+/**
+ * What to tell a person about a review that cannot count: what happened, and the one safe
+ * next step. Kept beside {@link planReviewRecovery} so the screen, the correction loop's
+ * outcome and the backend's refusals cannot describe the same state in different words.
+ * None of it quotes the provider; the refusal itself is on the gate as `lastError`.
+ */
+export function planReviewRecoveryMessage(reason: PlanReviewRecoveryReason): string {
+  return reason === 'refused_before_dispatch'
+    ? 'The provider refused this plan review before any round existed, so nothing ran and the specification is still unreviewed. It can be retried in a fresh review session; nothing is repeated, and this attempt stays on record.'
+    : 'This plan review was recorded against a provider session that belongs to a different review, so nothing read from it counts as a review of this specification. It can be retried in a fresh review session; nothing is repeated, and this attempt stays on record.';
+}
+
+export function planReviewRecovery(
+  gate: Pick<
+    PlanReviewGate,
+    'id' | 'sessionId' | 'status' | 'failureKind' | 'reconciledAt' | 'supersededBy'
+  > | null,
+  gates: readonly Pick<PlanReviewGate, 'id' | 'sessionId'>[]
+): PlanReviewRecoveryReason | null {
+  if (gate === null || gate.supersededBy !== null) return null;
+  const foreign = planReviewSessionIsForeign(gate, gates);
+  switch (gate.status) {
+    case 'prepared':
+    case 'opening':
+    case 'reviewing':
+    case 'failed':
+      if (gate.failureKind === 'not_dispatched') return 'refused_before_dispatch';
+      return gate.failureKind === 'foreign_session' || foreign ? 'foreign_session' : null;
+    case 'proceeded':
+    case 'changes_requested':
+    case 'interrupted':
+      return gate.failureKind === 'foreign_session' || (foreign && gate.reconciledAt !== null)
+        ? 'foreign_session'
+        : null;
+    default:
+      // `awaiting_resolve` and `resolving`: the round is this gate's own, returned
+      // directly by the call that made it.
+      return null;
+  }
+}
 
 export function parsePlanReviewFindings(json: string | null): PlanReviewFinding[] {
   if (json === null) return [];

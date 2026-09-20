@@ -38,6 +38,10 @@ function setup() {
       threshold: null,
       lastError: null,
       reconciledAt: null,
+      reviewSubject: null,
+      roundsAtOpen: null,
+      failureKind: null,
+      supersededBy: null,
       triageJson: null,
       triageForFindings: null,
       autoDecisionsJson: null

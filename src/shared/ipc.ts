@@ -67,7 +67,8 @@ import {
   type PlanReviewAutoDecision,
   type PlanReviewFinding,
   type PlanReviewGate,
-  type PlanReviewGateIdentity
+  type PlanReviewGateIdentity,
+  type PlanReviewRecoveryReason
 } from './domain/plan-review';
 import type {
   PlanAdvanceOutcome,
@@ -279,6 +280,20 @@ export interface PlanReviewDetail {
   readonly analyzing: readonly number[];
   /** The plan-correction workflow: budget, next step, running phase, versions. */
   readonly correction: PlanCorrectionDetail;
+  /**
+   * Set when the latest review attempt cannot count and must be replaced under a fresh
+   * review identity. Computed in the main process from the task's own gate rows — the same
+   * function the correction loop and the approval rule use — so the screen never decides
+   * for itself whether a review is trustworthy. While it is set, nothing about this gate
+   * is evidence, whatever its status says, and the only action is the retry.
+   */
+  readonly recovery: PlanReviewRecoveryDetail | null;
+}
+
+/** Why a review cannot count, and the one safe thing to do about it. */
+export interface PlanReviewRecoveryDetail {
+  readonly reason: PlanReviewRecoveryReason;
+  readonly message: string;
 }
 
 /** Push payload delivered on the `agent-relay:event` channel. */
@@ -431,6 +446,10 @@ export const ipcInputSchemas = {
     .strict(),
   'planReview:review': byTask,
   'planReview:reconcile': byTask,
+  // Replace a review that cannot count with a new attempt under a fresh review identity, and
+  // run it. Takes no round identity: it acts on the task's latest attempt, and refuses one
+  // whose call has an unknown outcome (that is reconciled, never repeated).
+  'planReview:retryFreshSession': byTask,
 
   // Code review (INT-D-A). Identifiers and typed decisions only.
   //
@@ -664,6 +683,7 @@ export interface IpcResponseMap {
   'planReview:prepare': PlanReviewDetail;
   'planReview:review': PlanReviewDetail;
   'planReview:reconcile': PlanReviewDetail;
+  'planReview:retryFreshSession': PlanReviewDetail;
   'planReview:resolve': PlanReviewDetail;
   'planReview:triage': PlanReviewDetail;
   'planReview:autoDecide': { readonly detail: PlanReviewDetail; readonly outcome: PlanAutoDecideOutcome };

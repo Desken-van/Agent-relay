@@ -11,6 +11,7 @@ import type { ExternalPlanReviewRound } from '../../src/main/ports';
 import { deferred, FakePlanReviewer, finding, snapshot } from '../helpers/fake-plan-reviewer';
 import { makeSpecification } from '../helpers/fakes';
 import { createHarness, type Harness } from '../helpers/harness';
+import { FakePlanReviewSubjects } from '../helpers/fake-plan-review-subjects';
 
 const harnesses: Harness[] = [];
 afterEach(() => {
@@ -29,6 +30,7 @@ function setup(settings: Partial<Settings> = {}) {
   // whose `stop()` must reach an operation started through ANY of them.
   const build = () => {
     const gateService = new PlanReviewGateService({
+      subjects: new FakePlanReviewSubjects(),
       tasks: harness.tasks,
       projects: harness.projects,
       ruleEvidence: harness.taskRuleEvidence,

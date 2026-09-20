@@ -30,7 +30,12 @@ import {
 import { IPC_INVOKE_CHANNEL } from '../../shared/ipc-channels';
 import type { Application } from '../container';
 import { assertKnownPath } from '../services/path-safety';
-import { parsePlanReviewAutoDecisions, parsePlanReviewFindings } from '../../shared/domain/plan-review';
+import {
+  parsePlanReviewAutoDecisions,
+  parsePlanReviewFindings,
+  planReviewRecovery,
+  planReviewRecoveryMessage
+} from '../../shared/domain/plan-review';
 import { codeCorrectionRequirements, type CodeReviewDecision } from '../../shared/domain/code-review';
 import { redactAndTruncate } from '../../shared/util/redact';
 import { describePlanCorrection } from '../services/plan-correction';
@@ -169,11 +174,15 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     }
     const gate = app.planReviewGates.findByTask(taskId);
     const findingsSha256 = gate?.findingsJson ? planFindingsSha256(gate.findingsJson) : null;
+    const recoveryReason = planReviewRecovery(gate, app.planReviewGates.listByTask(taskId));
+    const recoveryDetail =
+      recoveryReason === null ? null : { reason: recoveryReason, message: planReviewRecoveryMessage(recoveryReason) };
     return {
       ruleEvidenceProblem,
       findingsSha256,
       autoDecisions: gate === null ? [] : parsePlanReviewAutoDecisions(gate.autoDecisionsJson, findingsSha256),
       analyzing: app.planReviewClaims.analyzingFindings(taskId),
+      recovery: recoveryDetail,
       correction: describePlanCorrection(
         {
           tasks: app.tasks,
@@ -310,6 +319,15 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     },
     'planReview:review': async (input) => {
       await planReviewService().review(input.taskId);
+      return planReviewDetail(input.taskId);
+    },
+    'planReview:retryFreshSession': async (input) => {
+      const service = planReviewService();
+      // Two explicit steps: replace the attempt, THEN review it. The first sends nothing to the
+      // provider and never starts implementation; a failure of the second leaves a normal,
+      // recoverable gate for the new attempt.
+      await service.retryInFreshSession(input.taskId);
+      await service.review(input.taskId);
       return planReviewDetail(input.taskId);
     },
     'planReview:reconcile': async (input) => {

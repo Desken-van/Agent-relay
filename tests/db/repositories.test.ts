@@ -126,7 +126,7 @@ describe('migrations', () => {
       // 14 (review-blocked-status), 15 (compatibility repair), 16
       // (Coai contract fingerprint), 17 (plan-review triage), and 18
       // (code-review triage) are pending.
-      expect(runMigrations(legacy)).toBe(8);
+      expect(runMigrations(legacy)).toBe(9);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_LIMIT_REACHED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');
       expect(() => tasks.create({
@@ -199,7 +199,7 @@ describe('migrations', () => {
       // subject), 15 (compatibility repair), 16 (Coai contract
       // fingerprint), 17 (plan-review triage), and 18 (code-review triage)
       // are still pending.
-      expect(runMigrations(legacy)).toBe(7);
+      expect(runMigrations(legacy)).toBe(8);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_BLOCKED');
       expect(tasks.findById(staleEvidence.id)?.status).toBe('FAILED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');

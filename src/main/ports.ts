@@ -723,6 +723,14 @@ export interface PlanReviewGateRepository {
     patch: PlanReviewGatePatch,
     expectedRevision: number
   ): PlanReviewGate | null;
+  /**
+   * Replace an attempt with a new gate, atomically.
+   *
+   * Writes `next` and marks `id` as superseded by it in ONE transaction, and refuses
+   * an attempt that was already replaced. The replaced row keeps every column it had —
+   * its status, its session and its error text — so the failed attempt stays evidence.
+   */
+  supersede(id: string, next: NewPlanReviewGate): PlanReviewGate;
 }
 
 /**
@@ -1384,6 +1392,16 @@ export interface ExternalPlanReviewSession {
   readonly stage: string;
   readonly awaitingResolve: boolean;
   readonly planProceeded: boolean;
+  /**
+   * The plan rounds the session already held when it was opened, or null when the
+   * provider did not say.
+   *
+   * What makes a session provably FRESH: `open` is idempotent per repository and ref, so
+   * it may hand back a session that has run rounds, or has moved past the plan stage,
+   * and only this tells the two apart. Null is never read as "none": it is the absence
+   * of proof, and a gate that needs a fresh session refuses to dispatch on it.
+   */
+  readonly planRounds: ExternalPlanReviewRoundCounts | null;
   readonly serverName: string;
   readonly serverVersion: string;
   /** The exact contract this `open` call proved — see `ExternalMcpDiscovery.contractFingerprint`. */
@@ -1485,6 +1503,39 @@ export interface ExternalPlanReviewer {
     decisions: readonly PlanReviewDecision[],
     signal?: AbortSignal
   ): Promise<ExternalPlanReviewResolution>;
+}
+
+export interface PlanReviewSubjectRequest {
+  /** The repository the provider is asked about — the same one `ExternalPlanReviewSubject` names. */
+  readonly repositoryPath: string;
+  /** The task branch the plan belongs to. Its tree is the content of the subject; it is never moved. */
+  readonly branch: string;
+  /** The gate the subject is FOR: no other gate may be given the same one. */
+  readonly gateId: string;
+  readonly specificationSha256: string;
+  /** The gate's creation time, fixed into the subject so the same request always names the same object. */
+  readonly createdAt: string;
+}
+
+/**
+ * Gives one plan-review gate a review identity of its own.
+ *
+ * The provider keys a session by (repository, ref) and `open` is idempotent, so two
+ * gates that name the same ref share one session — and once the first has been
+ * resolved that session is past the plan stage and can review nothing more. A gate
+ * that is not the task's first therefore needs a ref no other gate has.
+ *
+ * The identity is a commit that reachable from NO ref: same tree as the task branch,
+ * the branch head as its parent, a message naming the gate. Nothing is checked out,
+ * no branch is created or moved, nothing is pushed, and the working tree and index are
+ * untouched. It is fixed by its inputs, so asking again — after a crash between the
+ * commit and the write that records it — names the same object rather than another.
+ * Git prunes unreachable objects on its own schedule (two weeks by default); a gate
+ * still waiting on the provider after that is recovered like any other spent identity.
+ */
+export interface PlanReviewSubjectFactory {
+  /** The identity — a 40-hex commit id — to hand the provider as this gate's ref. */
+  createIsolatedSubject(request: PlanReviewSubjectRequest, signal?: AbortSignal): Promise<string>;
 }
 
 /* -------------------------------------------------------------------------- */

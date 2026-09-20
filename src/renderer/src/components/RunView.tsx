@@ -69,6 +69,7 @@ const ACTION_SCOPE: Record<RunActionKey, 'read' | 'local' | 'remote'> = {
   prepare_plan_review: 'local',
   run_plan_review: 'read',
   reconcile_plan_review: 'read',
+  retry_plan_review: 'read',
   resolve_plan_review: 'read',
   continue_plan_correction: 'read',
   approve_specification: 'read',
@@ -563,6 +564,7 @@ export function RunView(): React.JSX.Element {
       case 'prepare_plan_review':
       case 'run_plan_review':
       case 'reconcile_plan_review':
+      case 'retry_plan_review':
       case 'resolve_plan_review':
         planPrimaryDispatch.current?.(action.key);
         return;
@@ -765,7 +767,7 @@ export function RunView(): React.JSX.Element {
         <Card title="Task" collapsible defaultOpen key={`task-${task.id}`}>
           <div className="stack">
             <div className="row row--wrap">
-              <StatusBadge status={task.status} />
+              <StatusBadge status={task.status} specificationApprovedAt={task.specificationApprovedAt} />
               <Rounds used={task.currentRound} max={task.maxRounds} />
               <span className="faint">
                 round {task.currentRound} of {task.maxRounds}

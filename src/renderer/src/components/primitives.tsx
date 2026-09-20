@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from 'react';
 import type { ToolStatus } from '@shared/domain/diagnostics';
 import type { RunAgent } from '@shared/domain/models';
-import { STATUS_LABELS, type TaskStatus } from '@shared/domain/workflow';
+import { statusLabel, type TaskStatus } from '@shared/domain/workflow';
 
 /** Which of the four visual lanes an actor belongs to. */
 export function agentTone(agent: RunAgent): 'codex' | 'claude' | 'ornith' | 'system' {
@@ -38,11 +38,22 @@ const BUSY: ReadonlySet<TaskStatus> = new Set([
   'PUBLISHING'
 ]);
 
-export function StatusBadge({ status }: { status: TaskStatus }): React.JSX.Element {
+/**
+ * `specificationApprovedAt` is passed wherever the task is at hand: a task that has a
+ * specification but no approval is not "ready for implementation", whatever its internal
+ * status is called. Omitted, the badge shows the plain status.
+ */
+export function StatusBadge({
+  status,
+  specificationApprovedAt
+}: {
+  status: TaskStatus;
+  specificationApprovedAt?: string | null;
+}): React.JSX.Element {
   return (
     <span className={`status status--${STATUS_CLASS[status]}${BUSY.has(status) ? ' status--busy' : ''}`}>
       <span className="status__pulse" />
-      {STATUS_LABELS[status]}
+      {statusLabel({ status, specificationApprovedAt })}
     </span>
   );
 }

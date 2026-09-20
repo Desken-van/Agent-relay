@@ -50,8 +50,9 @@ const roundFields = {
   findingsSha256: null,
   autoDecisions: [],
   analyzing: [],
-  correction: NO_CORRECTION
-} satisfies Pick<PlanReviewDetail, 'findingsSha256' | 'autoDecisions' | 'analyzing' | 'correction'>;
+  correction: NO_CORRECTION,
+  recovery: null
+} satisfies Pick<PlanReviewDetail, 'findingsSha256' | 'autoDecisions' | 'analyzing' | 'correction' | 'recovery'>;
 
 const emptyDetail: PlanReviewDetail = {
   ...roundFields,
@@ -235,6 +236,10 @@ describe('the external plan-review panel', () => {
         triageJson: null,
         triageForFindings: null,
         autoDecisionsJson: null,
+        reviewSubject: null,
+        roundsAtOpen: null,
+        failureKind: null,
+        supersededBy: null,
         createdAt: '2026-09-06T00:00:00.000Z',
         updatedAt: '2026-09-06T00:00:00.000Z'
       },
@@ -317,6 +322,10 @@ describe('the external plan-review panel', () => {
       triageJson: null,
       triageForFindings: null,
       autoDecisionsJson: null,
+      reviewSubject: null,
+      roundsAtOpen: null,
+      failureKind: null,
+      supersededBy: null,
       createdAt: '2026-09-06T00:00:00.000Z',
       updatedAt: '2026-09-06T00:00:00.000Z',
       ...extra
@@ -763,6 +772,80 @@ describe('the external plan-review panel', () => {
     }
   });
 
+  it.each([
+    ['prepared', 'not_dispatched', 'refused_before_dispatch'],
+    ['reviewing', null, 'foreign_session'],
+    ['proceeded', 'foreign_session', 'foreign_session']
+  ] as const)(
+    'says the current plan has no successful review, shows the provider refusal, and offers only the fresh-session retry (%s gate)',
+    async (status, failureKind, reason) => {
+      const refusal =
+        'Coai refused the request: the plan stage is over for this session (stage: CodeReview); open a new session for a new plan';
+      bridge.set('planReview:get', () =>
+        ok<'planReview:get'>({
+          ...gateWith(status, { failureKind, lastError: refusal, reconciledAt: status === 'proceeded' ? '2026-09-20T00:00:00.000Z' : null }),
+          recovery: { reason, message: `Recovery for ${reason}: retry in a fresh review session.` }
+        })
+      );
+      const onGuidanceStateChanged = vi.fn();
+      render(
+        <PlanReviewPanel
+          task={task('READY_FOR_IMPLEMENTATION')}
+          integrationEnabled
+          onChanged={async () => undefined}
+          onGuidanceStateChanged={onGuidanceStateChanged}
+        />
+      );
+
+      const retry = await screen.findByRole('button', { name: /Retry in a fresh review session/i });
+      expect(retry.className).toContain('btn--recommended');
+      await waitFor(() => expect(onGuidanceStateChanged).toHaveBeenLastCalledWith('recover_review'));
+      // What is wrong, in plain words, and the provider's own refusal beside it.
+      expect(screen.getByText(/The current plan has no successful review/i)).toBeTruthy();
+      expect(screen.getByText(`Recovery for ${reason}: retry in a fresh review session.`)).toBeTruthy();
+      expect(screen.getByText(/cannot be approved, and implementation is not available/i)).toBeTruthy();
+      expect(screen.getByText(refusal)).toBeTruthy();
+      // Nothing else is offered: not another round, not a read-back of another review, not approval.
+      expect(screen.queryByRole('button', { name: /Run external plan review/i })).toBeNull();
+      expect(screen.queryByRole('button', { name: /Reconcile external state/i })).toBeNull();
+      expect(screen.queryByRole('button', { name: /Approve specification|Run implementation/i })).toBeNull();
+
+      await burstClick(retry);
+      expect(bridge.callsTo('planReview:retryFreshSession')).toHaveLength(1);
+      expect(bridge.callsTo('planReview:retryFreshSession')[0]?.input).toEqual({ taskId: 'task-1' });
+      // Never a review, a reconciliation or an implementation on the way.
+      expect(bridge.callsTo('planReview:review')).toHaveLength(0);
+      expect(bridge.callsTo('planReview:reconcile')).toHaveLength(0);
+    }
+  );
+
+  it('still offers Reconcile, and no fresh-session retry, for a call whose outcome is unknown on a session of its own', async () => {
+    bridge.set('planReview:get', () =>
+      ok<'planReview:get'>({ ...gateWith('reviewing', { sessionId: 'session-2', lastError: 'The Coai call timed out.' }), recovery: null })
+    );
+    render(<PlanReviewPanel task={task('READY_FOR_IMPLEMENTATION')} integrationEnabled onChanged={async () => undefined} />);
+
+    expect(await screen.findByRole('button', { name: /Reconcile external state/i })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Retry in a fresh review session/i })).toBeNull();
+    expect(screen.queryByText(/no successful review/i)).toBeNull();
+  });
+
+  it('keeps the retry present but disabled once the task is no longer where it can act', async () => {
+    bridge.set('planReview:get', () =>
+      ok<'planReview:get'>({
+        ...gateWith('prepared', { failureKind: 'not_dispatched', lastError: 'refused' }),
+        recovery: { reason: 'refused_before_dispatch', message: 'Retry.' }
+      })
+    );
+    render(<PlanReviewPanel task={task('CANCELLED')} integrationEnabled onChanged={async () => undefined} />);
+
+    // A cancelled task takes no further action, whatever the gate says.
+    const retry = await screen.findByRole('button', { name: /Retry in a fresh review session/i });
+    expect(retry).toHaveProperty('disabled', true);
+    await burstClick(retry);
+    expect(bridge.callsTo('planReview:retryFreshSession')).toHaveLength(0);
+  });
+
   it('reports a corrupt binding as corrupt and refuses to offer a rebind', async () => {
     bridge.set('planReview:get', () =>
       ok<'planReview:get'>({
@@ -809,6 +892,10 @@ describe('the external plan-review panel', () => {
           triageJson: null,
           triageForFindings: null,
           autoDecisionsJson: null,
+          reviewSubject: null,
+          roundsAtOpen: null,
+          failureKind: null,
+          supersededBy: null,
           createdAt: '2026-09-06T00:00:00.000Z',
           updatedAt: '2026-09-06T00:00:00.000Z'
         }
