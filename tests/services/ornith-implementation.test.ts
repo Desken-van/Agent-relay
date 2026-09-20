@@ -499,16 +499,16 @@ describe('OrnithImplementationService limits and cancellation', () => {
     // tests/adapters/ornith-worktree-tools.test.ts, where the budget is supplied
     // directly rather than derived from preflight.
     // chars values are recalibrated whenever ORNITH_PROTOCOL_INSTRUCTIONS' fixed
-    // byte length changes (most recently: the read-only-timeout-recovery rule),
+    // byte length changes (most recently: the two-budget discovery/edit-validation rule and its budget line),
     // since that text is part of the same authoritative/fixed prompt budget this
     // filler trades off against. Recompute empirically (binary-search
     // `preflightOrnithPrompt` for the `chars` that yields each target budget)
     // rather than hand-deriving the offset.
     const budgetCases: { label: string; chars: number; expectedBudget: number }[] = [
-      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 122_027, expectedBudget: 384 },
-      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 121_981, expectedBudget: 407 },
-      { label: '408 bytes (right at the old fallback stub size)', chars: 121_979, expectedBudget: 408 },
-      { label: '471 bytes ("408+": comfortably normal)', chars: 121_853, expectedBudget: 471 }
+      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 121_304, expectedBudget: 384 },
+      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 121_258, expectedBudget: 407 },
+      { label: '408 bytes (right at the old fallback stub size)', chars: 121_256, expectedBudget: 408 },
+      { label: '471 bytes ("408+": comfortably normal)', chars: 121_130, expectedBudget: 471 }
     ];
 
     for (const { label, chars, expectedBudget } of budgetCases) {
@@ -588,7 +588,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_027)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(121_304)}` // -> 384-byte budget
       };
       const preflight = preflightOrnithPrompt({
         specification: oversizedSpecification,
@@ -640,7 +640,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_027)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(121_304)}` // -> 384-byte budget
       };
       for (let index = 0; index < 40; index += 1) {
         writeFileSync(join(worktree, `s${String(index).padStart(3, '0')}.txt`), 'needle appears here\n', 'utf8');
@@ -682,7 +682,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(122_027)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(121_304)}` // -> 384-byte budget
       };
       // Multi-byte (3 UTF-8 bytes each) names: short enough in UTF-16 code units to
       // stay well under Windows' MAX_PATH, long enough in UTF-8 bytes that every
@@ -1306,8 +1306,11 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(prompts[1]).toContain('Local inference');
       expect(prompts[1]).toMatch(/"nextOffset":\d+/);
       expect(prompts[1]).toContain(`"totalBytes":${bytes}`);
-      // Honest accounting is unchanged: read + read + replace_text (which reads twice) each charge the whole file.
-      expect(result.ornithAudit.readBytes).toBe(bytes * 4);
+      // Honest accounting, now split: the two model-visible reads each charge the whole file to
+      // DISCOVERY; replace_text targets a file the model was shown the hash of, so its two internal
+      // re-reads are charged to the separate edit-validation budget instead.
+      expect(result.ornithAudit.readBytes).toBe(bytes * 2);
+      expect(result.ornithAudit.validationReadBytes).toBe(bytes * 2);
     }, 120_000);
 
     it('tells the model about the new fields and the no-crawl rule, and every field it names really exists in a result', async () => {

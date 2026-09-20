@@ -159,7 +159,15 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       undefined,
       { readBytes: raw.byteLength * 2, writeBytes: raw.byteLength }
     );
-    expect(replaced).toMatchObject({ ok: true, readBytes: raw.byteLength * 2, writeBytes: raw.byteLength });
+    // The file's hash was shown by the read above, so both internal validation re-reads are
+    // charged to the separate edit-validation budget and none to discovery.
+    expect(replaced).toMatchObject({
+      ok: true,
+      readBytes: 0,
+      validationReadBytes: raw.byteLength * 2,
+      writeBytes: raw.byteLength
+    });
+    expect(boundary.validationReadBytesUsed()).toBe(raw.byteLength * 2);
     expect(readFileSync(join(worktree, 'fixture.txt'), 'utf8').replaceAll('\r\n', '\n')).toBe('alpha π delta\n');
   });
 
@@ -1699,5 +1707,256 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(forModel.content).toBe(bytes.toString('utf8'));
       expect(forModel.lineEnding).toBe('crlf');
     });
+  });
+});
+
+describe('OrnithWorktreeTools mutation validation budget', () => {
+  const MIB = 1024 * 1024;
+  /** Nothing left for the model to discover with; edits must not depend on it. */
+  const NO_DISCOVERY = { readBytes: 0, writeBytes: MIB * 4 };
+
+  const shaOf = (raw: string | Buffer): string => createHash('sha256').update(raw).digest('hex');
+
+  /** Read `path` the way the model does, so its hash is one Relay has shown. Returns that hash. */
+  async function showHash(boundary: OrnithWorktreeTools, path: string): Promise<string> {
+    const read = await boundary.readFile({ version: 1, action: 'read_file', path, offset: 0, limit: 8 });
+    if (!read.ok) throw new Error(`expected a successful read of ${path}: ${read.code}`);
+    return (read.forModel as { sha256: string }).sha256;
+  }
+
+  function write(path: string, content: string): Buffer {
+    writeFileSync(join(worktree, path), content, 'utf8');
+    return readFileSync(join(worktree, path));
+  }
+
+  const replace = (path: string, sha256: string, oldText = 'omega', newText = 'delta') => ({
+    version: 1 as const,
+    action: 'replace_text' as const,
+    path,
+    sha256,
+    replacements: [{ oldText, newText }]
+  });
+
+  it('charges the internal re-reads of a shown file to validation and none to discovery, at 0 discovery bytes', async () => {
+    const boundary = tools();
+    const sha256 = await showHash(boundary, 'fixture.txt');
+    const size = readFileSync(join(worktree, 'fixture.txt')).byteLength;
+
+    const result = await boundary.replaceText(replace('fixture.txt', sha256), undefined, NO_DISCOVERY);
+
+    expect(result).toMatchObject({ ok: true, readBytes: 0, validationReadBytes: size * 2 });
+    expect(boundary.validationReadBytesUsed()).toBe(size * 2);
+    expect(readFileSync(join(worktree, 'fixture.txt'), 'utf8')).toContain('delta');
+  });
+
+  it('still charges an edit of a file whose hash was never shown to the discovery budget, and refuses it when that is short', async () => {
+    const boundary = tools();
+    const raw = readFileSync(join(worktree, 'fixture.txt'));
+
+    const result = await boundary.replaceText(
+      replace('fixture.txt', shaOf(raw)),
+      undefined,
+      { readBytes: raw.byteLength - 1, writeBytes: MIB }
+    );
+
+    expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+    expect(readFileSync(join(worktree, 'fixture.txt'))).toEqual(raw);
+
+    const withBudget = await boundary.replaceText(
+      replace('fixture.txt', shaOf(raw)),
+      undefined,
+      { readBytes: raw.byteLength * 2, writeBytes: MIB }
+    );
+    expect(withBudget).toMatchObject({ ok: true, readBytes: raw.byteLength * 2 });
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+  });
+
+  it('does not let a hash shown for one file authorize an edit of another', async () => {
+    write('other.txt', 'omega elsewhere\n');
+    const boundary = tools();
+    const otherSha = await showHash(boundary, 'other.txt');
+    const target = readFileSync(join(worktree, 'fixture.txt'));
+
+    // The target's own hash is right, but only `other.txt`'s hash was ever shown for `other.txt`.
+    const result = await boundary.replaceText(replace('fixture.txt', shaOf(target)), undefined, NO_DISCOVERY);
+    expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    // …and a hash shown for another path is not shown for this one.
+    const wrongPath = await boundary.replaceText(replace('fixture.txt', otherSha), undefined, NO_DISCOVERY);
+    expect(wrongPath).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+    expect(readFileSync(join(worktree, 'fixture.txt'))).toEqual(target);
+  });
+
+  it('fails closed on a target changed after its last read, charging Relay for the one read that found it', async () => {
+    const boundary = tools();
+    const sha256 = await showHash(boundary, 'fixture.txt');
+    writeFileSync(join(worktree, 'fixture.txt'), 'alpha π OMEGA\n', 'utf8');
+    const changed = readFileSync(join(worktree, 'fixture.txt'));
+
+    const result = await boundary.replaceText(replace('fixture.txt', sha256), undefined, NO_DISCOVERY);
+
+    expect(result).toMatchObject({ ok: false, code: 'stale_hash' });
+    expect(boundary.validationReadBytesUsed()).toBe(changed.byteLength);
+    expect(readFileSync(join(worktree, 'fixture.txt'))).toEqual(changed);
+  });
+
+  it('keeps the time-of-check/time-of-use guard on the validation budget: a swap at the mutation boundary is refused', async () => {
+    const original = readFileSync(join(worktree, 'fixture.txt'));
+    const boundary = tools({
+      beforeMutation: () => writeFileSync(join(worktree, 'fixture.txt'), 'newer concurrent content\n', 'utf8')
+    });
+    const sha256 = await showHash(boundary, 'fixture.txt');
+
+    const result = await boundary.replaceText(replace('fixture.txt', sha256), undefined, NO_DISCOVERY);
+
+    expect(result).toMatchObject({ ok: false, code: 'stale_hash' });
+    expect(readFileSync(join(worktree, 'fixture.txt'), 'utf8')).toBe('newer concurrent content\n');
+    // Both internal reads were paid for: the first, and the final re-read that caught the swap.
+    expect(boundary.validationReadBytesUsed()).toBe(original.byteLength * 2);
+  });
+
+  it('treats a target that grew at the mutation boundary as stale, never reading past the size it validated', async () => {
+    const original = readFileSync(join(worktree, 'fixture.txt'));
+    const boundary = tools({
+      beforeMutation: () => writeFileSync(join(worktree, 'fixture.txt'), Buffer.concat([original, Buffer.alloc(64 * 1024, 0x61)]))
+    });
+    const sha256 = await showHash(boundary, 'fixture.txt');
+
+    const result = await boundary.replaceText(replace('fixture.txt', sha256), undefined, NO_DISCOVERY);
+
+    expect(result).toMatchObject({ ok: false, code: 'stale_hash' });
+    expect(boundary.validationReadBytesUsed()).toBe(original.byteLength * 2);
+    expect(readFileSync(join(worktree, 'fixture.txt')).byteLength).toBe(original.byteLength + 64 * 1024);
+  });
+
+  it('deletes a shown file at 0 discovery bytes on the validation budget, and prunes its authorization', async () => {
+    const boundary = tools();
+    const sha256 = await showHash(boundary, 'fixture.txt');
+    const size = readFileSync(join(worktree, 'fixture.txt')).byteLength;
+
+    const result = await boundary.deleteFile(
+      { version: 1, action: 'delete_file', path: 'fixture.txt', sha256 },
+      undefined,
+      { readBytes: 0, writeBytes: 0 }
+    );
+
+    expect(result).toMatchObject({ ok: true, readBytes: 0, validationReadBytes: size * 2 });
+    expect(existsSync(join(worktree, 'fixture.txt'))).toBe(false);
+    expect(boundary.validationReadBytesUsed()).toBe(size * 2);
+  });
+
+  it('refuses to delete a file whose hash was never shown when discovery cannot cover it', async () => {
+    const boundary = tools();
+    const raw = readFileSync(join(worktree, 'fixture.txt'));
+
+    const result = await boundary.deleteFile(
+      { version: 1, action: 'delete_file', path: 'fixture.txt', sha256: shaOf(raw) },
+      undefined,
+      { readBytes: 0, writeBytes: 0 }
+    );
+
+    expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    expect(readFileSync(join(worktree, 'fixture.txt'))).toEqual(raw);
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+  });
+
+  it('authorizes a further edit with the hash an edit or a create returned', async () => {
+    const boundary = tools();
+    const first = await boundary.createFile(
+      { version: 1, action: 'create_file', path: 'made.txt', content: 'omega one\n' },
+      undefined,
+      NO_DISCOVERY
+    );
+    if (!first.ok) throw new Error(first.reason);
+    const second = await boundary.replaceText(
+      replace('made.txt', (first.forModel as { sha256: string }).sha256, 'one', 'two'),
+      undefined,
+      NO_DISCOVERY
+    );
+    if (!second.ok) throw new Error(second.reason);
+    const third = await boundary.replaceText(
+      replace('made.txt', (second.forModel as { sha256: string }).sha256, 'two', 'three'),
+      undefined,
+      NO_DISCOVERY
+    );
+
+    expect(third).toMatchObject({ ok: true, readBytes: 0 });
+    expect(readFileSync(join(worktree, 'made.txt'), 'utf8')).toBe('omega three\n');
+    // Two 10-byte files' worth of double reads: 'omega one\n' then 'omega two\n'.
+    expect(boundary.validationReadBytesUsed()).toBe(2 * 10 + 2 * 10);
+  });
+
+  it('bounds cumulative validation itself: retries that fail still spend it, and the bound is never exceeded', async () => {
+    write('big.txt', `${'a'.repeat(MIB - 6)}omega\n`);
+    const boundary = tools();
+    const sha256 = await showHash(boundary, 'big.txt');
+    const limit = ORNITH_LIMITS.maxCumulativeMutationValidationBytes;
+    const attempt = () => boundary.replaceText(replace('big.txt', sha256, 'no such text', 'x'), undefined, NO_DISCOVERY);
+
+    // A mismatch is found after the first read only, so each failed attempt costs 1 MiB of validation.
+    // Two reads of a MiB must still fit before an attempt starts: seven attempts do, the eighth does not.
+    for (let index = 1; index <= 7; index += 1) {
+      expect(await attempt()).toMatchObject({ ok: false, code: 'replacement_mismatch' });
+      expect(boundary.validationReadBytesUsed()).toBe(index * MIB);
+    }
+    const refused = await attempt();
+    expect(refused).toMatchObject({ ok: false, code: 'limit_mutation_validation_bytes_exceeded' });
+    expect(refused.ok ? '' : refused.reason).toContain(`of the ${limit}-byte mutation-validation budget remain`);
+    // Refusing did not read anything, and a further retry is refused just the same.
+    expect(boundary.validationReadBytesUsed()).toBe(7 * MIB);
+    expect(await attempt()).toMatchObject({ ok: false, code: 'limit_mutation_validation_bytes_exceeded' });
+    expect(boundary.validationReadBytesUsed()).toBeLessThanOrEqual(limit);
+    expect(readFileSync(join(worktree, 'big.txt')).byteLength).toBe(MIB);
+  });
+
+  it('refuses a target above the per-edit validation bound before reading it, whether or not its hash was shown', async () => {
+    const raw = write('huge.txt', `${'b'.repeat(ORNITH_LIMITS.maxFileBytes)}omega\n`);
+    const boundary = tools();
+    const shown = await showHash(boundary, 'huge.txt');
+
+    for (const sha256 of [shown, shaOf('never shown')]) {
+      const result = await boundary.replaceText(replace('huge.txt', sha256), undefined, NO_DISCOVERY);
+      expect(result).toMatchObject({ ok: false, code: 'limit_mutation_validation_bytes_exceeded' });
+    }
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+    expect(readFileSync(join(worktree, 'huge.txt'))).toEqual(raw);
+  });
+
+  it('keeps a delete of a target above the validation bound on the discovery budget, exactly as before', async () => {
+    const raw = write('huge.txt', `${'b'.repeat(ORNITH_LIMITS.maxFileBytes)}omega\n`);
+    const boundary = tools();
+    const sha256 = await showHash(boundary, 'huge.txt');
+
+    const refused = await boundary.deleteFile(
+      { version: 1, action: 'delete_file', path: 'huge.txt', sha256 },
+      undefined,
+      { readBytes: raw.byteLength, writeBytes: 0 }
+    );
+    expect(refused).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    expect(existsSync(join(worktree, 'huge.txt'))).toBe(true);
+
+    const allowed = await boundary.deleteFile(
+      { version: 1, action: 'delete_file', path: 'huge.txt', sha256 },
+      undefined,
+      { readBytes: raw.byteLength * 2, writeBytes: 0 }
+    );
+    expect(allowed).toMatchObject({ ok: true, readBytes: raw.byteLength * 2, validationReadBytes: 0 });
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+  });
+
+  it('never returns file content, or anything but the fixed reason, for a refused validation', async () => {
+    write('big.txt', `${'a'.repeat(MIB - 6)}omega\n`);
+    const boundary = tools();
+    const sha256 = await showHash(boundary, 'big.txt');
+    for (let index = 0; index < 7; index += 1) {
+      await boundary.replaceText(replace('big.txt', sha256, 'no such text', 'x'), undefined, NO_DISCOVERY);
+    }
+
+    const refused = await boundary.replaceText(replace('big.txt', sha256, 'no such text', 'x'), undefined, NO_DISCOVERY);
+
+    expect(refused.ok).toBe(false);
+    expect(JSON.stringify(refused)).not.toContain('aaaa');
+    expect(JSON.stringify(refused)).not.toContain('omega');
   });
 });

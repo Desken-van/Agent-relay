@@ -86,7 +86,10 @@ export interface OrnithImplementationRequest {
 export interface OrnithImplementationAudit {
   readonly turns: number;
   readonly actions: number;
+  /** Model-visible DISCOVERY bytes (read_file / search_text / git_diff, and edits of files never shown to the model). */
   readonly readBytes: number;
+  /** Bytes Relay itself re-read to validate edits of files the model was shown; a separate budget from `readBytes`. */
+  readonly validationReadBytes: number;
   readonly writeBytes: number;
   readonly changedFiles: number;
   readonly verifications: number;
@@ -279,6 +282,13 @@ Rules:
   possible request, and is NEVER automatically narrowed for you, including by a SCOPE section
   above. If you already know which file matters, pass it in "files" explicitly, or better, skip
   the search entirely and use "read_file" directly.
+- There are TWO separate byte budgets. "Repository read bytes remaining" is for DISCOVERY only:
+  "read_file", "search_text" and "git_diff" spend it. Agent Relay's own re-reads of a file to
+  validate an edit are charged to a different internal budget ("Edit validation bytes
+  remaining") that discovery can never spend. So an edit ("replace_text", "delete_file") of a
+  file whose sha256 a "read_file" result gave you still works when the read budget is exhausted;
+  a hash you were never shown earns no such allowance. Once you have read the whole file you
+  must change, do NOT search the repository "to be sure" — send the edit.
 - A "read_file" result reports "totalBytes" (the file's size) and "nextOffset" (where the next
   chunk starts; null at the end of the file). Every "read_file" is charged the file's FULL size
   against the read budget however small the chunk, so NEVER page through a large file in small
@@ -393,6 +403,7 @@ Non-terminal actions remaining: ${ORNITH_LIMITS.maxNonterminalActions}
 Verification calls remaining: ${ORNITH_LIMITS.maxVerificationCalls}
 Repository read bytes remaining: ${ORNITH_LIMITS.maxCumulativeReadBytes}
 Repository write bytes remaining: ${ORNITH_LIMITS.maxCumulativeWriteBytes}
+Edit validation bytes remaining (internal; reads and searches never spend it): ${ORNITH_LIMITS.maxCumulativeMutationValidationBytes}
 Changed files remaining: ${ORNITH_LIMITS.maxChangedFiles}
 Maximum retained tool-result bytes: ${maxToolResultBytes}
 Round ${input.round} of at most ${input.maxRounds}.
@@ -428,7 +439,15 @@ Reply with exactly one JSON action now.`, 'utf8');
 function buildOrnithPromptText(
   request: OrnithPromptPreflightInput,
   rolling: readonly RollingResult[],
-  remaining: { turns: number; actions: number; verifications: number; readBytes: number; writeBytes: number; changedFiles: number },
+  remaining: {
+    turns: number;
+    actions: number;
+    verifications: number;
+    readBytes: number;
+    writeBytes: number;
+    validationBytes: number;
+    changedFiles: number;
+  },
   promptBudget: OrnithPromptBudget
 ): string | null {
   const authoritative = authoritativePromptText(request);
@@ -443,6 +462,7 @@ Non-terminal actions remaining: ${remaining.actions}
 Verification calls remaining: ${remaining.verifications}
 Repository read bytes remaining: ${remaining.readBytes}
 Repository write bytes remaining: ${remaining.writeBytes}
+Edit validation bytes remaining (internal; reads and searches never spend it): ${remaining.validationBytes}
 Changed files remaining: ${remaining.changedFiles}
 Maximum retained tool-result bytes: ${promptBudget.maxToolResultBytes}
 Round ${request.round} of at most ${request.maxRounds}.`;
@@ -552,6 +572,7 @@ const ORNITH_DENIAL_PUBLISH_BLOCK: Record<OrnithDenialCode, ClaudePublishBlock> 
   limit_prompt_exceeded: 'configuration',
   limit_result_exceeded: 'configuration',
   limit_read_bytes_exceeded: 'configuration',
+  limit_mutation_validation_bytes_exceeded: 'configuration',
   limit_write_bytes_exceeded: 'configuration',
   limit_changed_files_exceeded: 'configuration',
   limit_manifest_files_exceeded: 'configuration',
@@ -582,13 +603,50 @@ function isRecoverableToolDenial(action: OrnithAction, code: OrnithDenialCode): 
   return (code === 'timeout' || code === 'limit_read_bytes_exceeded') && isNoProgressGuardAction(action);
 }
 
+/** Where both byte budgets stood when a tool call was refused. */
+interface OrnithBudgetSnapshot {
+  readonly discoveryUsed: number;
+  readonly validationUsed: number;
+  readonly changedFiles: number;
+}
+
+/**
+ * For the two byte-budget denials, says WHICH budget ran out, how much of each was used,
+ * whether the worktree was changed, and the safe next step — so a discovery shortfall is
+ * never mistaken for an edit-validation one. Bounded, numbers only: no path, no content.
+ */
+function describeByteBudgetDenial(code: OrnithDenialCode, snapshot: OrnithBudgetSnapshot): string | null {
+  if (code !== 'limit_read_bytes_exceeded' && code !== 'limit_mutation_validation_bytes_exceeded') return null;
+  const discovery = `${snapshot.discoveryUsed} of ${ORNITH_LIMITS.maxCumulativeReadBytes} repository discovery bytes used`;
+  const validation =
+    `${snapshot.validationUsed} of ${ORNITH_LIMITS.maxCumulativeMutationValidationBytes} internal edit-validation bytes used`;
+  const changed = snapshot.changedFiles === 0
+    ? 'No files were changed.'
+    : snapshot.changedFiles === 1
+      ? '1 file was changed and remains in the task worktree.'
+      : `${snapshot.changedFiles} files were changed and remain in the task worktree.`;
+  if (code === 'limit_read_bytes_exceeded') {
+    return `Budget exhausted: repository DISCOVERY (${discovery}; edit validation is a separate budget, ${validation}). ${changed} ` +
+      'Next: retry the task, naming the exact file(s) in the scope so Ornith reads them directly instead of searching the repository.';
+  }
+  return `Budget exhausted: internal EDIT VALIDATION (${validation}; repository discovery is a separate budget, ${discovery}). ${changed} ` +
+    'Next: retry with a smaller change, or split the work so each edit touches a smaller file.';
+}
+
 /** One safe, specific sentence naming the action, its exact denial code, and the tool's own reason. */
-function describeOrnithToolDenial(action: OrnithAction, toolResult: Extract<OrnithToolResult, { ok: false }>): {
+function describeOrnithToolDenial(
+  action: OrnithAction,
+  toolResult: Extract<OrnithToolResult, { ok: false }>,
+  snapshot: OrnithBudgetSnapshot
+): {
   readonly message: string;
   readonly publishBlock: ClaudePublishBlock;
 } {
+  const budget = describeByteBudgetDenial(toolResult.code, snapshot);
   return {
-    message: `Agent Relay stopped the Ornith "${action.action}" action (${toolResult.code}): ${toolResult.reason}`,
+    message:
+      `Agent Relay stopped the Ornith "${action.action}" action (${toolResult.code}): ${toolResult.reason}` +
+      (budget === null ? '' : ` ${budget}`),
     publishBlock: ORNITH_DENIAL_PUBLISH_BLOCK[toolResult.code]
   };
 }
@@ -651,6 +709,8 @@ export class OrnithImplementationService {
     let readOnlyRecoveryAttemptsUsed = 0;
     let readBudgetRecoveryAttemptsUsed = 0;
     let replacementEscapeRecoveryAttemptsUsed = 0;
+    /** The one-time "discovery budget is nearly spent" notice has been handed to the model. */
+    let lowDiscoveryNoticeGiven = false;
     /** The exact `replace_text` action refused with `replacement_escape_suspected`, so an
      *  identical repeat is refused before dispatch. `null` until such a denial.
      *  Sound to keep for the whole run: the action carries `path` and the expected
@@ -670,6 +730,7 @@ export class OrnithImplementationService {
         turns: turnsUsed,
         actions: nonterminalActionsUsed,
         readBytes: cumulativeReadBytes,
+        validationReadBytes: tools.validationReadBytesUsed(),
         writeBytes: cumulativeWriteBytes,
         changedFiles: tools.changedFileCount(),
         verifications: verificationsUsed,
@@ -805,6 +866,7 @@ export class OrnithImplementationService {
         verifications: Math.max(0, ORNITH_LIMITS.maxVerificationCalls - verificationsUsed),
         readBytes: Math.max(0, ORNITH_LIMITS.maxCumulativeReadBytes - cumulativeReadBytes),
         writeBytes: Math.max(0, ORNITH_LIMITS.maxCumulativeWriteBytes - cumulativeWriteBytes),
+        validationBytes: Math.max(0, ORNITH_LIMITS.maxCumulativeMutationValidationBytes - tools.validationReadBytesUsed()),
         changedFiles: Math.max(0, ORNITH_LIMITS.maxChangedFiles - tools.changedFileCount())
       }, promptBudget);
       if (promptText === null) {
@@ -1152,6 +1214,8 @@ export class OrnithImplementationService {
           recoverable: willRecover,
           readBytesUsed: cumulativeReadBytes,
           readBytesConfigured: ORNITH_LIMITS.maxCumulativeReadBytes,
+          validationBytesUsed: tools.validationReadBytesUsed(),
+          validationBytesConfigured: ORNITH_LIMITS.maxCumulativeMutationValidationBytes,
           changedFiles: tools.changedFileCount()
         };
         request.onProgress({
@@ -1180,7 +1244,8 @@ export class OrnithImplementationService {
               : isBudgetDenial
               ? `${toolResult.reason} (${describeActionParams(action)}) No further reads or searches are ` +
                 'available for this request; the repository read budget for this run cannot fit it. Use the ' +
-                'verified context you already have to make the scoped edit now, or call "blocked" if you cannot ' +
+                'verified context you already have to make the scoped edit now — an edit of a file whose sha256 ' +
+                'you were shown does not need that budget — or call "blocked" if you cannot ' +
                 'safely continue without it. This exact request will not be retried.'
               : `${toolResult.reason} (${describeActionParams(action)}) ${remaining} read-only recovery ` +
                 `attempt${remaining === 1 ? '' : 's'} remain this run. Narrow "files", the query, offset, or limit ` +
@@ -1190,12 +1255,26 @@ export class OrnithImplementationService {
           continue;
         }
 
-        const { message, publishBlock } = describeOrnithToolDenial(action, toolResult);
+        const { message, publishBlock } = describeOrnithToolDenial(action, toolResult, {
+          discoveryUsed: cumulativeReadBytes,
+          validationUsed: tools.validationReadBytesUsed(),
+          changedFiles: tools.changedFileCount()
+        });
         return finish('fail', message, publishBlock, [toolResult.code]);
       }
 
       if (cumulativeReadBytes + toolResult.readBytes > ORNITH_LIMITS.maxCumulativeReadBytes) {
         return finish('fail', 'The Ornith repository read budget was exceeded.', 'configuration', ['limit_read_bytes_exceeded']);
+      }
+      // Defence in depth: the tools reserve before they read, so this can only fire if that
+      // bookkeeping is ever wrong. It fails the run rather than letting validation go unbounded.
+      if (tools.validationReadBytesUsed() > ORNITH_LIMITS.maxCumulativeMutationValidationBytes) {
+        return finish(
+          'fail',
+          'The Ornith internal edit-validation budget was exceeded.',
+          'configuration',
+          ['limit_mutation_validation_bytes_exceeded']
+        );
       }
       if (cumulativeWriteBytes + toolResult.writeBytes > ORNITH_LIMITS.maxCumulativeWriteBytes) {
         return finish('fail', 'The Ornith repository write budget was exceeded.', 'configuration', ['limit_write_bytes_exceeded']);
@@ -1210,7 +1289,9 @@ export class OrnithImplementationService {
         data: {
           sequence: nonterminalActionsUsed, turn: turnsUsed, action: action.action, ok: true,
           durationMs, readBytes: toolResult.readBytes, writeBytes: toolResult.writeBytes,
+          validationReadBytes: toolResult.validationReadBytes ?? 0,
           changedPath: toolResult.changedPath ?? null, cumulativeReadBytes, cumulativeWriteBytes,
+          cumulativeValidationReadBytes: tools.validationReadBytesUsed(),
           changedFiles: tools.changedFileCount(), verifications: verificationsUsed,
           providerId: request.lease.providerId, modelId: request.lease.modelId,
           runtimeInstanceId: request.lease.runtimeInstanceId
@@ -1219,6 +1300,26 @@ export class OrnithImplementationService {
 
       const resultText = resultTextFor(action.action, toolResult.forModel, promptBudget.maxToolResultBytes);
       rolling.push({ turn: turnsUsed, action: action.action, resultText });
+
+      // Deterministic, once per run: the moment discovery is nearly spent the model is told,
+      // in Relay's own words rather than the prompt's standing text, that edits of files it
+      // was shown do not depend on what is left. Numbers only.
+      const discoveryRemaining = ORNITH_LIMITS.maxCumulativeReadBytes - cumulativeReadBytes;
+      if (!lowDiscoveryNoticeGiven && toolResult.readBytes > 0 && discoveryRemaining < ORNITH_LIMITS.lowDiscoveryBudgetNoticeBytes) {
+        lowDiscoveryNoticeGiven = true;
+        rolling.push({
+          turn: turnsUsed,
+          action: action.action,
+          resultText: JSON.stringify({
+            relayNotice:
+              `Repository discovery budget is nearly spent: ${discoveryRemaining} of ${ORNITH_LIMITS.maxCumulativeReadBytes} bytes remain, ` +
+              'so further read_file, search_text or git_diff requests may be refused. This does NOT block edits: replace_text and ' +
+              'delete_file on a file whose sha256 you were shown are validated on a separate internal budget ' +
+              `(${ORNITH_LIMITS.maxCumulativeMutationValidationBytes - tools.validationReadBytesUsed()} bytes left). ` +
+              'Do not search the repository again; make the edit now, or call "blocked".'
+          })
+        });
+      }
     }
   }
 

@@ -627,6 +627,31 @@ renderer-configurable, and nothing an Ornith completion contains can widen
 any of them — there is no `limit` field anywhere in the action schema for a
 completion to supply one.
 
+**Two byte budgets, never one.** What the model may *discover* and what Agent
+Relay must *re-read to validate an edit safely* are metered separately.
+`maxCumulativeReadBytes` (4 MiB) is the discovery budget: `read_file` (which
+charges the file's whole size however small the window), `search_text` and
+`git_diff` spend it, and it is the only one the model is shown as "Repository
+read bytes remaining". `maxCumulativeMutationValidationBytes` (8 MiB, twice the
+write budget) is the internal budget for the identity, hash, replacement and
+final time-of-check/time-of-use re-reads of an edit's target; the model sees
+only its remaining figure, and discovery can neither spend nor enlarge it.
+An edit or delete draws on the validation budget only when the `sha256` it
+cites is one Relay itself issued for that exact path in this run (a `read_file`,
+`create_file` or `replace_text` result) and the target is no larger than
+`maxFileBytes` (1 MiB). A hash Relay never showed earns nothing: that edit still
+draws on the discovery budget exactly as before, so an unread or invented
+target stays denied when discovery is short. The validation reads are bounded —
+both are reserved before any byte is read, the counter is charged as bytes are
+read (so a failed or repeated attempt still spends it and retrying cannot buy
+more), and a target that grows past the size it was validated at is a stale
+target — and they add nothing to what the model can see. Path validation,
+repository-root and identity checks, credential scanning, the stale-hash and
+TOCTOU re-checks, the write and changed-file limits and post-provider snapshot
+verification are unchanged. A denial names which budget ran out
+(`limit_read_bytes_exceeded` for discovery,
+`limit_mutation_validation_bytes_exceeded` for validation), never both.
+
 **Least-privilege runtime access.** Selecting Ornith never starts, restarts,
 or health-checks the local runtime; a round refuses outright unless the
 runtime is already retained and already `healthy`, reconfirmed by one bounded

@@ -426,6 +426,17 @@ What Ornith adds, precisely:
   an overall loop deadline of `min(settings.processTimeoutMs, 30 minutes)`.
   None of this is renderer-configurable, and nothing a completion contains
   can widen any of it.
+- **Two separate byte budgets.** The 4 MiB *discovery* budget is what
+  `read_file`, `search_text` and `git_diff` spend; the internal 8 MiB
+  *edit-validation* budget is what Agent Relay spends re-reading a target to
+  validate an edit or delete of a file whose `sha256` it already showed the
+  model. Spending discovery — for example one repository-wide search after
+  reading the whole target — therefore cannot make that edit impossible, and
+  validation never adds to discovery. A run's audit (`counters`) and its
+  `tool_use` events report both (`readBytes` / `validationReadBytes`, and the
+  cumulative `cumulativeReadBytes` / `cumulativeValidationReadBytes`); a denial
+  says which budget ran out, the used/configured bytes of each, whether any
+  file changed, and the safe next step. See `docs/security.md` §5c.
 - The execution lease captures the retained runtime's exact context and output
   limits. Before a worktree or round is created, Relay reserves template and
   completion space and proves the immutable prompt fits using a conservative
