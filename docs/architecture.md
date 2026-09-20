@@ -670,6 +670,12 @@ branch, its worktree and the user's checkout are never written; the only Git com
 - Each dispatch records how many plan rounds its session already held (`rounds_at_open`). A read-back
   attributes a round to the dispatch only if the count went up; a previous round "returned by status"
   settles nothing.
+- Rows written before migration 20 (the four columns are NULL): a NULL `review_subject` means the
+  task's own branch — the identity every earlier gate was dispatched under — so an in-flight legacy
+  gate is read back against the session its round actually lives in; a NULL `rounds_at_open` means
+  no baseline check (the earlier behaviour); and session ownership is structural (the first gate to
+  record a session owns it), so a legacy gate that shares a session with an earlier gate is foreign
+  and is recovered without any provider call. Nothing is backfilled or rewritten by the migration.
 - Reconciliation reads only evidence that is the gate's. A gate whose recorded session belongs to an
   earlier gate (the first to record a session owns it) is not read against the provider at all: it is
   marked `foreign_session` and left as it was. A gate still at `opening` sent no round, so rounds found

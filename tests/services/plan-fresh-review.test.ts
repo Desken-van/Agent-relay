@@ -571,6 +571,37 @@ describe('reconciliation reads only evidence that belongs to the gate', () => {
     expect(after.lastError).toMatch(/never sent one/);
   });
 
+  it('reads a legacy in-flight FIRST gate — no recorded subject or baseline — against the task branch it was dispatched under, and keeps its unknown outcome', async () => {
+    const value = coaiScenario();
+    const task = await afterFirstReview(value);
+    const [first] = gatesOf(value, task.id) as [PlanReviewGate];
+    // The row as a version-19 build left it: dispatched, answer lost, and nothing recorded about a subject or a baseline.
+    value.harness.planReviewGates.update(first.id, {
+      status: 'reviewing',
+      reviewSubject: null,
+      roundsAtOpen: null,
+      verdict: null,
+      findingsJson: null,
+      reviewers: null,
+      gatingCount: null,
+      threshold: null
+    });
+    const branch = taskSubject(value, task.id).branch;
+
+    const after = await value.gateService.reconcile(task.id);
+
+    // NULL means the task's own branch: the session its round actually lives in — and no other is asked.
+    expect(value.reviewer.statusCalls.map((call) => call.branch)).toEqual([branch]);
+    // The provider records a finished round awaiting decisions but returns none of its findings: nothing is
+    // invented, nothing is repeated, and the attempt is neither marked spent nor replaced.
+    expect(after).toMatchObject({ status: 'reviewing', failureKind: null, supersededBy: null, sessionId: first.sessionId });
+    expect(after.lastError).toMatch(/does not return that round/);
+    expect(value.subjects.requests).toHaveLength(0);
+    expect(value.reviewer.reviewCalls).toHaveLength(1);
+    await expect(value.gateService.retryInFreshSession(task.id)).rejects.toMatchObject({ code: 'VALIDATION_FAILED' });
+    expect(gatesOf(value, task.id)).toHaveLength(1);
+  });
+
   it('does not adopt another review’s session for a legacy gate that recorded none', async () => {
     const value = coaiScenario();
     const task = await afterFirstReview(value);
