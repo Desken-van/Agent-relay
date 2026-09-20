@@ -196,7 +196,9 @@ const VALIDATION_READ_CHUNK_BYTES = 64 * 1024;
  * Read at most `limit + 1` bytes from an open handle. A result longer than `limit`
  * proves the file outgrew what the caller was authorised to read, without ever
  * buffering more than one byte past that bound — `handle.readFile` would buffer
- * whatever the file has become.
+ * whatever the file has become. The one extra byte is only a growth sentinel: callers
+ * charge at most `limit` for a read (see the validation counter), so a reservation of
+ * `limit` per read is never exceeded by what is counted.
  */
 async function readAtMost(handle: FileHandle, limit: number, signal: AbortSignal): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -1485,9 +1487,16 @@ export class OrnithWorktreeTools {
 
       const beforeStats = await lstat(resolved.absolutePath, { bigint: true });
       const targetSize = Number(beforeStats.size);
-      // A delete has no size gate of its own, so a target above the per-target validation
-      // bound keeps drawing on the discovery budget exactly as it always did.
-      const onValidationBudget = this.wasShownHash(action.path, action.sha256) && targetSize <= ORNITH_LIMITS.maxFileBytes;
+      // The same per-target bound as an edit, checked before anything is read: a delete is a
+      // mutation too. (Under the old single budget only a ~1.3 MiB band above this bound was
+      // even deletable — read plus two validation reads had to fit in 4 MiB.)
+      if (targetSize > ORNITH_LIMITS.maxFileBytes) {
+        return denied(
+          'limit_mutation_validation_bytes_exceeded',
+          `The file is larger than the ${ORNITH_LIMITS.maxFileBytes} bytes a change may validate. Nothing was read for the model and nothing was deleted.`
+        );
+      }
+      const onValidationBudget = this.wasShownHash(action.path, action.sha256);
       if (onValidationBudget) {
         const denial = this.validationReservationDenial(targetSize);
         if (denial !== null) return denial;

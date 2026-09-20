@@ -638,8 +638,9 @@ final time-of-check/time-of-use re-reads of an edit's target; the model sees
 only its remaining figure, and discovery can neither spend nor enlarge it.
 An edit or delete draws on the validation budget only when the `sha256` it
 cites is one Relay itself issued for that exact path in this run (a `read_file`,
-`create_file` or `replace_text` result) and the target is no larger than
-`maxFileBytes` (1 MiB). A hash Relay never showed earns nothing: that edit still
+`create_file` or `replace_text` result). A target larger than `maxFileBytes`
+(1 MiB) is refused, edit or delete, before it is read. A hash Relay never
+showed earns nothing: that edit still
 draws on the discovery budget exactly as before, so an unread or invented
 target stays denied when discovery is short. The validation reads are bounded —
 both are reserved before any byte is read, the counter is charged as bytes are

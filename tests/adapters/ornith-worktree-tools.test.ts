@@ -1923,25 +1923,20 @@ describe('OrnithWorktreeTools mutation validation budget', () => {
     expect(readFileSync(join(worktree, 'huge.txt'))).toEqual(raw);
   });
 
-  it('keeps a delete of a target above the validation bound on the discovery budget, exactly as before', async () => {
+  it('refuses to delete a target above the per-change validation bound before reading it, whatever budget is left', async () => {
     const raw = write('huge.txt', `${'b'.repeat(ORNITH_LIMITS.maxFileBytes)}omega\n`);
     const boundary = tools();
-    const sha256 = await showHash(boundary, 'huge.txt');
+    const shown = await showHash(boundary, 'huge.txt');
 
-    const refused = await boundary.deleteFile(
-      { version: 1, action: 'delete_file', path: 'huge.txt', sha256 },
-      undefined,
-      { readBytes: raw.byteLength, writeBytes: 0 }
-    );
-    expect(refused).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    for (const sha256 of [shown, shaOf('never shown')]) {
+      const result = await boundary.deleteFile(
+        { version: 1, action: 'delete_file', path: 'huge.txt', sha256 },
+        undefined,
+        { readBytes: raw.byteLength * 4, writeBytes: 0 }
+      );
+      expect(result).toMatchObject({ ok: false, code: 'limit_mutation_validation_bytes_exceeded' });
+    }
     expect(existsSync(join(worktree, 'huge.txt'))).toBe(true);
-
-    const allowed = await boundary.deleteFile(
-      { version: 1, action: 'delete_file', path: 'huge.txt', sha256 },
-      undefined,
-      { readBytes: raw.byteLength * 2, writeBytes: 0 }
-    );
-    expect(allowed).toMatchObject({ ok: true, readBytes: raw.byteLength * 2, validationReadBytes: 0 });
     expect(boundary.validationReadBytesUsed()).toBe(0);
   });
 
