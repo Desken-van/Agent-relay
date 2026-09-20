@@ -196,11 +196,17 @@ const VALIDATION_READ_CHUNK_BYTES = 64 * 1024;
  * Read at most `limit + 1` bytes from an open handle. A result longer than `limit`
  * proves the file outgrew what the caller was authorised to read, without ever
  * buffering more than one byte past that bound — `handle.readFile` would buffer
- * whatever the file has become. The one extra byte is only a growth sentinel: callers
- * charge at most `limit` for a read (see the validation counter), so a reservation of
- * `limit` per read is never exceeded by what is counted.
+ * whatever the file has become. The one extra byte is only a growth sentinel and is never
+ * counted: `onRead` is told, chunk by chunk as each chunk arrives, how many of the bytes
+ * just read count toward `limit`, so a read that is aborted or times out part-way has still
+ * been charged for everything it read, and the total charged never exceeds `limit`.
  */
-async function readAtMost(handle: FileHandle, limit: number, signal: AbortSignal): Promise<Buffer> {
+async function readAtMost(
+  handle: FileHandle,
+  limit: number,
+  signal: AbortSignal,
+  onRead?: (countedBytes: number) => void
+): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
   while (total <= limit) {
@@ -208,6 +214,7 @@ async function readAtMost(handle: FileHandle, limit: number, signal: AbortSignal
     const chunk = Buffer.allocUnsafe(Math.min(VALIDATION_READ_CHUNK_BYTES, limit + 1 - total));
     const { bytesRead } = await handle.read(chunk, 0, chunk.length, total);
     if (bytesRead === 0) break;
+    onRead?.(Math.max(0, Math.min(bytesRead, limit - total)));
     chunks.push(bytesRead === chunk.length ? chunk : chunk.subarray(0, bytesRead));
     total += bytesRead;
   }
@@ -323,6 +330,14 @@ export class OrnithWorktreeTools {
       return { ok: false, code: 'stale_hash', reason: 'The file changed size before the change was applied.' };
     }
     return read;
+  }
+
+  /** Charges each chunk of an internal validation read as it arrives; discovery-pool reads charge nothing here. */
+  private validationCharge(onValidationBudget: boolean): ((countedBytes: number) => void) | undefined {
+    if (!onValidationBudget) return undefined;
+    return (countedBytes) => {
+      this.validationBytesRead += countedBytes;
+    };
   }
 
   private recordShownHash(relativePath: string, sha256: string): void {
@@ -1326,12 +1341,14 @@ export class OrnithWorktreeTools {
 
       const beforeStats = await lstat(resolved.absolutePath, { bigint: true });
       const targetSize = Number(beforeStats.size);
-      // Per-target bound on what Relay will read to validate one edit. Checked before
-      // anything is read, and the same for every pool: an edit never buffers a larger file.
+      // Per-target size bound on what Relay will read to validate one edit. Not a budget: it is
+      // checked before anything is read, the same for every pool, so an edit never buffers a
+      // larger file — and it has its own code, so a size refusal is never reported as a budget
+      // that ran out.
       if (targetSize > ORNITH_LIMITS.maxFileBytes) {
         return denied(
-          'limit_mutation_validation_bytes_exceeded',
-          `The file is larger than the ${ORNITH_LIMITS.maxFileBytes} bytes an edit may validate. Nothing was read for the model and nothing was written.`
+          'limit_mutation_target_bytes_exceeded',
+          `The file is larger than the ${ORNITH_LIMITS.maxFileBytes} bytes one change may validate. Nothing was read for the model and nothing was written.`
         );
       }
       const onValidationBudget = this.wasShownHash(action.path, action.sha256);
@@ -1353,23 +1370,14 @@ export class OrnithWorktreeTools {
           volumeSerial: openedStats.dev.toString(),
           fileIndex: openedStats.ino.toString()
         };
-        if (onValidationBudget) {
-          raw = await readAtMost(handle, targetSize, bounded);
-          this.validationBytesRead += Math.min(raw.byteLength, targetSize);
-          if (raw.byteLength > targetSize) {
-            return denied('stale_hash', 'The file grew while the edit was being validated.');
-          }
-        } else {
-          raw = await handle.readFile({ signal: bounded });
+        // Bounded for every pool: never buffers more than one byte past the size that was
+        // checked above. On the validation pool the bytes are charged as each chunk arrives.
+        raw = await readAtMost(handle, targetSize, bounded, this.validationCharge(onValidationBudget));
+        if (raw.byteLength > targetSize) {
+          return denied('stale_hash', 'The file grew while the edit was being validated.');
         }
       } finally {
         await handle.close();
-      }
-      if (raw.byteLength > ORNITH_LIMITS.maxFileBytes) {
-        return denied(
-          'limit_mutation_validation_bytes_exceeded',
-          `The file is larger than the ${ORNITH_LIMITS.maxFileBytes} bytes an edit may validate. Nothing was written.`
-        );
       }
       const currentSha256 = createHash('sha256').update(raw).digest('hex');
       if (currentSha256 !== action.sha256) {
@@ -1487,13 +1495,13 @@ export class OrnithWorktreeTools {
 
       const beforeStats = await lstat(resolved.absolutePath, { bigint: true });
       const targetSize = Number(beforeStats.size);
-      // The same per-target bound as an edit, checked before anything is read: a delete is a
-      // mutation too. (Under the old single budget only a ~1.3 MiB band above this bound was
+      // The same per-target size bound as an edit, checked before anything is read: a delete is
+      // a mutation too. (Under the old single budget only a ~1.3 MiB band above this bound was
       // even deletable — read plus two validation reads had to fit in 4 MiB.)
       if (targetSize > ORNITH_LIMITS.maxFileBytes) {
         return denied(
-          'limit_mutation_validation_bytes_exceeded',
-          `The file is larger than the ${ORNITH_LIMITS.maxFileBytes} bytes a change may validate. Nothing was read for the model and nothing was deleted.`
+          'limit_mutation_target_bytes_exceeded',
+          `The file is larger than the ${ORNITH_LIMITS.maxFileBytes} bytes one change may validate. Nothing was read for the model and nothing was deleted.`
         );
       }
       const onValidationBudget = this.wasShownHash(action.path, action.sha256);
@@ -1515,14 +1523,9 @@ export class OrnithWorktreeTools {
           volumeSerial: openedStats.dev.toString(),
           fileIndex: openedStats.ino.toString()
         };
-        if (onValidationBudget) {
-          raw = await readAtMost(handle, targetSize, bounded);
-          this.validationBytesRead += Math.min(raw.byteLength, targetSize);
-          if (raw.byteLength > targetSize) {
-            return denied('stale_hash', 'The file grew while the deletion was being validated.');
-          }
-        } else {
-          raw = await handle.readFile({ signal: bounded });
+        raw = await readAtMost(handle, targetSize, bounded, this.validationCharge(onValidationBudget));
+        if (raw.byteLength > targetSize) {
+          return denied('stale_hash', 'The file grew while the deletion was being validated.');
         }
       } finally {
         await handle.close();

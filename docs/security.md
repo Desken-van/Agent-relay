@@ -639,7 +639,9 @@ only its remaining figure, and discovery can neither spend nor enlarge it.
 An edit or delete draws on the validation budget only when the `sha256` it
 cites is one Relay itself issued for that exact path in this run (a `read_file`,
 `create_file` or `replace_text` result). A target larger than `maxFileBytes`
-(1 MiB) is refused, edit or delete, before it is read. A hash Relay never
+(1 MiB) is refused, edit or delete, before it is read, with its own code
+(`limit_mutation_target_bytes_exceeded`) — a per-file size bound, reported as
+"no byte budget was exhausted", never as one that ran out. A hash Relay never
 showed earns nothing: that edit still
 draws on the discovery budget exactly as before, so an unread or invented
 target stays denied when discovery is short. The validation reads are bounded —

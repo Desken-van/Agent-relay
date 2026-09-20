@@ -228,15 +228,23 @@ function WarningLine({
   );
 }
 
-/** The two byte budgets a denial can name, each with the safe next step once the run has stopped on it. */
-const ORNITH_BUDGET_DENIALS: Partial<Record<OrnithToolDenialEventData['code'], { readonly exhausted: string; readonly next: string }>> = {
+/**
+ * The limits a byte-related denial can name: the two budgets and the per-file size bound. Each
+ * carries its own label — the size bound is never called an exhausted budget — and the safe
+ * next step once the run has stopped on it.
+ */
+const ORNITH_BUDGET_DENIALS: Partial<Record<OrnithToolDenialEventData['code'], { readonly label: string; readonly next: string }>> = {
   limit_read_bytes_exceeded: {
-    exhausted: 'repository discovery budget exhausted',
+    label: 'repository discovery budget exhausted',
     next: 'retry naming the exact file(s) so Ornith reads them instead of searching'
   },
   limit_mutation_validation_bytes_exceeded: {
-    exhausted: 'internal edit-validation budget exhausted',
+    label: 'internal edit-validation budget exhausted',
     next: 'retry with a smaller change, or split it across smaller files'
+  },
+  limit_mutation_target_bytes_exceeded: {
+    label: 'file above the per-change size limit (no budget exhausted)',
+    next: 'split the change so each edit touches a smaller file, or make it by hand'
   }
 };
 
@@ -260,7 +268,7 @@ function OrnithDenialLine({ data }: { data: OrnithToolDenialEventData }): React.
     <div className="logs__text selectable">
       Ornith action <span className="mono">{data.action}</span> denied (
       <span className="mono">{data.code}</span>)
-      {budget ? ` — ${budget.exhausted}` : ''} · discovery budget {data.readBytesUsed} /{' '}
+      {budget ? ` — ${budget.label}` : ''} · discovery budget {data.readBytesUsed} /{' '}
       {data.readBytesConfigured} bytes
       {hasValidation
         ? ` · edit-validation budget ${data.validationBytesUsed} / ${data.validationBytesConfigured} bytes`

@@ -1910,20 +1910,20 @@ describe('OrnithWorktreeTools mutation validation budget', () => {
     expect(readFileSync(join(worktree, 'big.txt')).byteLength).toBe(MIB);
   });
 
-  it('refuses a target above the per-edit validation bound before reading it, whether or not its hash was shown', async () => {
+  it('refuses a target above the per-change size bound before reading it, whether or not its hash was shown', async () => {
     const raw = write('huge.txt', `${'b'.repeat(ORNITH_LIMITS.maxFileBytes)}omega\n`);
     const boundary = tools();
     const shown = await showHash(boundary, 'huge.txt');
 
     for (const sha256 of [shown, shaOf('never shown')]) {
       const result = await boundary.replaceText(replace('huge.txt', sha256), undefined, NO_DISCOVERY);
-      expect(result).toMatchObject({ ok: false, code: 'limit_mutation_validation_bytes_exceeded' });
+      expect(result).toMatchObject({ ok: false, code: 'limit_mutation_target_bytes_exceeded' });
     }
     expect(boundary.validationReadBytesUsed()).toBe(0);
     expect(readFileSync(join(worktree, 'huge.txt'))).toEqual(raw);
   });
 
-  it('refuses to delete a target above the per-change validation bound before reading it, whatever budget is left', async () => {
+  it('refuses to delete a target above the per-change size bound before reading it, whatever budget is left', async () => {
     const raw = write('huge.txt', `${'b'.repeat(ORNITH_LIMITS.maxFileBytes)}omega\n`);
     const boundary = tools();
     const shown = await showHash(boundary, 'huge.txt');
@@ -1934,7 +1934,7 @@ describe('OrnithWorktreeTools mutation validation budget', () => {
         undefined,
         { readBytes: raw.byteLength * 4, writeBytes: 0 }
       );
-      expect(result).toMatchObject({ ok: false, code: 'limit_mutation_validation_bytes_exceeded' });
+      expect(result).toMatchObject({ ok: false, code: 'limit_mutation_target_bytes_exceeded' });
     }
     expect(existsSync(join(worktree, 'huge.txt'))).toBe(true);
     expect(boundary.validationReadBytesUsed()).toBe(0);

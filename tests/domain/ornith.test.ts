@@ -569,6 +569,8 @@ describe('the two byte budgets: repository discovery vs internal edit validation
     expect(ORNITH_LIMITS.maxCumulativeMutationValidationBytes).toBe(2 * ORNITH_LIMITS.maxCumulativeWriteBytes);
     expect(ORNITH_DENIAL_CODES).toContain('limit_read_bytes_exceeded');
     expect(ORNITH_DENIAL_CODES).toContain('limit_mutation_validation_bytes_exceeded');
+    // The per-file size bound is not a budget and has a code of its own.
+    expect(ORNITH_DENIAL_CODES).toContain('limit_mutation_target_bytes_exceeded');
     // The discovery-exhaustion notice fires while some budget remains, never after it is gone.
     expect(ORNITH_LIMITS.lowDiscoveryBudgetNoticeBytes).toBeGreaterThan(0);
     expect(ORNITH_LIMITS.lowDiscoveryBudgetNoticeBytes).toBeLessThan(ORNITH_LIMITS.maxCumulativeReadBytes);

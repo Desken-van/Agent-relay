@@ -573,6 +573,7 @@ const ORNITH_DENIAL_PUBLISH_BLOCK: Record<OrnithDenialCode, ClaudePublishBlock> 
   limit_result_exceeded: 'configuration',
   limit_read_bytes_exceeded: 'configuration',
   limit_mutation_validation_bytes_exceeded: 'configuration',
+  limit_mutation_target_bytes_exceeded: 'configuration',
   limit_write_bytes_exceeded: 'configuration',
   limit_changed_files_exceeded: 'configuration',
   limit_manifest_files_exceeded: 'configuration',
@@ -611,12 +612,17 @@ interface OrnithBudgetSnapshot {
 }
 
 /**
- * For the two byte-budget denials, says WHICH budget ran out, how much of each was used,
- * whether the worktree was changed, and the safe next step — so a discovery shortfall is
- * never mistaken for an edit-validation one. Bounded, numbers only: no path, no content.
+ * For the byte-budget and target-size denials, says WHICH limit applied, how much of each
+ * budget was used, whether the worktree was changed, and the safe next step — so a discovery
+ * shortfall is never mistaken for an edit-validation one, and a per-file size refusal is
+ * never reported as a budget that ran out. Bounded, numbers only: no path, no content.
  */
 function describeByteBudgetDenial(code: OrnithDenialCode, snapshot: OrnithBudgetSnapshot): string | null {
-  if (code !== 'limit_read_bytes_exceeded' && code !== 'limit_mutation_validation_bytes_exceeded') return null;
+  if (
+    code !== 'limit_read_bytes_exceeded' &&
+    code !== 'limit_mutation_validation_bytes_exceeded' &&
+    code !== 'limit_mutation_target_bytes_exceeded'
+  ) return null;
   const discovery = `${snapshot.discoveryUsed} of ${ORNITH_LIMITS.maxCumulativeReadBytes} repository discovery bytes used`;
   const validation =
     `${snapshot.validationUsed} of ${ORNITH_LIMITS.maxCumulativeMutationValidationBytes} internal edit-validation bytes used`;
@@ -628,6 +634,10 @@ function describeByteBudgetDenial(code: OrnithDenialCode, snapshot: OrnithBudget
   if (code === 'limit_read_bytes_exceeded') {
     return `Budget exhausted: repository DISCOVERY (${discovery}; edit validation is a separate budget, ${validation}). ${changed} ` +
       'Next: retry the task, naming the exact file(s) in the scope so Ornith reads them directly instead of searching the repository.';
+  }
+  if (code === 'limit_mutation_target_bytes_exceeded') {
+    return `No byte budget was exhausted (${discovery}; ${validation}): the file is above the ${ORNITH_LIMITS.maxFileBytes}-byte ` +
+      `limit for one change. ${changed} Next: split the change so each edit touches a smaller file, or make this change by hand.`;
   }
   return `Budget exhausted: internal EDIT VALIDATION (${validation}; repository discovery is a separate budget, ${discovery}). ${changed} ` +
     'Next: retry with a smaller change, or split the work so each edit touches a smaller file.';

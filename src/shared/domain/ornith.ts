@@ -182,6 +182,8 @@ export const ORNITH_DENIAL_CODES = [
   'limit_result_exceeded',
   'limit_read_bytes_exceeded',
   'limit_mutation_validation_bytes_exceeded',
+  /** The target of an edit/delete is larger than `maxFileBytes`: a per-file size bound, not an exhausted budget. */
+  'limit_mutation_target_bytes_exceeded',
   'limit_write_bytes_exceeded',
   'limit_changed_files_exceeded',
   'limit_manifest_files_exceeded',

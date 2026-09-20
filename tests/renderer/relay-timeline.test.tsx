@@ -376,6 +376,46 @@ describe('Relay timeline — Ornith read-budget denial events', () => {
     expect(text).toContain('next: retry with a smaller change');
   });
 
+  it('says no budget was exhausted, and why, when the target is above the per-change size limit', async () => {
+    installBridge({
+      'runs:events': () =>
+        ok<'runs:events'>([
+          {
+            id: 'e1',
+            runId: 'ornith-run',
+            timestamp: '2026-09-10T10:00:01.000Z',
+            type: 'tool_use',
+            payload: JSON.stringify({
+              text: 'Ornith action replace_text denied (limit_mutation_target_bytes_exceeded); the run stopped.',
+              data: {
+                sequence: 5,
+                action: 'replace_text',
+                ok: false,
+                code: 'limit_mutation_target_bytes_exceeded',
+                recoverable: false,
+                readBytesUsed: 1_048_577,
+                readBytesConfigured: 4_194_304,
+                validationBytesUsed: 0,
+                validationBytesConfigured: 8_388_608,
+                changedFiles: 0
+              }
+            })
+          }
+        ])
+    });
+    renderApp(<RelayTimeline runs={[makeRun({ id: 'ornith-run', agent: 'ornith', status: 'failed' })]} />);
+
+    await screen.findByText('tool use');
+    const text = document.querySelector('.logs__text')?.textContent ?? '';
+    expect(text).toContain('limit_mutation_target_bytes_exceeded');
+    expect(text).toContain('file above the per-change size limit (no budget exhausted)');
+    expect(text).not.toContain('budget exhausted ·');
+    expect(text).not.toContain('edit-validation budget exhausted');
+    expect(text).not.toContain('discovery budget exhausted');
+    expect(text).toContain('edit-validation budget 0 / 8388608 bytes');
+    expect(text).toContain('next: split the change');
+  });
+
   it('does not name a budget, or offer a budget next step, for a denial that is not about a budget', async () => {
     installBridge({
       'runs:events': () =>

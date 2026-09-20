@@ -251,7 +251,7 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
     expect(readFileSync(join(fixture.worktree, TARGET), 'utf8')).toBe(outside);
   }, 180_000);
 
-  it('refuses a target larger than the validation bound, before reading it, and names the validation budget', async () => {
+  it('refuses a target above the per-change size bound before reading it, and does not call that an exhausted budget', async () => {
     const fixture = await fixtureFor({ targetBytes: ORNITH_LIMITS.maxFileBytes + 1, companions: false });
     const run = await replay(fixture, {
       windows: 1,
@@ -259,7 +259,7 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
       afterRead: [{ kind: 'replace' }, { kind: 'finish' }]
     });
 
-    expect(run.result.assessment.reasonCodes).toEqual(['limit_mutation_validation_bytes_exceeded']);
+    expect(run.result.assessment.reasonCodes).toEqual(['limit_mutation_target_bytes_exceeded']);
     expect(run.result.assessment.publishBlock).toBe('configuration');
     expect(run.targetAfter).toBe(targetContent(ORNITH_LIMITS.maxFileBytes + 1));
     expect(run.result.ornithAudit).toMatchObject({
@@ -267,12 +267,13 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
       validationReadBytes: 0,
       changedFiles: 0
     });
-    expect(run.result.finalMessage).toContain('Budget exhausted: internal EDIT VALIDATION');
-    expect(run.result.finalMessage).toContain('repository discovery is a separate budget');
+    // Neither budget ran out, and the message says so instead of blaming one of them.
+    expect(run.result.finalMessage).toContain('No byte budget was exhausted');
+    expect(run.result.finalMessage).toContain(`${ORNITH_LIMITS.maxFileBytes}-byte limit for one change`);
     expect(run.result.finalMessage).toContain('No files were changed.');
-    expect(run.result.finalMessage).not.toContain('repository DISCOVERY');
+    expect(run.result.finalMessage).not.toContain('Budget exhausted');
     expect(eventFor(run, 'replace_text', false)).toMatchObject({
-      code: 'limit_mutation_validation_bytes_exceeded',
+      code: 'limit_mutation_target_bytes_exceeded',
       recoverable: false,
       readBytesUsed: ORNITH_LIMITS.maxFileBytes + 1,
       validationBytesUsed: 0,
