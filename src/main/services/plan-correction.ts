@@ -70,6 +70,7 @@ import {
   readBoundRuleEvidence,
   type PlanReviewGateService
 } from './plan-review-gate';
+import { planReviewRecovery } from '../../shared/domain/plan-review';
 import { renderRuleEvidence } from './rule-evidence';
 import { specificationIdentity } from './specification-identity';
 
@@ -171,7 +172,10 @@ function deriveState(deps: PlanCorrectionReadDeps, taskId: string): DerivedState
     identity: planReviewGateIdentity({ task, gate, ruleEvidence: deps.ruleEvidence }),
     correctionForGate,
     used: all.filter((entry) => entry.id !== correctionForGate?.id).length,
-    max
+    max,
+    // Read from the task's own rows, like everything else here: an attempt that cannot
+    // count is replaced, whatever else its status would suggest.
+    recovery: planReviewRecovery(gate, deps.gates.listByTask(taskId))
   });
   return { task, gate, correctionForGate, all, next, max };
 }
@@ -430,6 +434,14 @@ export class PlanCorrectionService {
             return outcome(
               'reconcile_required',
               'A dispatched external call has an unknown outcome. Reconcile it first; nothing was repeated.'
+            );
+
+          case 'recover_review':
+            // Not retried here, whatever the loop was asked to do: a refusal is a fact
+            // about a review identity, and replacing it is an explicit, recorded step.
+            return outcome(
+              'recovery_required',
+              'The latest plan review cannot count: the provider refused it before any round existed, or its session belongs to a different review. Retry the review in a fresh review session; nothing was repeated.'
             );
 
           case 'round_limit':

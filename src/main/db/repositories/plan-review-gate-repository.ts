@@ -13,7 +13,8 @@ const COLUMNS = `id, task_id, specification_sha256, rule_evidence_sha256,
                  contract_fingerprint, contract_mismatch_at, status, verdict,
                  findings_json, decisions_json, reviewers, gating_count, threshold,
                  last_error, reconciled_at, revision, triage_json, triage_for_findings,
-                 auto_decisions_json, created_at, updated_at`;
+                 auto_decisions_json, review_subject, rounds_at_open, failure_kind,
+                 superseded_by, created_at, updated_at`;
 
 interface GateRow {
   id: string;
@@ -38,6 +39,10 @@ interface GateRow {
   triage_json: string | null;
   triage_for_findings: string | null;
   auto_decisions_json: string | null;
+  review_subject: string | null;
+  rounds_at_open: number | null;
+  failure_kind: PlanReviewGate['failureKind'];
+  superseded_by: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -66,6 +71,10 @@ function toGate(row: GateRow): PlanReviewGate {
     triageJson: row.triage_json,
     triageForFindings: row.triage_for_findings,
     autoDecisionsJson: row.auto_decisions_json,
+    reviewSubject: row.review_subject,
+    roundsAtOpen: row.rounds_at_open,
+    failureKind: row.failure_kind,
+    supersededBy: row.superseded_by,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -118,17 +127,57 @@ export class SqlitePlanReviewGateRepository implements PlanReviewGateRepository 
            contract_fingerprint, contract_mismatch_at, status, verdict,
            findings_json, decisions_json, reviewers, gating_count, threshold,
            last_error, reconciled_at, revision, triage_json, triage_for_findings,
-           auto_decisions_json, created_at, updated_at)
+           auto_decisions_json, review_subject, rounds_at_open, failure_kind,
+           superseded_by, created_at, updated_at)
          VALUES (
            @id, @taskId, @specificationSha256, @ruleEvidenceSha256,
            @sessionId, @serverName, @serverVersion,
            @contractFingerprint, @contractMismatchAt, @status, @verdict,
            @findingsJson, @decisionsJson, @reviewers, @gatingCount, @threshold,
            @lastError, @reconciledAt, @revision, @triageJson, @triageForFindings,
-           @autoDecisionsJson, @createdAt, @updatedAt)`
+           @autoDecisionsJson, @reviewSubject, @roundsAtOpen, @failureKind,
+           @supersededBy, @createdAt, @updatedAt)`
       )
       .run({ ...gate, revision: 0, createdAt: now, updatedAt: now });
     return { ...gate, revision: 0, createdAt: now, updatedAt: now };
+  }
+
+  supersede(id: string, next: NewPlanReviewGate, options: { readonly withdrawApproval?: boolean } = {}): PlanReviewGate {
+    let created: PlanReviewGate | null = null;
+    // One transaction: a replacement that exists without the old attempt pointing at
+    // it, or a pointer at a replacement that was never written, would each leave the
+    // task with two gates that both claim to be its current one.
+    const apply = this.db.transaction((): void => {
+      const old = this.db
+        .prepare(`SELECT superseded_by FROM plan_review_gates WHERE id = ?`)
+        .get(id) as { superseded_by: string | null } | undefined;
+      if (!old) throw new AgentRelayError('NOT_FOUND', `No plan review gate with id ${id}.`);
+      if (old.superseded_by !== null) {
+        throw new AgentRelayError('VALIDATION_FAILED', 'This plan-review attempt was already replaced.');
+      }
+      created = this.create(next);
+      const marked = this.db
+        .prepare(
+          `UPDATE plan_review_gates
+              SET superseded_by = @by, revision = revision + 1, updated_at = @now
+            WHERE id = @id AND superseded_by IS NULL`
+        )
+        .run({ by: next.id, now: this.clock.nowIso(), id });
+      if (Number(marked.changes) !== 1) {
+        throw new AgentRelayError('INTERNAL', `Plan review gate ${id} changed while it was being replaced.`);
+      }
+      if (options.withdrawApproval === true) {
+        // Same transaction: the approval and the review it rested on go together or not at all.
+        this.db
+          .prepare(
+            `UPDATE tasks SET specification_approved_at = NULL, updated_at = @now
+              WHERE id = @taskId AND specification_approved_at IS NOT NULL`
+          )
+          .run({ taskId: next.taskId, now: this.clock.nowIso() });
+      }
+    });
+    apply();
+    return created as unknown as PlanReviewGate;
   }
 
   update(id: string, patch: PlanReviewGatePatch): PlanReviewGate {
@@ -194,6 +243,10 @@ export class SqlitePlanReviewGateRepository implements PlanReviewGateRepository 
            triage_json = @triageJson,
            triage_for_findings = @triageForFindings,
            auto_decisions_json = @autoDecisionsJson,
+           review_subject = @reviewSubject,
+           rounds_at_open = @roundsAtOpen,
+           failure_kind = @failureKind,
+           superseded_by = @supersededBy,
            updated_at = @updatedAt
          WHERE id = @id AND revision = @currentRevision`
       )

@@ -192,6 +192,7 @@ describe('run guidance — External Plan Review states', () => {
     ['run_review', 'run_plan_review'],
     ['run_next_review', 'run_plan_review'],
     ['reconcile', 'reconcile_plan_review'],
+    ['recover_review', 'retry_plan_review'],
     ['resolve', 'resolve_plan_review'],
     ['passed', 'approve_specification'],
     ['not_required', 'approve_specification']
@@ -199,6 +200,24 @@ describe('run guidance — External Plan Review states', () => {
     const value = runGuidance(task({ status: 'READY_FOR_IMPLEMENTATION' }), [], true, false, state);
     expect(value.action?.key ?? null).toBe(actionKey);
     expectConsistent(value);
+  });
+
+  it('offers only the fresh-session retry — never implementation, approval or another round — for a plan whose review cannot count', () => {
+    const value = runGuidance(task({ status: 'READY_FOR_IMPLEMENTATION' }), [], true, false, 'recover_review');
+
+    expect(value.action).toEqual({
+      key: 'retry_plan_review',
+      label: 'Retry in a fresh review session',
+      enabled: true,
+      disabledReason: null
+    });
+    expect(value.tone).toBe('error');
+    expect(value.result).toMatch(/no successful review/);
+    expect(value.result).toMatch(/cannot be approved/);
+    expect(value.result).toMatch(/implementation is not available/);
+    expectConsistent(value);
+    // Not "Run implementation", whatever the internal status is called.
+    expect(JSON.stringify(value)).not.toMatch(/Run implementation/);
   });
 
   it('uses the same "Run external plan review" label for a first round and a next round', () => {
@@ -432,6 +451,7 @@ describe('run guidance — every action label is one of the fixed set', () => {
     'Prepare isolated review branch',
     'Run external plan review',
     'Reconcile external state',
+    'Retry in a fresh review session',
     'Resolve external plan review',
     'Approve specification',
     'Run implementation · Claude',
@@ -451,7 +471,7 @@ describe('run guidance — every action label is one of the fixed set', () => {
   ] as const;
   const PLAN_STATES = [
     'not_required', 'loading', 'capture_rules', 'ready', 'prepare_review', 'run_review',
-    'run_next_review', 'reconcile', 'resolve', 'passed', 'working', 'unavailable'
+    'run_next_review', 'reconcile', 'recover_review', 'resolve', 'passed', 'working', 'unavailable'
   ] as const;
 
   it('every combination either has no action or one of the fixed labels', () => {

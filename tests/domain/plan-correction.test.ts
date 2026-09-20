@@ -24,6 +24,59 @@ const step = (
     max: extra.max ?? 3
   });
 
+describe('planCorrectionNextStep: an attempt that cannot count is replaced first', () => {
+  const withRecovery = (
+    status: PlanReviewGate['status'],
+    recovery: 'refused_before_dispatch' | 'foreign_session' | null
+  ) =>
+    planCorrectionNextStep({
+      gate: { status, decisionsJson: null },
+      identity: 'current',
+      correctionForGate: null,
+      used: 0,
+      max: 3,
+      recovery
+    });
+
+  it.each(['prepared', 'opening', 'reviewing', 'failed', 'proceeded', 'changes_requested'] as const)(
+    'is recover_review for a %s gate that cannot count, ahead of reconcile and of every reading of the status',
+    (status) => {
+      expect(withRecovery(status, 'foreign_session')).toBe('recover_review');
+      expect(withRecovery(status, 'refused_before_dispatch')).toBe('recover_review');
+    }
+  );
+
+  it('is not recovery for a gate of an EARLIER specification: the retry would be refused, so the ordinary path applies', () => {
+    const obsolete = (
+      status: PlanReviewGate['status'],
+      correction: 'completed' | null
+    ) =>
+      planCorrectionNextStep({
+        gate: { status, decisionsJson: null },
+        identity: 'obsolete',
+        correctionForGate: correction === null ? null : { status: correction },
+        used: 0,
+        max: 3,
+        recovery: 'foreign_session'
+      });
+
+    // Never reconciled either: what the provider says about that session is about another review.
+    expect(obsolete('reviewing', null)).toBe('none');
+    expect(obsolete('opening', null)).toBe('none');
+    expect(obsolete('reviewing', 'completed')).toBe('run_review');
+    // Unknown identity is still not judged.
+    expect(
+      planCorrectionNextStep({ gate: { status: 'reviewing', decisionsJson: null }, identity: 'unknown', correctionForGate: null, used: 0, max: 3, recovery: 'foreign_session' })
+    ).toBe('none');
+  });
+
+  it('changes nothing for a gate with no recovery, so a stuck call is still reconciled and a prepared gate still reviewed', () => {
+    expect(withRecovery('reviewing', null)).toBe('reconcile');
+    expect(withRecovery('prepared', null)).toBe('run_review');
+    expect(withRecovery('proceeded', null)).toBe('clean');
+  });
+});
+
 describe('planCorrectionNextStep: derived from durable state only', () => {
   it('has nothing to do without a gate, or when the identity cannot be judged', () => {
     expect(planCorrectionNextStep({ gate: null, identity: 'no_gate', correctionForGate: null, used: 0, max: 3 })).toBe('none');

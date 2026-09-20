@@ -2,6 +2,7 @@
 import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PrimaryActionButton, publishRecoveryFor, RunFlowOverview } from '../../src/renderer/src/components/RunView';
+import { StatusBadge } from '../../src/renderer/src/components/primitives';
 import { runGuidance, type RunActionKey, type RunGuidance } from '../../src/shared/domain/run-guidance';
 import { taskSchema } from '../../src/shared/domain/models';
 import { burstClick } from './harness';
@@ -14,6 +15,7 @@ const ACTIONS: readonly [RunActionKey, string][] = [
   ['prepare_plan_review', 'Prepare isolated review branch'],
   ['run_plan_review', 'Run external plan review'],
   ['reconcile_plan_review', 'Reconcile external state'],
+  ['retry_plan_review', 'Retry in a fresh review session'],
   ['resolve_plan_review', 'Resolve external plan review'],
   ['approve_specification', 'Approve specification'],
   ['run_implementation', 'Run implementation · Claude'],
@@ -84,5 +86,29 @@ describe('the single workflow primary control', () => {
     expect(projected.action).toBeNull();
     expect(screen.getByText(/Use the Publishing panel/)).toBeTruthy();
     expect(container.querySelector('button.btn--recommended')).toBeNull();
+  });
+});
+
+describe('the scope marker of the recovery action', () => {
+  it('is local: it writes a Git object and database rows and reaches no provider', () => {
+    const projected = guidance('retry_plan_review', 'Retry in a fresh review session');
+    const { container } = render(<PrimaryActionButton action={projected.action!} pending={false} blocked={false} onClick={() => undefined} />);
+
+    expect(container.querySelector('.btn__scope--local')).not.toBeNull();
+    expect(container.querySelector('.btn__scope--read')).toBeNull();
+  });
+});
+
+describe('what the task badge says while the specification has no approval', () => {
+  it('does not call an unapproved specification ready for implementation — nowhere the badge is shown', () => {
+    const { container, rerender } = render(<StatusBadge status="READY_FOR_IMPLEMENTATION" specificationApprovedAt={null} />);
+    expect(container.textContent).toBe('Specification awaiting approval');
+
+    rerender(<StatusBadge status="READY_FOR_IMPLEMENTATION" specificationApprovedAt="2026-09-20T00:00:00.000Z" />);
+    expect(container.textContent).toBe('Ready for implementation');
+
+    // Every other status reads as it always did, approved or not.
+    rerender(<StatusBadge status="IMPLEMENTING" specificationApprovedAt={null} />);
+    expect(container.textContent).toBe('Implementing');
   });
 });

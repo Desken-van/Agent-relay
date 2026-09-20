@@ -1155,6 +1155,34 @@ export const MIGRATIONS: readonly Migration[] = [
         END;
       `);
     }
+  },
+  {
+    version: 20,
+    name: 'plan-review-isolated-subjects',
+    up(db) {
+      // A gate now records WHICH review identity it was run under, and what proves
+      // its evidence is its own. Four nullable additions, no new CHECK and no rebuild:
+      // every existing row reads back exactly as it was, with the four columns NULL.
+      //
+      // - review_subject: the ref handed to the provider as the review's identity (the
+      //   provider keys a session by repository + ref, and `open` is idempotent, so a
+      //   second gate on the same ref gets the FIRST gate's session back). NULL means
+      //   the task's own branch, which is what every gate used before this column.
+      // - rounds_at_open: how many plan rounds the provider's session already held
+      //   when this dispatch opened it, so a later read-back can tell a round this
+      //   dispatch produced from one that was already there. NULL when unknown.
+      // - failure_kind: why this gate's review cannot count, when the answer is known
+      //   (a refusal before anything was dispatched; evidence that belongs to another
+      //   gate's session). NULL for every gate that has no such problem.
+      // - superseded_by: the gate that replaced this attempt. The failed attempt and
+      //   its error text stay exactly as they were; only this pointer is added.
+      db.exec(`
+        ALTER TABLE plan_review_gates ADD COLUMN review_subject TEXT;
+        ALTER TABLE plan_review_gates ADD COLUMN rounds_at_open INTEGER;
+        ALTER TABLE plan_review_gates ADD COLUMN failure_kind TEXT;
+        ALTER TABLE plan_review_gates ADD COLUMN superseded_by TEXT;
+      `);
+    }
   }
 ];
 

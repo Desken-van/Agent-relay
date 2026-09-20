@@ -16,6 +16,7 @@ import {
   snapshot
 } from '../helpers/fake-plan-reviewer';
 import { createHarness, type Harness } from '../helpers/harness';
+import { FakePlanReviewSubjects } from '../helpers/fake-plan-review-subjects';
 
 /**
  * Resolve the round the gate is actually showing.
@@ -56,6 +57,7 @@ function setup() {
   const claims = new PlanReviewClaims();
   const build = (): PlanReviewGateService =>
     new PlanReviewGateService({
+      subjects: new FakePlanReviewSubjects(),
       tasks: harness.tasks,
       projects: harness.projects,
       ruleEvidence: harness.taskRuleEvidence,
@@ -79,6 +81,7 @@ function setup() {
    */
   const unguarded = (): PlanReviewGateService =>
     new PlanReviewGateService({
+      subjects: new FakePlanReviewSubjects(),
       tasks: harness.tasks,
       projects: harness.projects,
       ruleEvidence: harness.taskRuleEvidence,
@@ -1796,6 +1799,7 @@ describe('durable external plan review gate', () => {
       const value = setup();
       const { task, gate } = await awaitingTwoFindings(value);
       const unconfigured = new PlanReviewGateService({
+        subjects: new FakePlanReviewSubjects(),
         tasks: value.harness.tasks,
         projects: value.harness.projects,
         ruleEvidence: value.harness.taskRuleEvidence,

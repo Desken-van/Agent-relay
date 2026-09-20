@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { CoaiPlanReviewer, COAI_TOOL_ALLOWLIST } from '../../src/main/adapters/mcp/coai-plan-reviewer';
 import { COAI_PLAN_REVIEW_TOOLS } from '../../src/main/adapters/mcp/coai-profiles';
+import { AgentRelayError, PlanReviewNotDispatchedError } from '../../src/shared/domain/errors';
 import type {
   ExternalMcpCallResult,
   ExternalMcpClient,
@@ -348,5 +349,149 @@ describe('Coai plan reviewer adapter', () => {
           allowedTools: [...COAI_PLAN_REVIEW_TOOLS.slice(0, 3), 'open']
         })
     ).toThrow(/exactly its four tools/i);
+  });
+});
+
+describe('Coai plan reviewer adapter: proving a session fresh and telling a refusal from a lost answer', () => {
+  const subject = { repositoryPath: 'C:\repo', branch: 'a'.repeat(40) };
+  const session = (overrides: Record<string, unknown> = {}) => ({
+    sessionId: 'abc123',
+    stage: 'PlanReview',
+    awaitingResolve: false,
+    planProceeded: false,
+    ...overrides
+  });
+
+  it('reports what the opened session already holds, counting only plan rounds by state', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('open', session({
+        rounds: [
+          { stage: 'PlanReview', status: 'done' },
+          { stage: 'PlanReview', status: 'running' },
+          { stage: 'PlanReview', status: 'interrupted' },
+          { stage: 'CodeReview', status: 'done' }
+        ]
+      }))
+    );
+
+    const opened = await new CoaiPlanReviewer(client, config).open(subject);
+
+    expect(opened.planRounds).toEqual({ total: 3, running: 1, done: 1, interrupted: 1 });
+  });
+
+  it('reports an empty session as empty — and a session that did not say as NOT KNOWN, never as none', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('open', session({ rounds: [] })), result('open', session()));
+    const reviewer = new CoaiPlanReviewer(client, config);
+
+    expect((await reviewer.open(subject)).planRounds).toEqual({ total: 0, running: 0, done: 0, interrupted: 0 });
+    expect((await reviewer.open(subject)).planRounds).toBeNull();
+  });
+
+  it('opens with the subject it was given — a commit id is as good as a branch name — and nothing else', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('open', session({ rounds: [] })));
+
+    await new CoaiPlanReviewer(client, config).open(subject);
+
+    expect(client.calls).toEqual([{ tool: 'open', args: { repoPath: 'C:\repo', branch: subject.branch } }]);
+  });
+
+  it.each([
+    ['the plan stage is over for this session (stage: CodeReview); open a new session for a new plan', 'plan_stage_over'],
+    ['no session for this repo+branch — call open first', 'no_session']
+  ] as const)('types the provider’s documented refusal "%s" as one that came before any round', async (words, reason) => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('review_plan', { error: words }));
+
+    const failure = await new CoaiPlanReviewer(client, config).reviewPlan(subject, 'plan').catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PlanReviewNotDispatchedError);
+    expect(failure).toMatchObject({ reason, code: 'TOOL_FAILED' });
+    // The provider's own sentence is what a person is shown.
+    expect((failure as Error).message).toContain(words);
+  });
+
+  it.each([
+    ['a refusal in words this build has not audited', result('review_plan', { error: 'reviewer budget exhausted' })],
+    ['an MCP tool error', result('review_plan', {}, { isError: true })],
+    ['malformed text', result('review_plan', {}, { content: ['not json'] })]
+  ])('leaves %s as an ordinary failure, because it is not proof that nothing ran', async (_name, response) => {
+    const client = new FakeMcpClient();
+    client.responses.push(response);
+
+    const failure = await new CoaiPlanReviewer(client, config).reviewPlan(subject, 'plan').catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AgentRelayError);
+    expect(failure).not.toBeInstanceOf(PlanReviewNotDispatchedError);
+  });
+
+  it('does not type a transport failure or a timeout, which reach the caller exactly as they were thrown', async () => {
+    const timeout = new AgentRelayError('TIMEOUT', 'The Coai call timed out.');
+    const client = new FakeMcpClient();
+    client.call = async () => {
+      throw timeout;
+    };
+
+    const failure = await new CoaiPlanReviewer(client, config).reviewPlan(subject, 'plan').catch((error: unknown) => error);
+
+    expect(failure).toBe(timeout);
+    expect(failure).not.toBeInstanceOf(PlanReviewNotDispatchedError);
+  });
+
+  it('types a subject the provider cannot resolve — a pruned commit — as a refusal before anything existed', async () => {
+    const client = new FakeMcpClient();
+    const words = `git rev-parse: cannot resolve '${subject.branch}': fatal: Needed a single revision`;
+    client.responses.push(result('open', { error: words }), result('review_plan', { error: words }));
+    const reviewer = new CoaiPlanReviewer(client, config);
+
+    const opened = await reviewer.open(subject).catch((error: unknown) => error);
+    const reviewed = await reviewer.reviewPlan(subject, 'plan').catch((error: unknown) => error);
+
+    for (const failure of [opened, reviewed]) {
+      expect(failure).toBeInstanceOf(PlanReviewNotDispatchedError);
+      expect(failure).toMatchObject({ reason: 'unresolvable_subject', code: 'TOOL_FAILED' });
+      expect((failure as Error).message).toContain(words);
+    }
+  });
+
+  it('does not type other refusals of open — only the documented unresolvable-ref sentence', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(
+      result('open', { error: 'no session budget' }),
+      result('open', { error: 'git rev-parse: something else entirely' }),
+      result('open', {}, { isError: true })
+    );
+    const reviewer = new CoaiPlanReviewer(client, config);
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const failure = await reviewer.open(subject).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(AgentRelayError);
+      expect(failure).not.toBeInstanceOf(PlanReviewNotDispatchedError);
+    }
+  });
+
+  it('reads a long round history in full rather than failing on it', async () => {
+    const client = new FakeMcpClient();
+    const rounds = Array.from({ length: 200 }, (_, index) => ({
+      stage: index % 2 === 0 ? 'PlanReview' : 'CodeReview',
+      status: 'done'
+    }));
+    client.responses.push(result('open', session({ rounds })), result('status', { sessionId: 'abc123', stage: 'CodeReview', awaitingResolve: false, planProceeded: true, rounds }));
+    const reviewer = new CoaiPlanReviewer(client, config);
+
+    expect((await reviewer.open(subject)).planRounds).toEqual({ total: 100, running: 0, done: 100, interrupted: 0 });
+    expect((await reviewer.status(subject)).planRounds).toEqual({ total: 100, running: 0, done: 100, interrupted: 0 });
+  });
+
+  it('types the refusal only for review_plan: the same words from any other tool stay ordinary', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('resolve', { error: 'the plan stage is over for this session (stage: CodeReview); open a new session for a new plan' }));
+
+    const failure = await new CoaiPlanReviewer(client, config).resolve(subject, []).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AgentRelayError);
+    expect(failure).not.toBeInstanceOf(PlanReviewNotDispatchedError);
   });
 });

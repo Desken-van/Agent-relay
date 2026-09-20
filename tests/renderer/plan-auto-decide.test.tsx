@@ -88,6 +88,10 @@ function awaiting(count: number, overrides: Partial<PlanReviewDetail> = {}): Pla
       triageJson: null,
       triageForFindings: null,
       autoDecisionsJson: null,
+      reviewSubject: null,
+      roundsAtOpen: null,
+      failureKind: null,
+      supersededBy: null,
       createdAt: NOW,
       updatedAt: NOW
     },
@@ -106,6 +110,7 @@ function awaiting(count: number, overrides: Partial<PlanReviewDetail> = {}): Pla
     autoDecisions: [],
     analyzing: [],
     correction: NO_CORRECTION,
+    recovery: null,
     ...overrides
   };
 }

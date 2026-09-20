@@ -87,6 +87,7 @@ import { PublishService } from './services/publish-service';
 import { TaskService } from './services/task-service';
 import { SqliteCodeReviewRepository } from './db/repositories/code-review-repository';
 import { GitCodeSnapshotSource } from './adapters/git/git-code-snapshot';
+import { GitPlanReviewSubjectFactory } from './adapters/git/git-plan-review-subject';
 import { CodeReviewClaims, CodeReviewService } from './services/code-review';
 import { SettingsBoundCodeReviewer } from './services/code-review-provider';
 import { PlanReviewClaims } from './services/plan-review-claims';
@@ -550,6 +551,9 @@ export function buildApplication(options: BuildApplicationOptions): Application 
       gates: planReviewGates,
       claims: planReviewClaims,
       operations: taskOperations,
+      // A gate after a task's first is reviewed under a ref of its own, not the task's
+      // branch: the provider hands back the first review's finished session for that.
+      subjects: new GitPlanReviewSubjectFactory(runner),
       reviewer: new CoaiPlanReviewer(
         new StdioMcpClient(
           runner instanceof ExecaProcessRunner ? runner : new ExecaProcessRunner()

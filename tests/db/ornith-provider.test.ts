@@ -230,7 +230,7 @@ describe('migration 12 (ornith-provider)', () => {
       continuations: (db.prepare('SELECT COUNT(*) AS n FROM task_continuations').get() as { n: number }).n
     };
 
-    expect(runMigrations(db)).toBe(5);
+    expect(runMigrations(db)).toBe(6);
     db.pragma('foreign_keys = ON');
 
     expect((db.prepare('SELECT COUNT(*) AS n FROM tasks').get() as { n: number }).n).toBe(before.tasks);
@@ -268,7 +268,8 @@ describe('migration 12 (ornith-provider)', () => {
       { version: 16, name: 'coai-contract-fingerprint' },
       { version: 17, name: 'plan-review-triage' },
       { version: 18, name: 'code-review-triage' },
-      { version: 19, name: 'plan-auto-decisions-and-corrections' }
+      { version: 19, name: 'plan-auto-decisions-and-corrections' },
+      { version: 20, name: 'plan-review-isolated-subjects' }
     ]);
   });
 

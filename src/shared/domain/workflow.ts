@@ -301,6 +301,27 @@ export function assertPublishable(
   }
 }
 
+/**
+ * What a person is told the task's status is.
+ *
+ * `READY_FOR_IMPLEMENTATION` is the internal state of a task whose specification exists
+ * and whose implementation has not started; it says nothing about whether the
+ * specification may be implemented. Implementation needs an APPROVED specification, so for
+ * an unapproved one the honest words are "awaiting approval" — a corrected plan whose review
+ * failed must never read as ready to run. The internal status is unchanged and remains what
+ * the state machine and every backend check read; only the label is derived.
+ */
+export function statusLabel(task: {
+  readonly status: TaskStatus;
+  /** Required, not optional: a caller that leaves it out could not tell an unapproved plan from an approved one. */
+  readonly specificationApprovedAt: string | null;
+}): string {
+  if (task.status === 'READY_FOR_IMPLEMENTATION' && task.specificationApprovedAt === null) {
+    return 'Specification awaiting approval';
+  }
+  return STATUS_LABELS[task.status];
+}
+
 /** Human-readable label used in the UI timeline. */
 export const STATUS_LABELS: Record<TaskStatus, string> = {
   VERIFYING: 'Verifying existing code',

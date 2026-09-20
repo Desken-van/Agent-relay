@@ -632,6 +632,77 @@ any decision set containing an accept, so the only way to settle such a round is
 loop that revises the plan.
 `Resolve review` (no revision) is available only when nothing was accepted.
 
+**Review identity.** Coai keys a session by (repository, ref) and `open` is idempotent: the same
+pair returns the same session however far it has advanced, and there is no "new session"
+parameter (the tool schemas are `open`, `status`, `review_plan`, `resolve`, plus the ones this
+build does not call). Every gate of a task used the task's branch, so once the first review was
+resolved — the session then stands at CodeReview — the loop's review of the revised
+specification was handed that finished session and `review_plan` was refused ("the plan stage is
+over for this session"), and reconciling that gate read the finished session back and settled the
+corrected plan as `proceeded`. A gate now records the ref it was reviewed under
+(`plan_review_gates.review_subject`, additive, migration 20). A task's first gate keeps the task's
+branch; every later gate is given a ref of its own by `PlanReviewSubjectFactory`
+(`GitPlanReviewSubjectFactory`): one commit object — the task branch head's tree, that head as its
+parent, a message naming the gate and the specification — that no branch, tag or other ref reaches.
+The provider resolves the ref with `git rev-parse` and documents a commit id as a valid ref, so the
+id is a fresh identity. Nothing is checked out, staged, created as a ref or pushed, and the task
+branch, its worktree and the user's checkout are never written; the only Git commands are
+`rev-parse` and `commit-tree` (signing forced off, fixed author and timestamps).
+- Lifecycle: the commit is fixed by its inputs, and no two gates can share one (the gate id is in
+  the message). For a gate whose row already exists (the loop's review of a revised specification) a
+  crash between making it and recording its id names the same object on retry; a recovery retry is a
+  new gate with a new id, so an interrupted one leaves one more unreferenced object that nothing points
+  at. The id is the gate's `review_subject`, used by every provider call for that gate — `open`,
+  `review_plan`, `status`, `resolve`. There is nothing to delete: an unreachable object is removed
+  by Git's own `gc` after `gc.pruneExpire` (two weeks by default) and Agent Relay creates no ref that
+  would keep it (a ref would show in `git branch`/`for-each-ref` and be pushed by a mirror push).
+  After that, on the real server, `status` still answers for a session already opened under the pruned
+  id (it looks the session up by key), so a dispatched gate remains reconcilable; a new `open` is
+  refused with `git rev-parse: cannot resolve '<id>' ...`. The adapter types exactly that refusal as a
+  known non-dispatch (`unresolvable_subject`), so an undispatched gate is marked spent and offered
+  the fresh-session retry instead of looping through reconcile.
+- `open` proves nothing by returning, so before the non-idempotent `review_plan` the service checks
+  the session it got: it is not another gate's, it is the one this gate recorded, it is at PlanReview
+  and not awaiting a resolution, and — for a first dispatch — it is provably empty (the adapter reports
+  the rounds `open` returned; a provider that does not say proves nothing, and nothing is not read as
+  "none"). Otherwise nothing is sent: the gate goes back to `prepared`, marked `failure_kind` (the
+  session it was handed is NOT recorded as its own), and the loop stops with `recovery_required`.
+- Each dispatch records how many plan rounds its session already held (`rounds_at_open`). A read-back
+  attributes a round to the dispatch only if the count went up; a previous round "returned by status"
+  settles nothing.
+- Rows written before migration 20 (the four columns are NULL): a NULL `review_subject` means the
+  task's own branch — the identity every earlier gate was dispatched under — so an in-flight legacy
+  gate is read back against the session its round actually lives in; a NULL `rounds_at_open` means
+  no baseline check (the earlier behaviour); and session ownership is structural (the first gate to
+  record a session owns it), so a legacy gate that shares a session with an earlier gate is foreign
+  and is recovered without any provider call. Nothing is backfilled or rewritten by the migration.
+- Reconciliation reads only evidence that is the gate's. A gate whose recorded session belongs to an
+  earlier gate (the first to record a session owns it) is not read against the provider at all: it is
+  marked `foreign_session` and left as it was. A gate still at `opening` sent no round, so rounds found
+  in its session are foreign. A gate with a session of its own that is answered for another one keeps
+  its unknown outcome (a mismatch) and is not replaced over it. The same rule stops approval:
+  `assertPlanReviewAllowsApproval` — used by approve, implement, verify and a continuation — refuses a
+  `proceeded` gate that was settled by reading another review's session.
+- Failures are not equal. A provider refusal in words the adapter has audited as coming before any round
+  (`plan stage is over`, `no session`) and a session found unfit are known non-dispatches
+  (`PlanReviewNotDispatchedError`; safe to replace under a fresh identity). A timeout, a lost
+  connection or a refusal in other words is an unknown outcome: never classified, never repeated, never
+  replaced — only a read-back may settle it. The loop never retries by itself in either case.
+- Recovery. A gate that cannot count (`planReviewRecovery`, derived from the task's own rows) is shown as
+  such, the loop's next step is `recover_review`, and the one action is "Retry in a fresh review session"
+  (`planReview:retryFreshSession`, which replaces and nothing else; the replacement is an ordinary current
+  `prepared` gate, so reviewing it is the usual separate "Run external plan review" — these calls are never
+  chained): `retryInFreshSession` makes a review identity, then in ONE transaction
+  writes a new gate for the SAME specification and rule evidence and marks the old attempt
+  `superseded_by` it (its status, session and error text untouched), withdraws an approval that rested
+  on the discarded evidence, and sends nothing to the provider; the review is a separate, explicit call.
+  It refuses an attempt whose call has an unknown outcome on a session of its own, and one whose
+  specification has since changed. It never starts implementation.
+- Implementation stays impossible while the specification is unapproved or its review cannot count: the
+  approval check runs in the backend entry points themselves, not in the renderer. The status badge says
+  "Specification awaiting approval" for an unapproved `READY_FOR_IMPLEMENTATION` task (the internal
+  status is unchanged), and no screen offers "Run implementation" until an approved, reviewed plan exists.
+
 **Stopping.** The task stays `READY_FOR_IMPLEMENTATION` while the loop runs, so `Stop task`
 (`workflow:stop` → `Orchestrator.stop()`) has to reach it, and `Orchestrator.stop()` used
 to know only its own agent runs. `TaskOperationRegistry` is the process-wide register of

@@ -63,6 +63,53 @@ export class AgentRelayError extends Error {
   }
 }
 
+/**
+ * Why a plan round was not sent or was refused before it existed — a KNOWN reason, never
+ * an inference from a failure.
+ *
+ * Raised by the provider adapter, from the provider's own documented refusals:
+ * - `plan_stage_over`: the session it was asked to review in has already moved past the
+ *   plan stage, so it can run no further plan round.
+ * - `no_session`: the provider holds no session for the repository and ref it was asked
+ *   about, so nothing could have run.
+ * - `unresolvable_subject`: the provider could not resolve the ref it was given (`git
+ *   rev-parse` refused it) — a subject Git has since pruned, or a branch that is gone. It is
+ *   refused before any session or round is created, so nothing ran.
+ *
+ * Raised by the gate service, from what `open` returned, BEFORE any round was sent:
+ * - `session_foreign`: the session was already used by another plan review of the task.
+ * - `session_not_fresh`: the session holds plan rounds, is awaiting a resolution, or could
+ *   not be proven empty.
+ * - `session_changed`: the session is not the one this review recorded.
+ */
+export type PlanReviewRefusalReason =
+  | 'plan_stage_over'
+  | 'no_session'
+  | 'unresolvable_subject'
+  | 'session_foreign'
+  | 'session_not_fresh'
+  | 'session_changed';
+
+/**
+ * The provider positively refused `review_plan` BEFORE creating a round.
+ *
+ * Recognised by type, never by parsing a message downstream: only the adapter, which
+ * sees the provider's own words, may say a refusal is one of the documented ones. Every
+ * other failure of the call — a timeout, a lost connection, a refusal in words this build
+ * has not audited — stays an unknown outcome, because a request that reached the provider
+ * and lost its answer looks exactly like one it never accepted. Its code is the ordinary
+ * `TOOL_FAILED`, so a caller that does not care keeps the behaviour it always had.
+ */
+export class PlanReviewNotDispatchedError extends AgentRelayError {
+  readonly reason: PlanReviewRefusalReason;
+
+  constructor(reason: PlanReviewRefusalReason, message: string, options?: { remediation?: string }) {
+    super('TOOL_FAILED', message, options);
+    this.name = 'PlanReviewNotDispatchedError';
+    this.reason = reason;
+  }
+}
+
 /** Thrown by the domain layer when a workflow transition is not permitted. */
 export class InvalidTransitionError extends AgentRelayError {
   constructor(from: string, event: string, to?: string) {

@@ -8,6 +8,7 @@ const PLAN_REVIEW_CHANNELS = [
   'planReview:review',
   'planReview:resolve',
   'planReview:reconcile',
+  'planReview:retryFreshSession',
   'planReview:triage',
   'planReview:autoDecide',
   'planReview:resolveAndRevise',
@@ -57,7 +58,7 @@ describe('the external plan-review IPC contract', () => {
     expect(schema.safeParse({}).success).toBe(false);
   });
 
-  it('registers exactly the ten bounded operations', () => {
+  it('registers exactly the eleven bounded operations', () => {
     expect(IPC_CHANNELS.filter((channel) => channel.startsWith('planReview:')).sort()).toEqual(
       [...PLAN_REVIEW_CHANNELS].sort()
     );

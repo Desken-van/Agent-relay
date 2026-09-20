@@ -23,6 +23,7 @@ import {
   type PlanReviewAutoDecision,
   type PlanReviewGate,
   type PlanReviewGateIdentity,
+  type PlanReviewRecoveryReason,
   type PlanReviewTriageRecommendation
 } from './plan-review';
 
@@ -183,6 +184,9 @@ export type PlanCorrectionLoopPhase = (typeof PLAN_CORRECTION_LOOP_PHASES)[numbe
  * - `reconcile`       a dispatched external call has an unknown outcome; read it back first.
  * - `revise`          accepted findings exist on a settled round and the specification is unchanged:
  *                     Codex must revise it before anything else happens.
+ * - `recover_review`  the latest review attempt cannot count — the provider refused it before a round
+ *                     existed, or its session belongs to another review — so it must be replaced under a
+ *                     fresh review identity before anything else can happen.
  * - `run_review`      the specification changed (or a gate is only prepared): review it.
  * - `run_next_review` a settled `changes_requested` round with nothing accepted: review again.
  * - `round_limit`     `revise` is needed but the configured correction budget is spent.
@@ -193,6 +197,7 @@ export const PLAN_CORRECTION_NEXT_STEPS = [
   'decide',
   'reconcile',
   'revise',
+  'recover_review',
   'run_review',
   'run_next_review',
   'round_limit',
@@ -228,10 +233,25 @@ export function planCorrectionNextStep(input: {
    */
   readonly used: number;
   readonly max: number;
+  /**
+   * Why the latest attempt cannot count, from `planReviewRecovery`. Ahead of everything
+   * that reads the gate's own status: a gate stuck in `reviewing` on a session that
+   * belongs to another review would otherwise be sent to `reconcile`, which can only
+   * read that other review back.
+   *
+   * It is a next step only while the gate describes the CURRENT specification. For a gate
+   * of an earlier one (`obsolete`) the retry would be refused — it never replaces a review
+   * for a specification that has moved — so such a gate is treated as settled and the
+   * ordinary path (prepare and review the current specification) applies; it is also never
+   * reconciled, because what the provider says about its session is about another review.
+   */
+  readonly recovery?: PlanReviewRecoveryReason | null;
 }): PlanCorrectionNextStep {
   const { gate } = input;
   if (gate === null) return 'none';
-  if (RECONCILE_STATUSES.includes(gate.status)) return 'reconcile';
+  const cannotCount = input.recovery !== undefined && input.recovery !== null;
+  if (cannotCount && input.identity === 'current') return 'recover_review';
+  if (!cannotCount && RECONCILE_STATUSES.includes(gate.status)) return 'reconcile';
   if (gate.status === 'awaiting_resolve') return 'decide';
 
   if (input.identity === 'unknown' || input.identity === 'no_gate') return 'none';
@@ -283,6 +303,7 @@ export type PlanAutoDecideOutcome =
  * - `verdict_needs_human` the provider's own verdict asks for a person.
  * - `contract_drift`      the Coai contract changed between rounds.
  * - `reconcile_required`  a dispatched external call has an unknown outcome.
+ * - `recovery_required`   the latest review attempt cannot count and must be retried in a fresh session.
  * - `round_limit`         accepted findings remain but the correction budget is spent.
  * - `none`                nothing for this workflow to do.
  */
@@ -294,6 +315,7 @@ export const PLAN_ADVANCE_STOPS = [
   'verdict_needs_human',
   'contract_drift',
   'reconcile_required',
+  'recovery_required',
   'round_limit',
   'none'
 ] as const;
