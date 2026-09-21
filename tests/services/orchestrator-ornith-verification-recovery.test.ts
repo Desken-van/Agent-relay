@@ -294,6 +294,21 @@ describe('an Ornith round that changed files and hit its time limit during verif
     expect(verification.calls).toBe(2);
   });
 
+  it('classifies a manual verification exactly as the Ornith loop would: a command that timed out AND was killed is timed out, not cancelled', async () => {
+    // The process layer reports both flags when its own timeout terminates the tree. One shared classifier
+    // decides, so the persisted outcome cannot depend on who started the command.
+    const { harness: h, task } = await taskAfterOrnithRound({
+      ornith: fakeOrnith(async () => deadlineAfterEditsResult()),
+      verification: scriptedVerification([{ exitCode: null, failed: true, timedOut: true, cancelled: true, durationMs: 1_800_000 }])
+    });
+
+    const after = await h.orchestrator.runVerification(task.id);
+
+    const record = readVerification(h.runs.listByTask(task.id).at(-1)!);
+    expect(record.success && record.data).toMatchObject({ passed: false, exitCode: null, outcome: 'timed_out' });
+    expect(after.lastError).toBe('Verification timed out; success was not established.');
+  });
+
   it('a timed-out manual verification is recorded as timed out (no exit code) and leaves Run verification as the action', async () => {
     const { harness: h, task } = await taskAfterOrnithRound({
       ornith: fakeOrnith(async () => deadlineAfterEditsResult()),

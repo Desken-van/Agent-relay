@@ -132,6 +132,20 @@ describe('after Ornith changed files and could not prove them verified', () => {
     expect(value.verification?.outcome).toBe('cancelled');
   });
 
+  it('does not say verification "has not run" when Ornith’s own check PASSED — it says the other half: Relay has not verified yet', () => {
+    // The round ended for another reason after a passing diagnostic run. The attempt panel beneath the headline
+    // shows that pass, so the headline must not contradict it — nor treat a diagnostic pass as publishable.
+    const value = guidance(
+      task(),
+      [ornithRun({ changedFiles: 1, worktreeChangedFiles: 1, reasonCodes: ['blocked'], attempts: [attempt({ outcome: 'passed', exitCode: 0, reason: null, summary: '' })] })]
+    );
+
+    expect(value.happened).toBe("Implementation changed 1 file; Ornith's own verification passed, but Agent Relay has not verified the files yet.");
+    expect(value.happened).not.toContain('has not run');
+    expect(value.verification).toMatchObject({ source: 'ornith', outcome: 'passed', exitCode: 0 });
+    expect(value.action?.key).toBe('run_verification'); // only Relay's own verification makes the files reviewable
+  });
+
   it('says a verification was never started when the loop refused it, and does not invent a result', () => {
     const value = guidance(
       task(),

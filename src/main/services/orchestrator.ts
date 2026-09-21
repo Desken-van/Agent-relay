@@ -32,6 +32,7 @@ import { AgentRelayError, InvalidTransitionError } from '../../shared/domain/err
 import type { GitChangeSet } from '../../shared/domain/git';
 import type { Project, Settings, Task } from '../../shared/domain/models';
 import {
+  classifyVerificationExecution,
   describeUnverifiedOrnithOutcome,
   preservedOrnithChanges,
   summarizeVerificationOutput
@@ -393,16 +394,34 @@ export class Orchestrator {
       const result = await executor.execute({ task, settings, project }, controller.signal, event => handle!.append(event));
       const after = await executor.identity({ task: this.requireTask(taskId), settings: this.deps.settings.get(), project: this.requireProject(task.projectId) });
       const passed = result.exitCode === 0 && !result.failed && !result.timedOut && !result.cancelled && !controller.signal.aborted && after === identity;
-      const reason = passed ? null : after !== identity ? 'Files or task inputs changed during verification. Run verification again.' : result.cancelled || controller.signal.aborted ? 'Verification cancelled; success was not established.' : result.timedOut ? 'Verification timed out; success was not established.' : `npm run verify failed (exit ${result.exitCode ?? 'unknown'}). See command output.`;
       // Which kind of stop it was — the reason string alone made a timeout, a cancel and a nonzero exit
-      // hard to tell apart — and the bounded, sanitized tail of the output, so the screen can say why.
-      const outcome = passed
+      // hard to tell apart — decided by the SAME classifier the Ornith loop uses, so one command result can
+      // never persist a different outcome depending on who started it. The operator's own Stop is a cancel.
+      const outcome: 'passed' | 'failed' | 'timed_out' | 'cancelled' = passed
         ? 'passed'
         : after !== identity
           ? 'failed'
-          : result.cancelled || controller.signal.aborted
-            ? 'cancelled'
-            : result.timedOut ? 'timed_out' : 'failed';
+          : classifyVerificationExecution(
+              {
+                exitCode: result.exitCode,
+                failed: result.failed,
+                timedOut: result.timedOut,
+                cancelled: result.cancelled || controller.signal.aborted,
+                durationMs: result.durationMs,
+                output: ''
+              },
+              { budgetExpired: false, budgetMs: 0 }
+            ).outcome;
+      const reason = passed
+        ? null
+        : after !== identity
+          ? 'Files or task inputs changed during verification. Run verification again.'
+          : outcome === 'cancelled'
+            ? 'Verification cancelled; success was not established.'
+            : outcome === 'timed_out'
+              ? 'Verification timed out; success was not established.'
+              : `npm run verify failed (exit ${result.exitCode ?? 'unknown'}). See command output.`;
+      // (The bounded, sanitized tail of the output goes with the record, so the screen can say why.)
       handle.finish({ status: passed ? 'succeeded' : 'failed', finalMessage: passed ? 'Verification passed for this code snapshot. Ready for review.' : reason,
         errorMessage: reason, structuredResult: { version: 1, command: 'npm run verify', identity, passed, exitCode: result.exitCode, durationMs: result.durationMs, reason,
           outcome, ...(passed ? {} : { outputSummary: summarizeVerificationOutput(`${result.stdout}\n${result.stderr}`) }) } });

@@ -1356,6 +1356,20 @@ export class OrnithImplementationService {
           lastVerificationDurationMs = attempt.durationMs;
           verificationEventAttempt = attempt;
           if (Date.now() >= deadline) {
+            // The run ends here, so the ordinary result event below is never reached. Emit its verification
+            // part now: a reloaded timeline must say how the command ended, not only that it started.
+            request.onProgress({
+              type: 'tool_use',
+              text: `run_verification -> ${attempt.outcome} (${describeAttemptBrief(attempt)})`,
+              data: {
+                sequence: nonterminalActionsUsed, turn: turnsUsed, action: 'run_verification',
+                ok: attempt.outcome === 'passed', dispatched: true,
+                verification: {
+                  command: attempt.command, outcome: attempt.outcome, exitCode: attempt.exitCode,
+                  durationMs: attempt.durationMs, reason: attempt.reason, summary: attempt.summary
+                }
+              }
+            });
             return finish(
               'fail',
               'The Ornith implementation loop exceeded its overall time budget.',

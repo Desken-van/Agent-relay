@@ -94,6 +94,9 @@ describe('Run screen — the secondary action shares the single-flight guard wit
     // Both are blocked while the deliberate alternative is in flight — not "until the backend answers".
     await waitFor(() => expect(primary).toHaveProperty('disabled', true));
     expect(secondary).toHaveProperty('disabled', true);
+    // The in-flight action shows its busy indicator, exactly as the primary control does; the other one does not.
+    expect(secondary.querySelector('.spinner')).not.toBeNull();
+    expect(primary.querySelector('.spinner')).toBeNull();
     fireEvent.click(primary);
     fireEvent.click(secondary);
 

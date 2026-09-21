@@ -294,6 +294,15 @@ function describePreservedAttempt(
       result: `${task.lastError ?? ornithAttempt ?? detail.reason ?? 'The verification result was not recorded.'} ${manual}`
     };
   }
+  if (detail !== null && detail.source === 'ornith' && detail.outcome === 'passed') {
+    // Ornith's OWN check passed but the round did not end cleanly (or Relay has not verified yet). That check
+    // is diagnostic — it never makes the files publishable — so say both halves rather than "has not run",
+    // which the attempt panel shown beneath this line would contradict.
+    return {
+      happened: `${changed}; Ornith's own verification passed, but Agent Relay has not verified the files yet.`,
+      result: task.lastError ?? 'The files were preserved. Review is blocked until Agent Relay verification passes.'
+    };
+  }
   return {
     // Files are known to be preserved but no verification was recorded: say so plainly. With nothing known
     // (an older run, a crash before any counters) the wording stays the general one it always was.

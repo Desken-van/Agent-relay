@@ -381,6 +381,12 @@ describe('the loop deadline and verification', () => {
     expect(outcome.result.assessment.verificationStatus).toBe('failed');
     expect(outcome.result.ornithAudit.changedFiles).toBe(1);
     expect(outcome.result.ornithAudit.worktreeChangedFiles).toBe(1);
+    // The timeline is told how it ended, not only that it started: the run stops here, so this event is the
+    // only place a reloaded timeline can read the outcome from.
+    const [terminal] = toolEvents(outcome, 'run_verification');
+    expect(isOrnithVerificationEventData(terminal ?? null)).toBe(true);
+    expect(terminal).toMatchObject({ ok: false, dispatched: true, verification: { outcome: 'timed_out', command: 'npm run verify' } });
+    expect(outcome.events.filter((event) => event.data?.['phase'] === 'started')).toHaveLength(1);
   }, REAL_GIT_TEST_TIMEOUT_MS);
 
   it('does not start a verification that cannot fit the remaining time plus the reserve, and refuses only a bounded number of times', async () => {
