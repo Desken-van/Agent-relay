@@ -85,9 +85,10 @@ export interface OrnithImplementationRequest {
    * only — its result never decides the attempt's outcome; only Relay's own post-provider snapshot
    * verification does. The loop, not the caller, classifies the facts (see
    * `classifyVerificationExecution`) and bounds and sanitizes the output, so every consumer reads one
-   * truthful account. `timeoutMs` is a budget the loop already enforces through `signal`.
+   * truthful account. The loop's time budget for the command is enforced ONLY through `signal` — there is
+   * deliberately no second timeout argument for an implementation to honour or ignore.
    */
-  readonly runVerification: (signal: AbortSignal, timeoutMs: number) => Promise<OrnithVerificationExecution>;
+  readonly runVerification: (signal: AbortSignal) => Promise<OrnithVerificationExecution>;
   /** Already acquired and health-confirmed by the caller. */
   readonly lease: OrnithHealthyLease;
   readonly leaseService: OrnithInferenceLeaseService;
@@ -1234,8 +1235,10 @@ export class OrnithImplementationService {
       let verificationEventAttempt: OrnithVerificationAttempt | null = null;
       /** The declared scope, confirmed against the manifest; empty means "no declared scope". */
       const authoritativeScope = promptInput.specification.scopedFilePaths ?? [];
+      // Only a search of the WHOLE declared scope is evidence about it: coming up empty in one of two named
+      // files says nothing about the other.
       const scopedSearch = action.action === 'search_text' && authoritativeScope.length > 0 &&
-        searchStaysInScope(action, authoritativeScope);
+        searchCoversScope(action, authoritativeScope);
       let identicalEscapeRetryRefused = false;
       const operationStarted = Date.now();
       if (action.action === 'replace_text' && escapeDeniedFingerprint !== null && JSON.stringify(action) === escapeDeniedFingerprint) {
@@ -1315,7 +1318,7 @@ export class OrnithImplementationService {
           const startedAt = Date.now();
           let execution: OrnithVerificationExecution;
           try {
-            execution = await request.runVerification(verificationSignal.signal, budgetMs);
+            execution = await request.runVerification(verificationSignal.signal);
           } catch (error) {
             if (request.signal.aborted) throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
             execution = {
@@ -1372,7 +1375,7 @@ export class OrnithImplementationService {
         action.action === 'search_text' &&
         authoritativeScope.length > 0 &&
         !searchStaysInScope(action, authoritativeScope) &&
-        scopeExpansionCredits === 0
+        scopeExpansionCredits <= 0
       ) {
         // A scope was declared and confirmed, and nothing in the named files has yet come up empty:
         // there is no evidence the task needs anything else, and a repository-wide search is the most
@@ -1443,8 +1446,10 @@ export class OrnithImplementationService {
           : isEscapeDenial
             ? ORNITH_LIMITS.maxReplacementEscapeRecoveryAttempts
             : ORNITH_LIMITS.maxReadOnlyRecoveryAttempts;
+        // The run ends ON the last permitted refusal: at most `refusalsMax` per run, and the feedback's
+        // "N more … will end the run" counts exactly the refusals still to come before that one.
         const willRecover = isBoundedRefusal
-          ? refusalsUsed <= refusalsMax
+          ? refusalsUsed < refusalsMax
           : !identicalEscapeRetryRefused &&
             isRecoverableToolDenial(action, toolResult.code) && recoveryAttemptsUsed < recoveryAttemptsMax;
 
@@ -1775,6 +1780,14 @@ function searchStaysInScope(
   scope: readonly string[]
 ): boolean {
   return action.files !== undefined && action.files.length > 0 && action.files.every((file) => scope.includes(file));
+}
+
+/** True when a search stays in the declared scope AND names every file of it. */
+function searchCoversScope(
+  action: Extract<OrnithAction, { action: 'search_text' }>,
+  scope: readonly string[]
+): boolean {
+  return searchStaysInScope(action, scope) && scope.every((file) => action.files?.includes(file) === true);
 }
 
 function boundedVerificationError(error: unknown): string {

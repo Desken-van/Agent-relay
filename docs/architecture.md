@@ -1632,21 +1632,26 @@ budget is the time remaining minus that reserve, and it is stopped at it (as
 is not started at all when that budget is under `minVerificationBudgetMs` (3
 minutes) or the last attempt's duration — a command that already took nine
 minutes is not begun with five to spare. A repeat is refused when the worktree
-fingerprint (the `git diff HEAD` plus each untracked file's content, hashed) is
-the one the last verification ran against, so an unchanged diff cannot buy the
-same answer twice — including after an edit and its exact reversal. Refusals are
-fed back to the model as recoverable, at most `maxVerificationRefusals` (2) per
-run, then the run ends; they are recorded as `not_run` and never as a verdict.
+fingerprint (the `git diff HEAD` plus each untracked file's content, hashed;
+unknown — and so allowed — beyond 200 files or 16 MiB) is the one the last
+verification ran against, so an unchanged diff cannot buy the same answer twice —
+including after an edit and its exact reversal. At most `maxVerificationRefusals`
+(2) refusals are made per run: the earlier ones are fed back to the model as
+recoverable, saying how many more will end the run, and the last one ends it. They
+are recorded as `not_run` and never as a verdict.
 
 **Scope, once named, is confirmed before it is widened.** When the
 specification names files and the manifest confirms them, a repository-wide
 `search_text` (no `files`, or files outside the list) is refused
 (`scope_expansion_refused`, not dispatched, no bytes charged) until a search of
-the named files came up empty; each such empty result earns exactly one wider
-search. A scan that could not search every named file (binary, too large,
-unreadable, or cut short by the read budget) reports no match count at all, so an
-incomplete scan never counts as "empty". Refusals are bounded (`maxScopeExpansionRefusals`, 2). A task that names
-no files, or whose named files the manifest does not confirm, is unaffected.
+ALL the named files came up empty (empty in one of two says nothing about the
+other); each such empty result earns exactly one wider search. A scan cut short by
+the read budget reports no match count at all, so it never counts as "empty"; a
+named file that cannot be searched by nature (binary, or above the 64 KiB
+per-file search limit — this repository's larger docs) does not block the task,
+since it could never come up non-empty. Refusals are bounded like verification's
+(`maxScopeExpansionRefusals`, 2, the last ending the run). A task that names no
+files, or whose named files the manifest does not confirm, is unaffected.
 
 **Stop.** `workflow:stop` aborts the task's `AbortController`, which
 `inferForOrnith` and every bounded tool/verification operation observe. The

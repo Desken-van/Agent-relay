@@ -2316,6 +2316,16 @@ describe('OrnithWorktreeTools facts for verification recovery', () => {
       expect(await tools().worktreeFingerprint()).toBeNull();
     });
 
+    it('is unknown (null) once the untracked files add up to more than the hashing budget, so the preflight cost is bounded by bytes too', async () => {
+      const chunk = 'x'.repeat(1_000_000); // under the per-file limit; 16 of these are just under 16 MiB
+      for (let index = 0; index < 16; index += 1) writeFileSync(join(worktree, `blob-${String(index).padStart(2, '0')}.txt`), chunk, 'utf8');
+      expect(await tools().worktreeFingerprint()).toMatch(/^[0-9a-f]{64}$/); // within budget: taken
+
+      writeFileSync(join(worktree, 'blob-16.txt'), chunk, 'utf8');
+      writeFileSync(join(worktree, 'blob-17.txt'), chunk, 'utf8');
+      expect(await tools().worktreeFingerprint()).toBeNull(); // over budget: unknown, verification is simply allowed
+    });
+
     it('runs no configured diff helper and only read-only Git subcommands', async () => {
       const recorded: string[][] = [];
       await toolsRecordingGitArgv(recorded).worktreeFingerprint();

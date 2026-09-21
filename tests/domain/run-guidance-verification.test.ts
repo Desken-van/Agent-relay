@@ -187,6 +187,26 @@ describe('preserved edits outlive a later attempt that changed nothing', () => {
     expect(value.happened).toBe('Implementation changed 1 file; verification has not run.');
   });
 
+  it('follows the latest recorded worktree count, not the most any earlier round ever left', () => {
+    // A first round left five files; a later one (say, after the operator or a correction removed four) left one.
+    const value = guidance(task(), [
+      ornithRun({ id: 'first', changedFiles: 5, worktreeChangedFiles: 5, attempts: [attempt()] }),
+      ornithRun({ id: 'second', changedFiles: 0, worktreeChangedFiles: 1 })
+    ]);
+
+    expect(value.action?.key).toBe('run_verification');
+    expect(value.happened).toBe('Implementation changed 1 file; verification has not run.');
+  });
+
+  it('falls back to an earlier round’s count only when the latest round could not establish one', () => {
+    const value = guidance(task(), [
+      ornithRun({ id: 'first', changedFiles: 2, worktreeChangedFiles: 2, attempts: [attempt()] }),
+      ornithRun({ id: 'second', changedFiles: 0, worktreeChangedFiles: null })
+    ]);
+
+    expect(value.happened).toBe('Implementation changed 2 files; verification has not run.');
+  });
+
   it('holds when only an older attempt recorded changes (no worktree count on the later one)', () => {
     const value = guidance(task(), [
       ornithRun({ id: 'first', changedFiles: 1, attempts: [attempt()] }),

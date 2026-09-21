@@ -112,6 +112,18 @@ const FAILING_LINE = /^\s*(FAIL\b|×|✗|✖)|AssertionError|\bError:|\bnpm erro
 const SUMMARY_LINE_MAX = 200;
 const SUMMARY_TAIL_LINES = 8;
 const SUMMARY_FAILING_LINES = 6;
+/**
+ * All of a command's output is never examined: it can be tens of megabytes, and the work below runs on the
+ * main thread. Only the start (where a run announces itself) and, above all, the end (where failures are
+ * summarised) are kept; a failing line lost in the middle of a huge log is the price of a bounded cost.
+ */
+const SUMMARY_INPUT_HEAD_CHARS = 32 * 1024;
+const SUMMARY_INPUT_TAIL_CHARS = 256 * 1024;
+
+function boundInput(raw: string): string {
+  if (raw.length <= SUMMARY_INPUT_HEAD_CHARS + SUMMARY_INPUT_TAIL_CHARS) return raw;
+  return `${raw.slice(0, SUMMARY_INPUT_HEAD_CHARS)}\n${raw.slice(raw.length - SUMMARY_INPUT_TAIL_CHARS)}`;
+}
 
 function stripControlCharacters(value: string): string {
   let out = '';
@@ -132,14 +144,15 @@ function clipLine(line: string): string {
  * Keep the part of a command's output that explains a failure — the failing-test lines and the tail —
  * and nothing else. Sanitized (ANSI escapes and control characters removed, credentials redacted,
  * absolute machine paths omitted) and hard-capped, so it is safe to persist, show and hand back to a
- * model. Never returns more than `maxChars`.
+ * model. Never returns more than `maxChars`, and never examines more than a bounded head and tail of the
+ * input, however large it is.
  */
 export function summarizeVerificationOutput(
   raw: string,
   maxChars: number = ORNITH_LIMITS.maxVerificationSummaryChars
 ): string {
   const cleaned = redactAbsoluteMachinePaths(
-    redactSecrets(stripControlCharacters(raw.replace(ANSI_SEQUENCE, '').replace(/\r\n?/g, '\n')))
+    redactSecrets(stripControlCharacters(boundInput(raw).replace(ANSI_SEQUENCE, '').replace(/\r\n?/g, '\n')))
   );
   const lines = cleaned
     .split('\n')

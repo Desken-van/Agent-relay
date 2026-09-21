@@ -203,6 +203,8 @@ const GIT_DEFAULT_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 /** More untracked files than this and a worktree fingerprint is not taken (the caller treats the state as new). */
 const FINGERPRINT_MAX_UNTRACKED_FILES = 200;
+/** ...and likewise when their content adds up to more than this: the fingerprint is a cheap preflight, not a scan. */
+const FINGERPRINT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 
 /** One reason for every diff that does not fit: it names the budget and promises nothing was returned. */
 const GIT_DIFF_BUDGET_REASON =
@@ -515,11 +517,16 @@ export class OrnithWorktreeTools {
       const hash = createHash('sha256');
       hash.update(diff.stdout);
       hash.update('\0');
+      let hashedBytes = 0;
       for (const name of names) {
         const resolved = await this.resolvePathOnly(name, { mustExist: true, forWrite: false });
         if (!resolved.ok) return null;
         const read = await this.readRegularFileSafely(resolved.absolutePath, ORNITH_LIMITS.maxFileBytes, bounded);
         if (!read.ok) return null;
+        // The preflight cost is bounded by bytes as well as by count: past it the state is "unknown"
+        // (verification proceeds) rather than the wait before the command spending the user's budget.
+        hashedBytes += read.raw.byteLength;
+        if (hashedBytes > FINGERPRINT_MAX_TOTAL_BYTES) return null;
         hash.update(name);
         hash.update('\0');
         hash.update(createHash('sha256').update(read.raw).digest('hex'));

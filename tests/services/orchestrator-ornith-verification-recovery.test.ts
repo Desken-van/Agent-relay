@@ -342,6 +342,32 @@ describe('an Ornith round that finished normally after its own verification fail
   });
 });
 
+describe('an Ornith round that made no new edits over files an earlier attempt left', () => {
+  it('is not "nothing changed": the preserved edits are named, the round is handed back, and Run verification leads', async () => {
+    const stoppedEarly = (): OrnithImplementationResult => {
+      const base = noChangeFailureResult();
+      return { ...base, ornithAudit: { ...base.ornithAudit, worktreeChangedFiles: 1 } };
+    };
+    const verification = scriptedVerification([{}]);
+    const { harness: h, task } = await taskAfterOrnithRound({ ornith: fakeOrnith(async () => stoppedEarly()), verification });
+
+    expect(task.status).toBe('READY_FOR_IMPLEMENTATION');
+    // This round changed nothing of its own, so it does not count against the review-round budget...
+    expect(task.currentRound).toBe(0);
+    // ...but the task does not claim nothing is there.
+    expect(task.lastError).toContain('made no new changes this round');
+    expect(task.lastError).toContain('still holds 1 changed file');
+    expect(task.lastError).toContain('preserved in the task worktree');
+    expect(task.lastError).not.toContain('stopped before changing any files');
+    expect(verification.calls).toBe(0);
+
+    const value = guidanceFor(h, task);
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification' });
+    expect(value.secondaryAction).toMatchObject({ key: 'run_implementation', label: 'Retry implementation · Ornith' });
+    expect(value.happened).toBe('Implementation changed 1 file; verification has not run.');
+  });
+});
+
 describe('an Ornith round that changed nothing', () => {
   it('keeps the existing behaviour: the round is handed back and Run implementation is still the action', async () => {
     const verification = scriptedVerification([{}]);

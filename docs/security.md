@@ -684,7 +684,9 @@ machine path or terminal control codes. `summarizeVerificationOutput`
 the process layer: it removes ANSI escapes and control characters, redacts
 credentials with the shared `redactSecrets`, replaces absolute machine paths,
 clips every line, keeps only the failing-test lines and the tail, and hard-caps
-the result at `maxVerificationSummaryChars` (1,500). That summary — not the
+the result at `maxVerificationSummaryChars` (1,500). It examines only the first
+32 KiB and last 256 KiB of the output, so a multi-megabyte log costs a bounded
+amount of main-thread time. That summary — not the
 output — is what the loop returns to the model, what the run event and
 `counters.verificationAttempts` (at most six attempts, each with a 400-character
 reason) store, and what Agent Relay's own verification record keeps as
@@ -694,8 +696,8 @@ are optional, and a damaged or oversized one is skipped, not rendered.
 **Two read-only Git questions, fixed and internal.** After a run the loop asks
 `git status --porcelain=v1 --untracked-files=all` (a changed-file *count*, stderr
 discarded) and, before a verification, hashes `git diff HEAD --no-ext-diff
---no-textconv --binary` plus each untracked file's content (at most 200; more
-means "unknown", not a guess) to recognise a repeat. Neither takes a model-supplied
+--no-textconv --binary` plus each untracked file's content (at most 200 files and 16 MiB;
+more means "unknown", not a guess) to recognise a repeat. Neither takes a model-supplied
 argument, neither can run a configured diff helper, both use the existing
 bounded Git timeout, and neither result is shown to the model or charged to
 either byte budget; only the count and a truncated digest are stored. The
@@ -706,7 +708,7 @@ be does not run one more Git command inside it.
 **A named scope is enforced, not merely stated.** When the approved
 specification names files and the manifest confirms them, a `search_text` that
 would read beyond them is refused before dispatch (`scope_expansion_refused`)
-until a search of the named files itself found nothing. It is a refusal, not a
+until a search of ALL the named files itself found nothing. It is a refusal, not a
 permission: it cannot widen what a completion may do, only narrow the most
 expensive request Ornith can make until there is evidence for it.
 

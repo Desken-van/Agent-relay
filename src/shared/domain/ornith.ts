@@ -86,9 +86,9 @@ export const ORNITH_LIMITS = {
   verificationFinishReserveMs: 2 * 60_000,
   /** The smallest verification window worth starting; below it Agent Relay verifies after `finish` instead. */
   minVerificationBudgetMs: 3 * 60_000,
-  /** How many times a refused `run_verification` is fed back before the run ends. */
+  /** Refusals of `run_verification` allowed per run: the earlier ones are fed back, and the last one ends the run. */
   maxVerificationRefusals: 2,
-  /** How many times an unjustified repository-wide search is fed back before the run ends. */
+  /** Refusals of an unjustified repository-wide search allowed per run: the earlier ones are fed back, the last ends the run. */
   maxScopeExpansionRefusals: 2,
   /** Bounded, sanitized verification output kept per attempt (event, audit, model feedback). */
   maxVerificationSummaryChars: 1_500,

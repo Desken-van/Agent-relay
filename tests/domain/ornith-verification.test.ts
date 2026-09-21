@@ -117,6 +117,25 @@ describe('summarizeVerificationOutput', () => {
     expect(summary.length).toBeLessThanOrEqual(ORNITH_LIMITS.maxVerificationSummaryChars);
   });
 
+  it('examines only a bounded head and tail of a huge log: failures at either end survive, one lost in the middle does not', () => {
+    const noise = 'noise line\n'.repeat(300_000); // ~3.3 MB
+    const raw = [
+      'FAIL  head.test.ts > announced first\n',
+      noise,
+      'FAIL  middle-lost.test.ts > buried\n',
+      noise,
+      'FAIL  tail.test.ts > reported last\n',
+      ' Test Files  2 failed | 1 passed (3)'
+    ].join('');
+    const summary = summarizeVerificationOutput(raw);
+
+    expect(summary).toContain('head.test.ts');
+    expect(summary).toContain('tail.test.ts');
+    expect(summary).toContain('Test Files  2 failed');
+    expect(summary).not.toContain('middle-lost.test.ts');
+    expect(summary.length).toBeLessThanOrEqual(ORNITH_LIMITS.maxVerificationSummaryChars);
+  });
+
   it('honours a smaller explicit limit, keeping the end of the output', () => {
     // Two 100-character lines (under the per-line clip) cannot both fit in 120 characters.
     const summary = summarizeVerificationOutput(`${'a'.repeat(100)}\n${'b'.repeat(100)}`, 120);

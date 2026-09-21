@@ -205,14 +205,20 @@ function failedOrnithAttemptProvedNoChanges(run: Run | null): run is Run {
  * and they are unverified, so the recovery action must stay verification rather than another attempt.
  */
 function preservedOrnithChanges(runs: readonly Run[]): number {
-  let most = 0;
-  for (const run of runs) {
+  let mostEverChanged = 0;
+  let latestKnown: number | null = null;
+  // Newest first: the latest recorded count of what the worktree holds is the best account of it NOW, so
+  // an earlier round that left five files does not keep saying five after a later one left one.
+  for (let index = runs.length - 1; index >= 0; index -= 1) {
+    const run = runs[index]!;
     if (run.runType !== 'implementation' && run.runType !== 'correction') continue;
     const evidence = readOrnithRunEvidence(run);
     if (evidence === null) continue;
-    most = Math.max(most, evidence.changedFiles ?? 0, evidence.worktreeChangedFiles ?? 0);
+    if (latestKnown === null && evidence.worktreeChangedFiles !== null) latestKnown = evidence.worktreeChangedFiles;
+    mostEverChanged = Math.max(mostEverChanged, evidence.changedFiles ?? 0);
   }
-  return most;
+  // Runs recorded before the worktree count existed can only say what each round changed itself.
+  return latestKnown ?? mostEverChanged;
 }
 
 /** The verification attempt an Ornith run ended on: the latest that ran, else its last refusal. */

@@ -55,13 +55,13 @@ const replace = (oldText: string, newText: string): Step => ({ sha }) => ({
 const editSentence = replace(ORIGINAL_SENTENCE, REPLACEMENT_SENTENCE);
 const editMarker = (from: number, to: number): Step => replace(marker(from), marker(to));
 const searchAll = (query = MISSING_NEEDLE): Step => ({ version: 1, action: 'search_text', query, caseSensitive: false, limit: 20 });
-const searchScoped = (query: string): Step => ({
+const searchScoped = (query: string, files: readonly string[] = [TARGET]): Step => ({
   version: 1,
   action: 'search_text',
   query,
   caseSensitive: false,
   limit: 20,
-  files: [TARGET]
+  files: [...files]
 });
 
 /** What the fake `npm run verify` does. `durationMs` is fake-clock time. */
@@ -175,9 +175,14 @@ async function runScenario(scenario: Scenario): Promise<Outcome> {
     loopDeadlineMs: scenario.loopDeadlineMs ?? 30 * MIN,
     signal: new AbortController().signal,
     onProgress: (event) => events.push(event),
-    runVerification: (signal, timeoutMs) => {
+    runVerification: (signal) => {
       const script = scripts[starts.length];
       if (script === undefined) throw new Error('The run started a verification the scenario did not script.');
+      // The budget the loop granted is what it just recorded in its "Verification started" event — the
+      // command itself is only ever told about it through `signal`.
+      const grant = [...events].reverse().find((event) => event.data?.['phase'] === 'started');
+      const timeoutMs = Number(grant?.data?.['budgetMs']);
+      if (!Number.isFinite(timeoutMs)) throw new Error('A verification started without recording its budget.');
       starts.push({ atMs: Date.now() - startedAt, budgetMs: timeoutMs });
       const begun = Date.now();
       return new Promise<OrnithVerificationExecution>((resolve) => {
@@ -378,7 +383,7 @@ describe('the loop deadline and verification', () => {
 
   it('does not start a verification that cannot fit the remaining time plus the reserve, and refuses only a bounded number of times', async () => {
     // 4 min left: 2 min of reserve leaves 2 min, under the 3-minute floor. The model asks again and again.
-    const asks = ORNITH_LIMITS.maxVerificationRefusals + 1;
+    const asks = ORNITH_LIMITS.maxVerificationRefusals; // the last permitted refusal ends the run
     const outcome = await runScenario({
       steps: [read, editSentence, ...Array.from({ length: asks + 2 }, () => verify)],
       loopDeadlineMs: 4 * MIN,
@@ -396,8 +401,10 @@ describe('the loop deadline and verification', () => {
     }
     // Recoverable feedback while the bound lasts, then the run ends.
     const denials = outcome.events.filter((event) => event.data?.['code'] === 'limit_verification_time_insufficient');
-    expect(denials.map((event) => event.data?.['recoverable'])).toEqual([true, true, false]);
+    expect(denials.map((event) => event.data?.['recoverable'])).toEqual([true, false]);
     expect(denials[0]?.data).toMatchObject({ action: 'run_verification', ok: false });
+    // The feedback counts exactly the refusals still to come: "1 more … will end the run".
+    expect(outcome.prompts.some((prompt) => prompt.includes('1 more refused verification will end the run'))).toBe(true);
     expect(outcome.result.assessment.reasonCodes).toEqual(['limit_verification_time_insufficient']);
     expect(outcome.result.assessment.disposition).toBe('fail');
     expect(outcome.result.assessment.publishBlock).toBe('verification');
@@ -429,11 +436,10 @@ describe('repeating a verification', () => {
         read,
         editSentence,
         verify, // runs: exit 1
-        verify, // refused: the files are exactly what it just ran on
+        verify, // refused (1st): the files are exactly what it just ran on
         editMarker(0, 1),
         editMarker(1, 0), // the exact reversal: byte-identical files again
-        verify, // refused: same files, despite two successful writes in between
-        verify // the bound is spent: the run ends
+        verify // refused (2nd, the last permitted): same files despite two writes in between — the run ends
       ],
       verifications: [exits(1, 200_000)]
     });
@@ -442,11 +448,10 @@ describe('repeating a verification', () => {
     expect(attempts(outcome).map((item) => [item.outcome, item.code])).toEqual([
       ['failed', null],
       ['not_run', 'verification_repeat_refused'],
-      ['not_run', 'verification_repeat_refused'],
       ['not_run', 'verification_repeat_refused']
     ]);
     const denials = outcome.events.filter((event) => event.data?.['code'] === 'verification_repeat_refused');
-    expect(denials.map((event) => event.data?.['recoverable'])).toEqual([true, true, false]);
+    expect(denials.map((event) => event.data?.['recoverable'])).toEqual([true, false]);
     expect(denials[0]?.data).toMatchObject({ action: 'run_verification', ok: false });
     // The feedback tells the model that nothing was started and what to do instead.
     expect(outcome.prompts.some((prompt) => prompt.includes('Verification was NOT started'))).toBe(true);
@@ -501,13 +506,13 @@ describe('exploring beyond an explicitly named file', () => {
         read,
         searchAll('dashboard'), // no scoped search yet: refused
         searchScoped('dashboard'), // finds the sentence in the named file
-        searchAll('dashboard loads'), // the named file was NOT empty, so still no evidence: refused
-        done
+        searchAll('dashboard loads') // the named file was NOT empty, so still no evidence: refused (2nd, the last permitted)
       ]
     });
 
     expect(denied(outcome).map((item) => item.sequence)).toEqual([2, 4]);
     expect(denied(outcome)[0]).toEqual({ sequence: 2, action: 'search_text', ok: false, code: 'scope_expansion_refused' });
+    expect(outcome.result.assessment.reasonCodes).toEqual(['scope_expansion_refused']); // the 2nd refusal ended the run
     expect(searchEvents(outcome)).toHaveLength(1); // only the scoped one was ever dispatched
     // Only the read of the named file and the scoped search were charged; the refused ones cost nothing.
     const charged = outcome.events
@@ -540,15 +545,41 @@ describe('exploring beyond an explicitly named file', () => {
     expect(denied(outcome)).toEqual([{ sequence: 4, action: 'search_text', ok: false, code: 'scope_expansion_refused' }]);
   }, REAL_GIT_TEST_TIMEOUT_MS);
 
-  it('ends the run after the bounded number of refused wide searches', async () => {
-    const asks = ORNITH_LIMITS.maxScopeExpansionRefusals + 1;
+  it('ends the run on the last permitted refusal of a wide search, feeding back only the ones before it', async () => {
+    const asks = ORNITH_LIMITS.maxScopeExpansionRefusals;
     const outcome = await runScenario({
-      steps: [read, ...Array.from({ length: asks }, (_, index) => searchAll(`needle-${index}`))]
+      steps: [read, ...Array.from({ length: asks + 1 }, (_, index) => searchAll(`needle-${index}`))]
     });
 
+    expect(denied(outcome)).toHaveLength(asks); // the extra request was never made: the run had ended
     expect(outcome.result.assessment.reasonCodes).toEqual(['scope_expansion_refused']);
     expect(outcome.result.assessment.disposition).toBe('fail');
     expect(searchEvents(outcome)).toEqual([]);
+    const denials = outcome.events.filter((event) => event.data?.['code'] === 'scope_expansion_refused');
+    expect(denials.map((event) => event.data?.['recoverable'])).toEqual([true, false]);
+    expect(outcome.prompts.some((prompt) => prompt.includes('1 more refused search will end the run'))).toBe(true);
+  }, REAL_GIT_TEST_TIMEOUT_MS);
+
+  it('grants a wider search only for a search of the WHOLE declared scope: empty in one of two named files proves nothing about the other', async () => {
+    const outcome = await runScenario({
+      scope: [TARGET, 'docs/other.md'],
+      extraFiles: { 'docs/other.md': 'The provider smoke-test checklist is described here.\n' },
+      steps: [
+        read,
+        searchScoped('provider smoke-test', [TARGET]), // empty in ONE of the two named files: earns nothing
+        searchAll('provider smoke-test'), // refused
+        searchScoped('provider smoke-test', [TARGET, 'docs/other.md']), // finds it in the other file: not empty either
+        searchScoped('zz-not-anywhere', [TARGET, 'docs/other.md']), // empty across the whole scope: earns one
+        searchAll('zz-not-anywhere'), // the earned wider search: dispatched
+        done
+      ]
+    });
+
+    expect(denied(outcome).map((item) => item.sequence)).toEqual([3]);
+    // Dispatched: the partial scoped search, the full one that found something, the empty full one, and the wide one.
+    expect(searchEvents(outcome)).toHaveLength(4);
+    expect(searchEvents(outcome).every((data) => data['ok'] === true)).toBe(true);
+    expect(outcome.result.assessment.reasonCodes).toEqual([]); // finished normally
   }, REAL_GIT_TEST_TIMEOUT_MS);
 
   it('leaves a task with no declared scope exactly as it was: repository-wide search is dispatched, and a clean worktree reports nothing', async () => {
