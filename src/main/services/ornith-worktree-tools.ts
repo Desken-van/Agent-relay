@@ -31,7 +31,7 @@ import {
 } from '../../shared/domain/ornith';
 import { containsSecretShape } from '../../shared/util/redact';
 import { locateExecutable } from '../adapters/process/executable-locator';
-import type { ProcessRunner } from '../adapters/process/process-runner';
+import type { ProcessResult, ProcessRunner } from '../adapters/process/process-runner';
 import {
   ExecaWindowsFsGuard,
   type WindowsFsFileIdentity,
@@ -191,6 +191,19 @@ function denied(code: OrnithDenialCode, reason: string): OrnithToolResult {
 }
 
 const VALIDATION_READ_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * Extra output `git diff` may produce past the remaining discovery bytes before the runner stops it.
+ * The runner applies one cap to stdout and stderr alike, so without slack a burst of Git warnings on
+ * stderr (an unscoped diff over many files whose line endings will be normalised, say) could trip the
+ * cap on a diff that in fact fits. Bounded, and never part of what is returned: the diff is still
+ * judged against the exact remaining bytes, and an over-budget diff is refused whole.
+ */
+const GIT_DIFF_STDERR_HEADROOM_BYTES = 32 * 1024;
+
+/** One reason for every diff that does not fit: it names the budget and promises nothing was returned. */
+const GIT_DIFF_BUDGET_REASON =
+  'The diff does not fit the remaining repository discovery budget. Nothing was returned and the worktree is unchanged by this request.';
 
 /**
  * Read at most `limit + 1` bytes from an open handle. A result longer than `limit`
@@ -1622,11 +1635,29 @@ export class OrnithWorktreeTools {
       if (!(await this.assertCheckoutIdentity(bounded))) return denied('checkout_identity_changed', 'The checkout identity changed.');
       const args = ['diff', 'HEAD', '--'];
       if (action.paths && action.paths.length > 0) args.push(...action.paths);
-      const trackedDiff = await this.git(args, bounded, undefined, Math.min(8 * 1024 * 1024, budget.readBytes + 1));
-      if (trackedDiff === null) return denied('internal_error', 'git diff could not be read.');
+      // The cap is `remaining + 1` so a diff of exactly the remaining bytes still fits, plus a small
+      // headroom because the runner applies the same cap to stderr, so Git's own warnings cannot, on
+      // their own, make a diff that fits look oversized. The exact byte comparison below decides.
+      const tracked = await this.gitCapture(
+        args,
+        bounded,
+        undefined,
+        Math.min(8 * 1024 * 1024, budget.readBytes + 1 + GIT_DIFF_STDERR_HEADROOM_BYTES)
+      );
+      if (tracked.exitCode !== 0 || tracked.failed) {
+        // The runner stopped Git at the cap AND what it kept of stdout alone already exceeds what
+        // the model may still read: the diff does not fit the discovery budget. Nothing retained
+        // is returned. Anything else — a non-zero exit, a spawn failure, an overflow that stdout
+        // did not cause — is a genuine failure and stays one.
+        if (tracked.outputLimitExceeded === true && Buffer.byteLength(tracked.stdout, 'utf8') > budget.readBytes) {
+          return denied('limit_read_bytes_exceeded', GIT_DIFF_BUDGET_REASON);
+        }
+        return denied('internal_error', 'git diff could not be read.');
+      }
+      const trackedDiff = tracked.stdout;
       let bytesConsumed = Buffer.byteLength(trackedDiff, 'utf8');
       if (bytesConsumed > budget.readBytes) {
-        return denied('limit_read_bytes_exceeded', 'Git diff would exceed the remaining repository byte budget.');
+        return denied('limit_read_bytes_exceeded', GIT_DIFF_BUDGET_REASON);
       }
       const manifest = await this.ensureManifest(bounded);
       const selected = action.paths ?? manifest;
@@ -1648,7 +1679,7 @@ export class OrnithWorktreeTools {
         if (!resolved.ok) return denied(resolved.code, resolved.reason);
         const stats = await lstat(resolved.absolutePath);
         if (bytesConsumed + stats.size > budget.readBytes) {
-          return denied('limit_read_bytes_exceeded', 'Untracked diff content would exceed the remaining repository byte budget.');
+          return denied('limit_read_bytes_exceeded', GIT_DIFF_BUDGET_REASON);
         }
         const safeRead = await this.readRegularFileSafely(
           resolved.absolutePath,
@@ -1708,6 +1739,17 @@ export class OrnithWorktreeTools {
 
   /** Fixed, read-only Git invocations only. Never stages, commits, or mutates the index. */
   private async git(args: readonly string[], signal: AbortSignal, cwd?: string, maxOutputBytes = 8 * 1024 * 1024): Promise<string | null> {
+    const result = await this.gitCapture(args, signal, cwd, maxOutputBytes);
+    if (result.exitCode !== 0 || result.failed) return null;
+    return result.stdout;
+  }
+
+  /**
+   * Run one fixed read-only Git argv and return the WHOLE process result, so a caller that set
+   * `maxOutputBytes` on purpose can tell an output overflow from a genuine failure. Cancellation
+   * and timeout still throw exactly as {@link git} always has.
+   */
+  private async gitCapture(args: readonly string[], signal: AbortSignal, cwd?: string, maxOutputBytes = 8 * 1024 * 1024): Promise<ProcessResult> {
     const result = await this.deps.runner.run(this.resolveGit(), args, {
       cwd: cwd ?? this.deps.worktreePath,
       signal,
@@ -1726,8 +1768,7 @@ export class OrnithWorktreeTools {
     if (result.timedOut) {
       throw new AgentRelayError('TIMEOUT', 'The Git inspection timed out.');
     }
-    if (result.exitCode !== 0 || result.failed) return null;
-    return result.stdout;
+    return result;
   }
 }
 

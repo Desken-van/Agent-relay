@@ -146,6 +146,28 @@ describe('process runner', () => {
     expect(result.failed).toBe(true);
   });
 
+  it('reports that the output cap is what failed the run — and only then', async () => {
+    const capped = await runner.run(process.execPath, ['-e', "process.stdout.write('x'.repeat(5000))"], {
+      maxOutputBytes: 100
+    });
+    expect(capped.failed).toBe(true);
+    expect(capped.outputLimitExceeded).toBe(true);
+    // Only what was retained up to the cap, never the whole output.
+    expect(capped.stdout.length).toBeLessThanOrEqual(100);
+
+    const fits = await runner.run(process.execPath, ['-e', "process.stdout.write('x'.repeat(50))"], {
+      maxOutputBytes: 100
+    });
+    expect(fits.failed).toBe(false);
+    expect('outputLimitExceeded' in fits).toBe(false);
+
+    // A genuine failure is not an output overflow.
+    const exited = await runner.run(process.execPath, ['-e', 'process.exit(3)'], { maxOutputBytes: 100 });
+    expect(exited.failed).toBe(true);
+    expect(exited.exitCode).toBe(3);
+    expect('outputLimitExceeded' in exited).toBe(false);
+  });
+
   it('honours a timeout', async () => {
     const result = await runner.run(process.execPath, ['-e', 'setTimeout(()=>{}, 10000)'], {
       timeoutMs: 400

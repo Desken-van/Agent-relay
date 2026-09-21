@@ -1955,3 +1955,138 @@ describe('OrnithWorktreeTools mutation validation budget', () => {
     expect(JSON.stringify(refused)).not.toContain('omega');
   });
 });
+
+describe('OrnithWorktreeTools git_diff against the remaining discovery budget', () => {
+  const diff = { version: 1 as const, action: 'git_diff' as const, paths: ['fixture.txt'] };
+  const TOKEN = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';
+
+  const editFixture = (text: string): void => writeFileSync(join(worktree, 'fixture.txt'), text, 'utf8');
+
+  /** Tools whose `git diff` is answered by `answer`; every other Git call (identity, manifest) is real. */
+  function toolsAnsweringDiff(answer: Partial<ProcessResult>): OrnithWorktreeTools {
+    const wrapping = {
+      run: (file: string, args: readonly string[], options?: Parameters<typeof runner.run>[2]): Promise<ProcessResult> =>
+        file === gitPath && args[0] === 'diff'
+          ? Promise.resolve({
+              command: 'git diff',
+              exitCode: 0,
+              stdout: '',
+              stderr: '',
+              timedOut: false,
+              cancelled: false,
+              durationMs: 1,
+              failed: false,
+              ...answer
+            })
+          : runner.run(file, args, options)
+    };
+    return new OrnithWorktreeTools({
+      worktreePath: worktree,
+      worktreesRoot,
+      repositoryPath: repository,
+      branchName: 'task',
+      runner: wrapping,
+      gitExecutablePath: gitPath
+    });
+  }
+
+  it('still returns a small diff that fits, charging its bytes to discovery', async () => {
+    editFixture('alpha π delta\n');
+
+    const result = await tools().gitDiff(diff);
+
+    expect(result).toMatchObject({ ok: true, writeBytes: 0 });
+    if (!result.ok) throw new Error(result.reason);
+    expect((result.forModel as { diff: string }).diff).toContain('delta');
+    expect(result.readBytes).toBeGreaterThan(0);
+    expect(result.readBytes).toBe(Buffer.byteLength((result.forModel as { diff: string }).diff, 'utf8'));
+  });
+
+  it('returns a diff of exactly the remaining bytes, and refuses one byte more or nothing left', async () => {
+    editFixture('alpha π delta\n');
+    const full = await tools().gitDiff(diff);
+    if (!full.ok) throw new Error(full.reason);
+    const bytes = full.readBytes;
+
+    const exact = await tools().gitDiff(diff, undefined, { readBytes: bytes, writeBytes: 0 });
+    expect(exact).toMatchObject({ ok: true, readBytes: bytes });
+
+    for (const remaining of [bytes - 1, 0]) {
+      const refused = await tools().gitDiff(diff, undefined, { readBytes: remaining, writeBytes: 0 });
+      expect(refused, `remaining ${remaining}`).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+      expect(refused.ok ? '' : refused.reason).toContain('discovery budget');
+      // A refusal carries no part of the diff.
+      expect(JSON.stringify(refused)).not.toContain('delta');
+    }
+  });
+
+  it('refuses a diff far beyond what the process layer may buffer as a budget refusal, not an internal error', async () => {
+    editFixture(`alpha π omega\n${'lorem ipsum dolor sit amet\n'.repeat(4_000)}`);
+
+    for (const remaining of [100, 0]) {
+      const refused = await tools().gitDiff(diff, undefined, { readBytes: remaining, writeBytes: 0 });
+      expect(refused).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+      expect(JSON.stringify(refused)).not.toContain('lorem');
+    }
+    // …and with the budget there, the very same diff is returned (truncated for the model, never refused).
+    const fits = await tools().gitDiff(diff);
+    expect(fits).toMatchObject({ ok: true });
+  });
+
+  it('keeps a genuine Git failure distinct from a budget refusal', async () => {
+    const limits = { readBytes: 100, writeBytes: 0 };
+
+    // Git itself failed.
+    const failed = await toolsAnsweringDiff({ exitCode: 128, failed: true, stderr: 'fatal: bad revision' }).gitDiff(diff, undefined, limits);
+    expect(failed).toMatchObject({ ok: false, code: 'internal_error', reason: 'git diff could not be read.' });
+
+    // Failed with no sign the output cap was involved, even though stdout happens to be large.
+    const noFlag = await toolsAnsweringDiff({ failed: true, stdout: 'x'.repeat(5_000) }).gitDiff(diff, undefined, limits);
+    expect(noFlag).toMatchObject({ ok: false, code: 'internal_error' });
+
+    // The cap was hit, but what stdout kept fits the budget: it was not the diff that overflowed.
+    const stderrCap = await toolsAnsweringDiff({ failed: true, outputLimitExceeded: true, stdout: 'x'.repeat(50) }).gitDiff(diff, undefined, limits);
+    expect(stderrCap).toMatchObject({ ok: false, code: 'internal_error' });
+
+    // The cap was hit and stdout alone is over the remaining bytes: a discovery refusal, with none of it returned.
+    const overflow = await toolsAnsweringDiff({ failed: true, outputLimitExceeded: true, stdout: 'x'.repeat(5_000) }).gitDiff(diff, undefined, limits);
+    expect(overflow).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    expect(JSON.stringify(overflow)).not.toContain('xxxxx');
+  });
+
+  it('decides the same way when Git prints a line-ending warning on stderr', async () => {
+    // A Windows checkout prints an LF-to-CRLF notice on stderr, and the runner caps stderr at the same
+    // size as stdout. The decision must still be the exact byte comparison on stdout, at the boundary.
+    await git(repository, ['config', 'core.autocrlf', 'true']);
+    editFixture('alpha π delta\n');
+    const probe = await runner.run(gitPath, ['diff', 'HEAD', '--', 'fixture.txt'], { cwd: worktree, timeoutMs: 20_000 });
+    expect(probe.stderr).toContain('will be replaced by');
+    const full = await tools().gitDiff(diff);
+    if (!full.ok) throw new Error(full.reason);
+
+    const exact = await tools().gitDiff(diff, undefined, { readBytes: full.readBytes, writeBytes: 0 });
+    expect(exact).toMatchObject({ ok: true, readBytes: full.readBytes });
+
+    const refused = await tools().gitDiff(diff, undefined, { readBytes: full.readBytes - 1, writeBytes: 0 });
+    expect(refused).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+  });
+
+  it('keeps credential detection fail-closed, and returns none of a credential-shaped diff over budget either', async () => {
+    const secretDiff = `diff --git a/fixture.txt b/fixture.txt\n+token=${TOKEN}\n`;
+
+    // Within budget: refused as credential-shaped, nothing returned.
+    const within = await toolsAnsweringDiff({ stdout: secretDiff }).gitDiff(diff);
+    expect(within).toMatchObject({ ok: false, code: 'disallowed_action' });
+    expect(JSON.stringify(within)).not.toContain('ghp_');
+
+    // Over budget: a budget refusal — and still none of it.
+    const over = await toolsAnsweringDiff({ stdout: secretDiff }).gitDiff(diff, undefined, { readBytes: 10, writeBytes: 0 });
+    expect(over).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    expect(JSON.stringify(over)).not.toContain('ghp_');
+
+    // A real tracked edit that adds a token never puts it in a result.
+    editFixture(`token=${TOKEN}\n`);
+    const real = await tools().gitDiff(diff);
+    expect(JSON.stringify(real)).not.toContain(TOKEN);
+  });
+});

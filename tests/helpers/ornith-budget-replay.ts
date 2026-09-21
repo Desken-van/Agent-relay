@@ -252,6 +252,8 @@ export type ReplayStep =
   | { readonly kind: 'delete'; readonly path?: string; readonly sha256?: ShaSource }
   | { readonly kind: 'verify' }
   | { readonly kind: 'diff' }
+  /** `git_diff` with no `paths`: a different request from `diff`, covering the whole worktree. */
+  | { readonly kind: 'diff_all' }
   | { readonly kind: 'finish' };
 
 export interface ReplayScript {
@@ -319,6 +321,8 @@ export async function replay(fixture: ReplayFixture, script: ReplayScript): Prom
         return { version: 1, action: 'run_verification' };
       case 'diff':
         return { version: 1, action: 'git_diff', paths: [TARGET] };
+      case 'diff_all':
+        return { version: 1, action: 'git_diff' };
       case 'finish':
         return { version: 1, action: 'finish', summary: 'Tightened the expected result in the manual test.' };
     }

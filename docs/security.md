@@ -610,7 +610,14 @@ terminal failure for that attempt.
   scrubbed environment) every other Git invocation in this application uses.
   Neither ever stages, commits, branches, merges, resets, or touches a
   remote; there is no code path from an Ornith completion to any of those
-  operations.
+  operations. A `git diff` is judged against the discovery bytes that remain by
+  its exact size: one that does not fit is refused whole, as
+  `limit_read_bytes_exceeded` (the discovery budget), and none of it is
+  returned — never as `internal_error`, which stays reserved for a genuine Git
+  or process failure. The process layer reports when its own output cap was
+  hit, and the diff is only called over budget when what it retained already
+  exceeds the remaining bytes. The refusal is recoverable once, so the model
+  can skip the diff and go on to verification with its edit intact.
 - Every checkout is re-confirmed (branch, common Git directory, not
   detached) before each turn and again before verification; a worktree
   re-pointed at a different repository underneath a running loop is refused
