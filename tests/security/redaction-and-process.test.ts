@@ -168,6 +168,32 @@ describe('process runner', () => {
     expect('outputLimitExceeded' in exited).toBe(false);
   });
 
+  it('caps stderr separately when asked, and shares one cap otherwise', async () => {
+    const both = "process.stdout.write('o'.repeat(50)); process.stderr.write('e'.repeat(5000))";
+
+    // One cap for both streams, as ever: the stderr alone trips it.
+    const shared = await runner.run(process.execPath, ['-e', both], { maxOutputBytes: 100 });
+    expect(shared.failed).toBe(true);
+    expect(shared.outputLimitExceeded).toBe(true);
+
+    // Its own cap: the same output now fits, whole.
+    const split = await runner.run(process.execPath, ['-e', both], { maxOutputBytes: 100, maxStderrBytes: 10_000 });
+    expect(split.failed).toBe(false);
+    expect(split.stdout).toBe('o'.repeat(50));
+    expect(split.stderr).toHaveLength(5000);
+    expect('outputLimitExceeded' in split).toBe(false);
+
+    // The tight stdout cap still applies to stdout.
+    const stdoutOver = await runner.run(
+      process.execPath,
+      ['-e', "process.stdout.write('o'.repeat(500)); process.stderr.write('e'.repeat(5000))"],
+      { maxOutputBytes: 100, maxStderrBytes: 10_000 }
+    );
+    expect(stdoutOver.failed).toBe(true);
+    expect(stdoutOver.outputLimitExceeded).toBe(true);
+    expect(stdoutOver.stdout.length).toBeLessThanOrEqual(100);
+  });
+
   it('honours a timeout', async () => {
     const result = await runner.run(process.execPath, ['-e', 'setTimeout(()=>{}, 10000)'], {
       timeoutMs: 400

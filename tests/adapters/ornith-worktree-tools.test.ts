@@ -2071,6 +2071,51 @@ describe('OrnithWorktreeTools git_diff against the remaining discovery budget', 
     expect(refused).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
   });
 
+  /**
+   * Tools whose `git diff` is a real process, through the real runner with the options the tool set, that
+   * prints a short diff on stdout and `stderrBytes` of warnings on stderr.
+   */
+  function toolsWithNoisyDiff(stderrBytes: number): OrnithWorktreeTools {
+    const script = `process.stdout.write(${JSON.stringify('+a line of diff\n'.repeat(3))}); process.stderr.write('w'.repeat(${stderrBytes}));`;
+    const wrapping = {
+      run: (file: string, args: readonly string[], options?: Parameters<typeof runner.run>[2]): Promise<ProcessResult> =>
+        file === gitPath && args[0] === 'diff'
+          ? runner.run(process.execPath, ['-e', script], options)
+          : runner.run(file, args, options)
+    };
+    return new OrnithWorktreeTools({
+      worktreePath: worktree,
+      worktreesRoot,
+      repositoryPath: repository,
+      branchName: 'task',
+      runner: wrapping,
+      gitExecutablePath: gitPath
+    });
+  }
+
+  it('is not thrown by any amount of stderr: only stdout is measured against the remaining budget', async () => {
+    // 200 KB of warnings — far more than the stdout cap for these few bytes, and more than any fixed headroom.
+    const noisy = toolsWithNoisyDiff(200_000);
+    const full = await noisy.gitDiff(diff);
+    if (!full.ok) throw new Error(full.reason);
+    const bytes = full.readBytes;
+    expect(bytes).toBeGreaterThan(0);
+
+    expect(await noisy.gitDiff(diff, undefined, { readBytes: bytes, writeBytes: 0 })).toMatchObject({ ok: true, readBytes: bytes });
+    for (const remaining of [bytes - 1, 0]) {
+      expect(await noisy.gitDiff(diff, undefined, { readBytes: remaining, writeBytes: 0 }), `remaining ${remaining}`).toMatchObject({
+        ok: false,
+        code: 'limit_read_bytes_exceeded'
+      });
+    }
+  });
+
+  it('still reports a genuine failure when stderr itself reaches its own cap', async () => {
+    const result = await toolsWithNoisyDiff(9 * 1024 * 1024).gitDiff(diff);
+
+    expect(result).toMatchObject({ ok: false, code: 'internal_error', reason: 'git diff could not be read.' });
+  });
+
   it('keeps credential detection fail-closed, and returns none of a credential-shaped diff over budget either', async () => {
     const secretDiff = `diff --git a/fixture.txt b/fixture.txt\n+token=${TOKEN}\n`;
 

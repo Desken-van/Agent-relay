@@ -614,8 +614,10 @@ terminal failure for that attempt.
   its exact size: one that does not fit is refused whole, as
   `limit_read_bytes_exceeded` (the discovery budget), and none of it is
   returned — never as `internal_error`, which stays reserved for a genuine Git
-  or process failure. The process layer reports when its own output cap was
-  hit, and the diff is only called over budget when what it retained already
+  or process failure. Git's stdout is capped at the remaining bytes plus one and
+  its stderr at its own ordinary limit, so warnings can never make a diff that
+  fits look oversized; the process layer reports when its output cap was hit,
+  and the diff is only called over budget when what stdout retained already
   exceeds the remaining bytes. The refusal is recoverable once, so the model
   can skip the diff and go on to verification with its edit intact.
 - Every checkout is re-confirmed (branch, common Git directory, not

@@ -41,6 +41,12 @@ export interface ProcessRunOptions {
   /** Cap on retained stdout/stderr. Excess is dropped, not buffered. */
   readonly maxOutputBytes?: number;
   /**
+   * A separate cap for stderr alone, for a buffered run whose stdout cap is deliberately tight and
+   * whose stderr (warnings, progress) must not be able to trip it. Unset: stderr shares
+   * {@link maxOutputBytes}, exactly as before. Ignored by streaming runs.
+   */
+  readonly maxStderrBytes?: number;
+  /**
    * When set, **stdout** is streamed line-by-line as it arrives.
    *
    * stdout only. A caller that streams is parsing a protocol, and stderr is
@@ -890,19 +896,26 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
       });
     }
 
-    return this.runBuffered(file, args, execaOptions, { maxBytes, startedAt, commandLabel });
+    return this.runBuffered(file, args, execaOptions, {
+      maxBytes,
+      maxStderrBytes: options.maxStderrBytes,
+      startedAt,
+      commandLabel
+    });
   }
 
   private async runBuffered(
     file: string,
     args: readonly string[],
     execaOptions: Options,
-    ctx: { maxBytes: number; startedAt: number; commandLabel: string }
+    ctx: { maxBytes: number; maxStderrBytes?: number; startedAt: number; commandLabel: string }
   ): Promise<ProcessResult> {
     try {
       const result = await execa(file, [...args], {
         ...execaOptions,
-        maxBuffer: ctx.maxBytes
+        // One number caps both streams, as it always has; the object form only when stderr is given its own.
+        maxBuffer:
+          ctx.maxStderrBytes === undefined ? ctx.maxBytes : { stdout: ctx.maxBytes, stderr: ctx.maxStderrBytes }
       });
 
       return {

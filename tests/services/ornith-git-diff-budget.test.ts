@@ -247,6 +247,16 @@ describe('git_diff with only a few discovery bytes left', () => {
       ['limit_read_bytes_exceeded', true],
       ['limit_read_bytes_exceeded', false]
     ]);
+    // Both events, the recovering one and the terminal one, carry both budgets' used/configured bytes.
+    for (const denial of denials) {
+      expect(denial).toMatchObject({
+        readBytesUsed: DISCOVERY_BUDGET,
+        readBytesConfigured: DISCOVERY_BUDGET,
+        validationBytesUsed: 2 * SMALL_TARGET,
+        validationBytesConfigured: VALIDATION_BUDGET,
+        changedFiles: 1
+      });
+    }
     expect(run.result.assessment.disposition).toBe('fail');
     expect(run.result.assessment.reasonCodes).toEqual(['limit_read_bytes_exceeded']);
     expect(run.result.assessment.publishBlock).toBe('configuration');
