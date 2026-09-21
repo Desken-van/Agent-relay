@@ -5,6 +5,7 @@ import {
   describeUnverifiedOrnithOutcome,
   describeVerificationAttempt,
   latestExecutedAttempt,
+  preservedOrnithChanges,
   readOrnithRunEvidence,
   type OrnithRunEvidence,
   type OrnithVerificationOutcome
@@ -199,28 +200,6 @@ function failedOrnithAttemptProvedNoChanges(run: Run | null): run is Run {
   }
 }
 
-/**
- * How many files an Ornith attempt left changed in the task worktree, taking the most any attempt
- * recorded. A LATER attempt that changed nothing does not erase EARLIER edits: the worktree keeps them,
- * and they are unverified, so the recovery action must stay verification rather than another attempt.
- */
-function preservedOrnithChanges(runs: readonly Run[]): number {
-  let mostEverChanged = 0;
-  let latestKnown: number | null = null;
-  // Newest first: the latest recorded count of what the worktree holds is the best account of it NOW, so
-  // an earlier round that left five files does not keep saying five after a later one left one.
-  for (let index = runs.length - 1; index >= 0; index -= 1) {
-    const run = runs[index]!;
-    if (run.runType !== 'implementation' && run.runType !== 'correction') continue;
-    const evidence = readOrnithRunEvidence(run);
-    if (evidence === null) continue;
-    if (latestKnown === null && evidence.worktreeChangedFiles !== null) latestKnown = evidence.worktreeChangedFiles;
-    mostEverChanged = Math.max(mostEverChanged, evidence.changedFiles ?? 0);
-  }
-  // Runs recorded before the worktree count existed can only say what each round changed itself.
-  return latestKnown ?? mostEverChanged;
-}
-
 /** The verification attempt an Ornith run ended on: the latest that ran, else its last refusal. */
 function ornithVerificationDetail(evidence: OrnithRunEvidence): RunVerificationDetail | null {
   const attempt = latestExecutedAttempt(evidence.attempts) ?? evidence.attempts.at(-1) ?? null;
@@ -282,7 +261,11 @@ function describePreservedAttempt(
 ): { readonly happened: string; readonly result: string } {
   const changed = preserved > 0 ? `Implementation changed ${filesPhrase(preserved)}` : 'An implementation attempt finished';
   const manual = 'Manual verification is required before review.';
-  if (evidence?.deadlineExpired) {
+  // Agent Relay's own verification is the LATEST event whenever it exists (guidance only sees a record that
+  // came after the last implementation attempt). What it found is the state of the task now, so it must not be
+  // masked by the earlier round's deadline: "the time limit expired" is history once the operator has verified.
+  const relayVerificationFailed = detail !== null && detail.source === 'relay' && detail.outcome !== 'passed';
+  if (evidence?.deadlineExpired && !relayVerificationFailed) {
     return {
       happened: `The implementation time limit expired. ${changed}.`,
       result: `${task.lastError ?? describeUnverifiedOrnithOutcome({
@@ -301,11 +284,14 @@ function describePreservedAttempt(
       cancelled: 'verification was cancelled',
       not_run: 'verification was not started'
     };
+    // The explanation comes from the attempt the headline is about: Relay's own record when that is what
+    // failed, never an earlier Ornith round's attempt.
+    const ornithAttempt = detail.source === 'ornith' && evidence !== null && evidence.attempts.length > 0
+      ? describeVerificationAttempt(latestExecutedAttempt(evidence.attempts) ?? evidence.attempts.at(-1)!)
+      : null;
     return {
       happened: `${changed}; ${what[detail.outcome]}.`,
-      result: `${task.lastError ?? (evidence !== null && evidence.attempts.length > 0
-        ? describeVerificationAttempt(latestExecutedAttempt(evidence.attempts) ?? evidence.attempts.at(-1)!)
-        : detail.reason ?? 'The verification result was not recorded.')} ${manual}`
+      result: `${task.lastError ?? ornithAttempt ?? detail.reason ?? 'The verification result was not recorded.'} ${manual}`
     };
   }
   return {

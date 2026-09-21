@@ -1620,7 +1620,9 @@ the action ran; a failing command is never `ok: true`. The run's
 `structuredResult.counters.verificationAttempts` holds up to six attempts, and
 `ornithAudit.worktreeChangedFiles` is a final `git status` count of what the
 worktree holds however it got there, so a later round that changed nothing does
-not make an earlier round's unverified edits look gone. The assessment's
+not make an earlier round's unverified edits look gone. When that count could
+not be established (Git failed or timed out), it is unknown rather than zero: the
+latest count an earlier round recorded stands. The assessment's
 `verificationStatus` follows the latest attempt that actually *ran* (a later
 refusal cannot hide a failure) and never becomes `passed` from a diagnostic run.
 

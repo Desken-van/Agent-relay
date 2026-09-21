@@ -368,6 +368,33 @@ describe('an Ornith round that made no new edits over files an earlier attempt l
   });
 });
 
+describe('an Ornith round whose end-of-run worktree count could not be established', () => {
+  it('reads "unknown" as unknown, not as zero: an earlier round\'s unverified edits are still named and verification still leads', async () => {
+    let round = 0;
+    const ornith = fakeOrnith(async () => {
+      round += 1;
+      if (round === 1) return deadlineAfterEditsResult(); // leaves one changed file, verification failed twice
+      // The second round edits nothing, and its final `git status` failed (null), so it cannot say what remains.
+      const base = noChangeFailureResult();
+      return { ...base, ornithAudit: { ...base.ornithAudit, worktreeChangedFiles: null } };
+    });
+    const verification = scriptedVerification([{}]);
+    const { harness: h, task: afterFirst } = await taskAfterOrnithRound({ ornith, verification });
+    expect(afterFirst.currentRound).toBe(1);
+
+    const afterSecond = await h.orchestrator.sendToClaude(afterFirst.id);
+
+    expect(afterSecond.status).toBe('READY_FOR_IMPLEMENTATION');
+    expect(afterSecond.currentRound).toBe(1); // this round changed nothing of its own: handed back, not consumed
+    expect(afterSecond.lastError).toContain('still holds 1 changed file');
+    expect(afterSecond.lastError).not.toContain('stopped before changing any files');
+    const value = guidanceFor(h, afterSecond);
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification' });
+    expect(value.happened).toBe('Implementation changed 1 file; verification has not run.');
+    expect(verification.calls).toBe(0);
+  });
+});
+
 describe('an Ornith round that changed nothing', () => {
   it('keeps the existing behaviour: the round is handed back and Run implementation is still the action', async () => {
     const verification = scriptedVerification([{}]);

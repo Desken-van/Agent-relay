@@ -101,9 +101,10 @@ export type OrnithToolResult =
       /** Normalized relative path this call changed, if any. */
       readonly changedPath?: string;
       /**
-       * For `search_text` only: how many matches it found. Present ONLY when every candidate file was
-       * searched; absent when any was skipped (unreadable, binary, too large, over budget), because then
-       * a count of zero would not mean "the named files do not contain this".
+       * For `search_text` only: how many matches it found. Absent when the read budget cut the scan short
+       * (a candidate was skipped for what was left of it), because then a count of zero would not mean
+       * "the named files do not contain this". Files that cannot be searched by nature (binary, above the
+       * per-file search limit) do not withhold it.
        */
       readonly matchCount?: number;
       /** Bounded, safe one-line summary for the audit run event. Never file content. */
@@ -1208,9 +1209,6 @@ export class OrnithWorktreeTools {
        *  NOT stop the scan — a later, smaller candidate may still fit — so
        *  this only affects `truncated` and the zero-progress check below. */
       let anySkippedDueToReadBudget = false;
-      /** A candidate was NOT searched (unresolvable, too large, unreadable or binary, or over budget): the scan
-       *  is incomplete, so "no matches" is not proof that the named files do not contain the text. */
-      let anyCandidateNotSearched = false;
 
       for (const path of candidates) {
         if (matches.length >= action.limit) break;
@@ -1231,17 +1229,11 @@ export class OrnithWorktreeTools {
           return denied('checkout_identity_changed', 'The checkout identity changed.');
         }
         const resolved = await this.resolvePathOnly(path, { mustExist: true, forWrite: false });
-        if (!resolved.ok) {
-          anyCandidateNotSearched = true;
-          continue;
-        }
+        if (!resolved.ok) continue;
         let content: string;
         try {
           const stats = await lstat(resolved.absolutePath);
-          if (stats.size > ORNITH_LIMITS.maxReadBytes) {
-            anyCandidateNotSearched = true;
-            continue;
-          }
+          if (stats.size > ORNITH_LIMITS.maxReadBytes) continue;
           if (readBytesTotal + stats.size > budget.readBytes) {
             // This exact candidate is never opened or read — every byte
             // charged below still comes from a fully, successfully read
@@ -1258,17 +1250,13 @@ export class OrnithWorktreeTools {
             bounded
           );
           if (!safeRead.ok) {
-            if (safeRead.code === 'limit_read_bytes_exceeded' && stats.size > ORNITH_LIMITS.maxReadBytes) {
-              anyCandidateNotSearched = true;
-              continue;
-            }
+            if (safeRead.code === 'limit_read_bytes_exceeded' && stats.size > ORNITH_LIMITS.maxReadBytes) continue;
             return denied(safeRead.code, safeRead.reason);
           }
           const raw = safeRead.raw;
           readBytesTotal += raw.byteLength;
           content = new TextDecoder('utf-8', { fatal: true }).decode(raw);
         } catch {
-          anyCandidateNotSearched = true;
           continue; // binary or unreadable: silently skipped, matching a literal-text search's scope
         }
         const haystack = action.caseSensitive ? content : content.toLowerCase();
@@ -1344,8 +1332,11 @@ export class OrnithWorktreeTools {
         readBytes: readBytesTotal,
         writeBytes: 0,
         // Only the number, so the loop can tell "the named files do not contain this" from "they do" —
-        // and only when every candidate was actually searched: a scan cut short proves nothing.
-        ...(anyCandidateNotSearched || anySkippedDueToReadBudget ? {} : { matchCount: matches.length }),
+        // and not when the READ BUDGET cut the scan short, which proves nothing. A file that cannot be
+        // searched by nature (binary, above the per-file search limit) is not a budget shortfall: it could
+        // never come up non-empty, and a task naming one (this repository's larger docs) must not be
+        // barred from ever earning a wider search.
+        ...(anySkippedDueToReadBudget ? {} : { matchCount: matches.length }),
         auditSummary: `search_text -> ${matches.length} match(es) across ${candidates.length} file(s)`
       };
     } catch (error) {

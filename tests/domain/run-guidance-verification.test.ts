@@ -294,6 +294,37 @@ describe('after Agent Relay’s own verification of the worktree', () => {
     expect(value.happened).toBe('Implementation changed 1 file; verification timed out.');
   });
 
+  it('a later Relay verification is the latest event: it is not masked by the earlier round having hit its time limit', () => {
+    // The live sequence: the implementation round ended on limit_deadline_exceeded; the operator then pressed
+    // Run verification and Relay's own verification timed out (no exit code). The screen must say THAT.
+    const value = guidance(
+      task({ lastError: 'Verification timed out; success was not established.' }),
+      [
+        ornithRun({ changedFiles: 1, worktreeChangedFiles: 1, reasonCodes: ['limit_deadline_exceeded'], attempts: [attempt()] }),
+        relayRecord({ exitCode: null, reason: 'Verification timed out; success was not established.', outcome: 'timed_out' })
+      ]
+    );
+
+    expect(value.happened).toBe('Implementation changed 1 file; verification timed out.');
+    expect(value.happened).not.toContain('time limit expired');
+    expect(value.result).toContain('Verification timed out; success was not established.');
+    expect(value.verification).toMatchObject({ source: 'relay', outcome: 'timed_out', exitCode: null });
+    expect(value.action?.key).toBe('run_verification');
+  });
+
+  it('explains a Relay verification from Relay’s own record, not from an earlier Ornith round’s attempt, when the task has no error text', () => {
+    const value = guidance(
+      task({ lastError: null }),
+      [
+        ornithRun({ changedFiles: 1, worktreeChangedFiles: 1, reasonCodes: ['limit_deadline_exceeded'], attempts: [attempt()] }),
+        relayRecord({ exitCode: null, reason: 'Verification cancelled; success was not established.', outcome: 'cancelled' })
+      ]
+    );
+
+    expect(value.result).toContain('Verification cancelled; success was not established.');
+    expect(value.result).not.toContain('exited with code 1'); // the old Ornith attempt's words
+  });
+
   it('reads a record written before outcomes existed, without calling a timeout a cancellation', () => {
     const timedOut = guidance(task(), [
       ornithRun({ changedFiles: 1 }),

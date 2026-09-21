@@ -33,6 +33,7 @@ import type { GitChangeSet } from '../../shared/domain/git';
 import type { Project, Settings, Task } from '../../shared/domain/models';
 import {
   describeUnverifiedOrnithOutcome,
+  preservedOrnithChanges,
   summarizeVerificationOutput
 } from '../../shared/domain/ornith-verification';
 import type { VerificationRecord } from '../../shared/domain/verification';
@@ -1337,13 +1338,23 @@ export class Orchestrator {
       const runFailed = failed && !(verificationOnly && this.deps.verification);
       const changedFiles = result.ornithAudit.changedFiles;
       // What the worktree holds, whoever changed it: a round that changed nothing must not make an earlier
-      // attempt's preserved, unverified edits look gone. Unknown (null) counts as none, as it always did.
-      const preservedChanges = changedFiles > 0 || (result.ornithAudit.worktreeChangedFiles ?? 0) > 0;
+      // attempt's preserved, unverified edits look gone. When this round could not establish the count
+      // (Git failed or timed out at its end) that is UNKNOWN, not zero: the latest count an earlier round
+      // recorded stands, so a failed status call cannot route the operator into overwriting unverified edits.
+      // Only for an IMPLEMENTATION round: it starts from READY_FOR_IMPLEMENTATION, where earlier edits are by
+      // definition unproven. A correction round starts from a state whose edits were already verified and
+      // reviewed, so an earlier round's count says nothing about what this one left unverified.
+      // (This round's own run row is still `running` here and has no result yet, so it is skipped.)
+      const worktreeChangedFiles = result.ornithAudit.worktreeChangedFiles ??
+        (changedFiles === 0 && options.runType === 'implementation'
+          ? preservedOrnithChanges(this.deps.runs.listByTask(task.id))
+          : null);
+      const preservedChanges = changedFiles > 0 || (worktreeChangedFiles ?? 0) > 0;
       const error = failed
         ? preservedChanges
           ? describeUnverifiedOrnithOutcome({
               changedFiles,
-              worktreeChangedFiles: result.ornithAudit.worktreeChangedFiles,
+              worktreeChangedFiles,
               attempts: result.ornithAudit.verificationAttempts,
               deadlineExpired: result.assessment.reasonCodes.includes('limit_deadline_exceeded')
             })

@@ -2183,17 +2183,22 @@ describe('OrnithWorktreeTools facts for verification recovery', () => {
       expect(found).toMatchObject({ ok: true, matchCount: 1 });
     });
 
-    it('is withheld — not reported as 0 — when a named file could not be searched, so an incomplete scan never reads as "empty"', async () => {
-      // A binary file: it cannot be decoded as text, so it is skipped rather than searched.
+    it('reports the count for a named file that cannot be searched by nature (binary, above the per-file limit), so it never bars a task from a wider search', async () => {
+      // A binary file cannot be decoded as text; a file above the per-file search limit is skipped unread.
+      // Neither could ever come up non-empty, and this repository's larger docs are exactly such files.
       writeFileSync(join(worktree, 'blob.bin'), Buffer.from([0xff, 0xfe, 0x00, 0xc3, 0x28, 0xa0, 0xa1]));
+      writeFileSync(join(worktree, 'large.md'), 'a documentation line\n'.repeat(4_000), 'utf8'); // ~84 KB > 64 KiB
+      expect(lstatSync(join(worktree, 'large.md')).size).toBeGreaterThan(ORNITH_LIMITS.maxReadBytes);
       const boundary = tools();
 
-      const withBinary = await boundary.searchText({ version: 1, action: 'search_text', query: 'zz-no-such-text', caseSensitive: false, files: ['fixture.txt', 'blob.bin'], limit: 10 });
-      expect(withBinary).toMatchObject({ ok: true });
-      expect(withBinary).not.toHaveProperty('matchCount');
+      for (const files of [['fixture.txt', 'blob.bin'], ['large.md']]) {
+        const result = await boundary.searchText({ version: 1, action: 'search_text', query: 'zz-no-such-text', caseSensitive: false, files, limit: 10 });
+        expect(result, files.join()).toMatchObject({ ok: true, matchCount: 0 });
+      }
+    });
 
-      // A candidate too large for what is left of the read budget is skipped, not searched.
-      writeFileSync(join(worktree, 'big.txt'), `${'filler line\n'.repeat(200)}`, 'utf8');
+    it('withholds the count when the READ BUDGET cut the scan short, because then zero proves nothing', async () => {
+      writeFileSync(join(worktree, 'big.txt'), 'filler line\n'.repeat(200), 'utf8');
       const overBudget = await tools().searchText( // a fresh executor: its manifest is read once, so it must see big.txt
         { version: 1, action: 'search_text', query: 'zz-no-such-text', caseSensitive: false, files: ['fixture.txt', 'big.txt'], limit: 10 },
         undefined,

@@ -266,6 +266,28 @@ export function readOrnithRunEvidence(run: Pick<Run, 'agent' | 'structuredResult
   };
 }
 
+/**
+ * How many files an Ornith attempt left changed in the task worktree, taking the most any attempt
+ * recorded. A LATER attempt that changed nothing does not erase EARLIER edits: the worktree keeps them,
+ * and they are unverified, so the recovery action must stay verification rather than another attempt.
+ */
+export function preservedOrnithChanges(runs: readonly Run[]): number {
+  let mostEverChanged = 0;
+  let latestKnown: number | null = null;
+  // Newest first: the latest recorded count of what the worktree holds is the best account of it NOW, so
+  // an earlier round that left five files does not keep saying five after a later one left one.
+  for (let index = runs.length - 1; index >= 0; index -= 1) {
+    const run = runs[index]!;
+    if (run.runType !== 'implementation' && run.runType !== 'correction') continue;
+    const evidence = readOrnithRunEvidence(run);
+    if (evidence === null) continue;
+    if (latestKnown === null && evidence.worktreeChangedFiles !== null) latestKnown = evidence.worktreeChangedFiles;
+    mostEverChanged = Math.max(mostEverChanged, evidence.changedFiles ?? 0);
+  }
+  // Runs recorded before the worktree count existed can only say what each round changed itself.
+  return latestKnown ?? mostEverChanged;
+}
+
 function plural(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? '' : 's'}`;
 }

@@ -84,6 +84,8 @@ interface Scenario {
   readonly extraFiles?: Readonly<Record<string, string>>;
   /** Overrides the specification's implementation prompt (default: a harmless one). */
   readonly implementationPrompt?: string;
+  /** Size of the named target file (default 2,000 bytes). */
+  readonly targetBytes?: number;
   /** Runs against the worktree before the loop starts — how an earlier attempt's preserved edits are set up. */
   readonly prepare?: (worktree: string) => void;
 }
@@ -120,7 +122,7 @@ function executionFor(script: VerificationScript, durationMs: number): OrnithVer
 }
 
 async function runScenario(scenario: Scenario): Promise<Outcome> {
-  const fixture = await createReplayFixture({ targetBytes: 2_000, companions: false, extraFiles: scenario.extraFiles });
+  const fixture = await createReplayFixture({ targetBytes: scenario.targetBytes ?? 2_000, companions: false, extraFiles: scenario.extraFiles });
   fixtures.push(fixture);
   scenario.prepare?.(fixture.worktree);
   // Installed only now: the fixture's own Git calls run on the real clock.
@@ -558,6 +560,22 @@ describe('exploring beyond an explicitly named file', () => {
     const denials = outcome.events.filter((event) => event.data?.['code'] === 'scope_expansion_refused');
     expect(denials.map((event) => event.data?.['recoverable'])).toEqual([true, false]);
     expect(outcome.prompts.some((prompt) => prompt.includes('1 more refused search will end the run'))).toBe(true);
+  }, REAL_GIT_TEST_TIMEOUT_MS);
+
+  it('never bars a task whose named file is too large to search (above the 64 KiB per-file limit) from earning a wider search', async () => {
+    // This repository's own docs are larger than the limit (docs/architecture.md is ~150 KB): search_text skips
+    // such a file unread, so its "empty" scoped search is all the evidence there can ever be.
+    const outcome = await runScenario({
+      targetBytes: 70_000,
+      extraFiles: { 'docs/other.md': 'The provider smoke-test checklist is described here.\n' },
+      steps: [read, searchScoped('provider smoke-test'), searchAll('provider smoke-test'), done]
+    });
+
+    expect(denied(outcome)).toEqual([]); // not refused, on the first request or ever
+    expect(searchEvents(outcome)).toHaveLength(2); // the scoped one, and the wider one it earned
+    expect(searchEvents(outcome).every((data) => data['ok'] === true)).toBe(true);
+    expect(outcome.prompts.some((prompt) => prompt.includes('docs/other.md'))).toBe(true);
+    expect(outcome.result.assessment.reasonCodes).toEqual([]);
   }, REAL_GIT_TEST_TIMEOUT_MS);
 
   it('grants a wider search only for a search of the WHOLE declared scope: empty in one of two named files proves nothing about the other', async () => {
