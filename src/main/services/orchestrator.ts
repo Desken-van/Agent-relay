@@ -31,6 +31,10 @@ import {
 import { AgentRelayError, InvalidTransitionError } from '../../shared/domain/errors';
 import type { GitChangeSet } from '../../shared/domain/git';
 import type { Project, Settings, Task } from '../../shared/domain/models';
+import {
+  describeUnverifiedOrnithOutcome,
+  summarizeVerificationOutput
+} from '../../shared/domain/ornith-verification';
 import type { VerificationRecord } from '../../shared/domain/verification';
 import type { WorktreeDependencyStatus } from '../../shared/domain/worktree-dependencies';
 import {
@@ -389,14 +393,25 @@ export class Orchestrator {
       const after = await executor.identity({ task: this.requireTask(taskId), settings: this.deps.settings.get(), project: this.requireProject(task.projectId) });
       const passed = result.exitCode === 0 && !result.failed && !result.timedOut && !result.cancelled && !controller.signal.aborted && after === identity;
       const reason = passed ? null : after !== identity ? 'Files or task inputs changed during verification. Run verification again.' : result.cancelled || controller.signal.aborted ? 'Verification cancelled; success was not established.' : result.timedOut ? 'Verification timed out; success was not established.' : `npm run verify failed (exit ${result.exitCode ?? 'unknown'}). See command output.`;
+      // Which kind of stop it was — the reason string alone made a timeout, a cancel and a nonzero exit
+      // hard to tell apart — and the bounded, sanitized tail of the output, so the screen can say why.
+      const outcome = passed
+        ? 'passed'
+        : after !== identity
+          ? 'failed'
+          : result.cancelled || controller.signal.aborted
+            ? 'cancelled'
+            : result.timedOut ? 'timed_out' : 'failed';
       handle.finish({ status: passed ? 'succeeded' : 'failed', finalMessage: passed ? 'Verification passed for this code snapshot. Ready for review.' : reason,
-        errorMessage: reason, structuredResult: { version: 1, command: 'npm run verify', identity, passed, exitCode: result.exitCode, durationMs: result.durationMs, reason } });
+        errorMessage: reason, structuredResult: { version: 1, command: 'npm run verify', identity, passed, exitCode: result.exitCode, durationMs: result.durationMs, reason,
+          outcome, ...(passed ? {} : { outputSummary: summarizeVerificationOutput(`${result.stdout}\n${result.stderr}`) }) } });
       if (this.requireTask(taskId).status !== 'VERIFYING') return this.requireTask(taskId);
       return this.applyEvent(this.requireTask(taskId), passed ? 'verification_completed' : 'verification_aborted', { lastError: reason });
     } catch (error) {
       const message = Orchestrator.describeError(error);
       handle?.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: message,
-        structuredResult: { version: 1, command: 'npm run verify', identity, passed: false, exitCode: null, durationMs: 0, reason: message } });
+        structuredResult: { version: 1, command: 'npm run verify', identity, passed: false, exitCode: null, durationMs: 0, reason: message,
+          outcome: isCancelled(error) ? 'cancelled' : 'failed' } });
       if (this.requireTask(taskId).status === 'VERIFYING') this.applyEvent(this.requireTask(taskId), 'verification_aborted', { lastError: message });
       throw error;
     } finally { this.endExclusive(taskId); }
@@ -856,6 +871,8 @@ export class Orchestrator {
       completed = await this.runImplementation(task, controller, prompt, {
         runType: 'implementation',
         recoverableFailure: 'implementation_aborted',
+        // Files saved but not proven verified: the same recoverable state, told apart from an abort.
+        unverifiedFailure: 'implementation_unverified',
         ornithLease,
         ornithCorrectionFindings: verificationRepair,
         roundBeforeAttempt
@@ -1282,20 +1299,32 @@ export class Orchestrator {
         loopDeadlineMs: Math.min(settings.processTimeoutMs, ORNITH_LIMITS.maxLoopDeadlineMs),
         signal: controller.signal,
         onProgress: (event) => handle.append(event),
-        // `WorktreeVerification.execute` already applies its own timeout from
-        // `settings.processTimeoutMs`; the remaining-loop-time budget the
-        // caller passes here is diagnostic only, matching the fact that this
-        // whole call is diagnostic — see the class comment.
-        runVerification: async (signal, timeoutMs) => {
+        // Reports what the command did — exit code, timeout, cancellation, duration and its output —
+        // and nothing else: the loop classifies it, bounds and sanitizes the output, and enforces the
+        // time budget through `signal`. (`WorktreeVerification.execute` still applies its own
+        // `settings.processTimeoutMs`.) A bare passed/failed here is how a failing command used to
+        // become "ok".
+        runVerification: async (signal) => {
           const executor = this.deps.verification;
-          if (!executor) return { passed: false, summary: 'Verification is not configured in this build.' };
+          if (!executor) {
+            return {
+              exitCode: null, failed: true, timedOut: false, cancelled: false, durationMs: 0,
+              output: 'Verification is not configured in this build.'
+            };
+          }
           const outcome = await executor.execute(
             { task: this.requireTask(task.id), settings, project },
-            AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, timeoutMs))]),
+            signal,
             () => undefined
           );
-          const passed = outcome.exitCode === 0 && !outcome.failed && !outcome.timedOut && !outcome.cancelled;
-          return { passed, summary: passed ? 'npm run verify passed.' : 'npm run verify did not pass.' };
+          return {
+            exitCode: outcome.exitCode,
+            failed: outcome.failed,
+            timedOut: outcome.timedOut,
+            cancelled: outcome.cancelled,
+            durationMs: outcome.durationMs,
+            output: `${outcome.stdout}\n${outcome.stderr}`
+          };
         },
         lease,
         leaseService: this.deps.ornithLease,
@@ -1307,12 +1336,20 @@ export class Orchestrator {
       const verificationOnly = checked.ok && checked.assessment.publishBlock === 'verification';
       const runFailed = failed && !(verificationOnly && this.deps.verification);
       const changedFiles = result.ornithAudit.changedFiles;
+      // What the worktree holds, whoever changed it: a round that changed nothing must not make an earlier
+      // attempt's preserved, unverified edits look gone. Unknown (null) counts as none, as it always did.
+      const preservedChanges = changedFiles > 0 || (result.ornithAudit.worktreeChangedFiles ?? 0) > 0;
       const error = failed
-        ? changedFiles === 0
-          ? `Ornith stopped before changing any files. ${result.finalMessage}`
-          : 'Ornith changed files, but this run did not prove verification passed. Run verification in Agent Relay to check the current files.'
+        ? preservedChanges
+          ? describeUnverifiedOrnithOutcome({
+              changedFiles,
+              worktreeChangedFiles: result.ornithAudit.worktreeChangedFiles,
+              attempts: result.ornithAudit.verificationAttempts,
+              deadlineExpired: result.assessment.reasonCodes.includes('limit_deadline_exceeded')
+            })
+          : `Ornith stopped before changing any files. ${result.finalMessage}`
         : null;
-      const failureEvent = failed && changedFiles > 0 && checked.ok && checked.assessment.publishBlock !== 'security'
+      const failureEvent = failed && preservedChanges && checked.ok && checked.assessment.publishBlock !== 'security'
         ? (options.unverifiedFailure ?? options.recoverableFailure)
         : options.recoverableFailure;
       handle.finish({

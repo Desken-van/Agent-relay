@@ -46,6 +46,7 @@ export const WORKFLOW_EVENTS = [
   'implementation_completed',
   'implementation_failed',
   'implementation_aborted',
+  'implementation_unverified',
   'correction_unverified',
   'correction_aborted',
   'review_started',
@@ -125,6 +126,11 @@ export const TRANSITIONS: TransitionTable = {
     implementation_failed: 'FAILED',
     // Recoverable failure during the first implementation round.
     implementation_aborted: 'READY_FOR_IMPLEMENTATION',
+    // The first round changed files and then did not prove them verified (its verification failed,
+    // timed out, or the loop ran out of time). Same state as an abort — the task is recoverable
+    // there — but a different cause: the files are PRESERVED and the next action is Relay's own
+    // verification, not another implementation attempt.
+    implementation_unverified: 'READY_FOR_IMPLEMENTATION',
     // A correction completed and its files were saved, but the AI process did
     // not prove them verified. Keep the work and hand proof to Relay's own
     // verification runner instead of spending another correction round.

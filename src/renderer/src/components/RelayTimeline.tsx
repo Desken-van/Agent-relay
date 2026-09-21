@@ -12,6 +12,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Run, RunEvent } from '@shared/domain/models';
 import { readVerification } from '@shared/domain/verification';
 import { isOrnithToolDenialEventData, type OrnithToolDenialEventData } from '@shared/domain/ornith';
+import {
+  formatVerificationDuration,
+  isOrnithVerificationEventData,
+  type OrnithVerificationEventData
+} from '@shared/domain/ornith-verification';
 import { call } from '../lib/api';
 import { readClaudeAssessment } from '@shared/domain/claude-assessment';
 import { decodeEvent, formatDuration, formatTime } from '../lib/format';
@@ -280,6 +285,37 @@ function OrnithDenialLine({ data }: { data: OrnithToolDenialEventData }): React.
   );
 }
 
+const VERIFICATION_OUTCOME_WORDS: Record<OrnithVerificationEventData['verification']['outcome'], string> = {
+  passed: 'passed',
+  failed: 'FAILED',
+  timed_out: 'TIMED OUT',
+  cancelled: 'was CANCELLED'
+};
+
+/**
+ * An Ornith `run_verification` event. Two facts, said separately: the action ran (`dispatched`), and the
+ * verification's own outcome — with its command, exit code, duration, reason and the bounded, sanitized tail
+ * of its output. A failed verification must never read as a success just because the action was dispatched.
+ */
+function OrnithVerificationLine({ data }: { data: OrnithVerificationEventData }): React.JSX.Element {
+  const verification = data.verification;
+  return (
+    <div className="logs__text selectable">
+      Ornith verification <span className="mono">{verification.command}</span>{' '}
+      {VERIFICATION_OUTCOME_WORDS[verification.outcome]}
+      {verification.exitCode !== null ? ` · exit code ${verification.exitCode}` : ''}
+      {` · ${formatVerificationDuration(verification.durationMs)}`}
+      {verification.reason ? ` · ${verification.reason}` : ''}
+      {verification.summary.length > 0 ? (
+        <details>
+          <summary className="faint" style={{ cursor: 'pointer', fontSize: 12 }}>Command output (bounded)</summary>
+          <pre className="pre selectable" style={{ marginTop: 6 }}>{verification.summary}</pre>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
 function RelayNodeBody({ run }: { run: Run }): React.JSX.Element {
   const { liveEvents } = useStore();
   const [stored, setStored] = useState<RunEvent[] | null>(null);
@@ -370,6 +406,8 @@ function RelayNodeBody({ run }: { run: Run }): React.JSX.Element {
                     <WarningLine text={decoded.text} data={decoded.data} />
                   ) : event.type === 'tool_use' && isOrnithToolDenialEventData(decoded.data) ? (
                     <OrnithDenialLine data={decoded.data} />
+                  ) : event.type === 'tool_use' && isOrnithVerificationEventData(decoded.data) ? (
+                    <OrnithVerificationLine data={decoded.data} />
                   ) : (
                     <span className="logs__text selectable">{decoded.text}</span>
                   )}

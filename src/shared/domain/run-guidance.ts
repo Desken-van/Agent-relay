@@ -1,7 +1,15 @@
 import { providerLabel } from './execution-providers';
 import type { ContinuationEntryAction, Run, Task } from './models';
 import type { LocalInferenceStateKind } from './local-inference';
-import { latestVerification, verificationNeedsImplementationRepair } from './verification';
+import {
+  describeUnverifiedOrnithOutcome,
+  describeVerificationAttempt,
+  latestExecutedAttempt,
+  readOrnithRunEvidence,
+  type OrnithRunEvidence,
+  type OrnithVerificationOutcome
+} from './ornith-verification';
+import { latestVerification, readVerification, verificationNeedsImplementationRepair } from './verification';
 
 /**
  * The one workflow transition Run → Actions may offer right now.
@@ -66,6 +74,22 @@ export type PlanReviewPreparation =
 
 export type RunGuidanceTone = 'active' | 'success' | 'warning' | 'error';
 
+/**
+ * What a verification attempt actually was, for the Run screen: the command, how it ended, and — when it
+ * is known — the exit code, duration, the explicit reason and the bounded, sanitized tail of its output.
+ * Built only from records that were sanitized and bounded when they were stored.
+ */
+export interface RunVerificationDetail {
+  /** Whose verification this is: Ornith's own in-loop attempt, or Agent Relay's verification of the worktree. */
+  readonly source: 'ornith' | 'relay';
+  readonly command: string;
+  readonly outcome: OrnithVerificationOutcome;
+  readonly exitCode: number | null;
+  readonly durationMs: number | null;
+  readonly reason: string | null;
+  readonly output: string | null;
+}
+
 export interface RunGuidance {
   readonly happened: string;
   readonly stage: string;
@@ -74,6 +98,14 @@ export interface RunGuidance {
   readonly next: string;
   /** The one primary workflow control to render, or null to render none. */
   readonly action: RunPrimaryAction | null;
+  /**
+   * A deliberate alternative to the primary action, rendered less prominently — for example re-running the
+   * implementation after a preserved change, or re-checking a verification that failed. Null/absent: none.
+   * Never the same key as `action`.
+   */
+  readonly secondaryAction?: RunPrimaryAction | null;
+  /** The verification attempt behind this state, when there is one. */
+  readonly verification?: RunVerificationDetail | null;
   readonly activeStep: number;
   readonly tone: RunGuidanceTone;
 }
@@ -157,12 +189,127 @@ function failedOrnithAttemptProvedNoChanges(run: Run | null): run is Run {
     const parsed: unknown = JSON.parse(run.structuredResult);
     if (typeof parsed !== 'object' || parsed === null) return false;
     const counters = (parsed as { readonly counters?: unknown }).counters;
-    return typeof counters === 'object'
-      && counters !== null
-      && (counters as { readonly changedFiles?: unknown }).changedFiles === 0;
+    if (typeof counters !== 'object' || counters === null) return false;
+    const record = counters as { readonly changedFiles?: unknown; readonly worktreeChangedFiles?: unknown };
+    // This run changed nothing — and, when the run could tell, the worktree holds nothing either.
+    return record.changedFiles === 0
+      && !(typeof record.worktreeChangedFiles === 'number' && record.worktreeChangedFiles > 0);
   } catch {
     return false;
   }
+}
+
+/**
+ * How many files an Ornith attempt left changed in the task worktree, taking the most any attempt
+ * recorded. A LATER attempt that changed nothing does not erase EARLIER edits: the worktree keeps them,
+ * and they are unverified, so the recovery action must stay verification rather than another attempt.
+ */
+function preservedOrnithChanges(runs: readonly Run[]): number {
+  let most = 0;
+  for (const run of runs) {
+    if (run.runType !== 'implementation' && run.runType !== 'correction') continue;
+    const evidence = readOrnithRunEvidence(run);
+    if (evidence === null) continue;
+    most = Math.max(most, evidence.changedFiles ?? 0, evidence.worktreeChangedFiles ?? 0);
+  }
+  return most;
+}
+
+/** The verification attempt an Ornith run ended on: the latest that ran, else its last refusal. */
+function ornithVerificationDetail(evidence: OrnithRunEvidence): RunVerificationDetail | null {
+  const attempt = latestExecutedAttempt(evidence.attempts) ?? evidence.attempts.at(-1) ?? null;
+  if (attempt === null) return null;
+  return {
+    source: 'ornith',
+    command: attempt.command,
+    outcome: attempt.outcome,
+    exitCode: attempt.exitCode,
+    durationMs: attempt.outcome === 'not_run' ? null : attempt.durationMs,
+    reason: attempt.reason,
+    output: attempt.summary.length > 0 ? attempt.summary : null
+  };
+}
+
+/**
+ * A record written before `outcome` existed said only `passed`, an exit code and a reason string. The
+ * reason is the one place a timeout was told apart from a cancel, so read it rather than call every
+ * exit-less failure a cancellation.
+ */
+function legacyRelayOutcome(data: { passed: boolean; exitCode: number | null; reason: string | null }): OrnithVerificationOutcome {
+  if (data.passed) return 'passed';
+  if (data.exitCode !== null && data.exitCode !== 0) return 'failed';
+  const reason = data.reason?.toLowerCase() ?? '';
+  if (reason.includes('timed out')) return 'timed_out';
+  if (reason.includes('cancelled')) return 'cancelled';
+  return 'failed';
+}
+
+/** Agent Relay's own verification record for a verification run, when it can be read. */
+function relayVerificationDetail(run: Run): RunVerificationDetail | null {
+  const record = readVerification(run);
+  if (!record.success) return null;
+  const { data } = record;
+  return {
+    source: 'relay',
+    command: data.command,
+    outcome: data.outcome ?? legacyRelayOutcome(data),
+    exitCode: data.exitCode,
+    durationMs: data.durationMs,
+    reason: data.reason,
+    output: data.outputSummary !== undefined && data.outputSummary.length > 0 ? data.outputSummary : null
+  };
+}
+
+function filesPhrase(count: number): string {
+  return `${count} file${count === 1 ? '' : 's'}`;
+}
+
+/**
+ * The words for "files are preserved and unverified", by what actually happened to the verification.
+ * `happened` names the situation; `result` is the reason, from the task's own explanation when it has one.
+ */
+function describePreservedAttempt(
+  task: Task,
+  evidence: OrnithRunEvidence | null,
+  preserved: number,
+  detail: RunVerificationDetail | null
+): { readonly happened: string; readonly result: string } {
+  const changed = preserved > 0 ? `Implementation changed ${filesPhrase(preserved)}` : 'An implementation attempt finished';
+  const manual = 'Manual verification is required before review.';
+  if (evidence?.deadlineExpired) {
+    return {
+      happened: `The implementation time limit expired. ${changed}.`,
+      result: `${task.lastError ?? describeUnverifiedOrnithOutcome({
+        changedFiles: evidence.changedFiles ?? 0,
+        worktreeChangedFiles: evidence.worktreeChangedFiles,
+        attempts: evidence.attempts,
+        deadlineExpired: true
+      })} ${manual}`
+    };
+  }
+  if (detail !== null && detail.outcome !== 'passed') {
+    const what: Record<OrnithVerificationOutcome, string> = {
+      passed: 'verification passed',
+      failed: 'verification failed',
+      timed_out: 'verification timed out',
+      cancelled: 'verification was cancelled',
+      not_run: 'verification was not started'
+    };
+    return {
+      happened: `${changed}; ${what[detail.outcome]}.`,
+      result: `${task.lastError ?? (evidence !== null && evidence.attempts.length > 0
+        ? describeVerificationAttempt(latestExecutedAttempt(evidence.attempts) ?? evidence.attempts.at(-1)!)
+        : detail.reason ?? 'The verification result was not recorded.')} ${manual}`
+    };
+  }
+  return {
+    // Files are known to be preserved but no verification was recorded: say so plainly. With nothing known
+    // (an older run, a crash before any counters) the wording stays the general one it always was.
+    happened: preserved > 0
+      ? `${changed}; verification has not run.`
+      : 'An implementation attempt finished without proving the current files are verified.',
+    result: task.lastError ?? 'The files were preserved. Review is blocked until verification passes.'
+  };
 }
 
 function stoppedResult(task: Task, runs: readonly Run[]): string {
@@ -411,19 +558,27 @@ export function runGuidance(
         });
       }
       const verification = latestVerification(runs);
+      const relayDetail = verification === null ? null : relayVerificationDetail(verification);
       if (verificationNeedsImplementationRepair(verification)) {
         const repairLabel = `Fix verification failures · ${providerLabel(task.implementationProvider)}`;
-        return acting({
-          happened: 'Agent Relay ran verification and the current files did not pass.',
-          stage: 'Step 2 of 5 · Fix verification failures',
-          result: task.lastError ?? verification.errorMessage ?? 'The verification output is saved for the implementation provider.',
-          action: guardOrnithReadiness(action('run_implementation', repairLabel), task, extra),
-          activeStep: 1,
-          tone: 'warning'
-        });
+        return {
+          ...acting({
+            happened: 'Agent Relay ran verification and the current files did not pass.',
+            stage: 'Step 2 of 5 · Fix verification failures',
+            result: task.lastError ?? verification.errorMessage ?? 'The verification output is saved for the implementation provider.',
+            action: guardOrnithReadiness(action('run_implementation', repairLabel), task, extra),
+            activeStep: 1,
+            tone: 'warning'
+          }),
+          // A nonzero exit is not always the code's fault (a busy machine, a flaky test): checking again
+          // must not require another implementation round.
+          secondaryAction: action('run_verification', 'Run verification again'),
+          verification: relayDetail
+        };
       }
       const implementationAttempt = latestRun(runs, ['implementation', 'correction']);
-      if (failedOrnithAttemptProvedNoChanges(implementationAttempt)) {
+      const preserved = preservedOrnithChanges(runs);
+      if (failedOrnithAttemptProvedNoChanges(implementationAttempt) && preserved === 0) {
         return acting({
           happened: 'Ornith stopped before changing any files.',
           stage: 'Step 2 of 5 · Implementation',
@@ -434,14 +589,26 @@ export function runGuidance(
         });
       }
       if (hasImplementationAttempt(runs)) {
-        return acting({
-          happened: 'An implementation attempt finished without proving the current files are verified.',
-          stage: 'Step 3 of 5 · Verification',
-          result: task.lastError ?? 'The files were preserved. Review is blocked until verification passes.',
-          action: action('run_verification', 'Run verification'),
-          activeStep: 2,
-          tone: 'warning'
-        });
+        const evidence = implementationAttempt === null ? null : readOrnithRunEvidence(implementationAttempt);
+        const detail = relayDetail ?? (evidence === null ? null : ornithVerificationDetail(evidence));
+        const story = describePreservedAttempt(task, evidence, preserved, detail);
+        return {
+          ...acting({
+            happened: story.happened,
+            stage: 'Step 3 of 5 · Verification',
+            result: story.result,
+            action: action('run_verification', 'Run verification'),
+            activeStep: 2,
+            tone: 'warning'
+          }),
+          // Deliberate, never the default: it runs the provider again on top of the preserved changes.
+          secondaryAction: guardOrnithReadiness(
+            action('run_implementation', `Retry implementation · ${providerLabel(task.implementationProvider)}`),
+            task,
+            extra
+          ),
+          verification: detail
+        };
       }
       if (extra.continuationEntryAction === 'verification' || extra.isContinuation) {
         return acting({

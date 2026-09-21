@@ -73,7 +73,10 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
     'replays the production run: 25 windows, one repository-wide search, then replace_text on the fully read target',
     async () => {
       const fixture = await fixtureFor({});
+      // Unscoped: the arithmetic under test is that of a repository-wide search, which a declared
+      // scope would refuse before dispatch (the scope gate has its own tests).
       const run = await replay(fixture, {
+        scope: [],
         afterRead: [{ kind: 'search_all' }, { kind: 'replace' }, { kind: 'verify' }, { kind: 'finish' }]
       });
 
@@ -178,6 +181,7 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
   it('a repository-wide search still respects the 4 MiB discovery limit, and the edit still works after its recovery', async () => {
     const fixture = await fixtureFor({ targetBytes: SMALL_TARGET, companions: false, fillerSizes: DRAIN_TO_ZERO });
     const run = await replay(fixture, {
+      scope: [], // see the production replay above: an unscoped task, so the search is dispatched
       windows: 1,
       windowLimit: 4_096,
       afterRead: [...drain(4), { kind: 'search_all' }, { kind: 'replace' }, { kind: 'verify' }, { kind: 'finish' }]

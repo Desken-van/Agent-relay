@@ -1697,6 +1697,48 @@ pre,
   font-weight: 600;
 }
 
+/* The verification attempt behind the current state: command, outcome, exit code, duration, reason, output. */
+.run-guide__verification {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(20, 24, 36, 0.72);
+}
+
+.run-guide__verification h4 {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.run-guide__verification dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 6px 12px;
+  margin: 0;
+}
+
+.run-guide__verification dt {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.run-guide__verification dd {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.run-guide__secondary {
+  margin-top: 8px;
+}
+
 @media (max-width: 560px) {
   .run-guide__facts {
     grid-template-columns: minmax(0, 1fr);

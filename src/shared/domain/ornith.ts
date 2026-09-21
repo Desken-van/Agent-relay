@@ -76,6 +76,24 @@ export const ORNITH_LIMITS = {
   lowDiscoveryBudgetNoticeBytes: 512 * 1024,
   maxChangedFiles: 100,
   maxVerificationCalls: 3,
+  /**
+   * Time kept back from the loop deadline whenever an in-loop verification starts, so the loop can
+   * still record the result, return it to the model, and take one `finish` turn. A verification is
+   * bounded by `remaining - reserve` and stopped there (`timed_out`), never allowed to run into the
+   * deadline. The reserve makes the finishing turn likely, not guaranteed: if the deadline still
+   * wins, the attempts are preserved and the task needs a manual verification.
+   */
+  verificationFinishReserveMs: 2 * 60_000,
+  /** The smallest verification window worth starting; below it Agent Relay verifies after `finish` instead. */
+  minVerificationBudgetMs: 3 * 60_000,
+  /** How many times a refused `run_verification` is fed back before the run ends. */
+  maxVerificationRefusals: 2,
+  /** How many times an unjustified repository-wide search is fed back before the run ends. */
+  maxScopeExpansionRefusals: 2,
+  /** Bounded, sanitized verification output kept per attempt (event, audit, model feedback). */
+  maxVerificationSummaryChars: 1_500,
+  /** Verification attempts (executed or refused) kept in a run's audit. */
+  maxVerificationAttemptsRecorded: 6,
 
   /** Per-operation timeouts. */
   filesystemTimeoutMs: 10_000,
@@ -188,6 +206,12 @@ export const ORNITH_DENIAL_CODES = [
   'limit_changed_files_exceeded',
   'limit_manifest_files_exceeded',
   'limit_verification_calls_exceeded',
+  /** A `run_verification` was refused because too little loop time remains to run it to an outcome. */
+  'limit_verification_time_insufficient',
+  /** A `run_verification` was refused because the files are identical to the last verified state. */
+  'verification_repeat_refused',
+  /** A repository-wide `search_text` was refused because the task's declared scope was not searched first. */
+  'scope_expansion_refused',
   'limit_deadline_exceeded',
   'timeout',
   'blocked',

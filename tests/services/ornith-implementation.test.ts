@@ -21,6 +21,7 @@ import {
 } from '../../src/shared/domain/local-inference';
 import { containsAbsoluteMachinePath, ORNITH_LIMITS } from '../../src/shared/domain/ornith';
 import type { TaskSpecification } from '../../src/shared/schemas/codex';
+import { passedExecution } from '../helpers/ornith-verification';
 
 const runner = new ExecaProcessRunner();
 const locatedGit = locateExecutable('git');
@@ -96,6 +97,9 @@ function completed(
   };
 }
 
+/** Roomy enough for the loop to grant a verification: reserve + minimum budget fit well inside it. */
+const VERIFYING_LOOP_DEADLINE_MS = 20 * 60_000;
+
 function baseRequest(leaseService: OrnithInferenceLeaseService, signal: AbortSignal, loopDeadlineMs = 60_000) {
   return {
     worktreePath: worktree,
@@ -112,7 +116,7 @@ function baseRequest(leaseService: OrnithInferenceLeaseService, signal: AbortSig
     loopDeadlineMs,
     signal,
     onProgress: () => undefined,
-    runVerification: async () => ({ passed: true, summary: 'passed' }),
+    runVerification: async () => passedExecution(),
     lease: lease(),
     leaseService,
     gitExecutablePath: gitPath,
@@ -348,10 +352,10 @@ describe('OrnithImplementationService limits and cancellation', () => {
     };
 
     const result = await new OrnithImplementationService().implement({
-      ...baseRequest(leaseService, new AbortController().signal),
+      ...baseRequest(leaseService, new AbortController().signal, VERIFYING_LOOP_DEADLINE_MS),
       runVerification: async () => {
         verifications += 1;
-        return { passed: true, summary: 'passed' };
+        return passedExecution();
       }
     });
 
@@ -499,16 +503,16 @@ describe('OrnithImplementationService limits and cancellation', () => {
     // tests/adapters/ornith-worktree-tools.test.ts, where the budget is supplied
     // directly rather than derived from preflight.
     // chars values are recalibrated whenever ORNITH_PROTOCOL_INSTRUCTIONS' fixed
-    // byte length changes (most recently: the two-budget discovery/edit-validation rule and its budget line),
+    // byte length changes (most recently: the run_verification budget/repeat rule and the scope-gate wording),
     // since that text is part of the same authoritative/fixed prompt budget this
     // filler trades off against. Recompute empirically (binary-search
     // `preflightOrnithPrompt` for the `chars` that yields each target budget)
     // rather than hand-deriving the offset.
     const budgetCases: { label: string; chars: number; expectedBudget: number }[] = [
-      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 121_304, expectedBudget: 384 },
-      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 121_258, expectedBudget: 407 },
-      { label: '408 bytes (right at the old fallback stub size)', chars: 121_256, expectedBudget: 408 },
-      { label: '471 bytes ("408+": comfortably normal)', chars: 121_130, expectedBudget: 471 }
+      { label: '384 bytes (the true minimum achievable from a passing preflight call)', chars: 120_703, expectedBudget: 384 },
+      { label: '407 bytes (just under the old, now-removed 409-byte fallback stub size)', chars: 120_657, expectedBudget: 407 },
+      { label: '408 bytes (right at the old fallback stub size)', chars: 120_655, expectedBudget: 408 },
+      { label: '471 bytes ("408+": comfortably normal)', chars: 120_529, expectedBudget: 471 }
     ];
 
     for (const { label, chars, expectedBudget } of budgetCases) {
@@ -588,7 +592,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(121_304)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(120_703)}` // -> 384-byte budget
       };
       const preflight = preflightOrnithPrompt({
         specification: oversizedSpecification,
@@ -640,7 +644,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(121_304)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(120_703)}` // -> 384-byte budget
       };
       for (let index = 0; index < 40; index += 1) {
         writeFileSync(join(worktree, `s${String(index).padStart(3, '0')}.txt`), 'needle appears here\n', 'utf8');
@@ -682,7 +686,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const bigLease = { contextLimitTokens: 131_072, maxOutputTokens: 1_024 };
       const oversizedSpecification: TaskSpecification = {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(121_304)}` // -> 384-byte budget
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(120_703)}` // -> 384-byte budget
       };
       // Multi-byte (3 UTF-8 bytes each) names: short enough in UTF-16 code units to
       // stay well under Windows' MAX_PATH, long enough in UTF-8 bytes that every
@@ -1093,7 +1097,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
     };
 
     const pending = new OrnithImplementationService().implement({
-      ...baseRequest(leaseService, controller.signal),
+      ...baseRequest(leaseService, controller.signal, VERIFYING_LOOP_DEADLINE_MS),
       runVerification: (signal) =>
         new Promise((_resolve, reject) => {
           signal.addEventListener('abort', () => reject(new AgentRelayError('CANCELLED', 'cancelled')), { once: true });
@@ -1454,6 +1458,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
     it('bounds eager scope confirmation by the whole-loop deadline: it fails with limit_deadline_exceeded before any inference and the deadline reaches the git layer', async () => {
       writeFileSync(join(worktree, 'scoped.txt'), 'content\n', 'utf8');
       let abortSeenByGit = false;
+      let gitCallsRunToCompletion: string[][] = [];
       // Every git call takes 1.5s unless the caller's signal aborts it first, so a
       // manifest build (several calls, up to two attempts) would run far past a
       // 400ms loop deadline if the deadline never reached this layer.
@@ -1462,6 +1467,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
           const signal = options?.signal;
           const timer = setTimeout(() => {
             signal?.removeEventListener('abort', onAbort);
+            gitCallsRunToCompletion = [...gitCallsRunToCompletion, [...args]];
             void runner.run(file, args, options).then(resolve);
           }, 1_500);
           function onAbort(): void {
@@ -1496,7 +1502,12 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(result.assessment.publishBlock).toBe('configuration');
       expect(inferenceCalls).toBe(0);
       expect(abortSeenByGit).toBe(true); // the deadline signal itself, not just a later check
-      expect(Date.now() - startedAt).toBeLessThan(1_400); // far below one un-aborted git call (1.5s), let alone a whole manifest build
+      // The only git call allowed to outlive the deadline is the end-of-run working-tree count: it is
+      // what tells the operator whether the run left edits behind, which matters most exactly when the
+      // deadline ended the run. It has its own bounded timeout. No manifest-build call may complete.
+      expect(gitCallsRunToCompletion).toEqual([['status', '--porcelain=v1', '--untracked-files=all']]);
+      expect(result.ornithAudit.worktreeChangedFiles).toBe(1); // scoped.txt, untracked
+      expect(Date.now() - startedAt).toBeLessThan(10_000); // a whole un-aborted manifest build would not stop at one call
     }, 30_000);
 
     it('emits a diagnostic note and falls back to unrestricted discovery when declared scope does not exist', async () => {
@@ -1569,8 +1580,8 @@ describe('OrnithImplementationService limits and cancellation', () => {
       };
 
       const result = await new OrnithImplementationService().implement({
-        ...baseRequest(leaseService, new AbortController().signal),
-        runVerification: async () => ({ passed: true, summary: 'passed' }),
+        ...baseRequest(leaseService, new AbortController().signal, VERIFYING_LOOP_DEADLINE_MS),
+        runVerification: async () => passedExecution(),
         onProgress: (event) => events.push(event)
       });
 

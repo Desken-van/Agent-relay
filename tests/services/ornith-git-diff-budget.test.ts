@@ -90,7 +90,10 @@ describe('git_diff with only a few discovery bytes left', () => {
     'replays the 93-byte run: replace succeeds on the validation budget, git_diff is honestly refused, the model skips it and finishes',
     async () => {
       const fixture = await fixtureFor({});
+      // Unscoped: the arithmetic under test is that of a repository-wide search, which a declared
+      // scope would refuse before dispatch (the scope gate has its own tests).
       const run = await replay(fixture, {
+        scope: [],
         afterRead: [{ kind: 'search_all' }, { kind: 'replace' }, { kind: 'diff' }, { kind: 'verify' }, { kind: 'finish' }]
       });
 

@@ -5,7 +5,14 @@ export const verificationRecordSchema = z.object({
   version: z.literal(1), command: z.literal('npm run verify'),
   identity: z.string().regex(/^[a-f0-9]{64}$/),
   passed: z.boolean(), exitCode: z.number().int().nullable(),
-  durationMs: z.number().nonnegative(), reason: z.string().nullable()
+  durationMs: z.number().nonnegative(), reason: z.string().nullable(),
+  /**
+   * Added after the first records were written, so both are optional: an older record has neither and
+   * still reads. `outcome` says which kind of stop it was (the reason string alone made a timeout and a
+   * nonzero exit look alike); `outputSummary` is the sanitized, bounded tail of the command's output.
+   */
+  outcome: z.enum(['passed', 'failed', 'timed_out', 'cancelled']).optional(),
+  outputSummary: z.string().max(1_500).optional()
 }).refine(value => !value.passed || (value.exitCode === 0 && value.reason === null), 'A pass requires exit zero and no failure reason');
 export type VerificationRecord = z.infer<typeof verificationRecordSchema>;
 export function latestVerification(runs: readonly Run[]): Run | null {

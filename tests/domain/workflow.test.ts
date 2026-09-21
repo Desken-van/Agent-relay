@@ -159,10 +159,39 @@ describe('workflow state machine', () => {
     it('allows every busy state to recover to a retryable state', () => {
       expect(transition('SPECIFYING', 'specification_aborted')).toBe('DRAFT');
       expect(transition('IMPLEMENTING', 'implementation_aborted')).toBe('READY_FOR_IMPLEMENTATION');
+      expect(transition('IMPLEMENTING', 'implementation_unverified')).toBe('READY_FOR_IMPLEMENTATION');
       expect(transition('IMPLEMENTING', 'correction_unverified')).toBe('READY_FOR_IMPLEMENTATION');
       expect(transition('IMPLEMENTING', 'correction_aborted')).toBe('CHANGES_REQUESTED');
       expect(transition('REVIEWING', 'review_aborted')).toBe('READY_FOR_REVIEW');
       expect(transition('PUBLISHING', 'publish_aborted')).toBe('READY_TO_PUBLISH');
+    });
+  });
+
+  describe('implementation that left files it could not prove verified', () => {
+    it('lands in the same recoverable state as an abort, through its own event so the two can be told apart', () => {
+      expect(transition('IMPLEMENTING', 'implementation_unverified')).toBe(transition('IMPLEMENTING', 'implementation_aborted'));
+      expect(WORKFLOW_EVENTS).toContain('implementation_unverified');
+    });
+
+    it('is only meaningful while implementing', () => {
+      for (const status of TASK_STATUSES) {
+        if (status === 'IMPLEMENTING') continue;
+        expect(canTransition(status, 'implementation_unverified'), status).toBe(false);
+      }
+    });
+
+    it('leaves verification reachable from that state without another implementation round', () => {
+      const recovered = transition('IMPLEMENTING', 'implementation_unverified');
+      expect(recovered).toBe('READY_FOR_IMPLEMENTATION');
+      expect(allowedEvents(recovered)).toContain('verification_started');
+      expect(transition(recovered, 'verification_started')).toBe('VERIFYING');
+    });
+
+    it('advances to review when verification passes, and stays recoverable when it does not', () => {
+      expect(transition('VERIFYING', 'verification_completed')).toBe('READY_FOR_REVIEW');
+      expect(transition('VERIFYING', 'verification_aborted')).toBe('READY_FOR_IMPLEMENTATION');
+      // ...and from there, verification can be run again.
+      expect(canTransition('READY_FOR_IMPLEMENTATION', 'verification_started')).toBe(true);
     });
   });
 
