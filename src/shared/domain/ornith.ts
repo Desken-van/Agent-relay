@@ -58,6 +58,22 @@ export const ORNITH_LIMITS = {
   /** Cumulative repository I/O for the whole run. */
   maxCumulativeReadBytes: 4 * 1024 * 1024,
   maxCumulativeWriteBytes: 4 * 1024 * 1024,
+  /**
+   * The bytes Relay itself re-reads to validate a mutation of a file the model was
+   * already shown (identity, hash, replacement and the final time-of-check/time-of-use
+   * re-read). Deliberately a SEPARATE pool from `maxCumulativeReadBytes`: that one meters
+   * what the model may discover, this one meters what Relay may spend proving an edit is
+   * safe, so exhausting discovery can no longer make an authorised edit impossible and
+   * spending on validation can never enlarge discovery. It is bounded on its own: every
+   * edit reads its target twice and an edit writes at most `maxFileBytes`, so this is
+   * twice the write budget — a run cannot validate more than it may write.
+   */
+  maxCumulativeMutationValidationBytes: 8 * 1024 * 1024,
+  /**
+   * When the discovery budget falls below this many bytes, Relay hands the model one
+   * deterministic notice saying so — and that edits of files it was shown are unaffected.
+   */
+  lowDiscoveryBudgetNoticeBytes: 512 * 1024,
   maxChangedFiles: 100,
   maxVerificationCalls: 3,
 
@@ -165,6 +181,9 @@ export const ORNITH_DENIAL_CODES = [
   'limit_prompt_exceeded',
   'limit_result_exceeded',
   'limit_read_bytes_exceeded',
+  'limit_mutation_validation_bytes_exceeded',
+  /** The target of an edit/delete is larger than `maxFileBytes`: a per-file size bound, not an exhausted budget. */
+  'limit_mutation_target_bytes_exceeded',
   'limit_write_bytes_exceeded',
   'limit_changed_files_exceeded',
   'limit_manifest_files_exceeded',
@@ -681,8 +700,15 @@ export interface OrnithToolDenialEventData {
   readonly durationMs: number;
   /** Whether this exact denial will be fed back for one more turn rather than ending the run. */
   readonly recoverable: boolean;
+  /** The model-visible repository DISCOVERY budget (read_file / search_text / diff). */
   readonly readBytesUsed: number;
   readonly readBytesConfigured: number;
+  /**
+   * The separate INTERNAL mutation-validation budget. Absent on events recorded before
+   * the two budgets were split, so a consumer must not assume it is present.
+   */
+  readonly validationBytesUsed?: number;
+  readonly validationBytesConfigured?: number;
   readonly changedFiles: number;
 }
 

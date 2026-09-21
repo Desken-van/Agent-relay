@@ -41,6 +41,14 @@ export interface ProcessRunOptions {
   /** Cap on retained stdout/stderr. Excess is dropped, not buffered. */
   readonly maxOutputBytes?: number;
   /**
+   * For a buffered run whose caller never uses stderr and sets a deliberately tight
+   * {@link maxOutputBytes}: stderr is not captured at all (the child's stderr goes nowhere), so
+   * warnings can neither trip the cap nor appear in the result, and an
+   * {@link ProcessResult.outputLimitExceeded} can then only mean stdout. Unset: stderr is captured and
+   * capped with stdout, exactly as before. Ignored by streaming runs.
+   */
+  readonly discardStderr?: boolean;
+  /**
    * When set, **stdout** is streamed line-by-line as it arrives.
    *
    * stdout only. A caller that streams is parsing a protocol, and stderr is
@@ -63,6 +71,13 @@ export interface ProcessResult {
   readonly cancelled: boolean;
   readonly durationMs: number;
   readonly failed: boolean;
+  /**
+   * Present (and `true`) only when the run failed BECAUSE a stream reached `maxOutputBytes`, as
+   * reported by the process layer itself. It lets a caller that set a cap on purpose tell "the
+   * output would not fit" from a genuine process failure; `stdout`/`stderr` then hold only what
+   * was retained up to the cap, never the whole output.
+   */
+  readonly outputLimitExceeded?: boolean;
 }
 
 export interface ProcessRunner {
@@ -883,18 +898,24 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
       });
     }
 
-    return this.runBuffered(file, args, execaOptions, { maxBytes, startedAt, commandLabel });
+    return this.runBuffered(file, args, execaOptions, {
+      maxBytes,
+      discardStderr: options.discardStderr === true,
+      startedAt,
+      commandLabel
+    });
   }
 
   private async runBuffered(
     file: string,
     args: readonly string[],
     execaOptions: Options,
-    ctx: { maxBytes: number; startedAt: number; commandLabel: string }
+    ctx: { maxBytes: number; discardStderr?: boolean; startedAt: number; commandLabel: string }
   ): Promise<ProcessResult> {
     try {
       const result = await execa(file, [...args], {
         ...execaOptions,
+        ...(ctx.discardStderr === true ? { stderr: 'ignore' as const } : {}),
         maxBuffer: ctx.maxBytes
       });
 
@@ -906,7 +927,9 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
         timedOut: Boolean(result.timedOut),
         cancelled: Boolean(result.isCanceled),
         durationMs: Date.now() - ctx.startedAt,
-        failed: Boolean(result.failed)
+        failed: Boolean(result.failed),
+        // The runner resolves rather than throws on failure, so the cap is reported here too.
+        ...(result.isMaxBuffer === true ? { outputLimitExceeded: true } : {})
       };
     } catch (error) {
       return toFailureResult(error, ctx);
@@ -1254,6 +1277,8 @@ interface ExecaFailure {
   all?: unknown;
   timedOut?: boolean;
   isCanceled?: boolean;
+  /** Set by execa when a stream exceeded `maxBuffer`. */
+  isMaxBuffer?: boolean;
   shortMessage?: string;
   message?: string;
 }
@@ -1273,7 +1298,9 @@ function toFailureResult(
     timedOut: Boolean(failure.timedOut),
     cancelled: Boolean(failure.isCanceled),
     durationMs: Date.now() - ctx.startedAt,
-    failed: true
+    failed: true,
+    // Only ever set when true, so a result that did not hit the cap is byte-for-byte what it was.
+    ...(failure.isMaxBuffer === true ? { outputLimitExceeded: true } : {})
   };
 }
 

@@ -159,7 +159,15 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       undefined,
       { readBytes: raw.byteLength * 2, writeBytes: raw.byteLength }
     );
-    expect(replaced).toMatchObject({ ok: true, readBytes: raw.byteLength * 2, writeBytes: raw.byteLength });
+    // The file's hash was shown by the read above, so both internal validation re-reads are
+    // charged to the separate edit-validation budget and none to discovery.
+    expect(replaced).toMatchObject({
+      ok: true,
+      readBytes: 0,
+      validationReadBytes: raw.byteLength * 2,
+      writeBytes: raw.byteLength
+    });
+    expect(boundary.validationReadBytesUsed()).toBe(raw.byteLength * 2);
     expect(readFileSync(join(worktree, 'fixture.txt'), 'utf8').replaceAll('\r\n', '\n')).toBe('alpha π delta\n');
   });
 
@@ -1699,5 +1707,465 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(forModel.content).toBe(bytes.toString('utf8'));
       expect(forModel.lineEnding).toBe('crlf');
     });
+  });
+});
+
+describe('OrnithWorktreeTools mutation validation budget', () => {
+  const MIB = 1024 * 1024;
+  /** Nothing left for the model to discover with; edits must not depend on it. */
+  const NO_DISCOVERY = { readBytes: 0, writeBytes: MIB * 4 };
+
+  const shaOf = (raw: string | Buffer): string => createHash('sha256').update(raw).digest('hex');
+
+  /** Read `path` the way the model does, so its hash is one Relay has shown. Returns that hash. */
+  async function showHash(boundary: OrnithWorktreeTools, path: string): Promise<string> {
+    const read = await boundary.readFile({ version: 1, action: 'read_file', path, offset: 0, limit: 8 });
+    if (!read.ok) throw new Error(`expected a successful read of ${path}: ${read.code}`);
+    return (read.forModel as { sha256: string }).sha256;
+  }
+
+  function write(path: string, content: string): Buffer {
+    writeFileSync(join(worktree, path), content, 'utf8');
+    return readFileSync(join(worktree, path));
+  }
+
+  const replace = (path: string, sha256: string, oldText = 'omega', newText = 'delta') => ({
+    version: 1 as const,
+    action: 'replace_text' as const,
+    path,
+    sha256,
+    replacements: [{ oldText, newText }]
+  });
+
+  it('charges the internal re-reads of a shown file to validation and none to discovery, at 0 discovery bytes', async () => {
+    const boundary = tools();
+    const sha256 = await showHash(boundary, 'fixture.txt');
+    const size = readFileSync(join(worktree, 'fixture.txt')).byteLength;
+
+    const result = await boundary.replaceText(replace('fixture.txt', sha256), undefined, NO_DISCOVERY);
+
+    expect(result).toMatchObject({ ok: true, readBytes: 0, validationReadBytes: size * 2 });
+    expect(boundary.validationReadBytesUsed()).toBe(size * 2);
+    expect(readFileSync(join(worktree, 'fixture.txt'), 'utf8')).toContain('delta');
+  });
+
+  it('still charges an edit of a file whose hash was never shown to the discovery budget, and refuses it when that is short', async () => {
+    const boundary = tools();
+    const raw = readFileSync(join(worktree, 'fixture.txt'));
+
+    const result = await boundary.replaceText(
+      replace('fixture.txt', shaOf(raw)),
+      undefined,
+      { readBytes: raw.byteLength - 1, writeBytes: MIB }
+    );
+
+    expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+    expect(readFileSync(join(worktree, 'fixture.txt'))).toEqual(raw);
+
+    const withBudget = await boundary.replaceText(
+      replace('fixture.txt', shaOf(raw)),
+      undefined,
+      { readBytes: raw.byteLength * 2, writeBytes: MIB }
+    );
+    expect(withBudget).toMatchObject({ ok: true, readBytes: raw.byteLength * 2 });
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+  });
+
+  it('does not let a hash shown for one file authorize an edit of another', async () => {
+    write('other.txt', 'omega elsewhere\n');
+    const boundary = tools();
+    const otherSha = await showHash(boundary, 'other.txt');
+    const target = readFileSync(join(worktree, 'fixture.txt'));
+
+    // The target's own hash is right, but only `other.txt`'s hash was ever shown for `other.txt`.
+    const result = await boundary.replaceText(replace('fixture.txt', shaOf(target)), undefined, NO_DISCOVERY);
+    expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    // …and a hash shown for another path is not shown for this one.
+    const wrongPath = await boundary.replaceText(replace('fixture.txt', otherSha), undefined, NO_DISCOVERY);
+    expect(wrongPath).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+    expect(readFileSync(join(worktree, 'fixture.txt'))).toEqual(target);
+  });
+
+  it('fails closed on a target changed after its last read, charging Relay for the one read that found it', async () => {
+    const boundary = tools();
+    const sha256 = await showHash(boundary, 'fixture.txt');
+    writeFileSync(join(worktree, 'fixture.txt'), 'alpha π OMEGA\n', 'utf8');
+    const changed = readFileSync(join(worktree, 'fixture.txt'));
+
+    const result = await boundary.replaceText(replace('fixture.txt', sha256), undefined, NO_DISCOVERY);
+
+    expect(result).toMatchObject({ ok: false, code: 'stale_hash' });
+    expect(boundary.validationReadBytesUsed()).toBe(changed.byteLength);
+    expect(readFileSync(join(worktree, 'fixture.txt'))).toEqual(changed);
+  });
+
+  it('keeps the time-of-check/time-of-use guard on the validation budget: a swap at the mutation boundary is refused', async () => {
+    const original = readFileSync(join(worktree, 'fixture.txt'));
+    const boundary = tools({
+      beforeMutation: () => writeFileSync(join(worktree, 'fixture.txt'), 'newer concurrent content\n', 'utf8')
+    });
+    const sha256 = await showHash(boundary, 'fixture.txt');
+
+    const result = await boundary.replaceText(replace('fixture.txt', sha256), undefined, NO_DISCOVERY);
+
+    expect(result).toMatchObject({ ok: false, code: 'stale_hash' });
+    expect(readFileSync(join(worktree, 'fixture.txt'), 'utf8')).toBe('newer concurrent content\n');
+    // Both internal reads were paid for: the first, and the final re-read that caught the swap.
+    expect(boundary.validationReadBytesUsed()).toBe(original.byteLength * 2);
+  });
+
+  it('treats a target that grew at the mutation boundary as stale, never reading past the size it validated', async () => {
+    const original = readFileSync(join(worktree, 'fixture.txt'));
+    const boundary = tools({
+      beforeMutation: () => writeFileSync(join(worktree, 'fixture.txt'), Buffer.concat([original, Buffer.alloc(64 * 1024, 0x61)]))
+    });
+    const sha256 = await showHash(boundary, 'fixture.txt');
+
+    const result = await boundary.replaceText(replace('fixture.txt', sha256), undefined, NO_DISCOVERY);
+
+    expect(result).toMatchObject({ ok: false, code: 'stale_hash' });
+    expect(boundary.validationReadBytesUsed()).toBe(original.byteLength * 2);
+    expect(readFileSync(join(worktree, 'fixture.txt')).byteLength).toBe(original.byteLength + 64 * 1024);
+  });
+
+  it('deletes a shown file at 0 discovery bytes on the validation budget, and prunes its authorization', async () => {
+    const boundary = tools();
+    const sha256 = await showHash(boundary, 'fixture.txt');
+    const size = readFileSync(join(worktree, 'fixture.txt')).byteLength;
+
+    const result = await boundary.deleteFile(
+      { version: 1, action: 'delete_file', path: 'fixture.txt', sha256 },
+      undefined,
+      { readBytes: 0, writeBytes: 0 }
+    );
+
+    expect(result).toMatchObject({ ok: true, readBytes: 0, validationReadBytes: size * 2 });
+    expect(existsSync(join(worktree, 'fixture.txt'))).toBe(false);
+    expect(boundary.validationReadBytesUsed()).toBe(size * 2);
+  });
+
+  it('refuses to delete a file whose hash was never shown when discovery cannot cover it', async () => {
+    const boundary = tools();
+    const raw = readFileSync(join(worktree, 'fixture.txt'));
+
+    const result = await boundary.deleteFile(
+      { version: 1, action: 'delete_file', path: 'fixture.txt', sha256: shaOf(raw) },
+      undefined,
+      { readBytes: 0, writeBytes: 0 }
+    );
+
+    expect(result).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    expect(readFileSync(join(worktree, 'fixture.txt'))).toEqual(raw);
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+  });
+
+  it('authorizes a further edit with the hash an edit or a create returned', async () => {
+    const boundary = tools();
+    const first = await boundary.createFile(
+      { version: 1, action: 'create_file', path: 'made.txt', content: 'omega one\n' },
+      undefined,
+      NO_DISCOVERY
+    );
+    if (!first.ok) throw new Error(first.reason);
+    const second = await boundary.replaceText(
+      replace('made.txt', (first.forModel as { sha256: string }).sha256, 'one', 'two'),
+      undefined,
+      NO_DISCOVERY
+    );
+    if (!second.ok) throw new Error(second.reason);
+    const third = await boundary.replaceText(
+      replace('made.txt', (second.forModel as { sha256: string }).sha256, 'two', 'three'),
+      undefined,
+      NO_DISCOVERY
+    );
+
+    expect(third).toMatchObject({ ok: true, readBytes: 0 });
+    expect(readFileSync(join(worktree, 'made.txt'), 'utf8')).toBe('omega three\n');
+    // Two 10-byte files' worth of double reads: 'omega one\n' then 'omega two\n'.
+    expect(boundary.validationReadBytesUsed()).toBe(2 * 10 + 2 * 10);
+  });
+
+  it('bounds cumulative validation itself: retries that fail still spend it, and the bound is never exceeded', async () => {
+    write('big.txt', `${'a'.repeat(MIB - 6)}omega\n`);
+    const boundary = tools();
+    const sha256 = await showHash(boundary, 'big.txt');
+    const limit = ORNITH_LIMITS.maxCumulativeMutationValidationBytes;
+    const attempt = () => boundary.replaceText(replace('big.txt', sha256, 'no such text', 'x'), undefined, NO_DISCOVERY);
+
+    // A mismatch is found after the first read only, so each failed attempt costs 1 MiB of validation.
+    // Two reads of a MiB must still fit before an attempt starts: seven attempts do, the eighth does not.
+    for (let index = 1; index <= 7; index += 1) {
+      expect(await attempt()).toMatchObject({ ok: false, code: 'replacement_mismatch' });
+      expect(boundary.validationReadBytesUsed()).toBe(index * MIB);
+    }
+    const refused = await attempt();
+    expect(refused).toMatchObject({ ok: false, code: 'limit_mutation_validation_bytes_exceeded' });
+    expect(refused.ok ? '' : refused.reason).toContain(`of the ${limit}-byte mutation-validation budget remain`);
+    // Refusing did not read anything, and a further retry is refused just the same.
+    expect(boundary.validationReadBytesUsed()).toBe(7 * MIB);
+    expect(await attempt()).toMatchObject({ ok: false, code: 'limit_mutation_validation_bytes_exceeded' });
+    expect(boundary.validationReadBytesUsed()).toBeLessThanOrEqual(limit);
+    expect(readFileSync(join(worktree, 'big.txt')).byteLength).toBe(MIB);
+  });
+
+  it('refuses a target above the per-change size bound before reading it, whether or not its hash was shown', async () => {
+    const raw = write('huge.txt', `${'b'.repeat(ORNITH_LIMITS.maxFileBytes)}omega\n`);
+    const boundary = tools();
+    const shown = await showHash(boundary, 'huge.txt');
+
+    for (const sha256 of [shown, shaOf('never shown')]) {
+      const result = await boundary.replaceText(replace('huge.txt', sha256), undefined, NO_DISCOVERY);
+      expect(result).toMatchObject({ ok: false, code: 'limit_mutation_target_bytes_exceeded' });
+    }
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+    expect(readFileSync(join(worktree, 'huge.txt'))).toEqual(raw);
+  });
+
+  it('refuses to delete a target above the per-change size bound before reading it, whatever budget is left', async () => {
+    const raw = write('huge.txt', `${'b'.repeat(ORNITH_LIMITS.maxFileBytes)}omega\n`);
+    const boundary = tools();
+    const shown = await showHash(boundary, 'huge.txt');
+
+    for (const sha256 of [shown, shaOf('never shown')]) {
+      const result = await boundary.deleteFile(
+        { version: 1, action: 'delete_file', path: 'huge.txt', sha256 },
+        undefined,
+        { readBytes: raw.byteLength * 4, writeBytes: 0 }
+      );
+      expect(result).toMatchObject({ ok: false, code: 'limit_mutation_target_bytes_exceeded' });
+    }
+    expect(existsSync(join(worktree, 'huge.txt'))).toBe(true);
+    expect(boundary.validationReadBytesUsed()).toBe(0);
+  });
+
+  it('never returns file content, or anything but the fixed reason, for a refused validation', async () => {
+    write('big.txt', `${'a'.repeat(MIB - 6)}omega\n`);
+    const boundary = tools();
+    const sha256 = await showHash(boundary, 'big.txt');
+    for (let index = 0; index < 7; index += 1) {
+      await boundary.replaceText(replace('big.txt', sha256, 'no such text', 'x'), undefined, NO_DISCOVERY);
+    }
+
+    const refused = await boundary.replaceText(replace('big.txt', sha256, 'no such text', 'x'), undefined, NO_DISCOVERY);
+
+    expect(refused.ok).toBe(false);
+    expect(JSON.stringify(refused)).not.toContain('aaaa');
+    expect(JSON.stringify(refused)).not.toContain('omega');
+  });
+});
+
+describe('OrnithWorktreeTools git_diff against the remaining discovery budget', () => {
+  const diff = { version: 1 as const, action: 'git_diff' as const, paths: ['fixture.txt'] };
+  const TOKEN = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';
+
+  const editFixture = (text: string): void => writeFileSync(join(worktree, 'fixture.txt'), text, 'utf8');
+
+  /** Tools whose `git diff` is answered by `answer`; every other Git call (identity, manifest) is real. */
+  function toolsAnsweringDiff(answer: Partial<ProcessResult>): OrnithWorktreeTools {
+    const wrapping = {
+      run: (file: string, args: readonly string[], options?: Parameters<typeof runner.run>[2]): Promise<ProcessResult> =>
+        file === gitPath && args[0] === 'diff'
+          ? Promise.resolve({
+              command: 'git diff',
+              exitCode: 0,
+              stdout: '',
+              stderr: '',
+              timedOut: false,
+              cancelled: false,
+              durationMs: 1,
+              failed: false,
+              ...answer
+            })
+          : runner.run(file, args, options)
+    };
+    return new OrnithWorktreeTools({
+      worktreePath: worktree,
+      worktreesRoot,
+      repositoryPath: repository,
+      branchName: 'task',
+      runner: wrapping,
+      gitExecutablePath: gitPath
+    });
+  }
+
+  it('still returns a small diff that fits, charging its bytes to discovery', async () => {
+    editFixture('alpha π delta\n');
+
+    const result = await tools().gitDiff(diff);
+
+    expect(result).toMatchObject({ ok: true, writeBytes: 0 });
+    if (!result.ok) throw new Error(result.reason);
+    expect((result.forModel as { diff: string }).diff).toContain('delta');
+    expect(result.readBytes).toBeGreaterThan(0);
+    expect(result.readBytes).toBe(Buffer.byteLength((result.forModel as { diff: string }).diff, 'utf8'));
+  });
+
+  it('returns a diff of exactly the remaining bytes, and refuses one byte more or nothing left', async () => {
+    editFixture('alpha π delta\n');
+    const full = await tools().gitDiff(diff);
+    if (!full.ok) throw new Error(full.reason);
+    const bytes = full.readBytes;
+
+    const exact = await tools().gitDiff(diff, undefined, { readBytes: bytes, writeBytes: 0 });
+    expect(exact).toMatchObject({ ok: true, readBytes: bytes });
+
+    for (const remaining of [bytes - 1, 0]) {
+      const refused = await tools().gitDiff(diff, undefined, { readBytes: remaining, writeBytes: 0 });
+      expect(refused, `remaining ${remaining}`).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+      expect(refused.ok ? '' : refused.reason).toContain('discovery budget');
+      // A refusal carries no part of the diff.
+      expect(JSON.stringify(refused)).not.toContain('delta');
+    }
+  });
+
+  it('refuses a diff far beyond what the process layer may buffer as a budget refusal, not an internal error', async () => {
+    editFixture(`alpha π omega\n${'lorem ipsum dolor sit amet\n'.repeat(4_000)}`);
+
+    for (const remaining of [100, 0]) {
+      const refused = await tools().gitDiff(diff, undefined, { readBytes: remaining, writeBytes: 0 });
+      expect(refused).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+      expect(JSON.stringify(refused)).not.toContain('lorem');
+    }
+    // …and with the budget there, the very same diff is returned (truncated for the model, never refused).
+    const fits = await tools().gitDiff(diff);
+    expect(fits).toMatchObject({ ok: true });
+  });
+
+  it('keeps a genuine Git failure distinct from a budget refusal', async () => {
+    const limits = { readBytes: 100, writeBytes: 0 };
+
+    // Git itself failed.
+    const failed = await toolsAnsweringDiff({ exitCode: 128, failed: true, stderr: 'fatal: bad revision' }).gitDiff(diff, undefined, limits);
+    expect(failed).toMatchObject({ ok: false, code: 'internal_error', reason: 'git diff could not be read.' });
+
+    // Failed with no sign the output cap was involved, even though stdout happens to be large.
+    const noFlag = await toolsAnsweringDiff({ failed: true, stdout: 'x'.repeat(5_000) }).gitDiff(diff, undefined, limits);
+    expect(noFlag).toMatchObject({ ok: false, code: 'internal_error' });
+
+    // The output cap was hit: the diff does not fit, whatever length of it the runner happened to keep
+    // (it may have trimmed a newline, leaving exactly the remaining bytes) — and none of it is returned.
+    for (const kept of [50, 99, 100, 5_000]) {
+      const overflow = await toolsAnsweringDiff({ failed: true, outputLimitExceeded: true, stdout: 'x'.repeat(kept) }).gitDiff(diff, undefined, limits);
+      expect(overflow, `kept ${kept}`).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+      expect(JSON.stringify(overflow)).not.toContain('xxxxx');
+    }
+  });
+
+  it('decides the same way when Git prints a line-ending warning on stderr', async () => {
+    // A Windows checkout prints an LF-to-CRLF notice on stderr, and the runner caps stderr at the same
+    // size as stdout. The decision must still be the exact byte comparison on stdout, at the boundary.
+    await git(repository, ['config', 'core.autocrlf', 'true']);
+    editFixture('alpha π delta\n');
+    const probe = await runner.run(gitPath, ['diff', 'HEAD', '--', 'fixture.txt'], { cwd: worktree, timeoutMs: 20_000 });
+    expect(probe.stderr).toContain('will be replaced by');
+    const full = await tools().gitDiff(diff);
+    if (!full.ok) throw new Error(full.reason);
+
+    const exact = await tools().gitDiff(diff, undefined, { readBytes: full.readBytes, writeBytes: 0 });
+    expect(exact).toMatchObject({ ok: true, readBytes: full.readBytes });
+
+    const refused = await tools().gitDiff(diff, undefined, { readBytes: full.readBytes - 1, writeBytes: 0 });
+    expect(refused).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+  });
+
+  /**
+   * Tools whose `git diff` is a real process, through the real runner with the options the tool set, that
+   * prints a short diff on stdout and `stderrBytes` of warnings on stderr.
+   */
+  function toolsWithNoisyDiff(stderrBytes: number): OrnithWorktreeTools {
+    const script = `process.stdout.write(${JSON.stringify('+a line of diff\n'.repeat(3))}); process.stderr.write('w'.repeat(${stderrBytes}));`;
+    const wrapping = {
+      run: (file: string, args: readonly string[], options?: Parameters<typeof runner.run>[2]): Promise<ProcessResult> =>
+        file === gitPath && args[0] === 'diff'
+          ? runner.run(process.execPath, ['-e', script], options)
+          : runner.run(file, args, options)
+    };
+    return new OrnithWorktreeTools({
+      worktreePath: worktree,
+      worktreesRoot,
+      repositoryPath: repository,
+      branchName: 'task',
+      runner: wrapping,
+      gitExecutablePath: gitPath
+    });
+  }
+
+  it('is not thrown by any amount of stderr: only stdout is measured against the remaining budget', async () => {
+    // 200 KB of warnings — far more than the stdout cap for these few bytes, and more than any fixed headroom.
+    const noisy = toolsWithNoisyDiff(200_000);
+    const full = await noisy.gitDiff(diff);
+    if (!full.ok) throw new Error(full.reason);
+    const bytes = full.readBytes;
+    expect(bytes).toBeGreaterThan(0);
+
+    expect(await noisy.gitDiff(diff, undefined, { readBytes: bytes, writeBytes: 0 })).toMatchObject({ ok: true, readBytes: bytes });
+    for (const remaining of [bytes - 1, 0]) {
+      expect(await noisy.gitDiff(diff, undefined, { readBytes: remaining, writeBytes: 0 }), `remaining ${remaining}`).toMatchObject({
+        ok: false,
+        code: 'limit_read_bytes_exceeded'
+      });
+    }
+  });
+
+  it('refuses an oversized diff as a budget even when the runner trims a newline at the cut', async () => {
+    // The runner strips a final newline from what it kept, so when the cap lands right after a line break
+    // the retained text is one shorter than the cap: exactly the remaining bytes, not more. It is the cap
+    // being hit that proves the diff does not fit — never the length of what was kept.
+    const script = `process.stdout.write(${JSON.stringify('x\n'.repeat(500))});`;
+    const wrapping = {
+      run: (file: string, args: readonly string[], options?: Parameters<typeof runner.run>[2]): Promise<ProcessResult> =>
+        file === gitPath && args[0] === 'diff'
+          ? runner.run(process.execPath, ['-e', script], options)
+          : runner.run(file, args, options)
+    };
+    const boundary = new OrnithWorktreeTools({
+      worktreePath: worktree,
+      worktreesRoot,
+      repositoryPath: repository,
+      branchName: 'task',
+      runner: wrapping,
+      gitExecutablePath: gitPath
+    });
+
+    // An even remaining size puts the cap (remaining + 1) right after a "\n" in "x\nx\n…".
+    for (const remaining of [99, 101, 199, 0, 1, 2]) {
+      const result = await boundary.gitDiff(diff, undefined, { readBytes: remaining, writeBytes: 0 });
+      expect(result, `remaining ${remaining}`).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    }
+  });
+
+  it('treats a stderr of any size as irrelevant: it is never captured, so it cannot fail a diff', async () => {
+    // Far more than any output cap: still just a diff that fits.
+    const result = await toolsWithNoisyDiff(9 * 1024 * 1024).gitDiff(diff);
+
+    expect(result).toMatchObject({ ok: true });
+  });
+
+  it('never lets a clamped or negative remaining budget reach the runner as a non-positive cap', async () => {
+    for (const remaining of [0, -5]) {
+      const result = await toolsWithNoisyDiff(10).gitDiff(diff, undefined, { readBytes: remaining, writeBytes: 0 });
+      expect(result, `remaining ${remaining}`).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    }
+  });
+
+  it('keeps credential detection fail-closed, and returns none of a credential-shaped diff over budget either', async () => {
+    const secretDiff = `diff --git a/fixture.txt b/fixture.txt\n+token=${TOKEN}\n`;
+
+    // Within budget: refused as credential-shaped, nothing returned.
+    const within = await toolsAnsweringDiff({ stdout: secretDiff }).gitDiff(diff);
+    expect(within).toMatchObject({ ok: false, code: 'disallowed_action' });
+    expect(JSON.stringify(within)).not.toContain('ghp_');
+
+    // Over budget: a budget refusal — and still none of it.
+    const over = await toolsAnsweringDiff({ stdout: secretDiff }).gitDiff(diff, undefined, { readBytes: 10, writeBytes: 0 });
+    expect(over).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    expect(JSON.stringify(over)).not.toContain('ghp_');
+
+    // A real tracked edit that adds a token never puts it in a result.
+    editFixture(`token=${TOKEN}\n`);
+    const real = await tools().gitDiff(diff);
+    expect(JSON.stringify(real)).not.toContain(TOKEN);
   });
 });

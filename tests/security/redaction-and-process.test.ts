@@ -146,6 +146,64 @@ describe('process runner', () => {
     expect(result.failed).toBe(true);
   });
 
+  it('reports that the output cap is what failed the run — and only then', async () => {
+    const capped = await runner.run(process.execPath, ['-e', "process.stdout.write('x'.repeat(5000))"], {
+      maxOutputBytes: 100
+    });
+    expect(capped.failed).toBe(true);
+    expect(capped.outputLimitExceeded).toBe(true);
+    // Only what was retained up to the cap, never the whole output.
+    expect(capped.stdout.length).toBeLessThanOrEqual(100);
+
+    const fits = await runner.run(process.execPath, ['-e', "process.stdout.write('x'.repeat(50))"], {
+      maxOutputBytes: 100
+    });
+    expect(fits.failed).toBe(false);
+    expect('outputLimitExceeded' in fits).toBe(false);
+
+    // A genuine failure is not an output overflow.
+    const exited = await runner.run(process.execPath, ['-e', 'process.exit(3)'], { maxOutputBytes: 100 });
+    expect(exited.failed).toBe(true);
+    expect(exited.exitCode).toBe(3);
+    expect('outputLimitExceeded' in exited).toBe(false);
+  });
+
+  it('discards stderr when asked, so it cannot trip the cap — and captures it, capped with stdout, otherwise', async () => {
+    const both = "process.stdout.write('o'.repeat(50)); process.stderr.write('e'.repeat(5000))";
+
+    // Default: one cap for both streams, as ever — the stderr alone trips it.
+    const shared = await runner.run(process.execPath, ['-e', both], { maxOutputBytes: 100 });
+    expect(shared.failed).toBe(true);
+    expect(shared.outputLimitExceeded).toBe(true);
+
+    // Discarded: the same output fits, stdout whole, stderr never captured.
+    const discarded = await runner.run(process.execPath, ['-e', both], { maxOutputBytes: 100, discardStderr: true });
+    expect(discarded.failed).toBe(false);
+    expect(discarded.exitCode).toBe(0);
+    expect(discarded.stdout).toBe('o'.repeat(50));
+    expect(discarded.stderr).toBe('');
+    expect('outputLimitExceeded' in discarded).toBe(false);
+
+    // The tight cap still applies to stdout, and a hit cap can then only mean stdout.
+    const stdoutOver = await runner.run(
+      process.execPath,
+      ['-e', "process.stdout.write('o'.repeat(500)); process.stderr.write('e'.repeat(5000))"],
+      { maxOutputBytes: 100, discardStderr: true }
+    );
+    expect(stdoutOver.failed).toBe(true);
+    expect(stdoutOver.outputLimitExceeded).toBe(true);
+    expect(stdoutOver.stdout.length).toBeLessThanOrEqual(100);
+
+    // A child that fails still fails, with its stderr discarded.
+    const exited = await runner.run(process.execPath, ['-e', 'console.error("boom"); process.exit(4)'], {
+      maxOutputBytes: 100,
+      discardStderr: true
+    });
+    expect(exited.exitCode).toBe(4);
+    expect(exited.failed).toBe(true);
+    expect(exited.stderr).toBe('');
+  });
+
   it('honours a timeout', async () => {
     const result = await runner.run(process.execPath, ['-e', 'setTimeout(()=>{}, 10000)'], {
       timeoutMs: 400

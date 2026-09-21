@@ -294,6 +294,208 @@ describe('Relay timeline — Ornith read-budget denial events', () => {
     expect(text).toContain('no files changed yet');
   });
 
+  it('names the discovery budget, with both budgets shown, when a search is refused and the run stopped', async () => {
+    installBridge({
+      'runs:events': () =>
+        ok<'runs:events'>([
+          {
+            id: 'e1',
+            runId: 'ornith-run',
+            timestamp: '2026-09-10T10:00:01.000Z',
+            type: 'tool_use',
+            payload: JSON.stringify({
+              text: 'Ornith action search_text denied (limit_read_bytes_exceeded); the run stopped.',
+              data: {
+                sequence: 9,
+                action: 'search_text',
+                ok: false,
+                code: 'limit_read_bytes_exceeded',
+                recoverable: false,
+                readBytesUsed: 4_194_211,
+                readBytesConfigured: 4_194_304,
+                validationBytesUsed: 82_664,
+                validationBytesConfigured: 8_388_608,
+                changedFiles: 1
+              }
+            })
+          }
+        ])
+    });
+    renderApp(<RelayTimeline runs={[makeRun({ id: 'ornith-run', agent: 'ornith', status: 'failed' })]} />);
+
+    await screen.findByText('tool use');
+    const lines = document.querySelectorAll('.logs__text');
+    expect(lines).toHaveLength(1);
+    const text = lines[0]!.textContent ?? '';
+    expect(text).toContain('repository discovery budget exhausted');
+    expect(text).not.toContain('internal edit-validation budget exhausted');
+    expect(text).toContain('discovery budget 4194211 / 4194304 bytes');
+    expect(text).toContain('edit-validation budget 82664 / 8388608 bytes');
+    expect(text).toContain('the run stopped');
+    expect(text).toContain('1 file(s) changed');
+    expect(text).toContain('next: retry naming the exact file(s)');
+  });
+
+  it('names the edit-validation budget — not discovery — when an edit is refused for it, and offers the safe next step', async () => {
+    installBridge({
+      'runs:events': () =>
+        ok<'runs:events'>([
+          {
+            id: 'e1',
+            runId: 'ornith-run',
+            timestamp: '2026-09-10T10:00:01.000Z',
+            type: 'tool_use',
+            payload: JSON.stringify({
+              text: 'Ornith action replace_text denied (limit_mutation_validation_bytes_exceeded); the run stopped.',
+              data: {
+                sequence: 5,
+                action: 'replace_text',
+                ok: false,
+                code: 'limit_mutation_validation_bytes_exceeded',
+                recoverable: false,
+                readBytesUsed: 1_048_576,
+                readBytesConfigured: 4_194_304,
+                validationBytesUsed: 8_388_608,
+                validationBytesConfigured: 8_388_608,
+                changedFiles: 0
+              }
+            })
+          }
+        ])
+    });
+    renderApp(<RelayTimeline runs={[makeRun({ id: 'ornith-run', agent: 'ornith', status: 'failed' })]} />);
+
+    await screen.findByText('tool use');
+    const text = document.querySelector('.logs__text')?.textContent ?? '';
+    expect(text).toContain('limit_mutation_validation_bytes_exceeded');
+    expect(text).toContain('internal edit-validation budget exhausted');
+    expect(text).not.toContain('repository discovery budget exhausted');
+    expect(text).toContain('discovery budget 1048576 / 4194304 bytes');
+    expect(text).toContain('edit-validation budget 8388608 / 8388608 bytes');
+    expect(text).toContain('no files changed yet');
+    expect(text).toContain('next: retry with a smaller change');
+  });
+
+  it('shows a refused git_diff after an edit as a recoverable discovery-budget refusal with both budgets and the edit kept', async () => {
+    installBridge({
+      'runs:events': () =>
+        ok<'runs:events'>([
+          {
+            id: 'e1',
+            runId: 'ornith-run',
+            timestamp: '2026-09-10T10:00:01.000Z',
+            type: 'tool_use',
+            payload: JSON.stringify({
+              text: 'Ornith action git_diff denied (limit_read_bytes_exceeded); recovering with feedback.',
+              data: {
+                sequence: 28,
+                action: 'git_diff',
+                ok: false,
+                code: 'limit_read_bytes_exceeded',
+                recoverable: true,
+                readBytesUsed: 4_194_211,
+                readBytesConfigured: 4_194_304,
+                validationBytesUsed: 82_664,
+                validationBytesConfigured: 8_388_608,
+                changedFiles: 1
+              }
+            })
+          }
+        ])
+    });
+    renderApp(<RelayTimeline runs={[makeRun({ id: 'ornith-run', agent: 'ornith' })]} />);
+
+    await screen.findByText('tool use');
+    const lines = document.querySelectorAll('.logs__text');
+    expect(lines).toHaveLength(1);
+    const text = lines[0]!.textContent ?? '';
+    expect(text).toContain('git_diff');
+    expect(text).toContain('repository discovery budget exhausted');
+    expect(text).toContain('discovery budget 4194211 / 4194304 bytes');
+    expect(text).toContain('edit-validation budget 82664 / 8388608 bytes');
+    expect(text).toContain('recovering with feedback');
+    expect(text).toContain('1 file(s) changed');
+    // Still recovering: no "retry the task" hint, and never an internal error.
+    expect(text).not.toContain('next:');
+    expect(text).not.toContain('internal_error');
+  });
+
+  it('says no budget was exhausted, and why, when the target is above the per-change size limit', async () => {
+    installBridge({
+      'runs:events': () =>
+        ok<'runs:events'>([
+          {
+            id: 'e1',
+            runId: 'ornith-run',
+            timestamp: '2026-09-10T10:00:01.000Z',
+            type: 'tool_use',
+            payload: JSON.stringify({
+              text: 'Ornith action replace_text denied (limit_mutation_target_bytes_exceeded); the run stopped.',
+              data: {
+                sequence: 5,
+                action: 'replace_text',
+                ok: false,
+                code: 'limit_mutation_target_bytes_exceeded',
+                recoverable: false,
+                readBytesUsed: 1_048_577,
+                readBytesConfigured: 4_194_304,
+                validationBytesUsed: 0,
+                validationBytesConfigured: 8_388_608,
+                changedFiles: 0
+              }
+            })
+          }
+        ])
+    });
+    renderApp(<RelayTimeline runs={[makeRun({ id: 'ornith-run', agent: 'ornith', status: 'failed' })]} />);
+
+    await screen.findByText('tool use');
+    const text = document.querySelector('.logs__text')?.textContent ?? '';
+    expect(text).toContain('limit_mutation_target_bytes_exceeded');
+    expect(text).toContain('file above the per-change size limit (no budget exhausted)');
+    expect(text).not.toContain('budget exhausted ·');
+    expect(text).not.toContain('edit-validation budget exhausted');
+    expect(text).not.toContain('discovery budget exhausted');
+    expect(text).toContain('edit-validation budget 0 / 8388608 bytes');
+    expect(text).toContain('next: split the change');
+  });
+
+  it('does not name a budget, or offer a budget next step, for a denial that is not about a budget', async () => {
+    installBridge({
+      'runs:events': () =>
+        ok<'runs:events'>([
+          {
+            id: 'e1',
+            runId: 'ornith-run',
+            timestamp: '2026-09-10T10:00:01.000Z',
+            type: 'tool_use',
+            payload: JSON.stringify({
+              text: 'Ornith action replace_text denied (stale_hash); the run stopped.',
+              data: {
+                sequence: 5,
+                action: 'replace_text',
+                ok: false,
+                code: 'stale_hash',
+                recoverable: false,
+                readBytesUsed: 4_194_304,
+                readBytesConfigured: 4_194_304,
+                validationBytesUsed: 2_000,
+                validationBytesConfigured: 8_388_608,
+                changedFiles: 0
+              }
+            })
+          }
+        ])
+    });
+    renderApp(<RelayTimeline runs={[makeRun({ id: 'ornith-run', agent: 'ornith', status: 'failed' })]} />);
+
+    await screen.findByText('tool use');
+    const text = document.querySelector('.logs__text')?.textContent ?? '';
+    expect(text).toContain('stale_hash');
+    expect(text).not.toContain('budget exhausted');
+    expect(text).not.toContain('next:');
+  });
+
   it('leaves an ordinary tool_use event (no enriched denial data) rendered as plain text, unaffected', async () => {
     installBridge({
       'runs:events': () =>

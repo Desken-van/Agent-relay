@@ -229,21 +229,53 @@ function WarningLine({
 }
 
 /**
+ * The limits a byte-related denial can name: the two budgets and the per-file size bound. Each
+ * carries its own label — the size bound is never called an exhausted budget — and the safe
+ * next step once the run has stopped on it.
+ */
+const ORNITH_BUDGET_DENIALS: Partial<Record<OrnithToolDenialEventData['code'], { readonly label: string; readonly next: string }>> = {
+  limit_read_bytes_exceeded: {
+    label: 'repository discovery budget exhausted',
+    next: 'retry naming the exact file(s) so Ornith reads them instead of searching'
+  },
+  limit_mutation_validation_bytes_exceeded: {
+    label: 'internal edit-validation budget exhausted',
+    next: 'retry with a smaller change, or split it across smaller files'
+  },
+  limit_mutation_target_bytes_exceeded: {
+    label: 'file above the per-change size limit (no budget exhausted)',
+    next: 'split the change so each edit touches a smaller file, or make it by hand'
+  }
+};
+
+/**
  * A precise line for an Ornith denied-action event, replacing the plain
  * "Ornith action X denied (code)." text with the exact facts an operator
- * needs: which action, which code, the used/configured read budget, whether
- * the run may still retry/pivot or has stopped, and whether anything has
- * changed yet — never a generic "unsafe or over-limit action" message when a
- * precise reason already exists in `data`.
+ * needs: which action, which code, WHICH of the two byte budgets ran out
+ * (repository discovery vs. internal edit validation — they are separate and
+ * never conflated), the used/configured bytes of each, whether the run may
+ * still retry/pivot or has stopped, whether anything has changed yet, and, once
+ * stopped on a budget, the safe next step — never a generic "unsafe or
+ * over-limit action" message when a precise reason already exists in `data`.
+ * Events recorded before the edit-validation budget existed carry no
+ * validation figures, and simply omit that part.
  */
 function OrnithDenialLine({ data }: { data: OrnithToolDenialEventData }): React.JSX.Element {
+  const budget = ORNITH_BUDGET_DENIALS[data.code];
+  const hasValidation =
+    typeof data.validationBytesUsed === 'number' && typeof data.validationBytesConfigured === 'number';
   return (
     <div className="logs__text selectable">
       Ornith action <span className="mono">{data.action}</span> denied (
-      <span className="mono">{data.code}</span>) · read budget {data.readBytesUsed} /{' '}
-      {data.readBytesConfigured} bytes ·{' '}
-      {data.recoverable ? 'recovering with feedback' : 'the run stopped'} ·{' '}
+      <span className="mono">{data.code}</span>)
+      {budget ? ` — ${budget.label}` : ''} · discovery budget {data.readBytesUsed} /{' '}
+      {data.readBytesConfigured} bytes
+      {hasValidation
+        ? ` · edit-validation budget ${data.validationBytesUsed} / ${data.validationBytesConfigured} bytes`
+        : ''}{' '}
+      · {data.recoverable ? 'recovering with feedback' : 'the run stopped'} ·{' '}
       {data.changedFiles === 0 ? 'no files changed yet' : `${data.changedFiles} file(s) changed`}
+      {budget && !data.recoverable ? ` · next: ${budget.next}` : ''}
     </div>
   );
 }

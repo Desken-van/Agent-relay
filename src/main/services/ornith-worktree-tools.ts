@@ -16,7 +16,8 @@ import { createHash } from 'node:crypto';
 import {
   lstat,
   open,
-  realpath
+  realpath,
+  type FileHandle
 } from 'node:fs/promises';
 import { constants, lstatSync, realpathSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
@@ -30,7 +31,7 @@ import {
 } from '../../shared/domain/ornith';
 import { containsSecretShape } from '../../shared/util/redact';
 import { locateExecutable } from '../adapters/process/executable-locator';
-import type { ProcessRunner } from '../adapters/process/process-runner';
+import type { ProcessResult, ProcessRunner } from '../adapters/process/process-runner';
 import {
   ExecaWindowsFsGuard,
   type WindowsFsFileIdentity,
@@ -83,8 +84,18 @@ export type OrnithToolResult =
       readonly ok: true;
       /** Bounded, JSON-serializable. Sent back to the model as the tool result. */
       readonly forModel: unknown;
-      /** Bytes of repository content this call actually read (0 for a write-only call). */
+      /**
+       * Bytes of repository content this call read on the model's behalf and that count
+       * against the DISCOVERY budget (0 for a write-only call, and 0 for a mutation whose
+       * internal validation was charged to `validationReadBytes` instead).
+       */
       readonly readBytes: number;
+      /**
+       * Bytes Relay re-read only to validate a mutation of a file the model was already
+       * shown, charged to the separate mutation-validation budget. Never shown to the
+       * model. Absent means 0.
+       */
+      readonly validationReadBytes?: number;
       /** Bytes of repository content this call actually wrote (0 for a read-only call). */
       readonly writeBytes: number;
       /** Normalized relative path this call changed, if any. */
@@ -179,6 +190,44 @@ function denied(code: OrnithDenialCode, reason: string): OrnithToolResult {
   return { ok: false, code, reason };
 }
 
+const VALIDATION_READ_CHUNK_BYTES = 64 * 1024;
+
+/** Ordinary ceiling for the output of one fixed read-only Git invocation, per stream. */
+const GIT_DEFAULT_OUTPUT_BYTES = 8 * 1024 * 1024;
+
+/** One reason for every diff that does not fit: it names the budget and promises nothing was returned. */
+const GIT_DIFF_BUDGET_REASON =
+  'The diff does not fit the remaining repository discovery budget. Nothing was returned and the worktree is unchanged by this request.';
+
+/**
+ * Read at most `limit + 1` bytes from an open handle. A result longer than `limit`
+ * proves the file outgrew what the caller was authorised to read, without ever
+ * buffering more than one byte past that bound — `handle.readFile` would buffer
+ * whatever the file has become. The one extra byte is only a growth sentinel and is never
+ * counted: `onRead` is told, chunk by chunk as each chunk arrives, how many of the bytes
+ * just read count toward `limit`, so a read that is aborted or times out part-way has still
+ * been charged for everything it read, and the total charged never exceeds `limit`.
+ */
+async function readAtMost(
+  handle: FileHandle,
+  limit: number,
+  signal: AbortSignal,
+  onRead?: (countedBytes: number) => void
+): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (total <= limit) {
+    signal.throwIfAborted();
+    const chunk = Buffer.allocUnsafe(Math.min(VALIDATION_READ_CHUNK_BYTES, limit + 1 - total));
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, total);
+    if (bytesRead === 0) break;
+    onRead?.(Math.max(0, Math.min(bytesRead, limit - total)));
+    chunks.push(bytesRead === chunk.length ? chunk : chunk.subarray(0, bytesRead));
+    total += bytesRead;
+  }
+  return Buffer.concat(chunks, total);
+}
+
 /** True when any path segment resolves to `.git`, checked again here defensively. */
 function touchesDotGit(relativePath: string): boolean {
   return relativePath.split('/').includes('.git');
@@ -189,6 +238,22 @@ export class OrnithWorktreeTools {
   /** Manifest entries plus files created this run, minus files deleted this run. */
   private readonly knownFiles = new Set<string>();
   private readonly changedFiles = new Set<string>();
+  /**
+   * The whole-file sha256 values this run has SHOWN the model, per path: one is issued
+   * by every successful `read_file`, `create_file` and `replace_text`. A mutation that
+   * supplies one of them is editing a file the model was already authorised to read —
+   * and paid the discovery budget for — so Relay's own re-reads to validate that edit
+   * are charged to {@link validationBytesRead}, not to discovery. A hash Relay never
+   * issued (a guess, or one from another file) earns nothing: the edit keeps drawing on
+   * the discovery budget exactly as before. Bounded by the action cap, and pruned on delete.
+   */
+  private readonly shownHashes = new Map<string, Set<string>>();
+  /**
+   * Bytes Relay itself re-read for mutation validation, cumulative for this run and
+   * counted at the moment they are read — a denied or failed attempt still consumed
+   * them, so retrying cannot buy more.
+   */
+  private validationBytesRead = 0;
   private gitPath: string | null = null;
   private readonly canonicalRoot: string;
   private readonly rootDevice: bigint | number;
@@ -225,6 +290,71 @@ export class OrnithWorktreeTools {
     }
     this.rootDevice = rootStats.dev;
     this.rootInode = rootStats.ino;
+  }
+
+  /** Cumulative bytes Relay re-read for mutation validation this run (never model-visible). */
+  validationReadBytesUsed(): number {
+    return this.validationBytesRead;
+  }
+
+  /**
+   * `null` when the mutation-validation budget can still cover BOTH internal reads of a
+   * target this size (the first read and the final time-of-check/time-of-use re-read);
+   * otherwise the denial. Reserving both up front makes the bound fail closed before any
+   * byte is read, and the counter is then charged as the reads actually happen.
+   */
+  private validationReservationDenial(targetSize: number): OrnithToolResult | null {
+    const needed = targetSize * 2;
+    const remaining = ORNITH_LIMITS.maxCumulativeMutationValidationBytes - this.validationBytesRead;
+    if (needed <= remaining) return null;
+    return denied(
+      'limit_mutation_validation_bytes_exceeded',
+      `Validating this change needs ${needed} internal bytes but only ${Math.max(0, remaining)} of the ` +
+        `${ORNITH_LIMITS.maxCumulativeMutationValidationBytes}-byte mutation-validation budget remain. ` +
+        'Nothing was read for the model and nothing was written.'
+    );
+  }
+
+  /**
+   * The final re-read of a mutation target, immediately before the native mutation guard.
+   * On the validation budget it is bounded by the size of the first read and charged
+   * before it runs — a re-read that fails still read the file. A file that no longer fits
+   * that size has changed since it was validated, which is a stale target, not a budget.
+   */
+  private async finalValidationRead(
+    absolutePath: string,
+    firstReadBytes: number,
+    onValidationBudget: boolean,
+    budget: OrnithOperationBudget,
+    signal: AbortSignal
+  ): Promise<{ ok: true; raw: Buffer } | { ok: false; code: OrnithDenialCode; reason: string }> {
+    if (!onValidationBudget) {
+      return this.readRegularFileSafely(absolutePath, budget.readBytes - firstReadBytes, signal);
+    }
+    this.validationBytesRead += firstReadBytes;
+    const read = await this.readRegularFileSafely(absolutePath, firstReadBytes, signal);
+    if (!read.ok && read.code === 'limit_read_bytes_exceeded') {
+      return { ok: false, code: 'stale_hash', reason: 'The file changed size before the change was applied.' };
+    }
+    return read;
+  }
+
+  /** Charges each chunk of an internal validation read as it arrives; discovery-pool reads charge nothing here. */
+  private validationCharge(onValidationBudget: boolean): ((countedBytes: number) => void) | undefined {
+    if (!onValidationBudget) return undefined;
+    return (countedBytes) => {
+      this.validationBytesRead += countedBytes;
+    };
+  }
+
+  private recordShownHash(relativePath: string, sha256: string): void {
+    const known = this.shownHashes.get(relativePath);
+    if (known === undefined) this.shownHashes.set(relativePath, new Set([sha256]));
+    else known.add(sha256);
+  }
+
+  private wasShownHash(relativePath: string, sha256: string): boolean {
+    return this.shownHashes.get(relativePath)?.has(sha256) ?? false;
   }
 
   private async validateRootIdentity(): Promise<boolean> {
@@ -633,7 +763,12 @@ export class OrnithWorktreeTools {
       if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
         return { ok: false, code: 'path_symlink', reason: 'The file identity changed before it was opened.' };
       }
-      const raw = await handle.readFile({ signal });
+      // Bounded by the same limit the size check above used: a file that grew after
+      // that check is reported instead of being buffered whole.
+      const raw = await readAtMost(handle, maxBytes, signal);
+      if (raw.byteLength > maxBytes) {
+        return { ok: false, code: 'limit_read_bytes_exceeded', reason: 'The file grew past the allowed read size while it was being read.' };
+      }
       const after = await handle.stat();
       const named = await lstat(absolutePath);
       const namedReal = await realpath(absolutePath);
@@ -859,6 +994,8 @@ export class OrnithWorktreeTools {
           );
         }
 
+        // The model now holds this hash; an edit that cites it is an authorised one.
+        this.recordShownHash(action.path, sha256);
         return {
           ok: true,
           forModel: packed,
@@ -1180,6 +1317,7 @@ export class OrnithWorktreeTools {
       this.knownFiles.add(action.path);
       this.changedFiles.add(action.path);
       const sha256 = createHash('sha256').update(action.content, 'utf8').digest('hex');
+      this.recordShownHash(action.path, sha256);
 
       return {
         ok: true,
@@ -1209,7 +1347,22 @@ export class OrnithWorktreeTools {
       if (!resolved.ok) return denied(resolved.code, resolved.reason);
 
       const beforeStats = await lstat(resolved.absolutePath, { bigint: true });
-      if (beforeStats.size > budget.readBytes) {
+      const targetSize = Number(beforeStats.size);
+      // Per-target size bound on what Relay will read to validate one edit. Not a budget: it is
+      // checked before anything is read, the same for every pool, so an edit never buffers a
+      // larger file — and it has its own code, so a size refusal is never reported as a budget
+      // that ran out.
+      if (targetSize > ORNITH_LIMITS.maxFileBytes) {
+        return denied(
+          'limit_mutation_target_bytes_exceeded',
+          `The file is larger than the ${ORNITH_LIMITS.maxFileBytes} bytes one change may validate. Nothing was read for the model and nothing was written.`
+        );
+      }
+      const onValidationBudget = this.wasShownHash(action.path, action.sha256);
+      if (onValidationBudget) {
+        const denial = this.validationReservationDenial(targetSize);
+        if (denial !== null) return denial;
+      } else if (beforeStats.size > budget.readBytes) {
         return denied('limit_read_bytes_exceeded', 'Reading the file would exceed the remaining repository byte budget.');
       }
       const handle = await open(resolved.absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -1224,12 +1377,14 @@ export class OrnithWorktreeTools {
           volumeSerial: openedStats.dev.toString(),
           fileIndex: openedStats.ino.toString()
         };
-        raw = await handle.readFile({ signal: bounded });
+        // Bounded for every pool: never buffers more than one byte past the size that was
+        // checked above. On the validation pool the bytes are charged as each chunk arrives.
+        raw = await readAtMost(handle, targetSize, bounded, this.validationCharge(onValidationBudget));
+        if (raw.byteLength > targetSize) {
+          return denied('stale_hash', 'The file grew while the edit was being validated.');
+        }
       } finally {
         await handle.close();
-      }
-      if (raw.byteLength > ORNITH_LIMITS.maxFileBytes) {
-        return denied('limit_read_bytes_exceeded', 'The file exceeds the size this tool may edit.');
       }
       const currentSha256 = createHash('sha256').update(raw).digest('hex');
       if (currentSha256 !== action.sha256) {
@@ -1284,11 +1439,7 @@ export class OrnithWorktreeTools {
       await this.deps.testHooks?.beforeMutation?.('replace_text', action.path);
       const rechecked = await this.resolveSafe(action.path, { mustExist: true, forWrite: true }, bounded);
       if (!rechecked.ok) return denied(rechecked.code, rechecked.reason);
-      const finalRead = await this.readRegularFileSafely(
-        rechecked.absolutePath,
-        budget.readBytes - raw.byteLength,
-        bounded
-      );
+      const finalRead = await this.finalValidationRead(rechecked.absolutePath, raw.byteLength, onValidationBudget, budget, bounded);
       if (!finalRead.ok) return denied(finalRead.code, finalRead.reason);
       if (createHash('sha256').update(finalRead.raw).digest('hex') !== action.sha256) {
         return denied('stale_hash', 'The file content changed before replacement.');
@@ -1318,11 +1469,14 @@ export class OrnithWorktreeTools {
 
       this.changedFiles.add(action.path);
       const newSha256 = createHash('sha256').update(next, 'utf8').digest('hex');
+      this.recordShownHash(action.path, newSha256);
 
       return {
         ok: true,
         forModel: { path: action.path, sha256: newSha256, bytesWritten: nextBytes },
-        readBytes: raw.byteLength * 2,
+        // Two internal reads of the target (first read, final re-read), on whichever pool paid for them.
+        readBytes: onValidationBudget ? 0 : raw.byteLength * 2,
+        validationReadBytes: onValidationBudget ? raw.byteLength * 2 : 0,
         writeBytes: nextBytes,
         changedPath: action.path,
         auditSummary: `replace_text path="${action.path}" replacements=${action.replacements.length}`
@@ -1347,7 +1501,21 @@ export class OrnithWorktreeTools {
       if (!resolved.ok) return denied(resolved.code, resolved.reason);
 
       const beforeStats = await lstat(resolved.absolutePath, { bigint: true });
-      if (beforeStats.size > budget.readBytes) {
+      const targetSize = Number(beforeStats.size);
+      // The same per-target size bound as an edit, checked before anything is read: a delete is
+      // a mutation too. (Under the old single budget only a ~1.3 MiB band above this bound was
+      // even deletable — read plus two validation reads had to fit in 4 MiB.)
+      if (targetSize > ORNITH_LIMITS.maxFileBytes) {
+        return denied(
+          'limit_mutation_target_bytes_exceeded',
+          `The file is larger than the ${ORNITH_LIMITS.maxFileBytes} bytes one change may validate. Nothing was read for the model and nothing was deleted.`
+        );
+      }
+      const onValidationBudget = this.wasShownHash(action.path, action.sha256);
+      if (onValidationBudget) {
+        const denial = this.validationReservationDenial(targetSize);
+        if (denial !== null) return denial;
+      } else if (beforeStats.size > budget.readBytes) {
         return denied('limit_read_bytes_exceeded', 'Hashing the file would exceed the remaining repository byte budget.');
       }
       const handle = await open(resolved.absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -1362,7 +1530,10 @@ export class OrnithWorktreeTools {
           volumeSerial: openedStats.dev.toString(),
           fileIndex: openedStats.ino.toString()
         };
-        raw = await handle.readFile({ signal: bounded });
+        raw = await readAtMost(handle, targetSize, bounded, this.validationCharge(onValidationBudget));
+        if (raw.byteLength > targetSize) {
+          return denied('stale_hash', 'The file grew while the deletion was being validated.');
+        }
       } finally {
         await handle.close();
       }
@@ -1375,11 +1546,7 @@ export class OrnithWorktreeTools {
         await this.deps.testHooks?.beforeMutation?.('delete_file', action.path);
         const rechecked = await this.resolveSafe(action.path, { mustExist: true, forWrite: true }, bounded);
         if (!rechecked.ok) return denied(rechecked.code, rechecked.reason);
-        const finalRead = await this.readRegularFileSafely(
-          rechecked.absolutePath,
-          budget.readBytes - raw.byteLength,
-          bounded
-        );
+        const finalRead = await this.finalValidationRead(rechecked.absolutePath, raw.byteLength, onValidationBudget, budget, bounded);
         if (!finalRead.ok) return denied(finalRead.code, finalRead.reason);
         if (createHash('sha256').update(finalRead.raw).digest('hex') !== action.sha256) {
           return denied('stale_hash', 'The file content changed before deletion.');
@@ -1411,12 +1578,14 @@ export class OrnithWorktreeTools {
       }
 
       this.knownFiles.delete(action.path);
+      this.shownHashes.delete(action.path);
       this.changedFiles.add(action.path);
 
       return {
         ok: true,
         forModel: { path: action.path, deleted: true },
-        readBytes: raw.byteLength * 2,
+        readBytes: onValidationBudget ? 0 : raw.byteLength * 2,
+        validationReadBytes: onValidationBudget ? raw.byteLength * 2 : 0,
         writeBytes: 0,
         changedPath: action.path,
         auditSummary: `delete_file path="${action.path}"`
@@ -1460,11 +1629,29 @@ export class OrnithWorktreeTools {
       if (!(await this.assertCheckoutIdentity(bounded))) return denied('checkout_identity_changed', 'The checkout identity changed.');
       const args = ['diff', 'HEAD', '--'];
       if (action.paths && action.paths.length > 0) args.push(...action.paths);
-      const trackedDiff = await this.git(args, bounded, undefined, Math.min(8 * 1024 * 1024, budget.readBytes + 1));
-      if (trackedDiff === null) return denied('internal_error', 'git diff could not be read.');
+      // stdout is capped at `remaining + 1`, so a diff of exactly the remaining bytes still fits and
+      // one byte more does not. Git's stderr is discarded: this tool never reads it, and it is the one
+      // stream that could otherwise share the cap — so warnings (a Windows checkout prints one per
+      // file whose line endings would change) cannot make a diff that fits look oversized, however
+      // many there are, and a hit cap can only mean stdout.
+      const remaining = Math.max(0, budget.readBytes);
+      const stdoutCap = Math.min(GIT_DEFAULT_OUTPUT_BYTES, remaining + 1);
+      const tracked = await this.gitCapture(args, bounded, undefined, stdoutCap, true);
+      if (tracked.exitCode !== 0 || tracked.failed) {
+        // Git was stopped because stdout reached the cap: at least `remaining + 1` characters, hence
+        // at least that many bytes, so the diff does not fit the discovery budget. The cap being hit is
+        // the evidence — never the length of what was kept, which the runner may have trimmed by a
+        // newline. Nothing that was kept is returned. Anything else — a non-zero exit, a spawn
+        // failure, a failure with no cap involved — is a genuine failure and stays one.
+        if (tracked.outputLimitExceeded === true && stdoutCap === remaining + 1) {
+          return denied('limit_read_bytes_exceeded', GIT_DIFF_BUDGET_REASON);
+        }
+        return denied('internal_error', 'git diff could not be read.');
+      }
+      const trackedDiff = tracked.stdout;
       let bytesConsumed = Buffer.byteLength(trackedDiff, 'utf8');
       if (bytesConsumed > budget.readBytes) {
-        return denied('limit_read_bytes_exceeded', 'Git diff would exceed the remaining repository byte budget.');
+        return denied('limit_read_bytes_exceeded', GIT_DIFF_BUDGET_REASON);
       }
       const manifest = await this.ensureManifest(bounded);
       const selected = action.paths ?? manifest;
@@ -1486,7 +1673,7 @@ export class OrnithWorktreeTools {
         if (!resolved.ok) return denied(resolved.code, resolved.reason);
         const stats = await lstat(resolved.absolutePath);
         if (bytesConsumed + stats.size > budget.readBytes) {
-          return denied('limit_read_bytes_exceeded', 'Untracked diff content would exceed the remaining repository byte budget.');
+          return denied('limit_read_bytes_exceeded', GIT_DIFF_BUDGET_REASON);
         }
         const safeRead = await this.readRegularFileSafely(
           resolved.absolutePath,
@@ -1545,12 +1732,30 @@ export class OrnithWorktreeTools {
   }
 
   /** Fixed, read-only Git invocations only. Never stages, commits, or mutates the index. */
-  private async git(args: readonly string[], signal: AbortSignal, cwd?: string, maxOutputBytes = 8 * 1024 * 1024): Promise<string | null> {
+  private async git(args: readonly string[], signal: AbortSignal, cwd?: string, maxOutputBytes = GIT_DEFAULT_OUTPUT_BYTES): Promise<string | null> {
+    const result = await this.gitCapture(args, signal, cwd, maxOutputBytes);
+    if (result.exitCode !== 0 || result.failed) return null;
+    return result.stdout;
+  }
+
+  /**
+   * Run one fixed read-only Git argv and return the WHOLE process result, so a caller that set
+   * `maxOutputBytes` on purpose can tell an output overflow from a genuine failure. Cancellation
+   * and timeout still throw exactly as {@link git} always has.
+   */
+  private async gitCapture(
+    args: readonly string[],
+    signal: AbortSignal,
+    cwd?: string,
+    maxOutputBytes = GIT_DEFAULT_OUTPUT_BYTES,
+    discardStderr = false
+  ): Promise<ProcessResult> {
     const result = await this.deps.runner.run(this.resolveGit(), args, {
       cwd: cwd ?? this.deps.worktreePath,
       signal,
       timeoutMs: ORNITH_LIMITS.gitTimeoutMs,
       maxOutputBytes,
+      ...(discardStderr ? { discardStderr: true } : {}),
       env: {
         GIT_TERMINAL_PROMPT: '0',
         GIT_OPTIONAL_LOCKS: '0',
@@ -1564,8 +1769,7 @@ export class OrnithWorktreeTools {
     if (result.timedOut) {
       throw new AgentRelayError('TIMEOUT', 'The Git inspection timed out.');
     }
-    if (result.exitCode !== 0 || result.failed) return null;
-    return result.stdout;
+    return result;
   }
 }
 

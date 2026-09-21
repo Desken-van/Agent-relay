@@ -11,6 +11,7 @@ import {
   containsAbsoluteMachinePath,
   containsLiteralLineBreakEscape,
   isOrnithTerminalAction,
+  isOrnithToolDenialEventData,
   ORNITH_ACTION_KINDS,
   ORNITH_DENIAL_CODES,
   ORNITH_LIMITS,
@@ -557,5 +558,48 @@ describe('line-ending classification and literal escape detection', () => {
   it('gives the escape diagnosis its own denial code and exactly one retry', () => {
     expect(ORNITH_DENIAL_CODES).toContain('replacement_escape_suspected');
     expect(ORNITH_LIMITS.maxReplacementEscapeRecoveryAttempts).toBe(1);
+  });
+});
+
+describe('the two byte budgets: repository discovery vs internal edit validation', () => {
+  it('keeps them separate, each with its own explicit bound and its own denial code', () => {
+    expect(ORNITH_LIMITS.maxCumulativeReadBytes).toBe(4 * 1024 * 1024);
+    // Validation is bounded by what a run may write: every edit re-reads its target twice, and an
+    // edit writes at most one file's worth, so it can never validate more than twice it may write.
+    expect(ORNITH_LIMITS.maxCumulativeMutationValidationBytes).toBe(2 * ORNITH_LIMITS.maxCumulativeWriteBytes);
+    expect(ORNITH_DENIAL_CODES).toContain('limit_read_bytes_exceeded');
+    expect(ORNITH_DENIAL_CODES).toContain('limit_mutation_validation_bytes_exceeded');
+    // The per-file size bound is not a budget and has a code of its own.
+    expect(ORNITH_DENIAL_CODES).toContain('limit_mutation_target_bytes_exceeded');
+    // The discovery-exhaustion notice fires while some budget remains, never after it is gone.
+    expect(ORNITH_LIMITS.lowDiscoveryBudgetNoticeBytes).toBeGreaterThan(0);
+    expect(ORNITH_LIMITS.lowDiscoveryBudgetNoticeBytes).toBeLessThan(ORNITH_LIMITS.maxCumulativeReadBytes);
+  });
+
+  const legacy = {
+    sequence: 3,
+    action: 'search_text',
+    ok: false,
+    code: 'limit_read_bytes_exceeded',
+    recoverable: true,
+    readBytesUsed: 4_160_000,
+    readBytesConfigured: 4_194_304,
+    changedFiles: 0
+  };
+
+  it('still recognises a denial event recorded before the validation budget existed', () => {
+    expect(isOrnithToolDenialEventData(legacy)).toBe(true);
+  });
+
+  it('recognises a denial event that carries both budgets', () => {
+    expect(
+      isOrnithToolDenialEventData({ ...legacy, validationBytesUsed: 82_664, validationBytesConfigured: 8_388_608 })
+    ).toBe(true);
+  });
+
+  it('rejects an event that is not a denial, or lacks the discovery figures', () => {
+    expect(isOrnithToolDenialEventData(null)).toBe(false);
+    expect(isOrnithToolDenialEventData({ ...legacy, ok: true })).toBe(false);
+    expect(isOrnithToolDenialEventData({ ...legacy, readBytesUsed: undefined })).toBe(false);
   });
 });
