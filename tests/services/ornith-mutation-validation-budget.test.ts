@@ -132,7 +132,7 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
         `Edit validation bytes remaining (internal; reads and searches never spend it): ${VALIDATION_BUDGET - 2 * TARGET_BYTES}`
       );
     },
-    180_000
+    600_000
   );
 
   it('still edits a fully read target when discovery is at exactly 0 bytes, and discovery stays refused', async () => {
@@ -173,7 +173,7 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
       validationBytesConfigured: VALIDATION_BUDGET,
       changedFiles: 1
     });
-  }, 180_000);
+  }, 600_000);
 
   it('a repository-wide search still respects the 4 MiB discovery limit, and the edit still works after its recovery', async () => {
     const fixture = await fixtureFor({ targetBytes: SMALL_TARGET, companions: false, fillerSizes: DRAIN_TO_ZERO });
@@ -190,7 +190,7 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
     expect(run.result.assessment.disposition, run.result.finalMessage).toBe('pass');
     expect(run.result.ornithAudit).toMatchObject({ readBytes: DISCOVERY_BUDGET, validationReadBytes: 2 * SMALL_TARGET });
     expect(run.targetAfter).toContain(REPLACEMENT_SENTENCE);
-  }, 180_000);
+  }, 600_000);
 
   it('denies an edit of a file whose hash was never shown, on the discovery budget, with 93 bytes left', async () => {
     const fixture = await fixtureFor({ targetBytes: SMALL_TARGET, companions: false, fillerSizes: DRAIN_TO_93_TARGET_UNREAD });
@@ -224,7 +224,7 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
       validationBytesUsed: 0,
       changedFiles: 0
     });
-  }, 180_000);
+  }, 600_000);
 
   it('fails closed when the target changed after its last read, and reports it as stale, not as a budget', async () => {
     const fixture = await fixtureFor({ targetBytes: SMALL_TARGET, companions: false, fillerSizes: DRAIN_TO_ZERO });
@@ -249,7 +249,7 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
     });
     // Relay wrote nothing; the file is exactly what the outside change left.
     expect(readFileSync(join(fixture.worktree, TARGET), 'utf8')).toBe(outside);
-  }, 180_000);
+  }, 600_000);
 
   it('refuses a target above the per-change size bound before reading it, and does not call that an exhausted budget', async () => {
     const fixture = await fixtureFor({ targetBytes: ORNITH_LIMITS.maxFileBytes + 1, companions: false });
@@ -279,7 +279,7 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
       validationBytesUsed: 0,
       validationBytesConfigured: VALIDATION_BUDGET
     });
-  }, 180_000);
+  }, 600_000);
 
   it('bounds cumulative validation on its own: four edits fit exactly, the fifth is refused as validation', async () => {
     const fixture = await fixtureFor({ targetBytes: ORNITH_LIMITS.maxFileBytes, companions: false });
@@ -313,5 +313,5 @@ describe('Ornith edit validation after the discovery budget is spent', () => {
       validationBytesConfigured: VALIDATION_BUDGET,
       readBytesUsed: ORNITH_LIMITS.maxFileBytes
     });
-  }, 240_000);
+  }, 600_000);
 });

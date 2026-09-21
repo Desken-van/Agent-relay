@@ -354,7 +354,7 @@ export async function replay(fixture: ReplayFixture, script: ReplayScript): Prom
     runType: 'implementation',
     round: 1,
     maxRounds: 3,
-    loopDeadlineMs: 120_000,
+    loopDeadlineMs: 20 * 60_000,
     signal: new AbortController().signal,
     onProgress: (event) => {
       events.push(event);

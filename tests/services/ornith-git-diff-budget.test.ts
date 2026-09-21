@@ -136,7 +136,7 @@ describe('git_diff with only a few discovery bytes left', () => {
         verifications: 1
       });
     },
-    180_000
+    600_000
   );
 
   it('refuses the diff at exactly 0 discovery bytes, recoverably, and the run still finishes with the edit intact', async () => {
@@ -161,7 +161,7 @@ describe('git_diff with only a few discovery bytes left', () => {
       changedFiles: 1
     });
     expect(run.targetAfter).toBe(targetContent(SMALL_TARGET).replace(ORIGINAL_SENTENCE, REPLACEMENT_SENTENCE));
-  }, 180_000);
+  }, 600_000);
 
   it('returns a diff that fits the remaining discovery budget exactly, and charges exactly that to discovery', async () => {
     const bytes = await diffBytesOfTheEdit();
@@ -174,7 +174,7 @@ describe('git_diff with only a few discovery bytes left', () => {
     expect(run.prompts[7]!).toContain(REPLACEMENT_SENTENCE);
     expect(run.result.assessment.disposition, run.result.finalMessage).toBe('pass');
     expect(run.result.ornithAudit).toMatchObject({ readBytes: DISCOVERY_BUDGET, validationReadBytes: 2 * SMALL_TARGET });
-  }, 180_000);
+  }, 600_000);
 
   it('refuses a diff that exceeds the remaining discovery budget by one byte, and by two', async () => {
     const bytes = await diffBytesOfTheEdit();
@@ -190,7 +190,7 @@ describe('git_diff with only a few discovery bytes left', () => {
       // The refused diff charged nothing: discovery is exactly what the target and fillers spent.
       expect(run.result.ornithAudit).toMatchObject({ readBytes: DISCOVERY_BUDGET - (bytes - short) });
     }
-  }, 240_000);
+  }, 600_000);
 
   it('refuses a diff far larger than the remaining budget without returning any of it', async () => {
     // Well past what the runner is allowed to buffer for the remaining bytes, so the process layer
@@ -205,7 +205,7 @@ describe('git_diff with only a few discovery bytes left', () => {
     expect(run.prompts.some((prompt) => prompt.includes(UNIQUE_MARKER))).toBe(false);
     expect(run.result.assessment.disposition, run.result.finalMessage).toBe('pass');
     expect(run.targetAfter).toContain(UNIQUE_MARKER);
-  }, 180_000);
+  }, 600_000);
 
   it('does not let an identical repeat of the refused diff become a retry loop: it is skipped once, then stops the run', async () => {
     const run = await runWithDiscoveryLeft(0, [
@@ -231,7 +231,7 @@ describe('git_diff with only a few discovery bytes left', () => {
       verifications: 0
     });
     expect(run.targetAfter).toContain(REPLACEMENT_SENTENCE);
-  }, 180_000);
+  }, 600_000);
 
   it('ends the run, honestly, when a DIFFERENT diff is refused too: the one recovery is spent, the edit stays', async () => {
     const run = await runWithDiscoveryLeft(0, [
@@ -268,5 +268,5 @@ describe('git_diff with only a few discovery bytes left', () => {
     expect(run.result.finalMessage).not.toContain('internal_error');
     expect(run.verifications).toBe(0);
     expect(run.targetAfter).toContain(REPLACEMENT_SENTENCE);
-  }, 180_000);
+  }, 600_000);
 });

@@ -2044,14 +2044,13 @@ describe('OrnithWorktreeTools git_diff against the remaining discovery budget', 
     const noFlag = await toolsAnsweringDiff({ failed: true, stdout: 'x'.repeat(5_000) }).gitDiff(diff, undefined, limits);
     expect(noFlag).toMatchObject({ ok: false, code: 'internal_error' });
 
-    // The cap was hit, but what stdout kept fits the budget: it was not the diff that overflowed.
-    const stderrCap = await toolsAnsweringDiff({ failed: true, outputLimitExceeded: true, stdout: 'x'.repeat(50) }).gitDiff(diff, undefined, limits);
-    expect(stderrCap).toMatchObject({ ok: false, code: 'internal_error' });
-
-    // The cap was hit and stdout alone is over the remaining bytes: a discovery refusal, with none of it returned.
-    const overflow = await toolsAnsweringDiff({ failed: true, outputLimitExceeded: true, stdout: 'x'.repeat(5_000) }).gitDiff(diff, undefined, limits);
-    expect(overflow).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
-    expect(JSON.stringify(overflow)).not.toContain('xxxxx');
+    // The output cap was hit: the diff does not fit, whatever length of it the runner happened to keep
+    // (it may have trimmed a newline, leaving exactly the remaining bytes) — and none of it is returned.
+    for (const kept of [50, 99, 100, 5_000]) {
+      const overflow = await toolsAnsweringDiff({ failed: true, outputLimitExceeded: true, stdout: 'x'.repeat(kept) }).gitDiff(diff, undefined, limits);
+      expect(overflow, `kept ${kept}`).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+      expect(JSON.stringify(overflow)).not.toContain('xxxxx');
+    }
   });
 
   it('decides the same way when Git prints a line-ending warning on stderr', async () => {
@@ -2110,10 +2109,45 @@ describe('OrnithWorktreeTools git_diff against the remaining discovery budget', 
     }
   });
 
-  it('still reports a genuine failure when stderr itself reaches its own cap', async () => {
+  it('refuses an oversized diff as a budget even when the runner trims a newline at the cut', async () => {
+    // The runner strips a final newline from what it kept, so when the cap lands right after a line break
+    // the retained text is one shorter than the cap: exactly the remaining bytes, not more. It is the cap
+    // being hit that proves the diff does not fit — never the length of what was kept.
+    const script = `process.stdout.write(${JSON.stringify('x\n'.repeat(500))});`;
+    const wrapping = {
+      run: (file: string, args: readonly string[], options?: Parameters<typeof runner.run>[2]): Promise<ProcessResult> =>
+        file === gitPath && args[0] === 'diff'
+          ? runner.run(process.execPath, ['-e', script], options)
+          : runner.run(file, args, options)
+    };
+    const boundary = new OrnithWorktreeTools({
+      worktreePath: worktree,
+      worktreesRoot,
+      repositoryPath: repository,
+      branchName: 'task',
+      runner: wrapping,
+      gitExecutablePath: gitPath
+    });
+
+    // An even remaining size puts the cap (remaining + 1) right after a "\n" in "x\nx\n…".
+    for (const remaining of [99, 101, 199, 0, 1, 2]) {
+      const result = await boundary.gitDiff(diff, undefined, { readBytes: remaining, writeBytes: 0 });
+      expect(result, `remaining ${remaining}`).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    }
+  });
+
+  it('treats a stderr of any size as irrelevant: it is never captured, so it cannot fail a diff', async () => {
+    // Far more than any output cap: still just a diff that fits.
     const result = await toolsWithNoisyDiff(9 * 1024 * 1024).gitDiff(diff);
 
-    expect(result).toMatchObject({ ok: false, code: 'internal_error', reason: 'git diff could not be read.' });
+    expect(result).toMatchObject({ ok: true });
+  });
+
+  it('never lets a clamped or negative remaining budget reach the runner as a non-positive cap', async () => {
+    for (const remaining of [0, -5]) {
+      const result = await toolsWithNoisyDiff(10).gitDiff(diff, undefined, { readBytes: remaining, writeBytes: 0 });
+      expect(result, `remaining ${remaining}`).toMatchObject({ ok: false, code: 'limit_read_bytes_exceeded' });
+    }
   });
 
   it('keeps credential detection fail-closed, and returns none of a credential-shaped diff over budget either', async () => {

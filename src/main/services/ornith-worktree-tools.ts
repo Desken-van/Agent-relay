@@ -1630,22 +1630,20 @@ export class OrnithWorktreeTools {
       const args = ['diff', 'HEAD', '--'];
       if (action.paths && action.paths.length > 0) args.push(...action.paths);
       // stdout is capped at `remaining + 1`, so a diff of exactly the remaining bytes still fits and
-      // one byte more does not. stderr has its OWN, ordinary cap: Git's warnings (a Windows checkout
-      // prints one per file whose line endings would change) can never make a diff that fits look
-      // oversized, however many there are.
-      const tracked = await this.gitCapture(
-        args,
-        bounded,
-        undefined,
-        Math.min(GIT_DEFAULT_OUTPUT_BYTES, budget.readBytes + 1),
-        GIT_DEFAULT_OUTPUT_BYTES
-      );
+      // one byte more does not. Git's stderr is discarded: this tool never reads it, and it is the one
+      // stream that could otherwise share the cap — so warnings (a Windows checkout prints one per
+      // file whose line endings would change) cannot make a diff that fits look oversized, however
+      // many there are, and a hit cap can only mean stdout.
+      const remaining = Math.max(0, budget.readBytes);
+      const stdoutCap = Math.min(GIT_DEFAULT_OUTPUT_BYTES, remaining + 1);
+      const tracked = await this.gitCapture(args, bounded, undefined, stdoutCap, true);
       if (tracked.exitCode !== 0 || tracked.failed) {
-        // The runner stopped Git at the stdout cap AND what it kept of stdout already exceeds what
-        // the model may still read: the diff does not fit the discovery budget. Nothing retained
-        // is returned. Anything else — a non-zero exit, a spawn failure, stderr reaching its own
-        // cap — is a genuine failure and stays one.
-        if (tracked.outputLimitExceeded === true && Buffer.byteLength(tracked.stdout, 'utf8') > budget.readBytes) {
+        // Git was stopped because stdout reached the cap: at least `remaining + 1` characters, hence
+        // at least that many bytes, so the diff does not fit the discovery budget. The cap being hit is
+        // the evidence — never the length of what was kept, which the runner may have trimmed by a
+        // newline. Nothing that was kept is returned. Anything else — a non-zero exit, a spawn
+        // failure, a failure with no cap involved — is a genuine failure and stays one.
+        if (tracked.outputLimitExceeded === true && stdoutCap === remaining + 1) {
           return denied('limit_read_bytes_exceeded', GIT_DIFF_BUDGET_REASON);
         }
         return denied('internal_error', 'git diff could not be read.');
@@ -1734,7 +1732,7 @@ export class OrnithWorktreeTools {
   }
 
   /** Fixed, read-only Git invocations only. Never stages, commits, or mutates the index. */
-  private async git(args: readonly string[], signal: AbortSignal, cwd?: string, maxOutputBytes = 8 * 1024 * 1024): Promise<string | null> {
+  private async git(args: readonly string[], signal: AbortSignal, cwd?: string, maxOutputBytes = GIT_DEFAULT_OUTPUT_BYTES): Promise<string | null> {
     const result = await this.gitCapture(args, signal, cwd, maxOutputBytes);
     if (result.exitCode !== 0 || result.failed) return null;
     return result.stdout;
@@ -1749,15 +1747,15 @@ export class OrnithWorktreeTools {
     args: readonly string[],
     signal: AbortSignal,
     cwd?: string,
-    maxOutputBytes = 8 * 1024 * 1024,
-    maxStderrBytes?: number
+    maxOutputBytes = GIT_DEFAULT_OUTPUT_BYTES,
+    discardStderr = false
   ): Promise<ProcessResult> {
     const result = await this.deps.runner.run(this.resolveGit(), args, {
       cwd: cwd ?? this.deps.worktreePath,
       signal,
       timeoutMs: ORNITH_LIMITS.gitTimeoutMs,
       maxOutputBytes,
-      ...(maxStderrBytes === undefined ? {} : { maxStderrBytes }),
+      ...(discardStderr ? { discardStderr: true } : {}),
       env: {
         GIT_TERMINAL_PROMPT: '0',
         GIT_OPTIONAL_LOCKS: '0',

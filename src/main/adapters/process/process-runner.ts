@@ -41,11 +41,13 @@ export interface ProcessRunOptions {
   /** Cap on retained stdout/stderr. Excess is dropped, not buffered. */
   readonly maxOutputBytes?: number;
   /**
-   * A separate cap for stderr alone, for a buffered run whose stdout cap is deliberately tight and
-   * whose stderr (warnings, progress) must not be able to trip it. Unset: stderr shares
-   * {@link maxOutputBytes}, exactly as before. Ignored by streaming runs.
+   * For a buffered run whose caller never uses stderr and sets a deliberately tight
+   * {@link maxOutputBytes}: stderr is not captured at all (the child's stderr goes nowhere), so
+   * warnings can neither trip the cap nor appear in the result, and an
+   * {@link ProcessResult.outputLimitExceeded} can then only mean stdout. Unset: stderr is captured and
+   * capped with stdout, exactly as before. Ignored by streaming runs.
    */
-  readonly maxStderrBytes?: number;
+  readonly discardStderr?: boolean;
   /**
    * When set, **stdout** is streamed line-by-line as it arrives.
    *
@@ -898,7 +900,7 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
 
     return this.runBuffered(file, args, execaOptions, {
       maxBytes,
-      maxStderrBytes: options.maxStderrBytes,
+      discardStderr: options.discardStderr === true,
       startedAt,
       commandLabel
     });
@@ -908,14 +910,13 @@ export class ExecaProcessRunner implements ProcessRunner, InteractiveProcessRunn
     file: string,
     args: readonly string[],
     execaOptions: Options,
-    ctx: { maxBytes: number; maxStderrBytes?: number; startedAt: number; commandLabel: string }
+    ctx: { maxBytes: number; discardStderr?: boolean; startedAt: number; commandLabel: string }
   ): Promise<ProcessResult> {
     try {
       const result = await execa(file, [...args], {
         ...execaOptions,
-        // One number caps both streams, as it always has; the object form only when stderr is given its own.
-        maxBuffer:
-          ctx.maxStderrBytes === undefined ? ctx.maxBytes : { stdout: ctx.maxBytes, stderr: ctx.maxStderrBytes }
+        ...(ctx.discardStderr === true ? { stderr: 'ignore' as const } : {}),
+        maxBuffer: ctx.maxBytes
       });
 
       return {

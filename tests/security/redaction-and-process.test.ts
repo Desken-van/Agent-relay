@@ -168,30 +168,40 @@ describe('process runner', () => {
     expect('outputLimitExceeded' in exited).toBe(false);
   });
 
-  it('caps stderr separately when asked, and shares one cap otherwise', async () => {
+  it('discards stderr when asked, so it cannot trip the cap — and captures it, capped with stdout, otherwise', async () => {
     const both = "process.stdout.write('o'.repeat(50)); process.stderr.write('e'.repeat(5000))";
 
-    // One cap for both streams, as ever: the stderr alone trips it.
+    // Default: one cap for both streams, as ever — the stderr alone trips it.
     const shared = await runner.run(process.execPath, ['-e', both], { maxOutputBytes: 100 });
     expect(shared.failed).toBe(true);
     expect(shared.outputLimitExceeded).toBe(true);
 
-    // Its own cap: the same output now fits, whole.
-    const split = await runner.run(process.execPath, ['-e', both], { maxOutputBytes: 100, maxStderrBytes: 10_000 });
-    expect(split.failed).toBe(false);
-    expect(split.stdout).toBe('o'.repeat(50));
-    expect(split.stderr).toHaveLength(5000);
-    expect('outputLimitExceeded' in split).toBe(false);
+    // Discarded: the same output fits, stdout whole, stderr never captured.
+    const discarded = await runner.run(process.execPath, ['-e', both], { maxOutputBytes: 100, discardStderr: true });
+    expect(discarded.failed).toBe(false);
+    expect(discarded.exitCode).toBe(0);
+    expect(discarded.stdout).toBe('o'.repeat(50));
+    expect(discarded.stderr).toBe('');
+    expect('outputLimitExceeded' in discarded).toBe(false);
 
-    // The tight stdout cap still applies to stdout.
+    // The tight cap still applies to stdout, and a hit cap can then only mean stdout.
     const stdoutOver = await runner.run(
       process.execPath,
       ['-e', "process.stdout.write('o'.repeat(500)); process.stderr.write('e'.repeat(5000))"],
-      { maxOutputBytes: 100, maxStderrBytes: 10_000 }
+      { maxOutputBytes: 100, discardStderr: true }
     );
     expect(stdoutOver.failed).toBe(true);
     expect(stdoutOver.outputLimitExceeded).toBe(true);
     expect(stdoutOver.stdout.length).toBeLessThanOrEqual(100);
+
+    // A child that fails still fails, with its stderr discarded.
+    const exited = await runner.run(process.execPath, ['-e', 'console.error("boom"); process.exit(4)'], {
+      maxOutputBytes: 100,
+      discardStderr: true
+    });
+    expect(exited.exitCode).toBe(4);
+    expect(exited.failed).toBe(true);
+    expect(exited.stderr).toBe('');
   });
 
   it('honours a timeout', async () => {

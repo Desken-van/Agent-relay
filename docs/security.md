@@ -615,11 +615,12 @@ terminal failure for that attempt.
   `limit_read_bytes_exceeded` (the discovery budget), and none of it is
   returned — never as `internal_error`, which stays reserved for a genuine Git
   or process failure. Git's stdout is capped at the remaining bytes plus one and
-  its stderr at its own ordinary limit, so warnings can never make a diff that
-  fits look oversized; the process layer reports when its output cap was hit,
-  and the diff is only called over budget when what stdout retained already
-  exceeds the remaining bytes. The refusal is recoverable once, so the model
-  can skip the diff and go on to verification with its edit intact.
+  its stderr, which this tool never reads, is discarded, so warnings can never
+  make a diff that fits look oversized and a hit cap can only mean stdout. The
+  process layer reports when its output cap was hit, and that — never the length
+  of what was kept, which it may have trimmed — is what marks the diff as over
+  budget. The refusal is recoverable once, so the model can skip the diff and
+  go on to verification with its edit intact.
 - Every checkout is re-confirmed (branch, common Git directory, not
   detached) before each turn and again before verification; a worktree
   re-pointed at a different repository underneath a running loop is refused
