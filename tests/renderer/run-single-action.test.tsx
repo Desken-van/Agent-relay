@@ -280,6 +280,44 @@ describe('Run screen — waiting states: a gated verification with nothing chang
     expect(screen.getByRole('button', { name: 'Check for changes' })).toBeTruthy();
   });
 
+  it('a rejected or failed readiness IPC call is read the same as "cannot check": a retry control appears, never a silent stall', async () => {
+    // Distinct from the domain-level `unavailable` answer (which `Orchestrator.verificationReadiness` itself
+    // returns): here the CALL fails — thrown, or the main process answered `{ok:false}` — and the renderer
+    // must still land on a state with a retry control, never stuck on "Checking…" with nothing to press.
+    const bridge = installBridge({
+      'dependencies:status': () => ok<'dependencies:status'>({ state: 'not_node_project', detail: 'No package.json.' }),
+      'workflow:verificationReadiness': () => { throw new Error('IPC channel closed'); }
+    });
+    renderApp(<SeededRun detail={OVERFLOW_DETAIL} />);
+
+    await screen.findAllByText(/User action required/);
+    expect(workflowControls()).toEqual([]);
+    expect(document.body.textContent).toContain('could not confirm whether verification may run yet');
+    expect(screen.getByRole('button', { name: 'Check for changes' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Stop task/ })).toBeTruthy();
+    expect(bridge.callsTo('workflow:verify')).toEqual([]);
+  });
+
+  it('an "{ok:false}" readiness response (no throw) is read the same way, and a later successful re-check still recovers', async () => {
+    let fail = true;
+    const bridge = installBridge({
+      'dependencies:status': () => ok<'dependencies:status'>({ state: 'not_node_project', detail: 'No package.json.' }),
+      'workflow:verificationReadiness': () => fail
+        ? { ok: false, error: { code: 'INTERNAL', message: 'boom' } }
+        : ok<'workflow:verificationReadiness'>({ state: 'ready', cause: 'unknown_exhausted', filesChanged: true, settingsChanged: false })
+    });
+    renderApp(<SeededRun detail={EXHAUSTED_DETAIL} />);
+
+    await screen.findAllByText(/User action required/);
+    expect(workflowControls()).toEqual([]);
+
+    fail = false;
+    fireEvent.click(screen.getByRole('button', { name: 'Check for changes' }));
+    await screen.findByRole('button', { name: 'Run verification' });
+    expect(workflowControls()).toEqual(['Run verification']);
+    expect(bridge.callsTo('workflow:verify')).toEqual([]);
+  });
+
   it('a re-check that finds the files changed replaces the waiting state with exactly one "Run verification"', async () => {
     let answer: VerificationReadiness = { state: 'blocked', cause: 'output_limit' };
     const bridge = bridgeWith(() => ok<'workflow:verificationReadiness'>(answer));

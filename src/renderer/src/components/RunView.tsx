@@ -383,10 +383,13 @@ export function RunView(): React.JSX.Element {
   // process's answer from the current worktree identity and settings, the same values its gate compares —
   // so this screen never offers a step that gate would refuse. Re-read whenever the gated run, the task or
   // the verification settings change, and on demand ("Check for changes") after edits made outside the app.
-  const gatedVerificationRunId = detail !== null && detail.task.status === 'READY_FOR_IMPLEMENTATION' &&
-    verificationRerunPolicy(detail.runs).state === 'changes_required'
+  const gatedVerificationRerun = detail !== null && detail.task.status === 'READY_FOR_IMPLEMENTATION'
+    ? verificationRerunPolicy(detail.runs)
+    : null;
+  const gatedVerificationRunId = detail !== null && gatedVerificationRerun?.state === 'changes_required'
     ? [...detail.runs].reverse().find((run) => run.runType === 'verification')?.id ?? null
     : null;
+  const gatedVerificationCause = gatedVerificationRerun?.state === 'changes_required' ? gatedVerificationRerun.cause : null;
   const [verificationReadiness, setVerificationReadiness] = useState<{
     taskId: string;
     runId: string;
@@ -395,18 +398,32 @@ export function RunView(): React.JSX.Element {
   const [readinessCheck, setReadinessCheck] = useState(0);
   const verificationSettingsRevision = settings === null ? null : `${settings.processTimeoutMs}:${settings.maxStoredLogBytes}`;
   useEffect(() => {
-    if (selectedTaskId === null || gatedVerificationRunId === null) return undefined;
+    if (selectedTaskId === null || gatedVerificationRunId === null || gatedVerificationCause === null) return undefined;
     let cancelled = false;
     const taskId = selectedTaskId;
     const runId = gatedVerificationRunId;
-    void call('workflow:verificationReadiness', { taskId }).then((response) => {
-      if (cancelled || !response.ok) return;
-      setVerificationReadiness({ taskId, runId, readiness: response.data });
-    });
+    // The IPC call itself failing (rejected, or the main process answering `{ok:false}`) is distinct from a
+    // domain-level "cannot check" answer, which `verificationReadiness` already returns as `unavailable` —
+    // but the operator must see the same thing either way: a fixed message and, critically, the "Check for
+    // changes" retry control, never silently stuck on "Checking…" forever with nothing to press.
+    const unavailable: VerificationReadiness = {
+      state: 'unavailable', cause: gatedVerificationCause,
+      detail: 'Agent Relay could not confirm whether verification may run yet.'
+    };
+    void call('workflow:verificationReadiness', { taskId }).then(
+      (response) => {
+        if (cancelled) return;
+        setVerificationReadiness({ taskId, runId, readiness: response.ok ? response.data : unavailable });
+      },
+      () => {
+        if (cancelled) return;
+        setVerificationReadiness({ taskId, runId, readiness: unavailable });
+      }
+    );
     return () => {
       cancelled = true;
     };
-  }, [selectedTaskId, gatedVerificationRunId, verificationSettingsRevision, readinessCheck]);
+  }, [selectedTaskId, gatedVerificationRunId, gatedVerificationCause, verificationSettingsRevision, readinessCheck]);
   const currentVerificationReadiness =
     verificationReadiness !== null && verificationReadiness.taskId === selectedTaskId && verificationReadiness.runId === gatedVerificationRunId
       ? verificationReadiness.readiness
