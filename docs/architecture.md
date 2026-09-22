@@ -231,7 +231,7 @@ Thirteen states, one transition table, one function that applies it.
 DRAFT → SPECIFYING → READY_FOR_IMPLEMENTATION → IMPLEMENTING
       → READY_FOR_REVIEW → REVIEWING → { APPROVED | CHANGES_REQUESTED | FAILED }
 CHANGES_REQUESTED → IMPLEMENTING (correction round)
-IMPLEMENTING → READY_FOR_IMPLEMENTATION (saved correction lacks verification proof)
+IMPLEMENTING → READY_FOR_IMPLEMENTATION (saved correction or implementation lacks verification proof)
 APPROVED → READY_TO_PUBLISH → PUBLISHING → COMPLETED
 any non-terminal → CANCELLED
 ```
@@ -272,6 +272,30 @@ telemetry limitation from silently spending another round on the same findings.
 `correction_aborted` is reserved for a security refusal or a thrown, cancelled
 or startup-reconciled correction whose attempt did not return normally, and
 therefore still restores `CHANGES_REQUESTED` so that attempt can be retried.
+
+An *implementation* round that saved files but cannot prove them verified has the
+same shape and now the same treatment: `implementation_unverified` (from
+`IMPLEMENTING`) lands in `READY_FOR_IMPLEMENTATION` exactly as
+`implementation_aborted` does, but through its own event so the two are not the
+same fact. It is used whenever a round that did not finish cleanly leaves files behind —
+its own edits, or edits an earlier attempt left in the worktree — and has no
+security refusal: its own verification failed, timed out or never ran, the loop's
+time limit ended it, or a limit or provider failure stopped it after it had
+written. The task's `lastError` then says what changed, which verification
+attempt (if any) ended how, and that the changes are preserved; the round is not
+handed back. A round that provably
+changed nothing is unchanged: `implementation_aborted`, round returned, and the
+primary action stays **Run implementation**.
+
+From that state the operator's primary action is **Run verification**, which
+runs `npm run verify` against the existing worktree — no new worktree, no new
+attempt, no provider call, no discarded diff. A pass advances to
+`READY_FOR_REVIEW`; a failure or timeout stays in `READY_FOR_IMPLEMENTATION` with
+the outcome, exit code, duration, reason and a bounded, sanitized output tail
+recorded on the verification run. A nonzero exit keeps *Fix verification
+failures* as the primary action with **Run verification again** beside it;
+**Retry implementation** is always a deliberate secondary control, never the
+only visible one.
 
 ### Recovering from an abrupt exit
 
@@ -1583,6 +1607,60 @@ in `docs/security.md` §5c); `finish` and `blocked` end the loop;
 used elsewhere, but only as diagnostic evidence folded into the loop's own
 assessment — the authoritative gate remains Agent Relay's own post-provider
 snapshot verification, run exactly as it is for Claude and Codex.
+
+The same output-handling rule covers both: the command's own stdout/stderr is
+never streamed as a progress event, in either path — only a fixed,
+Relay-authored line before and after it runs — and only the bounded, sanitized
+summary a completed run produces is ever persisted, broadcast live, or shown.
+See docs/security.md §5c ("Verification output is sanitized...") for the exact
+boundary between the raw buffer, the safe summary, and generic progress.
+
+**What a verification attempt is.** Dispatching the action and the command
+passing are different facts, and the record keeps them apart
+(`src/shared/domain/ornith-verification.ts`). The executor returns raw facts
+(exit code, timeout, cancellation, duration, output); `classifyVerificationExecution`
+turns them into one outcome — `passed`, `failed`, `timed_out`, `cancelled`, or
+`not_run` for an attempt Relay refused to start — with the command, exit code,
+duration, an explicit reason and a bounded, sanitized output summary. The
+`run_verification` event's `ok` is the *command's* result and `dispatched` says
+the action ran; a failing command is never `ok: true`. The run's
+`structuredResult.counters.verificationAttempts` holds up to six attempts, and
+`ornithAudit.worktreeChangedFiles` is a final `git status` count of what the
+worktree holds however it got there, so a later round that changed nothing does
+not make an earlier round's unverified edits look gone. When that count could
+not be established (Git failed or timed out), it is unknown rather than zero: the
+latest count an earlier round recorded stands. The assessment's
+`verificationStatus` follows the latest attempt that actually *ran* (a later
+refusal cannot hide a failure) and never becomes `passed` from a diagnostic run.
+
+**Verification is deadline-aware.** The loop keeps
+`verificationFinishReserveMs` (2 minutes) of its overall budget for recording the
+result, returning it to the model, `finish` and cleanup; a verification's own
+budget is the time remaining minus that reserve, and it is stopped at it (as
+`timed_out`, with that reason) rather than left to be cut off by the deadline. It
+is not started at all when that budget is under `minVerificationBudgetMs` (3
+minutes) or the last attempt's duration — a command that already took nine
+minutes is not begun with five to spare. A repeat is refused when the worktree
+fingerprint (the `git diff HEAD` plus each untracked file's content, hashed;
+unknown — and so allowed — beyond 200 files or 16 MiB) is the one the last
+verification ran against, so an unchanged diff cannot buy the same answer twice —
+including after an edit and its exact reversal. At most `maxVerificationRefusals`
+(2) refusals are made per run: the earlier ones are fed back to the model as
+recoverable, saying how many more will end the run, and the last one ends it. They
+are recorded as `not_run` and never as a verdict.
+
+**Scope, once named, is confirmed before it is widened.** When the
+specification names files and the manifest confirms them, a repository-wide
+`search_text` (no `files`, or files outside the list) is refused
+(`scope_expansion_refused`, not dispatched, no bytes charged) until a search of
+ALL the named files came up empty (empty in one of two says nothing about the
+other); each such empty result earns exactly one wider search. A scan cut short by
+the read budget reports no match count at all, so it never counts as "empty"; a
+named file that cannot be searched by nature (binary, or above the 64 KiB
+per-file search limit — this repository's larger docs) does not block the task,
+since it could never come up non-empty. Refusals are bounded like verification's
+(`maxScopeExpansionRefusals`, 2, the last ending the run). A task that names no
+files, or whose named files the manifest does not confirm, is unaffected.
 
 **Stop.** `workflow:stop` aborts the task's `AbortController`, which
 `inferForOrnith` and every bounded tool/verification operation observe. The

@@ -745,6 +745,24 @@ task this section creates.
 6. Confirm **Relay's own verification actually ran** after the Ornith round
    (visible as a `verification` timeline node), independent of anything
    Ornith itself reported via its own `run_verification` tool calls.
+   - **If a verification failed or the time limit expired after files were
+     changed** (a deliberately slow or failing `npm run verify` reproduces it):
+     **Expect** the task at `READY_FOR_IMPLEMENTATION` with the files still in
+     its worktree and a headline such as *Implementation changed 1 file;
+     verification failed.* The Run screen shows a **Verification attempt** panel
+     with the exact command, outcome (Failed / Timed out / Cancelled / Not
+     started), exit code, duration, the reason and, collapsed, a bounded output
+     tail with no token, path or terminal escape in it. **Run verification** is
+     the one highlighted button; **Retry implementation · Ornith** is a plain
+     button below it. In the timeline, the `run_verification` event reads
+     *FAILED*/*TIMED OUT* — never *ok* — for a failed command.
+   - Press **Run verification**: **Expect** it to run against the *existing*
+     worktree — no new worktree, no Ornith call, no round consumed — and, on a
+     pass, the task to move to `READY_FOR_REVIEW`; on a failure, to stay
+     recoverable with the new result shown.
+   - An Ornith run's own verification never starts with less than about five
+     minutes of its time budget left, and is stopped two minutes short of the
+     limit so the run can still finish and record it.
 7. Send corrections at least once if the reviewer requests changes, and
    confirm the correction round is also attributed to Ornith with a fresh
    bounded loop (no durable session reused).

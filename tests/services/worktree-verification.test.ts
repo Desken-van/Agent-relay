@@ -42,11 +42,16 @@ it('retains proof across a commit of the same bytes and ignores only generated i
 it('refuses a different checked-out branch', async () => {
   git(root, 'switch', '-c', 'other'); await expect(verifier.identity(target)).rejects.toThrow(/no longer belongs/);
 });
-it('runs the real npm script once with output, without a model or any agent', async () => {
+it('runs the real npm script once, without a model or any agent, and never streams its own output as a progress event', async () => {
   const output: string[] = [];
   const result = await verifier.execute(target, new AbortController().signal, event => output.push(event.text));
   expect(result.exitCode).toBe(0); expect(result.failed).toBe(false);
-  expect(output.join('\n')).toContain('synthetic verification passed');
+  // The command's output is returned, not streamed: every progress event during execute() is generic
+  // (Relay's own "Command: ..." line), and none of them carry a word the child process printed. A caller
+  // reduces `result.stdout`/`.stderr` to a sanitized summary itself, once the command has finished.
+  expect(result.stdout).toContain('synthetic verification passed');
+  expect(output.join('\n')).not.toContain('synthetic verification passed');
+  expect(output).toEqual(['Command: npm run verify (existing worktree; no implementation agent)']);
 }, 30_000);
 it('fails closed when the project has no verify script', async () => {
   writeFileSync(join(root,'package.json'), '{}');

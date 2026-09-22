@@ -40,6 +40,17 @@ import {
 import type { ClaudePublishBlock, ClaudeRoundAssessmentRecord } from '../../shared/domain/claude-assessment';
 import { CLAUDE_ASSESSMENT_VERSION } from '../../shared/domain/claude-assessment';
 import { AgentRelayError } from '../../shared/domain/errors';
+import {
+  classifyVerificationExecution,
+  formatVerificationDuration,
+  latestExecutedAttempt,
+  ORNITH_VERIFICATION_COMMAND,
+  ornithVerificationStatus,
+  summarizeVerificationOutput,
+  type OrnithVerificationAttempt,
+  type OrnithVerificationExecution,
+  type OrnithVerificationOutcome
+} from '../../shared/domain/ornith-verification';
 import { containsSecretShape } from '../../shared/util/redact';
 import type { TaskSpecification } from '../../shared/schemas/codex';
 import type { AgentProgressEvent, ImplementationResult, OrnithHealthyLease, OrnithInferenceLeaseService } from '../ports';
@@ -70,11 +81,14 @@ export interface OrnithImplementationRequest {
   readonly signal: AbortSignal;
   readonly onProgress: (event: AgentProgressEvent) => void;
   /**
-   * Dispatch to the existing WorktreeVerification executor. Diagnostic only —
-   * its result never decides the attempt's outcome; only Relay's own
-   * post-provider snapshot verification does.
+   * Dispatch to the existing WorktreeVerification executor and report what happened, raw. Diagnostic
+   * only — its result never decides the attempt's outcome; only Relay's own post-provider snapshot
+   * verification does. The loop, not the caller, classifies the facts (see
+   * `classifyVerificationExecution`) and bounds and sanitizes the output, so every consumer reads one
+   * truthful account. The loop's time budget for the command is enforced ONLY through `signal` — there is
+   * deliberately no second timeout argument for an implementation to honour or ignore.
    */
-  readonly runVerification: (signal: AbortSignal, timeoutMs: number) => Promise<{ readonly passed: boolean; readonly summary: string }>;
+  readonly runVerification: (signal: AbortSignal) => Promise<OrnithVerificationExecution>;
   /** Already acquired and health-confirmed by the caller. */
   readonly lease: OrnithHealthyLease;
   readonly leaseService: OrnithInferenceLeaseService;
@@ -91,9 +105,25 @@ export interface OrnithImplementationAudit {
   /** Bytes Relay itself re-read to validate edits of files the model was shown; a separate budget from `readBytes`. */
   readonly validationReadBytes: number;
   readonly writeBytes: number;
+  /** Files this run's own tools changed. */
   readonly changedFiles: number;
+  /**
+   * Files the task worktree holds changed when the run ended, whoever changed them (an earlier attempt's
+   * preserved edits included); null when it could not be established.
+   */
+  readonly worktreeChangedFiles: number | null;
+  /** Verifications that actually started. Refused ones are in `verificationAttempts` as `not_run`. */
   readonly verifications: number;
-  readonly outcomes: readonly { sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }[];
+  /** Every verification attempt this run made or was refused, bounded and sanitized. */
+  readonly verificationAttempts: readonly OrnithVerificationAttempt[];
+  readonly outcomes: readonly {
+    sequence: number;
+    action: OrnithActionKind;
+    /** For `run_verification`, the VERIFICATION's result — not merely that the action ran. */
+    ok: boolean;
+    code?: OrnithDenialCode;
+    verification?: OrnithVerificationOutcome;
+  }[];
 }
 
 export interface OrnithImplementationResult extends ImplementationResult {
@@ -208,9 +238,11 @@ function renderSpecification(specification: TaskSpecification): string {
 The approved specification confidently limits this task to the following existing repository
 file(s). Read them directly with "read_file" — you do not need "list_files" or "search_text" to
 find them; a search does NOT automatically narrow itself to this list, so calling one anyway to
-"double check" costs the same as any other repository-wide search. The list can be incomplete: if
-the work turns out to need other files, or a new one, discover them normally with "list_files"
-and "search_text".
+"double check" costs the same as any other repository-wide search. Agent Relay therefore refuses a
+"search_text" beyond this list until a "search_text" limited to these file(s) (set "files") has
+found nothing; each such empty search then allows one wider search. The list can be incomplete: if
+the work turns out to need other files, or a new one, discover them with "list_files" and, once
+the named file(s) have come up empty, "search_text".
 ${scope.map((path) => `  - ${path}`).join('\n')}
 `
     : '';
@@ -282,6 +314,12 @@ Rules:
   possible request, and is NEVER automatically narrowed for you, including by a SCOPE section
   above. If you already know which file matters, pass it in "files" explicitly, or better, skip
   the search entirely and use "read_file" directly.
+- "run_verification" runs the project's verification (npm run verify), which often takes 5-10 minutes.
+  Its result gives "outcome" (passed, failed, timed_out or cancelled), "exitCode", "durationMs",
+  "reason" and a short "summary" of the output — read them: "passed": false means the command did NOT
+  succeed. It is refused, and nothing runs, when the files are exactly what the last verification ran
+  on or when too little time remains. Agent Relay verifies your changes itself after you "finish", so a
+  failed or refused verification is a reason to fix the files or finish, not to ask again.
 - There are TWO separate byte budgets. "Repository read bytes remaining" is for DISCOVERY only:
   "read_file", "search_text" and "git_diff" spend it. Agent Relay's own re-reads of a file to
   validate an edit are charged to a different internal budget ("Edit validation bytes
@@ -578,6 +616,11 @@ const ORNITH_DENIAL_PUBLISH_BLOCK: Record<OrnithDenialCode, ClaudePublishBlock> 
   limit_changed_files_exceeded: 'configuration',
   limit_manifest_files_exceeded: 'configuration',
   limit_verification_calls_exceeded: 'configuration',
+  // Refused verification is recoverable through Relay's own verification, so a run that ends on it
+  // is handed to that verifier rather than blocked as a configuration failure.
+  limit_verification_time_insufficient: 'verification',
+  verification_repeat_refused: 'verification',
+  scope_expansion_refused: 'configuration',
   limit_deadline_exceeded: 'configuration',
   timeout: 'configuration',
   blocked: 'configuration',
@@ -690,17 +733,28 @@ function assessmentFor(input: {
   disposition: 'pass' | 'fail';
   publishBlock: ClaudeRoundAssessmentRecord['publishBlock'];
   reasonCodes: readonly string[];
+  verificationAttempts?: readonly OrnithVerificationAttempt[];
 }): ClaudeRoundAssessmentRecord {
+  const attempts = input.verificationAttempts ?? [];
+  const executed = latestExecutedAttempt(attempts);
   return {
     version: CLAUDE_ASSESSMENT_VERSION,
     disposition: input.disposition,
-    // Relay's own post-provider snapshot verification is what decides
-    // publish eligibility; Ornith's tool-loop `run_verification` is
-    // diagnostic and never sets this to "passed" on its own account.
-    verificationStatus: 'not_run',
+    // Relay's own post-provider snapshot verification is what decides publish eligibility, so a
+    // passing tool-loop `run_verification` never sets this to "passed" on its own account. A
+    // verification that RAN and failed or timed out is reported as such — it is evidence, not an
+    // absence — and a later refusal never replaces it (see `ornithVerificationStatus`).
+    verificationStatus: ornithVerificationStatus(attempts),
     publishBlock: input.publishBlock,
     reasonCodes: [...input.reasonCodes].slice(0, 40),
-    verification: null,
+    verification: executed === null
+      ? null
+      : {
+          tool: 'run_verification',
+          command: ORNITH_VERIFICATION_COMMAND,
+          matchedRule: 'ornith:run_verification',
+          toolUseSequence: Math.max(1, executed.sequence)
+        },
     denials: []
   };
 }
@@ -711,6 +765,22 @@ function assessmentFor(input: {
 
 export class OrnithImplementationService {
   async implement(request: OrnithImplementationRequest): Promise<OrnithImplementationResult> {
+    const holder: { tools: OrnithWorktreeTools | null } = { tools: null };
+    const result = await this.runLoop(request, (created) => { holder.tools = created; });
+    // What the worktree holds when the run ends, whoever changed it: a round that changed nothing must
+    // not make an earlier attempt's preserved, still-unverified edits look gone. One bounded Git call;
+    // `null` (unknown) rather than a guess when it cannot be established or the run was cancelled — and
+    // never after a security stop: a run that ended because the checkout was not what it should be must
+    // not run one more Git command inside it, and a security block is not recoverable through verification.
+    if (holder.tools === null || request.signal.aborted || result.assessment.publishBlock === 'security') return result;
+    const worktreeChangedFiles = await holder.tools.workingTreeChangedFileCount(request.signal);
+    return { ...result, ornithAudit: { ...result.ornithAudit, worktreeChangedFiles } };
+  }
+
+  private async runLoop(
+    request: OrnithImplementationRequest,
+    onTools: (tools: OrnithWorktreeTools) => void
+  ): Promise<OrnithImplementationResult> {
     const deadline = Date.now() + request.loopDeadlineMs;
     let promptInput = normalizeOrnithPromptInput(
       request,
@@ -725,6 +795,7 @@ export class OrnithImplementationService {
       gitExecutablePath: request.gitExecutablePath ?? null,
       scopedFilePathCandidates: promptInput.specification.scopedFilePaths
     });
+    onTools(tools);
 
     const rolling: RollingResult[] = [];
     let turnsUsed = 0;
@@ -749,13 +820,36 @@ export class OrnithImplementationService {
      *  would fail the same way) or a changed file (it would be `stale_hash`). Key order
      *  cannot defeat it: the schema-parsed action has a canonical key order. */
     let escapeDeniedFingerprint: string | null = null;
-    const outcomes: Array<{ sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }> = [];
+    /** Every verification attempt this run made or was refused, in order. Read by every exit path. */
+    const verificationAttempts: OrnithVerificationAttempt[] = [];
+    /** Refusals of `run_verification` fed back so far (repeat on unchanged files, or too little time). */
+    let verificationRefusalsUsed = 0;
+    /** The worktree fingerprint of the last verification that actually ran; `null` before any or when untaken. */
+    let lastVerifiedFingerprint: string | null = null;
+    let lastVerificationDurationMs = 0;
+    /** Repository-wide searches refused because the declared scope was not searched first. */
+    let scopeExpansionRefusalsUsed = 0;
+    /** One repository-wide search is earned by each scoped search that found nothing in the named files. */
+    let scopeExpansionCredits = 0;
+    const outcomes: Array<{
+      sequence: number;
+      action: OrnithActionKind;
+      ok: boolean;
+      code?: OrnithDenialCode;
+      verification?: OrnithVerificationOutcome;
+    }> = [];
+    const recordAttempt = (attempt: OrnithVerificationAttempt): void => {
+      verificationAttempts.push(attempt);
+      if (verificationAttempts.length > ORNITH_LIMITS.maxVerificationAttemptsRecorded) verificationAttempts.shift();
+    };
     const finish = (
       disposition: 'pass' | 'fail', message: string,
       publishBlock: ClaudeRoundAssessmentRecord['publishBlock'], reasonCodes: readonly string[],
       providerFailure: OrnithImplementationResult['providerFailure'] = null
     ): OrnithImplementationResult => ({
-      ...finishedResult(disposition, message, publishBlock, reasonCodes),
+      // Every exit path — including the deadline — reports the attempts made so far, so a run that
+      // ends for time still says what its verification did.
+      ...finishedResult(disposition, message, publishBlock, reasonCodes, verificationAttempts),
       providerFailure,
       ornithAudit: {
         turns: turnsUsed,
@@ -764,7 +858,10 @@ export class OrnithImplementationService {
         validationReadBytes: tools.validationReadBytesUsed(),
         writeBytes: cumulativeWriteBytes,
         changedFiles: tools.changedFileCount(),
+        // Filled in by `implement()` once the loop has ended; unknown until then.
+        worktreeChangedFiles: null,
         verifications: verificationsUsed,
+        verificationAttempts: [...verificationAttempts],
         outcomes: outcomes.slice(-20)
       }
     });
@@ -1134,6 +1231,14 @@ export class OrnithImplementationService {
       }
 
       let toolResult: OrnithToolResult;
+      /** Set only by a `run_verification` that actually ran: what its event and audit outcome are built from. */
+      let verificationEventAttempt: OrnithVerificationAttempt | null = null;
+      /** The declared scope, confirmed against the manifest; empty means "no declared scope". */
+      const authoritativeScope = promptInput.specification.scopedFilePaths ?? [];
+      // Only a search of the WHOLE declared scope is evidence about it: coming up empty in one of two named
+      // files says nothing about the other.
+      const scopedSearch = action.action === 'search_text' && authoritativeScope.length > 0 &&
+        searchCoversScope(action, authoritativeScope);
       let identicalEscapeRetryRefused = false;
       const operationStarted = Date.now();
       if (action.action === 'replace_text' && escapeDeniedFingerprint !== null && JSON.stringify(action) === escapeDeniedFingerprint) {
@@ -1149,48 +1254,160 @@ export class OrnithImplementationService {
       } else if (action.action === 'run_verification') {
         if (verificationsUsed >= ORNITH_LIMITS.maxVerificationCalls) {
           return finish('fail', 'The verification-call budget for this run is exhausted.', 'configuration', ['limit_verification_calls_exceeded']);
+        }
+        const preCheckMs = deadline - Date.now();
+        if (preCheckMs <= 0) {
+          return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+        }
+        // What the files are right now, so a verification that already ran on exactly this state is
+        // recognised — including after the model "changed" something and changed it back.
+        const fingerprintSignal = deadlineSignal(request.signal, preCheckMs);
+        let fingerprint: string | null;
+        try {
+          fingerprint = await tools.worktreeFingerprint(fingerprintSignal.signal);
+        } finally {
+          fingerprintSignal.dispose();
+        }
+        if (request.signal.aborted) throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+
+        const remainingLoopMs = deadline - Date.now();
+        // Time kept back so the loop can still record the result, return it to the model and finish.
+        const budgetMs = remainingLoopMs - ORNITH_LIMITS.verificationFinishReserveMs;
+        const neededMs = Math.max(ORNITH_LIMITS.minVerificationBudgetMs, lastVerificationDurationMs);
+        const refusal: { code: 'verification_repeat_refused' | 'limit_verification_time_insufficient'; reason: string } | null =
+          fingerprint !== null && fingerprint === lastVerifiedFingerprint
+            ? {
+                code: 'verification_repeat_refused',
+                reason: 'The files are exactly what the last verification already ran on, so running it again cannot ' +
+                  'give a different answer. Change the files first, or finish.'
+              }
+            : budgetMs < neededMs
+              ? {
+                  code: 'limit_verification_time_insufficient',
+                  reason: `Only ${formatVerificationDuration(Math.max(0, remainingLoopMs))} of the implementation time ` +
+                    `budget remain; verification needs at least ${formatVerificationDuration(neededMs)} plus ` +
+                    `${formatVerificationDuration(ORNITH_LIMITS.verificationFinishReserveMs)} to finish.`
+                }
+              : null;
+
+        if (refusal !== null) {
+          // Nothing was spawned. The attempt is recorded as not run — with its reason — so the record
+          // says why there is no verdict, and it can never replace an earlier verdict.
+          verificationRefusalsUsed += 1;
+          recordAttempt({
+            sequence: nonterminalActionsUsed,
+            command: ORNITH_VERIFICATION_COMMAND,
+            outcome: 'not_run',
+            exitCode: null,
+            durationMs: 0,
+            reason: refusal.reason.slice(0, 400),
+            summary: '',
+            code: refusal.code,
+            fingerprint: shortFingerprint(fingerprint)
+          });
+          toolResult = { ok: false, code: refusal.code, reason: refusal.reason };
         } else {
           verificationsUsed += 1;
-          // The caller's closure additionally clamps this to its own process
-          // timeout — see the `runVerification` field doc and the Orchestrator
-          // wiring, which is where `settings.processTimeoutMs` is known.
-          const remainingLoopMs = Math.max(1, deadline - Date.now());
-          const verificationSignal = deadlineSignal(request.signal, remainingLoopMs);
+          // Persisted as it happens: if the process dies mid-verification, the record shows one started.
+          request.onProgress({
+            type: 'progress',
+            text: `Verification started (${ORNITH_VERIFICATION_COMMAND}, at most ${formatVerificationDuration(budgetMs)}).`,
+            data: { sequence: nonterminalActionsUsed, action: 'run_verification', phase: 'started', budgetMs }
+          });
+          const verificationSignal = deadlineSignal(request.signal, budgetMs);
+          const startedAt = Date.now();
+          let execution: OrnithVerificationExecution;
           try {
-            const result = await request.runVerification(verificationSignal.signal, remainingLoopMs);
-            if (verificationSignal.timedOut() || Date.now() >= deadline) {
-              return finish(
-                'fail',
-                'The Ornith implementation loop exceeded its overall time budget.',
-                'configuration',
-                ['limit_deadline_exceeded']
-              );
-            }
-            toolResult = {
-              ok: true,
-              forModel: { passed: result.passed, summary: result.summary.slice(0, ORNITH_LIMITS.maxToolResultBytes) },
-              readBytes: 0,
-              writeBytes: 0,
-              auditSummary: `run_verification -> ${result.passed ? 'passed' : 'failed'}`
-            };
+            execution = await request.runVerification(verificationSignal.signal);
           } catch (error) {
-            if (request.signal.aborted) {
-              throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
-            }
-            if (verificationSignal.timedOut()) {
-              return finish(
-                'fail',
-                'The Ornith implementation loop exceeded its overall time budget.',
-                'configuration',
-                ['limit_deadline_exceeded']
-              );
-            }
-            toolResult = { ok: false, code: 'timeout', reason: boundedVerificationError(error) };
+            if (request.signal.aborted) throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+            execution = {
+              exitCode: null,
+              failed: true,
+              timedOut: false,
+              cancelled: false,
+              durationMs: Date.now() - startedAt,
+              output: boundedVerificationError(error)
+            };
           } finally {
             verificationSignal.dispose();
           }
+          if (request.signal.aborted) throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+
+          // The loop's own timer firing is what "the budget ran out" means; an abort that arrived at
+          // the budget without the flag (the two timers race) is the same thing, not a user cancel.
+          const budgetExpired = verificationSignal.timedOut() ||
+            (execution.cancelled && execution.durationMs >= budgetMs - 1_000);
+          const classified = classifyVerificationExecution(execution, { budgetExpired, budgetMs });
+          const attempt: OrnithVerificationAttempt = {
+            sequence: nonterminalActionsUsed,
+            command: ORNITH_VERIFICATION_COMMAND,
+            outcome: classified.outcome,
+            exitCode: execution.exitCode,
+            durationMs: Math.max(0, Math.round(execution.durationMs)),
+            reason: classified.reason === null ? null : classified.reason.slice(0, 400),
+            summary: summarizeVerificationOutput(execution.output),
+            code: null,
+            fingerprint: shortFingerprint(fingerprint)
+          };
+          // Recorded BEFORE the deadline check: a run that ends for time still says what this did.
+          recordAttempt(attempt);
+          lastVerifiedFingerprint = fingerprint;
+          lastVerificationDurationMs = attempt.durationMs;
+          verificationEventAttempt = attempt;
+          if (Date.now() >= deadline) {
+            // The run ends here, so the ordinary result event below is never reached. Emit its verification
+            // part now: a reloaded timeline must say how the command ended, not only that it started.
+            request.onProgress({
+              type: 'tool_use',
+              text: `run_verification -> ${attempt.outcome} (${describeAttemptBrief(attempt)})`,
+              data: {
+                sequence: nonterminalActionsUsed, turn: turnsUsed, action: 'run_verification',
+                ok: attempt.outcome === 'passed', dispatched: true,
+                verification: {
+                  command: attempt.command, outcome: attempt.outcome, exitCode: attempt.exitCode,
+                  durationMs: attempt.durationMs, reason: attempt.reason, summary: attempt.summary
+                }
+              }
+            });
+            return finish(
+              'fail',
+              'The Ornith implementation loop exceeded its overall time budget.',
+              'configuration',
+              ['limit_deadline_exceeded']
+            );
+          }
+          toolResult = {
+            ok: true,
+            forModel: verificationForModel(attempt, promptBudget.maxToolResultBytes),
+            readBytes: 0,
+            writeBytes: 0,
+            auditSummary: `run_verification -> ${attempt.outcome} (${describeAttemptBrief(attempt)})`
+          };
         }
+      } else if (
+        action.action === 'search_text' &&
+        authoritativeScope.length > 0 &&
+        !searchStaysInScope(action, authoritativeScope) &&
+        scopeExpansionCredits <= 0
+      ) {
+        // A scope was declared and confirmed, and nothing in the named files has yet come up empty:
+        // there is no evidence the task needs anything else, and a repository-wide search is the most
+        // expensive request there is. Refused before dispatch; the reason says exactly how to earn one.
+        scopeExpansionRefusalsUsed += 1;
+        toolResult = {
+          ok: false,
+          code: 'scope_expansion_refused',
+          reason: `This task is confined to: ${authoritativeScope.join(', ')}. A search beyond it reads the whole ` +
+            'repository against the discovery budget, and the named file(s) have not come up empty. Run ' +
+            '"search_text" with "files" set to those path(s) first; if it finds nothing there, one wider search ' +
+            'becomes available.'
+        };
       } else {
+        if (action.action === 'search_text' && authoritativeScope.length > 0 && !searchStaysInScope(action, authoritativeScope)) {
+          // Spends the credit an empty scoped search earned.
+          scopeExpansionCredits -= 1;
+        }
         const operationRemainingMs = deadline - Date.now();
         if (operationRemainingMs <= 0) {
           return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
@@ -1227,6 +1444,14 @@ export class OrnithImplementationService {
 
         const isBudgetDenial = toolResult.code === 'limit_read_bytes_exceeded';
         const isEscapeDenial = toolResult.code === 'replacement_escape_suspected';
+        // Refusals Relay makes on purpose, before anything is dispatched, each with its own bounded count
+        // (already advanced where the refusal was made): fed back, then the run ends.
+        const isVerificationRefusal =
+          toolResult.code === 'verification_repeat_refused' || toolResult.code === 'limit_verification_time_insufficient';
+        const isScopeRefusal = toolResult.code === 'scope_expansion_refused';
+        const isBoundedRefusal = isVerificationRefusal || isScopeRefusal;
+        const refusalsUsed = isVerificationRefusal ? verificationRefusalsUsed : scopeExpansionRefusalsUsed;
+        const refusalsMax = isVerificationRefusal ? ORNITH_LIMITS.maxVerificationRefusals : ORNITH_LIMITS.maxScopeExpansionRefusals;
         const recoveryAttemptsUsed = isBudgetDenial
           ? readBudgetRecoveryAttemptsUsed
           : isEscapeDenial ? replacementEscapeRecoveryAttemptsUsed : readOnlyRecoveryAttemptsUsed;
@@ -1235,8 +1460,12 @@ export class OrnithImplementationService {
           : isEscapeDenial
             ? ORNITH_LIMITS.maxReplacementEscapeRecoveryAttempts
             : ORNITH_LIMITS.maxReadOnlyRecoveryAttempts;
-        const willRecover = !identicalEscapeRetryRefused &&
-          isRecoverableToolDenial(action, toolResult.code) && recoveryAttemptsUsed < recoveryAttemptsMax;
+        // The run ends ON the last permitted refusal: at most `refusalsMax` per run, and the feedback's
+        // "N more … will end the run" counts exactly the refusals still to come before that one.
+        const willRecover = isBoundedRefusal
+          ? refusalsUsed < refusalsMax
+          : !identicalEscapeRetryRefused &&
+            isRecoverableToolDenial(action, toolResult.code) && recoveryAttemptsUsed < recoveryAttemptsMax;
 
         // One event covers both facts (denied, and whether it will recover)
         // so there is exactly one notification for this operation — never a
@@ -1263,16 +1492,25 @@ export class OrnithImplementationService {
         });
 
         if (willRecover) {
-          if (isBudgetDenial) readBudgetRecoveryAttemptsUsed += 1;
+          if (isBoundedRefusal) {
+            // Counted where it was refused.
+          } else if (isBudgetDenial) readBudgetRecoveryAttemptsUsed += 1;
           else if (isEscapeDenial) {
             replacementEscapeRecoveryAttemptsUsed += 1;
             escapeDeniedFingerprint = JSON.stringify(action);
           } else readOnlyRecoveryAttemptsUsed += 1;
           const remaining = recoveryAttemptsMax - (recoveryAttemptsUsed + 1);
+          const refusalsLeft = refusalsMax - refusalsUsed;
           const recoveryFeedback = {
             ok: false,
             code: toolResult.code,
-            reason: isEscapeDenial
+            reason: isVerificationRefusal
+              ? `${toolResult.reason} Verification was NOT started. Agent Relay verifies the preserved changes itself ` +
+                'after you finish, so call "finish" when the work is complete (or "blocked" if you cannot continue). ' +
+                `${refusalsLeft} more refused verification${refusalsLeft === 1 ? '' : 's'} will end the run.`
+              : isScopeRefusal
+              ? `${toolResult.reason} ${refusalsLeft} more refused search${refusalsLeft === 1 ? '' : 'es'} will end the run.`
+              : isEscapeDenial
               ? `${toolResult.reason} The file is unchanged and still has the sha256 you supplied. You have one ` +
                 'retry: send a DIFFERENT replace_text (or read_file again first), writing every real line break in ' +
                 'oldText and newText as the single-backslash JSON escape that matches the lineEnding read_file ' +
@@ -1313,13 +1551,38 @@ export class OrnithImplementationService {
       }
       cumulativeReadBytes += toolResult.readBytes;
       cumulativeWriteBytes += toolResult.writeBytes;
-      outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: true });
+      // Whether the ACTION ran and whether the VERIFICATION passed are different facts. For a verification,
+      // `ok` is the second one; the first is its own field, so "ok: true" can never mean "the command failed".
+      const actionOk = verificationEventAttempt === null ? true : verificationEventAttempt.outcome === 'passed';
+      outcomes.push({
+        sequence: nonterminalActionsUsed,
+        action: action.action,
+        ok: actionOk,
+        ...(verificationEventAttempt === null ? {} : { verification: verificationEventAttempt.outcome })
+      });
+      // An empty search of the named files is the evidence that earns one search beyond them.
+      if (scopedSearch && toolResult.matchCount === 0) {
+        scopeExpansionCredits = Math.min(ORNITH_LIMITS.maxScopeExpansionRefusals, scopeExpansionCredits + 1);
+      }
 
       request.onProgress({
         type: 'tool_use',
         text: toolResult.auditSummary,
         data: {
-          sequence: nonterminalActionsUsed, turn: turnsUsed, action: action.action, ok: true,
+          sequence: nonterminalActionsUsed, turn: turnsUsed, action: action.action, ok: actionOk,
+          ...(verificationEventAttempt === null
+            ? {}
+            : {
+                dispatched: true,
+                verification: {
+                  command: verificationEventAttempt.command,
+                  outcome: verificationEventAttempt.outcome,
+                  exitCode: verificationEventAttempt.exitCode,
+                  durationMs: verificationEventAttempt.durationMs,
+                  reason: verificationEventAttempt.reason,
+                  summary: verificationEventAttempt.summary
+                }
+              }),
           durationMs, readBytes: toolResult.readBytes, writeBytes: toolResult.writeBytes,
           validationReadBytes: toolResult.validationReadBytes ?? 0,
           changedPath: toolResult.changedPath ?? null, cumulativeReadBytes, cumulativeWriteBytes,
@@ -1427,12 +1690,13 @@ function finishedResult(
   disposition: 'pass' | 'fail',
   message: string,
   publishBlock: ClaudeRoundAssessmentRecord['publishBlock'],
-  reasonCodes: readonly string[]
+  reasonCodes: readonly string[],
+  verificationAttempts: readonly OrnithVerificationAttempt[] = []
 ): ImplementationResult {
   return {
     sessionId: null,
     finalMessage: message,
-    assessment: assessmentFor({ disposition, publishBlock, reasonCodes })
+    assessment: assessmentFor({ disposition, publishBlock, reasonCodes, verificationAttempts })
   };
 }
 
@@ -1492,6 +1756,52 @@ function safeProviderFailureReason(reason: string): string {
     return 'The runtime returned an unsafe or empty failure description.';
   }
   return bounded;
+}
+
+/** A short, non-reversible stand-in for a worktree fingerprint: enough to tell states apart in a record. */
+function shortFingerprint(fingerprint: string | null): string | null {
+  return fingerprint === null ? null : fingerprint.slice(0, 16);
+}
+
+/** `exit 1, 8m32s` — the parenthetical of a verification event's text. */
+function describeAttemptBrief(attempt: OrnithVerificationAttempt): string {
+  const took = formatVerificationDuration(attempt.durationMs);
+  return attempt.exitCode === null ? took : `exit ${attempt.exitCode}, ${took}`;
+}
+
+/**
+ * What the model is told about a verification: the outcome and the bounded, sanitized summary. The summary
+ * is fitted to the tool-result budget by construction, so the result can never be replaced by a stub.
+ */
+function verificationForModel(attempt: OrnithVerificationAttempt, maxToolResultBytes: number): Record<string, unknown> {
+  const base = {
+    passed: attempt.outcome === 'passed',
+    outcome: attempt.outcome,
+    command: attempt.command,
+    exitCode: attempt.exitCode,
+    durationMs: attempt.durationMs,
+    reason: attempt.reason
+  };
+  const room = maxToolResultBytes - Buffer.byteLength(JSON.stringify({ ...base, summary: '' }), 'utf8') - 32;
+  if (room <= 0 || attempt.summary.length === 0) return { ...base, summary: '' };
+  const clipped = Buffer.from(attempt.summary, 'utf8').subarray(0, room).toString('utf8').replace(/�+$/u, '');
+  return { ...base, summary: clipped };
+}
+
+/** True when a search names files and every one of them is in the declared scope. */
+function searchStaysInScope(
+  action: Extract<OrnithAction, { action: 'search_text' }>,
+  scope: readonly string[]
+): boolean {
+  return action.files !== undefined && action.files.length > 0 && action.files.every((file) => scope.includes(file));
+}
+
+/** True when a search stays in the declared scope AND names every file of it. */
+function searchCoversScope(
+  action: Extract<OrnithAction, { action: 'search_text' }>,
+  scope: readonly string[]
+): boolean {
+  return searchStaysInScope(action, scope) && scope.every((file) => action.files?.includes(file) === true);
 }
 
 function boundedVerificationError(error: unknown): string {

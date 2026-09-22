@@ -100,6 +100,13 @@ export type OrnithToolResult =
       readonly writeBytes: number;
       /** Normalized relative path this call changed, if any. */
       readonly changedPath?: string;
+      /**
+       * For `search_text` only: how many matches it found. Absent when the read budget cut the scan short
+       * (a candidate was skipped for what was left of it), because then a count of zero would not mean
+       * "the named files do not contain this". Files that cannot be searched by nature (binary, above the
+       * per-file search limit) do not withhold it.
+       */
+      readonly matchCount?: number;
       /** Bounded, safe one-line summary for the audit run event. Never file content. */
       readonly auditSummary: string;
     }
@@ -194,6 +201,11 @@ const VALIDATION_READ_CHUNK_BYTES = 64 * 1024;
 
 /** Ordinary ceiling for the output of one fixed read-only Git invocation, per stream. */
 const GIT_DEFAULT_OUTPUT_BYTES = 8 * 1024 * 1024;
+
+/** More untracked files than this and a worktree fingerprint is not taken (the caller treats the state as new). */
+const FINGERPRINT_MAX_UNTRACKED_FILES = 200;
+/** ...and likewise when their content adds up to more than this: the fingerprint is a cheap preflight, not a scan. */
+const FINGERPRINT_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
 
 /** One reason for every diff that does not fit: it names the budget and promises nothing was returned. */
 const GIT_DIFF_BUDGET_REASON =
@@ -442,6 +454,91 @@ export class OrnithWorktreeTools {
 
   wouldExceedChangedFileLimit(path: string): boolean {
     return !this.changedFiles.has(path) && this.changedFiles.size >= ORNITH_LIMITS.maxChangedFiles;
+  }
+
+  /**
+   * How many files the worktree holds changed against HEAD right now, WHOEVER changed them — not only
+   * this run's own edits, which is all {@link changedFileCount} knows. A later attempt that changes
+   * nothing must not make earlier, preserved and still-unverified edits look like they are gone.
+   *
+   * Internal: one bounded, fixed, read-only Git call with stderr discarded. Never shown to the model
+   * and not charged to either byte budget. `null` when it cannot be established (never a guess).
+   */
+  async workingTreeChangedFileCount(signal?: AbortSignal): Promise<number | null> {
+    const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.gitTimeoutMs, signal);
+    try {
+      const status = await this.gitCapture(
+        ['status', '--porcelain=v1', '--untracked-files=all'],
+        bounded,
+        undefined,
+        GIT_DEFAULT_OUTPUT_BYTES,
+        true
+      );
+      if (status.exitCode !== 0 || status.failed) return null;
+      return status.stdout.split('\n').filter((line) => line.trim().length > 0).length;
+    } catch {
+      return null;
+    } finally {
+      dispose();
+    }
+  }
+
+  /**
+   * A fingerprint of what the worktree holds relative to HEAD: the tracked diff plus the content of every
+   * untracked file. Two calls return the same value exactly when the files are the same — so a verification
+   * that already ran on this state is recognisable even if the model "changed" something and changed it
+   * back (a bookkeeping counter of successful writes could not tell). `null` when it cannot be taken
+   * (Git failed, an untracked file was unreadable or unsafe, or there are too many); the caller then
+   * treats the state as new rather than refusing on a guess.
+   *
+   * Internal and bounded like {@link workingTreeChangedFileCount}. `--no-ext-diff --no-textconv` keep a
+   * configured diff helper from running.
+   */
+  async worktreeFingerprint(signal?: AbortSignal): Promise<string | null> {
+    const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.gitTimeoutMs, signal);
+    try {
+      const diff = await this.gitCapture(
+        ['diff', 'HEAD', '--no-ext-diff', '--no-textconv', '--binary', '--'],
+        bounded,
+        undefined,
+        GIT_DEFAULT_OUTPUT_BYTES,
+        true
+      );
+      if (diff.exitCode !== 0 || diff.failed) return null;
+      const untracked = await this.gitCapture(
+        ['ls-files', '--others', '--exclude-standard', '-z', '--'],
+        bounded,
+        undefined,
+        GIT_DEFAULT_OUTPUT_BYTES,
+        true
+      );
+      if (untracked.exitCode !== 0 || untracked.failed) return null;
+      const names = untracked.stdout.split('\0').filter(Boolean).sort();
+      if (names.length > FINGERPRINT_MAX_UNTRACKED_FILES) return null;
+      const hash = createHash('sha256');
+      hash.update(diff.stdout);
+      hash.update('\0');
+      let hashedBytes = 0;
+      for (const name of names) {
+        const resolved = await this.resolvePathOnly(name, { mustExist: true, forWrite: false });
+        if (!resolved.ok) return null;
+        const read = await this.readRegularFileSafely(resolved.absolutePath, ORNITH_LIMITS.maxFileBytes, bounded);
+        if (!read.ok) return null;
+        // The preflight cost is bounded by bytes as well as by count: past it the state is "unknown"
+        // (verification proceeds) rather than the wait before the command spending the user's budget.
+        hashedBytes += read.raw.byteLength;
+        if (hashedBytes > FINGERPRINT_MAX_TOTAL_BYTES) return null;
+        hash.update(name);
+        hash.update('\0');
+        hash.update(createHash('sha256').update(read.raw).digest('hex'));
+        hash.update('\n');
+      }
+      return hash.digest('hex');
+    } catch {
+      return null;
+    } finally {
+      dispose();
+    }
   }
 
   /* ------------------------------------------------------------------ */
@@ -1234,6 +1331,12 @@ export class OrnithWorktreeTools {
         forModel: { matches, truncated: matches.length >= action.limit || anySkippedDueToBudget || anySkippedDueToReadBudget },
         readBytes: readBytesTotal,
         writeBytes: 0,
+        // Only the number, so the loop can tell "the named files do not contain this" from "they do" —
+        // and not when the READ BUDGET cut the scan short, which proves nothing. A file that cannot be
+        // searched by nature (binary, above the per-file search limit) is not a budget shortfall: it could
+        // never come up non-empty, and a task naming one (this repository's larger docs) must not be
+        // barred from ever earning a wider search.
+        ...(anySkippedDueToReadBudget ? {} : { matchCount: matches.length }),
         auditSummary: `search_text -> ${matches.length} match(es) across ${candidates.length} file(s)`
       };
     } catch (error) {

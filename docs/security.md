@@ -677,6 +677,68 @@ retained provider. If the retained runtime's identity changes, is stopped
 independently (`localInference:stop`), or the process exits, the run
 terminates without ever calling `start()` or falling back to Claude or Codex.
 
+**Verification output is sanitized before it ever reaches storage, the live
+renderer, or a model — for Ornith's own in-loop `run_verification` and for
+Agent Relay's own automatic and manually-triggered verification alike.** What a
+verification command printed is untrusted text that may contain a credential, a
+machine path or terminal control codes, and three tiers keep it from crossing
+that boundary raw:
+
+- **A bounded raw buffer, held only inside the process layer.**
+  `ProcessRunner.run()` (`src/main/adapters/process/process-runner.ts`)
+  captures a command's stdout/stderr — redacted for secret shapes and capped at
+  `maxOutputBytes` — into the `ProcessResult` it returns. That buffer lives
+  only in the caller's local variable; it is never itself persisted,
+  broadcast, or rendered.
+- **The safe summary, the only thing allowed to leave that boundary.**
+  `summarizeVerificationOutput` (`src/shared/domain/ornith-verification.ts`)
+  reduces the buffer to a further-sanitized, bounded text: it removes ANSI
+  escapes and control characters, redacts credentials with the shared
+  `redactSecrets`, replaces absolute machine paths, clips every line, keeps
+  only the failing-test lines and the tail, and hard-caps the result at
+  `maxVerificationSummaryChars` (1,500), examining only the first 32 KiB and
+  last 256 KiB of the input so a multi-megabyte log costs a bounded amount of
+  main-thread time. This summary — never the buffer — is what the Ornith loop
+  returns to the model, what a `run_verification` event and
+  `counters.verificationAttempts` (at most six attempts, each with a
+  400-character reason) store, and what a verification record keeps as
+  `outputSummary`.
+- **Generic, Relay-authored progress events, which never carry a byte of
+  child-process output.** While the command is running, the only events
+  persisted to `run_events` and pushed live to the renderer are fixed lines
+  Relay itself writes — `Command: npm run verify (existing worktree; no
+  implementation agent)` before it starts, `Verification finished: <outcome>
+  (exit <code>, <duration>)` after it ends, built from the classified outcome —
+  never from a line the command printed. `WorktreeVerification.execute`
+  (`src/main/services/worktree-verification.ts`) does not stream the child's
+  stdout/stderr line-by-line at all: no `onLine`/`onStderrLine` is ever passed
+  to the process runner for this command, because a streaming callback is both
+  persisted and broadcast the instant it arrives — before the command has even
+  finished, let alone been classified or summarized — which would defeat every
+  guarantee above.
+
+A record written before these fields existed still reads: they are optional,
+and a damaged or oversized one is skipped, not rendered.
+
+**Two read-only Git questions, fixed and internal.** After a run the loop asks
+`git status --porcelain=v1 --untracked-files=all` (a changed-file *count*, stderr
+discarded) and, before a verification, hashes `git diff HEAD --no-ext-diff
+--no-textconv --binary` plus each untracked file's content (at most 200 files and 16 MiB;
+more means "unknown", not a guess) to recognise a repeat. Neither takes a model-supplied
+argument, neither can run a configured diff helper, both use the existing
+bounded Git timeout, and neither result is shown to the model or charged to
+either byte budget; only the count and a truncated digest are stored. The
+end-of-run count is skipped after a security stop (for example a changed
+checkout identity): a run that ended because the checkout was not what it should
+be does not run one more Git command inside it.
+
+**A named scope is enforced, not merely stated.** When the approved
+specification names files and the manifest confirms them, a `search_text` that
+would read beyond them is refused before dispatch (`scope_expansion_refused`)
+until a search of ALL the named files itself found nothing. It is a refusal, not a
+permission: it cannot widen what a completion may do, only narrow the most
+expensive request Ornith can make until there is evidence for it.
+
 **Bounded, redacted audit evidence only.** Run events record the action kind,
 sequence number, normalized relative paths, byte/count/hash/truncation
 metadata, duration, and verification status — never a search query, file
@@ -686,7 +748,10 @@ final structured result carries the same class of bounded, safe identifiers
 existing assessment record, and a bounded redacted summary) and nothing else.
 A normally finished Ornith round still goes through Agent Relay's own
 post-provider `WorktreeVerification` snapshot before review — Ornith's own
-`run_verification` tool call is diagnostic only and never substitutes for it.
+`run_verification` tool call is diagnostic only and never substitutes for it. A
+diagnostic pass never sets `verificationStatus: passed`, and a diagnostic
+failure is recorded as what it was (`failed`, `timed_out`, `cancelled`) rather
+than as a missing run.
 
 ---
 

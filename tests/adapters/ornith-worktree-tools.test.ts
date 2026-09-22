@@ -2169,3 +2169,186 @@ describe('OrnithWorktreeTools git_diff against the remaining discovery budget', 
     expect(JSON.stringify(real)).not.toContain(TOKEN);
   });
 });
+
+describe('OrnithWorktreeTools facts for verification recovery', () => {
+  const runGit = (args: readonly string[]): Promise<string> => git(worktree, args);
+
+  describe('searchText matchCount', () => {
+    it('is 0 for a search of the named file that found nothing, and the number of matches when it found some', async () => {
+      const boundary = tools();
+      const empty = await boundary.searchText({ version: 1, action: 'search_text', query: 'zz-no-such-text', caseSensitive: false, files: ['fixture.txt'], limit: 10 });
+      const found = await boundary.searchText({ version: 1, action: 'search_text', query: 'alpha', caseSensitive: false, files: ['fixture.txt'], limit: 10 });
+
+      expect(empty).toMatchObject({ ok: true, matchCount: 0 });
+      expect(found).toMatchObject({ ok: true, matchCount: 1 });
+    });
+
+    it('reports the count for a named file that cannot be searched by nature (binary, above the per-file limit), so it never bars a task from a wider search', async () => {
+      // A binary file cannot be decoded as text; a file above the per-file search limit is skipped unread.
+      // Neither could ever come up non-empty, and this repository's larger docs are exactly such files.
+      writeFileSync(join(worktree, 'blob.bin'), Buffer.from([0xff, 0xfe, 0x00, 0xc3, 0x28, 0xa0, 0xa1]));
+      writeFileSync(join(worktree, 'large.md'), 'a documentation line\n'.repeat(4_000), 'utf8'); // ~84 KB > 64 KiB
+      expect(lstatSync(join(worktree, 'large.md')).size).toBeGreaterThan(ORNITH_LIMITS.maxReadBytes);
+      const boundary = tools();
+
+      for (const files of [['fixture.txt', 'blob.bin'], ['large.md']]) {
+        const result = await boundary.searchText({ version: 1, action: 'search_text', query: 'zz-no-such-text', caseSensitive: false, files, limit: 10 });
+        expect(result, files.join()).toMatchObject({ ok: true, matchCount: 0 });
+      }
+    });
+
+    it('withholds the count when the READ BUDGET cut the scan short, because then zero proves nothing', async () => {
+      writeFileSync(join(worktree, 'big.txt'), 'filler line\n'.repeat(200), 'utf8');
+      const overBudget = await tools().searchText( // a fresh executor: its manifest is read once, so it must see big.txt
+        { version: 1, action: 'search_text', query: 'zz-no-such-text', caseSensitive: false, files: ['fixture.txt', 'big.txt'], limit: 10 },
+        undefined,
+        { readBytes: 100, writeBytes: 0 }
+      );
+      expect(overBudget).toMatchObject({ ok: true, forModel: { truncated: true } });
+      expect(overBudget).not.toHaveProperty('matchCount');
+    });
+  });
+
+  describe('workingTreeChangedFileCount', () => {
+    it('counts tracked edits and untracked files, and is 0 for a clean worktree', async () => {
+      const boundary = tools();
+      expect(await boundary.workingTreeChangedFileCount()).toBe(0);
+
+      writeFileSync(join(worktree, 'fixture.txt'), 'changed\n', 'utf8');
+      writeFileSync(join(worktree, 'new-file.txt'), 'new\n', 'utf8');
+      expect(await boundary.workingTreeChangedFileCount()).toBe(2);
+    });
+
+    it('counts changes this tool executor did not make', async () => {
+      const boundary = tools();
+      writeFileSync(join(worktree, 'fixture.txt'), 'edited by an earlier attempt\n', 'utf8');
+
+      expect(boundary.changedFileCount()).toBe(0); // its own edits
+      expect(await boundary.workingTreeChangedFileCount()).toBe(1);
+    });
+
+    it('is unknown (null), not a guess, when Git cannot answer, and when the run was already aborted', async () => {
+      const failing = new OrnithWorktreeTools({
+        worktreePath: worktree,
+        worktreesRoot,
+        repositoryPath: repository,
+        branchName: 'task',
+        gitExecutablePath: gitPath,
+        runner: {
+          run: async (file, args, options) =>
+            args[0] === 'status'
+              ? { command: file, exitCode: 128, stdout: '', stderr: 'fatal', timedOut: false, cancelled: false, durationMs: 1, failed: true }
+              : runner.run(file, args, options)
+        }
+      });
+      expect(await failing.workingTreeChangedFileCount()).toBeNull();
+
+      const aborted = new AbortController();
+      aborted.abort();
+      expect(await tools().workingTreeChangedFileCount(aborted.signal)).toBeNull();
+    });
+
+    it('asks Git only a fixed, read-only question and shows nothing to the model', async () => {
+      const recorded: string[][] = [];
+      await toolsRecordingGitArgv(recorded).workingTreeChangedFileCount();
+
+      const statusCalls = recorded.filter((argv) => argv.includes('status'));
+      expect(statusCalls).toEqual([['status', '--porcelain=v1', '--untracked-files=all']]);
+      for (const argv of recorded) {
+        expect(ALLOWED_GIT_SUBCOMMANDS.has(argv[0]!)).toBe(true);
+        for (const verb of MUTATING_GIT_VERBS) expect(argv).not.toContain(verb);
+      }
+    });
+  });
+
+  describe('worktreeFingerprint', () => {
+    it('is stable for unchanged files and different for changed ones', async () => {
+      const boundary = tools();
+      const clean = await boundary.worktreeFingerprint();
+      expect(clean).toMatch(/^[0-9a-f]{64}$/);
+      expect(await boundary.worktreeFingerprint()).toBe(clean);
+
+      writeFileSync(join(worktree, 'fixture.txt'), 'changed once\n', 'utf8');
+      const changed = await boundary.worktreeFingerprint();
+      expect(changed).not.toBe(clean);
+      expect(await boundary.worktreeFingerprint()).toBe(changed);
+    });
+
+    it('returns to the same value when an edit is exactly reversed', async () => {
+      const boundary = tools();
+      writeFileSync(join(worktree, 'fixture.txt'), 'first edit\n', 'utf8');
+      const first = await boundary.worktreeFingerprint();
+
+      writeFileSync(join(worktree, 'fixture.txt'), 'second edit\n', 'utf8');
+      expect(await boundary.worktreeFingerprint()).not.toBe(first);
+      writeFileSync(join(worktree, 'fixture.txt'), 'first edit\n', 'utf8');
+      expect(await boundary.worktreeFingerprint()).toBe(first);
+    });
+
+    it('sees an untracked file, and a change to its content', async () => {
+      const boundary = tools();
+      const clean = await boundary.worktreeFingerprint();
+
+      writeFileSync(join(worktree, 'notes.md'), 'one\n', 'utf8');
+      const withNew = await boundary.worktreeFingerprint();
+      expect(withNew).not.toBe(clean);
+
+      writeFileSync(join(worktree, 'notes.md'), 'two\n', 'utf8');
+      expect(await boundary.worktreeFingerprint()).not.toBe(withNew);
+    });
+
+    it('is unknown (null) when Git fails, so a caller treats the state as new rather than refusing on a guess', async () => {
+      const failing = new OrnithWorktreeTools({
+        worktreePath: worktree,
+        worktreesRoot,
+        repositoryPath: repository,
+        branchName: 'task',
+        gitExecutablePath: gitPath,
+        runner: {
+          run: async (file, args, options) =>
+            args[0] === 'diff'
+              ? { command: file, exitCode: 128, stdout: '', stderr: 'fatal', timedOut: false, cancelled: false, durationMs: 1, failed: true }
+              : runner.run(file, args, options)
+        }
+      });
+      expect(await failing.worktreeFingerprint()).toBeNull();
+    });
+
+    it('is unknown (null) rather than unbounded when there are too many untracked files to hash', async () => {
+      for (let index = 0; index < 201; index += 1) {
+        writeFileSync(join(worktree, `untracked-${String(index).padStart(3, '0')}.txt`), `${index}\n`, 'utf8');
+      }
+      expect(await tools().worktreeFingerprint()).toBeNull();
+    });
+
+    it('is unknown (null) once the untracked files add up to more than the hashing budget, so the preflight cost is bounded by bytes too', async () => {
+      const chunk = 'x'.repeat(1_000_000); // under the per-file limit; 16 of these are just under 16 MiB
+      for (let index = 0; index < 16; index += 1) writeFileSync(join(worktree, `blob-${String(index).padStart(2, '0')}.txt`), chunk, 'utf8');
+      expect(await tools().worktreeFingerprint()).toMatch(/^[0-9a-f]{64}$/); // within budget: taken
+
+      writeFileSync(join(worktree, 'blob-16.txt'), chunk, 'utf8');
+      writeFileSync(join(worktree, 'blob-17.txt'), chunk, 'utf8');
+      expect(await tools().worktreeFingerprint()).toBeNull(); // over budget: unknown, verification is simply allowed
+    });
+
+    it('runs no configured diff helper and only read-only Git subcommands', async () => {
+      const recorded: string[][] = [];
+      await toolsRecordingGitArgv(recorded).worktreeFingerprint();
+
+      const diffCalls = recorded.filter((argv) => argv[0] === 'diff');
+      expect(diffCalls).toHaveLength(1);
+      expect(diffCalls[0]).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv']));
+      for (const argv of recorded) {
+        expect(ALLOWED_GIT_SUBCOMMANDS.has(argv[0]!)).toBe(true);
+        for (const verb of MUTATING_GIT_VERBS) expect(argv).not.toContain(verb);
+      }
+    });
+
+    it('does not depend on the worktree path or contain anything but a digest', async () => {
+      const value = await tools().worktreeFingerprint();
+      expect(value).not.toBeNull();
+      expect(containsAbsoluteMachinePath(value ?? '')).toBe(false);
+      expect(await runGit(['status', '--porcelain=v1'])).toBe(''); // and it changed nothing
+    });
+  });
+});

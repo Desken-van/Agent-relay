@@ -16,6 +16,10 @@ import {
   type RunGuidance,
   type RunPrimaryAction
 } from '@shared/domain/run-guidance';
+import {
+  formatVerificationDuration,
+  type OrnithVerificationOutcome
+} from '@shared/domain/ornith-verification';
 import { isBusy, isTerminal } from '@shared/domain/workflow';
 import {
   WORKTREE_DEPENDENCY_INSTALLABLE_BLOCKER_STATES,
@@ -59,6 +63,39 @@ export function RunFlowOverview({ guidance }: { guidance: RunGuidance }): React.
       <div><dt>Result</dt><dd>{guidance.result}</dd></div>
       <div className="run-guide__next"><dt>Next action</dt><dd>{guidance.next}</dd></div>
     </dl>
+    {guidance.verification ? <VerificationDetail detail={guidance.verification} /> : null}
+  </section>;
+}
+
+const VERIFICATION_OUTCOME_LABEL: Record<OrnithVerificationOutcome, string> = {
+  passed: 'Passed',
+  failed: 'Failed',
+  timed_out: 'Timed out',
+  cancelled: 'Cancelled',
+  not_run: 'Not started'
+};
+
+/**
+ * The verification attempt behind the current state, in its own words: which command, how it ended, the exit
+ * code, how long it ran, why it did not pass, and — collapsed — the bounded, sanitized tail of its output.
+ * Everything shown was bounded and sanitized when it was stored.
+ */
+function VerificationDetail({ detail }: { detail: NonNullable<RunGuidance['verification']> }): React.JSX.Element {
+  return <section className="run-guide__verification" aria-label="Verification attempt">
+    <h4>{detail.source === 'ornith' ? 'Ornith verification attempt' : 'Agent Relay verification'}</h4>
+    <dl>
+      <div><dt>Command</dt><dd className="mono">{detail.command}</dd></div>
+      <div><dt>Outcome</dt><dd>{VERIFICATION_OUTCOME_LABEL[detail.outcome]}</dd></div>
+      {detail.exitCode !== null ? <div><dt>Exit code</dt><dd>{detail.exitCode}</dd></div> : null}
+      {detail.durationMs !== null ? <div><dt>Duration</dt><dd>{formatVerificationDuration(detail.durationMs)}</dd></div> : null}
+      {detail.reason ? <div><dt>Reason</dt><dd>{detail.reason}</dd></div> : null}
+    </dl>
+    {detail.output ? (
+      <details>
+        <summary className="faint" style={{ cursor: 'pointer', fontSize: 12 }}>Command output (bounded)</summary>
+        <pre className="pre selectable" style={{ marginTop: 8 }}>{detail.output}</pre>
+      </details>
+    ) : null}
   </section>;
 }
 
@@ -94,19 +131,22 @@ export function PrimaryActionButton({
   action,
   onClick,
   pending,
-  blocked
+  blocked,
+  secondary = false
 }: {
   action: RunPrimaryAction;
   onClick: () => void;
   pending: boolean;
   /** True while an unrelated operation (another busy flag, Stop, …) is in flight. */
   blocked: boolean;
+  /** A deliberate alternative to the recommended action: same single-click guarantee, less prominent. */
+  secondary?: boolean;
 }): React.JSX.Element {
   const claim = useRef(false);
   return (
     <button
       type="button"
-      className="btn btn--wide btn--primary btn--recommended"
+      className={secondary ? 'btn btn--wide' : 'btn btn--wide btn--primary btn--recommended'}
       disabled={!action.enabled || pending || blocked}
       title={action.disabledReason ?? undefined}
       onClick={() => {
@@ -463,9 +503,11 @@ export function RunView(): React.JSX.Element {
     });
   };
 
-  /** Every non-plan-review primary action: exactly one bounded IPC call, then one read-only refresh. */
-  const dispatchPrimary = (): void => {
-    const action = guidance.action;
+  /**
+   * Every non-plan-review action, primary or secondary: exactly one bounded IPC call, then one read-only
+   * refresh. The secondary action is a deliberate alternative and goes through the same single-flight path.
+   */
+  const dispatchAction = (action: RunPrimaryAction | null | undefined): void => {
     if (!action || !action.enabled) return;
     switch (action.key) {
       case 'generate_specification':
@@ -571,6 +613,8 @@ export function RunView(): React.JSX.Element {
         return;
     }
   };
+  const dispatchPrimary = (): void => dispatchAction(guidance.action);
+  const dispatchSecondary = (): void => dispatchAction(guidance.secondaryAction);
 
   // Reasonable per-stage defaults for the sidebar's collapsible sections.
   // Each `key` includes the condition that drives its default so the panel
@@ -690,6 +734,24 @@ export function RunView(): React.JSX.Element {
               {dependencyBlocker !== null &&
               (guidance.action.key === 'run_implementation' || guidance.action.key === 'send_corrections') ? (
                 <p className="hint">Install dependencies in this task worktree first (above) before running {providerLabel(task.implementationProvider)}.</p>
+              ) : null}
+              {guidance.secondaryAction ? (
+                <div className="run-guide__secondary">
+                  <PrimaryActionButton
+                    secondary
+                    action={guidance.secondaryAction}
+                    pending={primaryPending === guidance.secondaryAction.key}
+                    blocked={otherOperationBusy || (
+                      dependencyBlocker !== null && guidance.secondaryAction.key === 'run_implementation'
+                    )}
+                    onClick={dispatchSecondary}
+                  />
+                  <p className="hint">
+                    {guidance.secondaryAction.key === 'run_implementation'
+                      ? 'Runs the implementation provider again on top of the preserved changes. Nothing is discarded.'
+                      : 'Checks the current files again. No implementation round is used.'}
+                  </p>
+                </div>
               ) : null}
             </div>
           ) : null}

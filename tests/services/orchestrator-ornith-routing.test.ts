@@ -82,7 +82,7 @@ function passingResult(finalMessage = 'Ornith finished.'): OrnithImplementationR
       verification: null,
       denials: []
     },
-    ornithAudit: { turns: 1, actions: 1, readBytes: 0, validationReadBytes: 0, writeBytes: 0, changedFiles: 1, verifications: 0, outcomes: [] }
+    ornithAudit: { turns: 1, actions: 1, readBytes: 0, validationReadBytes: 0, writeBytes: 0, changedFiles: 1, worktreeChangedFiles: null, verifications: 0, verificationAttempts: [], outcomes: [] }
   };
 }
 
@@ -104,7 +104,7 @@ function providerFailureResult(): OrnithImplementationResult {
       reason: 'The runtime rejected the inference request with HTTP 500.',
       dispatchOutcome: 'rejected'
     },
-    ornithAudit: { turns: 1, actions: 0, readBytes: 0, validationReadBytes: 0, writeBytes: 0, changedFiles: 0, verifications: 0, outcomes: [] }
+    ornithAudit: { turns: 1, actions: 0, readBytes: 0, validationReadBytes: 0, writeBytes: 0, changedFiles: 0, worktreeChangedFiles: null, verifications: 0, verificationAttempts: [], outcomes: [] }
   };
 }
 
@@ -129,7 +129,7 @@ function timeoutToolDenialResult(): OrnithImplementationResult {
       verification: null,
       denials: []
     },
-    ornithAudit: { turns: 4, actions: 4, readBytes: 0, validationReadBytes: 0, writeBytes: 0, changedFiles: 0, verifications: 0, outcomes: [] }
+    ornithAudit: { turns: 4, actions: 4, readBytes: 0, validationReadBytes: 0, writeBytes: 0, changedFiles: 0, worktreeChangedFiles: null, verifications: 0, verificationAttempts: [], outcomes: [] }
   };
 }
 

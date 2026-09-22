@@ -34,6 +34,7 @@ import {
   type LocalInferenceRequest
 } from '../../src/shared/domain/local-inference';
 import type { TaskSpecification } from '../../src/shared/schemas/codex';
+import { passedExecution } from './ornith-verification';
 
 export const runner = new ExecaProcessRunner();
 const located = locateExecutable('git');
@@ -265,6 +266,12 @@ export interface ReplayScript {
   readonly windowLimit?: number;
   /** Runs when a request for the given (1-based) turn is answered — lets a test change the disk. */
   readonly beforeTurn?: (turn: number) => void;
+  /**
+   * The files the task declares it is confined to; defaults to the target alone. A declared scope
+   * makes Relay refuse a repository-wide search until a search inside it comes up empty, so a replay
+   * whose point is the discovery-budget arithmetic of that search passes `[]` (an unscoped task).
+   */
+  readonly scope?: readonly string[];
 }
 
 const SHOWN_HASH = /"sha256":"([0-9a-f]{64})"/g;
@@ -347,7 +354,7 @@ export async function replay(fixture: ReplayFixture, script: ReplayScript): Prom
     worktreesRoot: fixture.worktreesRoot,
     repositoryPath: fixture.repository,
     branchName: 'task',
-    specification,
+    specification: script.scope === undefined ? specification : { ...specification, scopedFilePaths: [...script.scope] },
     ruleEvidence: null,
     acceptedPlanReviewAddenda: null,
     correctionFindings: null,
@@ -366,7 +373,7 @@ export async function replay(fixture: ReplayFixture, script: ReplayScript): Prom
     },
     runVerification: async () => {
       verifications += 1;
-      return { passed: true, summary: 'passed' };
+      return passedExecution();
     },
     lease: lease(),
     leaseService,

@@ -36,7 +36,9 @@ describe('verification-only workflow', () => {
     expect(h.codex.reviewCalls).toHaveLength(1);
     expect(h.codex.reviewCalls[0]?.relayVerification).toEqual({
       version: 1, command: 'npm run verify', identity, passed: true,
-      exitCode: 0, durationMs: 15, reason: null
+      exitCode: 0, durationMs: 15, reason: null,
+      // Recorded since the outcome became explicit; the reviewer prompt renders none of it.
+      outcome: 'passed'
     });
   });
   it('prepares local dependencies before capturing and executing verification', async () => {
