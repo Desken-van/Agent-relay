@@ -52,14 +52,11 @@ function ornithRun(input: { changedFiles: number; attempts?: readonly OrnithVeri
 const guidanceFor = (value: Task, runs: readonly Run[]): RunGuidance =>
   runGuidance(value, runs, true, false, 'not_required', { ornithLocalInferenceState: 'healthy' });
 
-/** What the Run screen renders for the guidance: the flow overview plus the primary and secondary controls. */
-function renderRunScreen(value: RunGuidance, handlers: { primary?: () => void; secondary?: () => void } = {}) {
+/** What the Run screen renders for the guidance: the flow overview plus the one workflow control. */
+function renderRunScreen(value: RunGuidance, handlers: { primary?: () => void } = {}) {
   return render(<>
     <RunFlowOverview guidance={value} />
     {value.action ? <PrimaryActionButton action={value.action} pending={false} blocked={false} onClick={handlers.primary ?? (() => undefined)} /> : null}
-    {value.secondaryAction ? (
-      <PrimaryActionButton secondary action={value.secondaryAction} pending={false} blocked={false} onClick={handlers.secondary ?? (() => undefined)} />
-    ) : null}
   </>);
 }
 
@@ -88,30 +85,22 @@ describe('the Run screen after Ornith changed a file and its verification failed
     expect(screen.getByText(/Manual verification is required before review\./)).toBeTruthy();
   });
 
-  it('makes "Run verification" the one recommended action and "Retry implementation" a plain, secondary button', () => {
+  it('renders "Run verification" as the one and only workflow control — no retry of the implementation anywhere', () => {
     const { container } = renderRunScreen(live());
 
-    expect(container.querySelectorAll('button.btn--recommended')).toHaveLength(1);
-    const primary = screen.getByRole('button', { name: 'Run verification' });
-    const secondary = screen.getByRole('button', { name: 'Retry implementation · Ornith' });
-    expect(primary.className).toContain('btn--recommended');
-    expect(secondary.className).not.toContain('btn--recommended');
-    expect(secondary.className).not.toContain('btn--primary');
-    // "Run implementation · Ornith" is not offered at all: it is no longer the only recovery.
-    expect(screen.queryByRole('button', { name: 'Run implementation · Ornith' })).toBeNull();
+    expect(container.querySelectorAll('button')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Run verification' }).className).toContain('btn--recommended');
+    expect(screen.queryByRole('button', { name: /Retry implementation/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Run implementation/ })).toBeNull();
+    expect(container.textContent).not.toContain('Retry implementation');
   });
 
-  it('routes each button to its own action, once per click even under a burst', async () => {
+  it('dispatches that one control once per click, even under a burst', async () => {
     const primary = vi.fn();
-    const secondary = vi.fn();
-    renderRunScreen(live(), { primary, secondary });
+    renderRunScreen(live(), { primary });
 
     await burstClick(screen.getByRole('button', { name: 'Run verification' }));
     expect(primary).toHaveBeenCalledOnce();
-    expect(secondary).not.toHaveBeenCalled();
-
-    await burstClick(screen.getByRole('button', { name: 'Retry implementation · Ornith' }));
-    expect(secondary).toHaveBeenCalledOnce();
   });
 
   it('distinguishes a timed-out verification and an expired implementation time limit', () => {
@@ -142,38 +131,40 @@ describe('the Run screen after Ornith changed a file and its verification failed
     expect(screen.queryByText('Command output (bounded)')).toBeNull();
   });
 
-  it('shows Agent Relay’s own failed verification the same way, with the repair primary and checking again secondary', () => {
-    const value = guidanceFor(task({ lastError: 'npm run verify failed (exit 1). See command output.' }), [
+  it('shows Agent Relay’s own failed verification the same way, with the repair as the one control when the files are at fault', () => {
+    const reason = 'npm run verify failed (exit 1): a test assertion failed. The current files did not pass.';
+    const value = guidanceFor(task({ lastError: reason }), [
       ornithRun({ changedFiles: 1 }),
       run({
         id: 'v', runType: 'verification', agent: 'system', status: 'failed',
         structuredResult: JSON.stringify({
           version: 1, command: 'npm run verify', identity: 'a'.repeat(64), passed: false, exitCode: 1, durationMs: 42_000,
-          reason: 'npm run verify failed (exit 1). See command output.', outcome: 'failed', outputSummary: ' FAIL  tests/a.test.ts'
+          reason, outcome: 'failed', failureKind: 'implementation', outputSummary: ' FAIL  tests/a.test.ts\nAssertionError: expected 1 to be 2'
         })
       })
     ]);
-    renderRunScreen(value);
+    const { container } = renderRunScreen(value);
 
     expect(screen.getByText('Agent Relay verification')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Fix verification failures · Ornith' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Run verification again' })).toBeTruthy();
+    expect(container.querySelectorAll('button')).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: 'Run verification again' })).toBeNull();
   });
 });
 
 describe('the Run screen when Ornith changed nothing', () => {
-  it('keeps "Run implementation · Ornith" as the action, with no verification panel and no secondary button', () => {
+  it('offers "Retry implementation · Ornith" as the one action, with no verification panel', () => {
     const value = guidanceFor(
       task({ lastError: 'Ornith stopped before changing any files.' }),
       [ornithRun({ changedFiles: 0 })]
     );
     const { container } = renderRunScreen(value);
 
-    expect(screen.getByRole('button', { name: 'Run implementation · Ornith' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Retry implementation · Ornith' })).toBeTruthy();
     expect(container.querySelectorAll('button')).toHaveLength(1);
     expect(screen.queryByRole('region', { name: 'Verification attempt' })).toBeNull();
-    // Said as the headline and again as the recorded result — the same words, not two different stories.
-    expect(screen.getAllByText('Ornith stopped before changing any files.')).toHaveLength(2);
+    // Said as the headline and again in the recorded result — the same words, not two different stories.
+    expect(screen.getAllByText(/Ornith stopped before changing any files\./)).toHaveLength(2);
   });
 });
 

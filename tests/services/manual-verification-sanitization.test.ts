@@ -27,6 +27,7 @@ import { WorktreeVerification } from '../../src/main/services/worktree-verificat
 import { ExecaProcessRunner, type ProcessResult, type ProcessRunner, type ProcessRunOptions } from '../../src/main/adapters/process/process-runner';
 import { readVerification } from '../../src/shared/domain/verification';
 import { ORNITH_LIMITS } from '../../src/shared/domain/ornith';
+import { PLANTED_PATH, PLANTED_SECRET, VITEST_WORKER_TIMEOUT_OUTPUT } from '../helpers/verification-output-fixtures';
 
 const MARKER = 'ZZ_UNIQUE_RAW_VERIFY_MARKER_8f2a1c9d';
 const SECRET = `ghp_${'A1b2C3d4E5f6G7h8I9j0K1l2'}`;
@@ -256,8 +257,37 @@ describe('manual verification never streams, persists or broadcasts raw command 
     const record = readVerification(run);
     expect(record.success).toBe(true);
     if (!record.success) return;
-    expect(record.data).toMatchObject({ passed: false, exitCode: null, outcome: 'cancelled' });
+    expect(record.data).toMatchObject({ passed: false, exitCode: null, outcome: 'cancelled', failureKind: 'cancelled' });
 
     expectNoLeak(allEventPayloads(taskId, run.id));
+  });
+
+  it('a test-runner failure (the live Vitest worker timeout): classified from the bounded local output, with a fixed reason and nothing raw stored or broadcast', async () => {
+    script = () => processResult({ exitCode: 1, failed: true, stdout: `${VITEST_WORKER_TIMEOUT_OUTPUT}\n${MARKER}-tail`, stderr: RAW_STDERR });
+    const taskId = await prepared();
+
+    const after = await h.orchestrator.runVerification(taskId);
+
+    expect(after.status).toBe('READY_FOR_IMPLEMENTATION');
+    // The live output carries two of the runner's own markers — the pool could not start a worker BECAUSE a
+    // worker stopped answering — and the reason names both, in the classifier's fixed words.
+    expect(after.lastError).toBe(
+      'Verification could not complete: a Vitest worker stopped answering (worker timeout) and a Vitest worker could not be started. That is a failure of the test infrastructure, not of the current files.'
+    );
+    const run = h.runs.listByTask(taskId).find((candidate) => candidate.runType === 'verification')!;
+    const record = readVerification(run);
+    expect(record.success).toBe(true);
+    if (!record.success) return;
+    expect(record.data).toMatchObject({ passed: false, exitCode: 1, outcome: 'failed', failureKind: 'infrastructure' });
+    // The reason is Relay's own sentence: no path, no token, no test name, nothing from the buffer.
+    for (const banned of [...BANNED, PLANTED_PATH, PLANTED_SECRET, 'ornith-worktree-tools']) expect(record.data.reason).not.toContain(banned);
+    expect(record.data.outputSummary!.length).toBeLessThanOrEqual(ORNITH_LIMITS.maxVerificationSummaryChars);
+    for (const banned of [...SENSITIVE, PLANTED_PATH, PLANTED_SECRET]) expect(record.data.outputSummary).not.toContain(banned);
+
+    expectNoLeak(allEventPayloads(taskId, run.id));
+    for (const payload of allEventPayloads(taskId, run.id)) {
+      expect(payload).not.toContain(PLANTED_PATH);
+      expect(payload).not.toContain(PLANTED_SECRET);
+    }
   });
 });

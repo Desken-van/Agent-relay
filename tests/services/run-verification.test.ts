@@ -131,14 +131,10 @@ describe('verification-only workflow', () => {
     const task = await prepared(); h.tasks.update(task.id, {currentRound:2});
     result = {
       ...result, exitCode: 1, failed: true,
-      stdout: 'FAIL tests/widget.test.ts\nexpected enabled but received disabled',
+      stdout: 'FAIL tests/widget.test.ts\nAssertionError: expected enabled but received disabled',
       stderr: 'TypeError: widget state is stale'
     };
-    execute = async (_target, _signal, progress) => {
-      progress({type:'log', text:result.stdout});
-      progress({type:'stderr', text:result.stderr});
-      return result;
-    };
+    execute = async () => result;
     const failed = await h.orchestrator.runVerification(task.id);
 
     expect(failed).toMatchObject({status:'READY_FOR_IMPLEMENTATION', currentRound:2});
@@ -146,10 +142,30 @@ describe('verification-only workflow', () => {
 
     expect(repaired.currentRound).toBe(2);
     expect(h.claude.calls).toHaveLength(1);
+    // The evidence is the record's own sanitized summary — the failing lines and the tail — never a run event.
     expect(h.claude.calls[0]?.prompt).toContain('Agent Relay independently verified');
     expect(h.claude.calls[0]?.prompt).toContain('FAIL tests/widget.test.ts');
+    expect(h.claude.calls[0]?.prompt).toContain('AssertionError: expected enabled but received disabled');
     expect(h.claude.calls[0]?.prompt).toContain('TypeError: widget state is stale');
     expect(h.claude.calls[0]?.prompt).toContain('npm run verify failed (exit 1)');
+  });
+  it('hands NO repair prompt to the implementation provider after a verification the test runner itself failed', async () => {
+    const task = await prepared(); h.tasks.update(task.id, {currentRound:2});
+    result = {
+      ...result, exitCode: 1, failed: true,
+      stdout: 'Error: [vitest-pool]: Failed to start forks worker for test files tests/adapters/x.test.ts.\nCaused by: Error: [vitest-pool-runner]: Timeout waiting for worker to respond',
+      stderr: ''
+    };
+    execute = async () => result;
+    const failed = await h.orchestrator.runVerification(task.id);
+
+    expect(failed.status).toBe('READY_FOR_IMPLEMENTATION');
+    expect(failed.lastError).toContain('not of the current files');
+    // A round started anyway (the operator can always choose to) carries no verification "repair" at all.
+    await h.orchestrator.sendToClaude(task.id);
+    expect(h.claude.calls).toHaveLength(1);
+    expect(h.claude.calls[0]?.prompt).not.toContain('Agent Relay independently verified');
+    expect(h.claude.calls[0]?.prompt).not.toContain('vitest-pool');
   });
   it('verification costs no round but a new review after an approval still consumes the next one', async () => {
     const task = await prepared();

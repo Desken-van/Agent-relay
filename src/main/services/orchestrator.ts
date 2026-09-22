@@ -39,6 +39,7 @@ import {
   summarizeVerificationOutput
 } from '../../shared/domain/ornith-verification';
 import type { VerificationRecord } from '../../shared/domain/verification';
+import { classifyVerificationFailure } from '../../shared/domain/verification-failure';
 import type { WorktreeDependencyStatus } from '../../shared/domain/worktree-dependencies';
 import {
   parsePlanReviewDecisions,
@@ -119,20 +120,9 @@ import type { VerificationExecutor } from './worktree-verification';
 import type { WorktreeDependencyInstaller, WorktreeDependencyPreparer } from './worktree-dependencies';
 import type { ProtectedContinuationAction } from './continuation-service';
 import type { TaskOperationRegistry } from './task-operations';
-import { redactAndTruncate, redactSecrets } from '../../shared/util/redact';
+import { redactAndTruncate } from '../../shared/util/redact';
 import { ORNITH_LIMITS, ornithRelativePathSchema, redactAbsoluteMachinePaths } from '../../shared/domain/ornith';
 
-const MAX_VERIFICATION_REPAIR_OUTPUT_CHARS = 64_000;
-
-function storedRunEventText(payload: string): string | null {
-  try {
-    const parsed: unknown = JSON.parse(payload);
-    if (!parsed || typeof parsed !== 'object' || !('text' in parsed)) return null;
-    return typeof parsed.text === 'string' ? parsed.text : null;
-  } catch {
-    return null;
-  }
-}
 
 export interface ContinuationActionGuard {
   prepareFirstAction(
@@ -279,26 +269,26 @@ export class Orchestrator {
     const reason = record.success
       ? record.data.reason ?? run.errorMessage ?? 'Verification failed.'
       : run.errorMessage ?? 'The stored verification result could not be read.';
-    const stored = this.deps.runEvents.listByRun(run.id)
-      .map((event) => storedRunEventText(event.payload))
-      .filter((text): text is string => text !== null && text.length > 0)
-      .join('\n');
-    const safe = redactSecrets(stored);
-    const output = safe.length <= MAX_VERIFICATION_REPAIR_OUTPUT_CHARS
-      ? safe
-      : `…[earlier verification output omitted]\n${safe.slice(-MAX_VERIFICATION_REPAIR_OUTPUT_CHARS)}`;
-
+    // The only evidence a provider is ever handed is the record's own bounded, sanitized summary: never a
+    // run event (those hold only Relay's generic progress lines) and never the raw output. And only for a
+    // failure classified as the files' own — `verificationNeedsImplementationRepair` above — so a runner
+    // failure, a cancellation or an unclassified failure never becomes a correction prompt at all.
+    const output = record.success ? record.data.outputSummary ?? '' : '';
     return buildVerificationFailurePrompt({ command, reason, output });
   }
 
-  /** Relay-authored status only; stored verification logs may contain absolute machine paths. */
+  /**
+   * Relay-authored status only; stored verification logs may contain absolute machine paths. The reason is
+   * the classifier's fixed wording (which check failed), never a line of the output. And only for a failure
+   * classified as the files' own: a runner failure, a cancellation or an unclassified failure hands nothing.
+   */
   private ornithVerificationFailureEvidence(taskId: string): string | null {
     const run = latestVerification(this.deps.runs.listByTask(taskId));
     if (!verificationNeedsImplementationRepair(run)) return null;
     const record = readVerification(run);
-    return record.success
-      ? `Relay verification status: failed; exitCode=${record.data.exitCode ?? 'unknown'}; durationMs=${record.data.durationMs}.`
-      : 'Relay verification status: failed; stored verification evidence was unavailable.';
+    if (!record.success) return 'Relay verification status: failed; stored verification evidence was unavailable.';
+    const status = `Relay verification status: failed; exitCode=${record.data.exitCode ?? 'unknown'}; durationMs=${record.data.durationMs}.`;
+    return record.data.reason === null ? status : `${status} ${record.data.reason}`;
   }
 
   private applyEvent(task: Task, event: WorkflowEvent, patch: Partial<Task> = {}): Task {
@@ -413,15 +403,20 @@ export class Orchestrator {
               },
               { budgetExpired: false, budgetMs: 0 }
             ).outcome;
-      const reason = passed
+      // WHAT failed — the files, the test runner's own machinery, a cancellation, or nothing the output can
+      // tell — is decided from the locally held, bounded output BEFORE anything is stored, because it
+      // selects the one next step the Run screen offers (`verification-failure.ts`): a runner failure is
+      // re-run, a failure of the files is handed to the provider, and anything unclear fails closed.
+      const failure = passed
         ? null
-        : after !== identity
-          ? 'Files or task inputs changed during verification. Run verification again.'
-          : outcome === 'cancelled'
-            ? 'Verification cancelled; success was not established.'
-            : outcome === 'timed_out'
-              ? 'Verification timed out; success was not established.'
-              : `npm run verify failed (exit ${result.exitCode ?? 'unknown'}). See command output.`;
+        : classifyVerificationFailure({
+            outcome,
+            exitCode: result.exitCode,
+            durationMs: result.durationMs,
+            identityChanged: after !== identity,
+            output: `${result.stdout}\n${result.stderr}`
+          });
+      const reason = failure === null ? null : failure.reason;
       // (The bounded, sanitized tail of the output goes with the record, so the screen can say why.)
       // A generic, Relay-authored line — the classified outcome, exit code and duration, never the
       // command's own text — so the timeline shows that the run ended and how, without the raw
@@ -432,14 +427,16 @@ export class Orchestrator {
       });
       handle.finish({ status: passed ? 'succeeded' : 'failed', finalMessage: passed ? 'Verification passed for this code snapshot. Ready for review.' : reason,
         errorMessage: reason, structuredResult: { version: 1, command: 'npm run verify', identity, passed, exitCode: result.exitCode, durationMs: result.durationMs, reason,
-          outcome, ...(passed ? {} : { outputSummary: summarizeVerificationOutput(`${result.stdout}\n${result.stderr}`) }) } });
+          outcome, ...(failure === null ? {} : { outputSummary: summarizeVerificationOutput(`${result.stdout}\n${result.stderr}`), failureKind: failure.kind }) } });
       if (this.requireTask(taskId).status !== 'VERIFYING') return this.requireTask(taskId);
       return this.applyEvent(this.requireTask(taskId), passed ? 'verification_completed' : 'verification_aborted', { lastError: reason });
     } catch (error) {
       const message = Orchestrator.describeError(error);
       handle?.finish({ status: isCancelled(error) ? 'cancelled' : 'failed', errorMessage: message,
+        // A verification that threw before its command ran (no worktree, no scripts.verify, no npm) has no
+        // output to classify from: cancelled when the operator stopped it, otherwise unknown — fail closed.
         structuredResult: { version: 1, command: 'npm run verify', identity, passed: false, exitCode: null, durationMs: 0, reason: message,
-          outcome: isCancelled(error) ? 'cancelled' : 'failed' } });
+          outcome: isCancelled(error) ? 'cancelled' : 'failed', failureKind: isCancelled(error) ? 'cancelled' : 'unknown' } });
       if (this.requireTask(taskId).status === 'VERIFYING') this.applyEvent(this.requireTask(taskId), 'verification_aborted', { lastError: message });
       throw error;
     } finally { this.endExclusive(taskId); }

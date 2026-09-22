@@ -93,8 +93,14 @@ export class WorktreeVerification implements VerificationExecutor {
     // `run()` still returns the full text in `ProcessResult.stdout`/`.stderr`, bounded by `maxOutputBytes`
     // and held only in this call's return value, for the caller to classify and reduce to a sanitized,
     // bounded summary once the command has completed. See `docs/security.md` for the resulting contract.
+    // The project's verification runs with the project's own defaults, as it would in a developer's
+    // terminal — not with the host application's runtime environment. A `NODE_ENV` the app process
+    // carries would switch the project's test run into that mode (React and Vite both key off it), and a
+    // live run was observed failing 528 renderer tests exactly that way (`React.act is not a function`
+    // from a production build) with no change to the files under test.
     return this.runner.run(node.path, [npmCli, 'run', 'verify'], {
-      cwd: root, signal, timeoutMs: settings.processTimeoutMs, maxOutputBytes: settings.maxStoredLogBytes
+      cwd: root, signal, timeoutMs: settings.processTimeoutMs, maxOutputBytes: settings.maxStoredLogBytes,
+      omitEnvNames: ['NODE_ENV']
     });
   }
 }

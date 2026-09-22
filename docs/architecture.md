@@ -287,15 +287,47 @@ handed back. A round that provably
 changed nothing is unchanged: `implementation_aborted`, round returned, and the
 primary action stays **Run implementation**.
 
-From that state the operator's primary action is **Run verification**, which
+From that state the operator's one action is **Run verification**, which
 runs `npm run verify` against the existing worktree — no new worktree, no new
-attempt, no provider call, no discarded diff. A pass advances to
+attempt, no provider call, no discarded diff, no round consumed. A pass advances to
 `READY_FOR_REVIEW`; a failure or timeout stays in `READY_FOR_IMPLEMENTATION` with
-the outcome, exit code, duration, reason and a bounded, sanitized output tail
-recorded on the verification run. A nonzero exit keeps *Fix verification
-failures* as the primary action with **Run verification again** beside it;
-**Retry implementation** is always a deliberate secondary control, never the
-only visible one.
+the outcome, exit code, duration, reason, a bounded sanitized output tail and a
+**failure kind** recorded on the verification run.
+
+### One next step, decided by what the verification found
+
+The Run screen renders exactly one workflow control at a time (plus the
+separate *Stop task* safety control). Two "next steps" side by side — a repair
+beside a re-run, a retry beside a verification — sent operators down the wrong
+one, so there is no secondary action anywhere in `runGuidance`. Which single
+step is right is decided from the recorded evidence, and the status text says
+why it is the right one. The failure kind is classified by
+`classifyVerificationFailure` (`src/shared/domain/verification-failure.ts`)
+from the locally held, bounded output BEFORE the record is stored, and only on
+positive evidence: `implementation` needs an explicit test assertion, `error
+TS…`, ESLint error or build failure in the output; `infrastructure` needs a
+known test-runner signature (vitest's own pool messages, a command that ended
+without an exit code, files that changed under the run) and NO such failure
+beside it; anything else is `unknown` and fails closed. A record written before
+the kind existed is read as `unknown`.
+
+| Evidence on the task                                             | The one action                          | Round | Provider prompt |
+|------------------------------------------------------------------|-----------------------------------------|-------|-----------------|
+| Verification passed                                              | **Run review · <reviewer>**             | —     | —               |
+| Verification failed, kind `implementation`                       | **Fix verification failures · <impl.>** | new round | repair prompt from the record's `outputSummary` only |
+| Verification failed, kind `infrastructure` (e.g. Vitest worker timeout) | **Run verification again**       | none  | none            |
+| Verification failed, kind `cancelled`                            | **Run verification**                    | none  | none            |
+| Verification failed, kind `unknown` (incl. a Relay timeout, a legacy record) | **Run verification to diagnose** | none | none         |
+| Implementation left files, no verification yet                   | **Run verification**                    | none  | none            |
+| Implementation attempt provably left nothing behind              | **Retry implementation · <impl.>**      | attempt returned | none    |
+| Approved specification, no attempt yet                           | **Run implementation · <impl.>**        | new round | —           |
+
+A generic **Retry implementation** is never offered while verification is the
+stage, and **Fix verification failures** and **Run verification again** are
+never offered together. Retrying verification consumes no implementation round,
+touches no file, and — because only an `implementation` kind supplies repair
+evidence — an infrastructure, cancelled or unknown failure never becomes a
+correction prompt for any provider.
 
 ### Recovering from an abrupt exit
 

@@ -10,7 +10,7 @@ import {
   type OrnithRunEvidence,
   type OrnithVerificationOutcome
 } from './ornith-verification';
-import { latestVerification, readVerification, verificationNeedsImplementationRepair } from './verification';
+import { latestVerification, readVerification, verificationFailureKind } from './verification';
 
 /**
  * The one workflow transition Run → Actions may offer right now.
@@ -97,14 +97,13 @@ export interface RunGuidance {
   readonly result: string;
   /** Free text while `action` is null; otherwise exactly `action.label`. */
   readonly next: string;
-  /** The one primary workflow control to render, or null to render none. */
-  readonly action: RunPrimaryAction | null;
   /**
-   * A deliberate alternative to the primary action, rendered less prominently — for example re-running the
-   * implementation after a preserved change, or re-checking a verification that failed. Null/absent: none.
-   * Never the same key as `action`.
+   * The one workflow control to render, or null to render none. Exactly one, by product decision: two
+   * "next steps" side by side (a repair beside a re-run, a retry beside a verification) sent operators down
+   * the wrong one, so which single step is right is decided here, from the recorded evidence, and the
+   * `result` text says why it is the right one.
    */
-  readonly secondaryAction?: RunPrimaryAction | null;
+  readonly action: RunPrimaryAction | null;
   /** The verification attempt behind this state, when there is one. */
   readonly verification?: RunVerificationDetail | null;
   readonly activeStep: number;
@@ -560,31 +559,86 @@ export function runGuidance(
       }
       const verification = latestVerification(runs);
       const relayDetail = verification === null ? null : relayVerificationDetail(verification);
-      if (verificationNeedsImplementationRepair(verification)) {
-        const repairLabel = `Fix verification failures · ${providerLabel(task.implementationProvider)}`;
-        return {
-          ...acting({
-            happened: 'Agent Relay ran verification and the current files did not pass.',
-            stage: 'Step 2 of 5 · Fix verification failures',
-            result: task.lastError ?? verification.errorMessage ?? 'The verification output is saved for the implementation provider.',
-            action: guardOrnithReadiness(action('run_implementation', repairLabel), task, extra),
-            activeStep: 1,
-            tone: 'warning'
-          }),
-          // A nonzero exit is not always the code's fault (a busy machine, a flaky test): checking again
-          // must not require another implementation round.
-          secondaryAction: action('run_verification', 'Run verification again'),
-          verification: relayDetail
-        };
+      const failureKind = verificationFailureKind(verification);
+      if (verification !== null && failureKind !== null) {
+        // Agent Relay's own verification ran on the current files and did not pass. WHAT it found — recorded
+        // by the classifier before the result was stored — decides the one next step, and the explanation
+        // says why that step and not another. Never two: a re-run beside a repair sent operators down the
+        // wrong one.
+        const finding = task.lastError ?? verification.errorMessage ?? relayDetail?.reason ?? 'The verification result was not recorded.';
+        switch (failureKind) {
+          case 'implementation':
+            return {
+              ...acting({
+                happened: 'Agent Relay ran verification and the current files did not pass.',
+                stage: 'Step 2 of 5 · Fix verification failures',
+                result: `${finding} The failing output is handed to ${providerLabel(task.implementationProvider)} as correction ` +
+                  'evidence; running the same command on the same files again would fail the same way.',
+                action: guardOrnithReadiness(
+                  action('run_implementation', `Fix verification failures · ${providerLabel(task.implementationProvider)}`),
+                  task,
+                  extra
+                ),
+                activeStep: 1,
+                tone: 'warning'
+              }),
+              verification: relayDetail
+            };
+          case 'infrastructure':
+            return {
+              ...acting({
+                happened: 'Agent Relay ran verification, but the verification tooling failed before it could judge the files.',
+                stage: 'Step 3 of 5 · Verification',
+                result: `${finding} The files are untouched and no implementation round is spent: the same command is simply run again.`,
+                action: action('run_verification', 'Run verification again'),
+                activeStep: 2,
+                tone: 'warning'
+              }),
+              verification: relayDetail
+            };
+          case 'cancelled':
+            return {
+              ...acting({
+                happened: 'Verification was stopped before it finished.',
+                stage: 'Step 3 of 5 · Verification',
+                result: `${finding} The files were not judged; run verification to completion.`,
+                action: action('run_verification', 'Run verification'),
+                activeStep: 2,
+                tone: 'warning'
+              }),
+              verification: relayDetail
+            };
+          case 'unknown':
+            return {
+              ...acting({
+                happened: relayDetail?.outcome === 'timed_out'
+                  ? 'Agent Relay ran verification and it did not finish within its time limit.'
+                  : 'Agent Relay ran verification and it failed for a reason the output does not make clear.',
+                stage: 'Step 3 of 5 · Verification',
+                result: `${finding} Nothing is retried automatically and no implementation round is spent: verification is run ` +
+                  'again to obtain a classified result. The Verification attempt panel holds the bounded output.',
+                action: action('run_verification', 'Run verification to diagnose'),
+                activeStep: 2,
+                tone: 'warning'
+              }),
+              verification: relayDetail
+            };
+        }
       }
       const implementationAttempt = latestRun(runs, ['implementation', 'correction']);
       const preserved = preservedOrnithChanges(runs);
       if (failedOrnithAttemptProvedNoChanges(implementationAttempt) && preserved === 0) {
+        // A retry, not a first run: an attempt exists and provably left nothing behind, so running the
+        // provider again is the only step that can make progress — and it is the only one offered.
         return acting({
           happened: 'Ornith stopped before changing any files.',
           stage: 'Step 2 of 5 · Implementation',
-          result: task.lastError ?? implementationAttempt.errorMessage ?? 'No worktree changes were made.',
-          action: guardOrnithReadiness(action('run_implementation', implementationLabel), task, extra),
+          result: `${task.lastError ?? implementationAttempt.errorMessage ?? 'No worktree changes were made.'} There is nothing to verify; the round is retried.`,
+          action: guardOrnithReadiness(
+            action('run_implementation', `Retry implementation · ${providerLabel(task.implementationProvider)}`),
+            task,
+            extra
+          ),
           activeStep: 1,
           tone: 'warning'
         });
@@ -602,12 +656,8 @@ export function runGuidance(
             activeStep: 2,
             tone: 'warning'
           }),
-          // Deliberate, never the default: it runs the provider again on top of the preserved changes.
-          secondaryAction: guardOrnithReadiness(
-            action('run_implementation', `Retry implementation · ${providerLabel(task.implementationProvider)}`),
-            task,
-            extra
-          ),
+          // Verification is the stage: the preserved files are judged first, and only a failure of the files
+          // themselves (classified above once it has run) ever leads back to the provider.
           verification: detail
         };
       }

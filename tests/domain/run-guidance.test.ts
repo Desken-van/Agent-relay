@@ -87,11 +87,12 @@ describe('run guidance — exactly one action per state', () => {
       })
     })], true, false, 'not_required', { ornithLocalInferenceState: 'healthy' });
 
+    // A retry, by name: an attempt exists and provably left nothing behind.
     expect(value.action).toMatchObject({
-      key: 'run_implementation', label: 'Run implementation · Ornith', enabled: true
+      key: 'run_implementation', label: 'Retry implementation · Ornith', enabled: true
     });
     expect(value.stage).toBe('Step 2 of 5 · Implementation');
-    expect(value.result).toBe('Ornith stopped before changing any files.');
+    expect(value.result).toContain('Ornith stopped before changing any files.');
     expectConsistent(value);
   });
 
@@ -121,9 +122,10 @@ describe('run guidance — exactly one action per state', () => {
         id: 'verification', runType: 'verification', agent: 'system', status: 'failed',
         structuredResult: JSON.stringify({
           version: 1, command: 'npm run verify', identity: 'a'.repeat(64), passed: false,
-          exitCode: 1, durationMs: 10, reason: 'npm run verify failed (exit 1). See command output.'
+          exitCode: 1, durationMs: 10, reason: 'npm run verify failed (exit 1): a test assertion failed. The current files did not pass.',
+          outcome: 'failed', failureKind: 'implementation'
         }),
-        errorMessage: 'npm run verify failed (exit 1). See command output.'
+        errorMessage: 'npm run verify failed (exit 1): a test assertion failed. The current files did not pass.'
       })
     ], true);
 
@@ -134,7 +136,7 @@ describe('run guidance — exactly one action per state', () => {
     expectConsistent(value);
   });
 
-  it('offers another verification after an infrastructure timeout, not an AI repair', () => {
+  it('offers a diagnostic re-run — never an AI repair — after a verification whose failure was not classified as the files’ own', () => {
     const value = runGuidance(task({
       status: 'READY_FOR_IMPLEMENTATION', currentRound: 2,
       specificationApprovedAt: '2026-09-11T00:00:00.000Z'
@@ -149,7 +151,7 @@ describe('run guidance — exactly one action per state', () => {
       })
     ], true);
 
-    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification' });
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification to diagnose' });
     expectConsistent(value);
   });
 
@@ -456,7 +458,16 @@ describe('run guidance — every action label is one of the fixed set', () => {
     'Approve specification',
     'Run implementation · Claude',
     'Run implementation · Codex',
+    'Run implementation · Ornith',
+    'Retry implementation · Claude',
+    'Retry implementation · Codex',
+    'Retry implementation · Ornith',
+    'Fix verification failures · Claude',
+    'Fix verification failures · Codex',
+    'Fix verification failures · Ornith',
     'Run verification',
+    'Run verification again',
+    'Run verification to diagnose',
     'Run review · Claude',
     'Run review · Codex',
     'Send corrections',

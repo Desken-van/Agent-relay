@@ -1735,10 +1735,6 @@ pre,
   overflow-wrap: anywhere;
 }
 
-.run-guide__secondary {
-  margin-top: 8px;
-}
-
 @media (max-width: 560px) {
   .run-guide__facts {
     grid-template-columns: minmax(0, 1fr);

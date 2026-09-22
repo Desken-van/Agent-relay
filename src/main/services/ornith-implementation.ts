@@ -51,6 +51,7 @@ import {
   type OrnithVerificationExecution,
   type OrnithVerificationOutcome
 } from '../../shared/domain/ornith-verification';
+import { classifyVerificationFailure } from '../../shared/domain/verification-failure';
 import { containsSecretShape } from '../../shared/util/redact';
 import type { TaskSpecification } from '../../shared/schemas/codex';
 import type { AgentProgressEvent, ImplementationResult, OrnithHealthyLease, OrnithInferenceLeaseService } from '../ports';
@@ -1339,6 +1340,16 @@ export class OrnithImplementationService {
           const budgetExpired = verificationSignal.timedOut() ||
             (execution.cancelled && execution.durationMs >= budgetMs - 1_000);
           const classified = classifyVerificationExecution(execution, { budgetExpired, budgetMs });
+          // What a failed command failed ON — the files, or the test runner itself — from the same bounded
+          // output the summary is built from, so the model is not told to change files over a runner failure.
+          const failure = classified.outcome === 'passed'
+            ? null
+            : classifyVerificationFailure({
+                outcome: classified.outcome,
+                exitCode: execution.exitCode,
+                durationMs: execution.durationMs,
+                output: execution.output
+              });
           const attempt: OrnithVerificationAttempt = {
             sequence: nonterminalActionsUsed,
             command: ORNITH_VERIFICATION_COMMAND,
@@ -1348,7 +1359,8 @@ export class OrnithImplementationService {
             reason: classified.reason === null ? null : classified.reason.slice(0, 400),
             summary: summarizeVerificationOutput(execution.output),
             code: null,
-            fingerprint: shortFingerprint(fingerprint)
+            fingerprint: shortFingerprint(fingerprint),
+            ...(failure === null ? {} : { failureKind: failure.kind })
           };
           // Recorded BEFORE the deadline check: a run that ends for time still says what this did.
           recordAttempt(attempt);
@@ -1366,7 +1378,8 @@ export class OrnithImplementationService {
                 ok: attempt.outcome === 'passed', dispatched: true,
                 verification: {
                   command: attempt.command, outcome: attempt.outcome, exitCode: attempt.exitCode,
-                  durationMs: attempt.durationMs, reason: attempt.reason, summary: attempt.summary
+                  durationMs: attempt.durationMs, reason: attempt.reason, summary: attempt.summary,
+                  ...(attempt.failureKind === undefined ? {} : { failureKind: attempt.failureKind })
                 }
               }
             });
@@ -1580,7 +1593,8 @@ export class OrnithImplementationService {
                   exitCode: verificationEventAttempt.exitCode,
                   durationMs: verificationEventAttempt.durationMs,
                   reason: verificationEventAttempt.reason,
-                  summary: verificationEventAttempt.summary
+                  summary: verificationEventAttempt.summary,
+                  ...(verificationEventAttempt.failureKind === undefined ? {} : { failureKind: verificationEventAttempt.failureKind })
                 }
               }),
           durationMs, readBytes: toolResult.readBytes, writeBytes: toolResult.writeBytes,
@@ -1777,10 +1791,14 @@ function verificationForModel(attempt: OrnithVerificationAttempt, maxToolResultB
   const base = {
     passed: attempt.outcome === 'passed',
     outcome: attempt.outcome,
+    failureKind: attempt.failureKind ?? null,
     command: attempt.command,
     exitCode: attempt.exitCode,
     durationMs: attempt.durationMs,
-    reason: attempt.reason
+    // A runner failure is said in so many words: the model must not "fix" files over it.
+    reason: attempt.failureKind === 'infrastructure'
+      ? `${attempt.reason ?? ''} This is a failure of the test runner itself, not of the files: do not change files because of it.`.trim()
+      : attempt.reason
   };
   const room = maxToolResultBytes - Buffer.byteLength(JSON.stringify({ ...base, summary: '' }), 'utf8') - 32;
   if (room <= 0 || attempt.summary.length === 0) return { ...base, summary: '' };

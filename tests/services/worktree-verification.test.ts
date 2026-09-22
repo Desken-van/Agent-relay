@@ -57,3 +57,18 @@ it('fails closed when the project has no verify script', async () => {
   writeFileSync(join(root,'package.json'), '{}');
   await expect(verifier.execute(target, new AbortController().signal, () => {})).rejects.toThrow(/scripts.verify/);
 });
+it('runs the project’s verification with the project’s own defaults: a NODE_ENV the host application carries never reaches it', async () => {
+  // The live failure this guards against: the app-launched `npm run verify` inherited NODE_ENV=production, Vite
+  // resolved React's production build for the test run, `React.act` did not exist, and 528 renderer tests
+  // failed with no change to the files under test.
+  writeFileSync(join(root,'package.json'), JSON.stringify({scripts:{verify:"node -e \"console.log('NODE_ENV=' + String(process.env.NODE_ENV))\""}}));
+  const previous = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+  try {
+    const result = await verifier.execute(target, new AbortController().signal, () => {});
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('NODE_ENV=undefined');
+  } finally {
+    if (previous === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previous;
+  }
+}, 30_000);

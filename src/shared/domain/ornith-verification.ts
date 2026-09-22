@@ -40,7 +40,12 @@ export const ornithVerificationAttemptSchema = z.object({
   /** The denial code when the attempt was refused before it started; null otherwise. */
   code: z.string().max(80).nullable(),
   /** Short fingerprint of the files the attempt ran against; null when it could not be taken. */
-  fingerprint: z.string().max(64).nullable()
+  fingerprint: z.string().max(64).nullable(),
+  /**
+   * What a failed attempt was classified as from its bounded output (see `verification-failure.ts`), so the
+   * model is not told to change files over a test-runner failure. Optional: older attempts have none.
+   */
+  failureKind: z.enum(['implementation', 'infrastructure', 'cancelled', 'unknown']).optional()
 });
 export type OrnithVerificationAttempt = z.infer<typeof ornithVerificationAttemptSchema>;
 
@@ -123,6 +128,14 @@ const SUMMARY_INPUT_TAIL_CHARS = 256 * 1024;
 function boundInput(raw: string): string {
   if (raw.length <= SUMMARY_INPUT_HEAD_CHARS + SUMMARY_INPUT_TAIL_CHARS) return raw;
   return `${raw.slice(0, SUMMARY_INPUT_HEAD_CHARS)}\n${raw.slice(raw.length - SUMMARY_INPUT_TAIL_CHARS)}`;
+}
+
+/**
+ * The same bounded head-and-tail window the summary is built from, for any other reader of a command's
+ * output (the failure classifier): whatever is decided about a log is decided from at most this much of it.
+ */
+export function boundedVerificationOutputWindow(raw: string): string {
+  return boundInput(raw);
 }
 
 function stripControlCharacters(value: string): string {
@@ -342,6 +355,8 @@ export interface OrnithVerificationEventData {
     readonly durationMs: number;
     readonly reason: string | null;
     readonly summary: string;
+    /** Present for a failed attempt written since classification existed; absent on older events. */
+    readonly failureKind?: 'implementation' | 'infrastructure' | 'cancelled' | 'unknown';
   };
 }
 

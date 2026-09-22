@@ -95,23 +95,23 @@ describe('after Ornith changed files and could not prove them verified', () => {
     expectConsistent(value);
   });
 
-  it('offers re-running the implementation only as a deliberate secondary action, never the primary one', () => {
+  it('offers exactly one action — Run verification — and never a retry of the implementation beside it', () => {
     const value = guidance(task(), [ornithRun({ changedFiles: 1, worktreeChangedFiles: 1, attempts: [attempt()] })]);
 
-    expect(value.action?.key).toBe('run_verification');
-    expect(value.secondaryAction).toMatchObject({ key: 'run_implementation', label: 'Retry implementation · Ornith', enabled: true });
-    expect(value.secondaryAction?.key).not.toBe(value.action?.key);
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification', enabled: true });
+    expect('secondaryAction' in value).toBe(false);
+    expect(JSON.stringify(value)).not.toContain('Retry implementation');
   });
 
-  it('keeps the secondary retry consistent with local-inference readiness: disabled with the reason when Ornith is not healthy', () => {
+  it('does not need the local runtime for that one action: verification is offered enabled even when Ornith is stopped', () => {
     const value = runGuidance(
       task(),
       [ornithRun({ changedFiles: 1, worktreeChangedFiles: 1, attempts: [attempt()] })],
       true, false, 'not_required', { ornithLocalInferenceState: 'stopped' }
     );
 
-    expect(value.action).toMatchObject({ key: 'run_verification', enabled: true }); // verification never needs the model
-    expect(value.secondaryAction?.enabled).toBe(false);
+    expect(value.action).toMatchObject({ key: 'run_verification', enabled: true });
+    expect(JSON.stringify(value)).not.toContain('run_implementation');
   });
 
   it('tells a timed-out verification from a failed one', () => {
@@ -239,15 +239,17 @@ describe('preserved edits outlive a later attempt that changed nothing', () => {
 });
 
 describe('when nothing was changed the existing behaviour stands', () => {
-  it('keeps "Run implementation · Ornith" as the only action after a run that proved no changes, with no secondary', () => {
+  it('offers "Retry implementation · Ornith" as the only action after a run that proved no changes: it is a retry, and there is nothing to verify', () => {
     const value = guidance(
       task({ lastError: 'Ornith stopped before changing any files.' }),
       [ornithRun({ changedFiles: 0, worktreeChangedFiles: 0 })]
     );
 
-    expect(value.action).toMatchObject({ key: 'run_implementation', label: 'Run implementation · Ornith', enabled: true });
-    expect(value.secondaryAction ?? null).toBeNull();
+    expect(value.action).toMatchObject({ key: 'run_implementation', label: 'Retry implementation · Ornith', enabled: true });
+    expect('secondaryAction' in value).toBe(false);
     expect(value.happened).toBe('Ornith stopped before changing any files.');
+    expect(value.result).toContain('Ornith stopped before changing any files.');
+    expect(value.result).toContain('nothing to verify');
     expect(value.verification ?? null).toBeNull();
   });
 
@@ -272,26 +274,75 @@ describe('when nothing was changed the existing behaviour stands', () => {
 });
 
 describe('after Agent Relay’s own verification of the worktree', () => {
-  it('a real failing exit keeps the repair as the primary action and makes checking again one click away, with the command output', () => {
+  it('a failure OF THE FILES makes the repair the one action, says why a re-run would not help, and carries the command output', () => {
     const value = guidance(
-      task({ lastError: 'npm run verify failed (exit 1). See command output.' }),
+      task({ lastError: 'npm run verify failed (exit 1): a test assertion failed. The current files did not pass.' }),
       [
         ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }),
-        relayRecord({ outcome: 'failed', outputSummary: ' FAIL  tests/a.test.ts\n Test Files  1 failed' })
+        relayRecord({ outcome: 'failed', failureKind: 'implementation', reason: 'npm run verify failed (exit 1): a test assertion failed. The current files did not pass.', outputSummary: ' FAIL  tests/a.test.ts\nAssertionError: expected 1 to be 2\n Test Files  1 failed' })
       ]
     );
 
     expect(value.action).toMatchObject({ key: 'run_implementation', label: 'Fix verification failures · Ornith' });
-    expect(value.secondaryAction).toMatchObject({ key: 'run_verification', label: 'Run verification again' });
+    expect('secondaryAction' in value).toBe(false);
+    expect(JSON.stringify(value)).not.toContain('Run verification again');
+    expect(value.stage).toBe('Step 2 of 5 · Fix verification failures');
+    expect(value.result).toContain('a test assertion failed');
+    expect(value.result).toContain('handed to Ornith as correction evidence');
+    expect(value.result).toContain('would fail the same way');
     expect(value.verification).toEqual({
       source: 'relay',
       command: 'npm run verify',
       outcome: 'failed',
       exitCode: 1,
       durationMs: 511_795,
-      reason: 'npm run verify failed (exit 1). See command output.',
-      output: ' FAIL  tests/a.test.ts\n Test Files  1 failed'
+      reason: 'npm run verify failed (exit 1): a test assertion failed. The current files did not pass.',
+      output: ' FAIL  tests/a.test.ts\nAssertionError: expected 1 to be 2\n Test Files  1 failed'
     });
+  });
+
+  it('a failure OF THE TEST RUNNER (the live Vitest worker timeout) makes "Run verification again" the one action, and never a repair', () => {
+    const reason = 'Verification could not complete: a Vitest worker stopped answering (worker timeout). That is a failure of the test infrastructure, not of the current files.';
+    const value = guidance(
+      task({ lastError: reason }),
+      [
+        ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }),
+        relayRecord({ outcome: 'failed', failureKind: 'infrastructure', reason, outputSummary: 'Caused by: Error: [vitest-pool-runner]: Timeout waiting for worker to respond' })
+      ]
+    );
+
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification again', enabled: true });
+    expect('secondaryAction' in value).toBe(false);
+    expect(JSON.stringify(value)).not.toContain('Fix verification failures');
+    expect(JSON.stringify(value)).not.toContain('run_implementation');
+    expect(value.happened).toContain('verification tooling failed');
+    expect(value.result).toContain('worker timeout');
+    expect(value.result).toContain('no implementation round is spent');
+    expect(value.verification).toMatchObject({ source: 'relay', outcome: 'failed', exitCode: 1 });
+  });
+
+  it('an UNCLASSIFIED failure fails closed: the one action is "Run verification to diagnose", never a repair and never a retry', () => {
+    const reason = 'npm run verify failed (exit 1), but the output does not show which check failed or why.';
+    const value = guidance(
+      task({ lastError: reason }),
+      [ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }), relayRecord({ outcome: 'failed', failureKind: 'unknown', reason })]
+    );
+
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification to diagnose', enabled: true });
+    expect('secondaryAction' in value).toBe(false);
+    expect(JSON.stringify(value)).not.toContain('run_implementation');
+    expect(value.result).toContain('Nothing is retried automatically');
+    expect(value.result).toContain('no implementation round is spent');
+  });
+
+  it('a record written before classification existed also fails closed, to "Run verification to diagnose"', () => {
+    const value = guidance(
+      task({ lastError: 'npm run verify failed (exit 1). See command output.' }),
+      [ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }), relayRecord({ outcome: 'failed', outputSummary: ' FAIL  tests/a.test.ts\n Test Files  1 failed' })]
+    );
+
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification to diagnose' });
+    expect(JSON.stringify(value)).not.toContain('run_implementation');
   });
 
   it('a timed-out Relay verification is recovered by running verification, and says it timed out', () => {
@@ -303,9 +354,11 @@ describe('after Agent Relay’s own verification of the worktree', () => {
       ]
     );
 
-    expect(value.action?.key).toBe('run_verification');
+    // A record with no classification fails closed: the timeout is named, and the one action is diagnostic.
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification to diagnose' });
     expect(value.verification).toMatchObject({ source: 'relay', outcome: 'timed_out', exitCode: null });
-    expect(value.happened).toBe('Implementation changed 1 file; verification timed out.');
+    expect(value.happened).toBe('Agent Relay ran verification and it did not finish within its time limit.');
+    expect('secondaryAction' in value).toBe(false);
   });
 
   it('a later Relay verification is the latest event: it is not masked by the earlier round having hit its time limit', () => {
@@ -319,11 +372,11 @@ describe('after Agent Relay’s own verification of the worktree', () => {
       ]
     );
 
-    expect(value.happened).toBe('Implementation changed 1 file; verification timed out.');
-    expect(value.happened).not.toContain('time limit expired');
+    expect(value.happened).toBe('Agent Relay ran verification and it did not finish within its time limit.');
+    expect(value.happened).not.toContain('time limit expired'); // the implementation round's deadline is history
     expect(value.result).toContain('Verification timed out; success was not established.');
     expect(value.verification).toMatchObject({ source: 'relay', outcome: 'timed_out', exitCode: null });
-    expect(value.action?.key).toBe('run_verification');
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification to diagnose' });
   });
 
   it('explains a Relay verification from Relay’s own record, not from an earlier Ornith round’s attempt, when the task has no error text', () => {
@@ -358,7 +411,7 @@ describe('after Agent Relay’s own verification of the worktree', () => {
 });
 
 describe('the same recovery for other providers', () => {
-  it('offers verification first for a Claude attempt too, with the provider named on the secondary retry', () => {
+  it('offers verification, and only verification, for a Claude attempt too', () => {
     const value = runGuidance(
       task({ implementationProvider: 'claude' }),
       [run({ agent: 'claude', status: 'failed' })],
@@ -366,43 +419,57 @@ describe('the same recovery for other providers', () => {
     );
 
     expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification' });
-    expect(value.secondaryAction).toMatchObject({ key: 'run_implementation', label: 'Retry implementation · Claude' });
+    expect('secondaryAction' in value).toBe(false);
+    expect(JSON.stringify(value)).not.toContain('Retry implementation');
   });
 });
 
-describe('every secondary action is from a fixed, documented set', () => {
-  const SECONDARY_LABELS = new Set([
-    'Run verification again',
-    'Retry implementation · Ornith',
-    'Retry implementation · Claude',
-    'Retry implementation · Codex'
-  ]);
+describe('exactly one action, from a fixed set, in every recovery combination', () => {
+  const VERIFICATION_STAGE_LABELS = new Set(['Run verification', 'Run verification again', 'Run verification to diagnose']);
+  const IMPLEMENTATION_STAGE_LABELS = new Set(
+    ['Ornith', 'Claude', 'Codex'].flatMap((provider) => [`Fix verification failures · ${provider}`, `Retry implementation · ${provider}`, `Run implementation · ${provider}`])
+  );
 
-  it('never returns a secondary action that is outside the set, or that repeats the primary', () => {
+  it('never returns a second action, never a label outside the set, and never a retry of the implementation while verification is the stage', () => {
     const attemptSets: (readonly OrnithVerificationAttempt[])[] = [
       [],
       [attempt()],
       [attempt({ outcome: 'timed_out', exitCode: null })],
       [attempt({ outcome: 'not_run', exitCode: null, durationMs: 0, summary: '', code: 'verification_repeat_refused' })]
     ];
+    const relayRecords: (Record<string, unknown> | null)[] = [
+      null,
+      {},
+      { failureKind: 'implementation' },
+      { failureKind: 'infrastructure' },
+      { failureKind: 'unknown' },
+      { failureKind: 'cancelled', exitCode: null, outcome: 'cancelled' }
+    ];
     for (const provider of ['ornith', 'claude', 'codex'] as const) {
       for (const attempts of attemptSets) {
         for (const changedFiles of [0, 1]) {
           for (const reasonCodes of [[], ['limit_deadline_exceeded']]) {
-            for (const withRelay of [false, true]) {
+            for (const relay of relayRecords) {
               const runs = [
                 ornithRun({ changedFiles, worktreeChangedFiles: changedFiles, attempts, reasonCodes }),
-                ...(withRelay ? [relayRecord({})] : [])
+                ...(relay === null ? [] : [relayRecord(relay)])
               ];
               const value = runGuidance(
                 task({ implementationProvider: provider }),
                 runs, true, false, 'not_required', { ornithLocalInferenceState: 'healthy' }
               );
               expectConsistent(value);
-              if (value.secondaryAction) {
-                expect(SECONDARY_LABELS.has(value.secondaryAction.label), value.secondaryAction.label).toBe(true);
-                expect(value.secondaryAction.key).not.toBe(value.action?.key);
-              }
+              expect(value.action, JSON.stringify({ provider, changedFiles, reasonCodes, relay })).not.toBeNull();
+              expect('secondaryAction' in value).toBe(false);
+              const label = value.action!.label;
+              expect(VERIFICATION_STAGE_LABELS.has(label) || IMPLEMENTATION_STAGE_LABELS.has(label), label).toBe(true);
+              // Verification is the stage whenever the action is a verification: no implementation retry may
+              // appear anywhere in the guidance then, in any field.
+              if (VERIFICATION_STAGE_LABELS.has(label)) expect(JSON.stringify(value)).not.toContain('Retry implementation');
+              // A generic retry of the implementation is offered only when there is provably nothing to verify.
+              if (label.startsWith('Retry implementation')) expect(changedFiles).toBe(0);
+              // A repair is offered only on a classified failure of the files.
+              if (label.startsWith('Fix verification failures')) expect(relay?.['failureKind']).toBe('implementation');
             }
           }
         }

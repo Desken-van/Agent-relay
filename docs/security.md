@@ -720,6 +720,30 @@ that boundary raw:
 A record written before these fields existed still reads: they are optional,
 and a damaged or oversized one is skipped, not rendered.
 
+**A failure is classified from that same bounded buffer, before it is stored,
+and the classification fails closed.** `classifyVerificationFailure`
+(`src/shared/domain/verification-failure.ts`) reads the head-and-tail window
+of the locally held output and records one of `implementation`,
+`infrastructure`, `cancelled` or `unknown` on the verification record. Its
+reason is always a fixed, Relay-authored sentence plus at most an exit code
+and a duration — never a line the command printed. Only an `implementation`
+kind (an explicit assertion, `error TS…`, ESLint or build failure in the
+output) ever supplies repair evidence to a provider, and that evidence is the
+record's sanitized `outputSummary`, never a run event and never the raw
+buffer; a test-runner failure (vitest's own pool messages), a cancellation and
+anything unclassifiable produce no prompt at all and are simply re-verified.
+So an unexplained failure can never be turned into a model's correction round
+on evidence nobody has read.
+
+**The project's verification runs with the project's own environment, not the
+application's.** `WorktreeVerification.execute` omits `NODE_ENV` from the
+child's environment (`omitEnvNames`, an opt-in `ProcessRunner` option that
+changes nothing for other callers). A live run had inherited
+`NODE_ENV=production` from the app process, which made Vite resolve React's
+production build for the test run and fail 528 renderer tests
+(`React.act is not a function`) with no change to the files under test. As in
+a developer's terminal, the project's tooling now picks its own defaults.
+
 **Two read-only Git questions, fixed and internal.** After a run the loop asks
 `git status --porcelain=v1 --untracked-files=all` (a changed-file *count*, stderr
 discarded) and, before a verification, hashes `git diff HEAD --no-ext-diff

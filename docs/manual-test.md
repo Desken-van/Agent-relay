@@ -753,9 +753,18 @@ task this section creates.
      with the exact command, outcome (Failed / Timed out / Cancelled / Not
      started), exit code, duration, the reason and, collapsed, a bounded output
      tail with no token, path or terminal escape in it. **Run verification** is
-     the one highlighted button; **Retry implementation · Ornith** is a plain
-     button below it. In the timeline, the `run_verification` event reads
-     *FAILED*/*TIMED OUT* — never *ok* — for a failed command.
+     the one and only workflow button (besides *Stop task*); no *Retry
+     implementation* appears anywhere while verification is the stage. In the
+     timeline, the `run_verification` event reads *FAILED*/*TIMED OUT* — never
+     *ok* — for a failed command.
+   - **After a failed Relay verification, expect exactly one button, chosen by
+     what failed:** a test assertion, type, lint or build error → *Fix
+     verification failures · Ornith* (and only then does the next round carry
+     the failing output as a correction prompt); a test-runner failure such as
+     `[vitest-pool-runner]: Timeout waiting for worker to respond` → *Run
+     verification again* (no round is spent, the files are untouched); an
+     unclassifiable failure or a legacy record → *Run verification to
+     diagnose*. Never two of these at once.
    - Press **Run verification**: **Expect** it to run against the *existing*
      worktree — no new worktree, no Ornith call, no round consumed — and, on a
      pass, the task to move to `READY_FOR_REVIEW`; on a failure, to stay
