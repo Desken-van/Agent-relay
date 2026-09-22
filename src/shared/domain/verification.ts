@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { Run } from './models';
+import type { Run, Settings } from './models';
 import { VERIFICATION_FAILURE_KINDS, type VerificationFailureKind } from './verification-failure';
 
 export const verificationRecordSchema = z.object({
@@ -64,6 +64,16 @@ export function verificationFailureKind(run: Run | null): VerificationFailureKin
  */
 export function verificationNeedsImplementationRepair(run: Run | null): run is Run {
   return verificationFailureKind(run) === 'implementation';
+}
+
+/**
+ * The Settings fields that change the CONDITIONS `npm run verify` runs under — the one list both the
+ * main-process `configurationFingerprint` (which hashes them) and the renderer (which only needs to notice
+ * when one of them changed, never their values) read from, so adding, removing or renaming one of them
+ * cannot update one side and silently leave the other comparing stale conditions.
+ */
+export function verificationConfigurationFields(settings: Pick<Settings, 'processTimeoutMs' | 'maxStoredLogBytes'>): readonly [number, number] {
+  return [settings.processTimeoutMs, settings.maxStoredLogBytes];
 }
 
 /**

@@ -5,7 +5,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import { runSchema, type Run } from '../../src/shared/domain/models';
-import { verificationRerunPolicy, verificationRerunRefusal } from '../../src/shared/domain/verification';
+import { verificationConfigurationFields, verificationRerunPolicy, verificationRerunRefusal } from '../../src/shared/domain/verification';
+import { verificationConfigurationFingerprint } from '../../src/main/services/verification-fingerprints';
 
 const IDENTITY_A = 'a'.repeat(64);
 const IDENTITY_B = 'b'.repeat(64);
@@ -113,5 +114,30 @@ describe('verificationRerunRefusal', () => {
     expect(verificationRerunRefusal([unknown()], current)).toBeNull();
     expect(verificationRerunRefusal([verification({ failureKind: 'infrastructure' })], current)).toBeNull();
     expect(verificationRerunRefusal([verification({ failureKind: 'output_limit', exitCode: null })], current)).toBeNull();
+  });
+});
+
+describe('verificationConfigurationFields', () => {
+  const settings = { processTimeoutMs: 1_800_000, maxStoredLogBytes: 2_000_000 };
+
+  it('is the one list both the main-process fingerprint and the renderer read: changing a value it names changes both', () => {
+    expect(verificationConfigurationFields(settings)).toEqual([1_800_000, 2_000_000]);
+
+    const baseline = verificationConfigurationFingerprint(settings);
+    const baselineRevision = verificationConfigurationFields(settings).join(':');
+
+    // A field this list DOES name: both consumers move.
+    const timeoutChanged = { ...settings, processTimeoutMs: settings.processTimeoutMs + 1 };
+    expect(verificationConfigurationFingerprint(timeoutChanged)).not.toBe(baseline);
+    expect(verificationConfigurationFields(timeoutChanged).join(':')).not.toBe(baselineRevision);
+
+    const budgetChanged = { ...settings, maxStoredLogBytes: settings.maxStoredLogBytes + 1 };
+    expect(verificationConfigurationFingerprint(budgetChanged)).not.toBe(baseline);
+    expect(verificationConfigurationFields(budgetChanged).join(':')).not.toBe(baselineRevision);
+  });
+
+  it('is deterministic and order-stable, so the fingerprint and the revision string agree on what "unchanged" means', () => {
+    expect(verificationConfigurationFields(settings)).toEqual(verificationConfigurationFields({ ...settings }));
+    expect(verificationConfigurationFingerprint(settings)).toBe(verificationConfigurationFingerprint({ ...settings }));
   });
 });

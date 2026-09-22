@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import type { Settings } from '../../shared/domain/models';
 import type { ExecutedVerificationOutcome } from '../../shared/domain/ornith-verification';
 import type { VerificationFailureKind } from '../../shared/domain/verification-failure-kind';
+import { verificationConfigurationFields } from '../../shared/domain/verification';
 
 const FINGERPRINT_HEX_CHARS = 16;
 
@@ -13,9 +14,12 @@ function digest(parts: readonly string[]): string {
   return createHash('sha256').update(parts.join('\n'), 'utf8').digest('hex').slice(0, FINGERPRINT_HEX_CHARS);
 }
 
-/** The settings `npm run verify` runs under; a change to either changes the conditions of the run. */
+/**
+ * The settings `npm run verify` runs under; a change to any of them changes the conditions of the run.
+ * `verificationConfigurationFields` (shared) is the one place that names which Settings fields those are.
+ */
 export function verificationConfigurationFingerprint(settings: Pick<Settings, 'processTimeoutMs' | 'maxStoredLogBytes'>): string {
-  return digest(['npm run verify', String(settings.processTimeoutMs), String(settings.maxStoredLogBytes)]);
+  return digest(['npm run verify', ...verificationConfigurationFields(settings).map(String)]);
 }
 
 /**

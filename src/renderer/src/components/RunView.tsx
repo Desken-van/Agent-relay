@@ -21,7 +21,7 @@ import {
   type OrnithVerificationOutcome
 } from '@shared/domain/ornith-verification';
 import { isBusy, isTerminal } from '@shared/domain/workflow';
-import { latestVerification, verificationRerunPolicy, type VerificationReadiness } from '@shared/domain/verification';
+import { latestVerification, verificationConfigurationFields, verificationRerunPolicy, type VerificationReadiness } from '@shared/domain/verification';
 import {
   WORKTREE_DEPENDENCY_INSTALLABLE_BLOCKER_STATES,
   type WorktreeDependencyStatus
@@ -391,7 +391,10 @@ export function RunView(): React.JSX.Element {
     : null;
   const gatedVerificationCause = gatedVerificationRerun?.state === 'changes_required' ? gatedVerificationRerun.cause : null;
   const [readinessCheck, setReadinessCheck] = useState(0);
-  const verificationSettingsRevision = settings === null ? null : `${settings.processTimeoutMs}:${settings.maxStoredLogBytes}`;
+  // The one list of which Settings fields change verification's conditions lives in `verificationConfigurationFields`
+  // (shared with `verificationConfigurationFingerprint` in main); reading it here, rather than naming the fields
+  // again, is what keeps a future field added there from being a field this key silently never notices.
+  const verificationSettingsRevision = settings === null ? null : verificationConfigurationFields(settings).join(':');
   // Everything a readiness answer is good FOR: the task, the gated run, its cause, the verification settings
   // it was computed against, and which "Check for changes" generation asked for it. A settings edit or a
   // manual re-check changes this key without necessarily changing the run id, and the answer this screen
