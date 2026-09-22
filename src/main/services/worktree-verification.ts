@@ -87,10 +87,14 @@ export class WorktreeVerification implements VerificationExecutor {
       : await realpath(npm.path);
     await lstat(npmCli);
     progress({ type: 'log', text: 'Command: npm run verify (existing worktree; no implementation agent)' });
+    // No `onLine`/`onStderrLine`: the child's stdout/stderr must never be streamed as a progress event,
+    // because every progress event is both persisted to `run_events` and pushed live to the renderer as
+    // soon as it arrives — before this command has even finished, let alone been classified or summarized.
+    // `run()` still returns the full text in `ProcessResult.stdout`/`.stderr`, bounded by `maxOutputBytes`
+    // and held only in this call's return value, for the caller to classify and reduce to a sanitized,
+    // bounded summary once the command has completed. See `docs/security.md` for the resulting contract.
     return this.runner.run(node.path, [npmCli, 'run', 'verify'], {
-      cwd: root, signal, timeoutMs: settings.processTimeoutMs, maxOutputBytes: settings.maxStoredLogBytes,
-      onLine: text => progress({ type: 'log', text }),
-      onStderrLine: text => progress({ type: 'log', text })
+      cwd: root, signal, timeoutMs: settings.processTimeoutMs, maxOutputBytes: settings.maxStoredLogBytes
     });
   }
 }

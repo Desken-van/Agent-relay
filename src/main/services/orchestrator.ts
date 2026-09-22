@@ -34,6 +34,7 @@ import type { Project, Settings, Task } from '../../shared/domain/models';
 import {
   classifyVerificationExecution,
   describeUnverifiedOrnithOutcome,
+  formatVerificationDuration,
   preservedOrnithChanges,
   summarizeVerificationOutput
 } from '../../shared/domain/ornith-verification';
@@ -422,6 +423,13 @@ export class Orchestrator {
               ? 'Verification timed out; success was not established.'
               : `npm run verify failed (exit ${result.exitCode ?? 'unknown'}). See command output.`;
       // (The bounded, sanitized tail of the output goes with the record, so the screen can say why.)
+      // A generic, Relay-authored line — the classified outcome, exit code and duration, never the
+      // command's own text — so the timeline shows that the run ended and how, without the raw
+      // stdout/stderr this run produced ever reaching a persisted or live-pushed event.
+      handle.append({
+        type: 'log',
+        text: `Verification finished: ${outcome} (exit ${result.exitCode ?? 'none'}, ${formatVerificationDuration(result.durationMs)}).`
+      });
       handle.finish({ status: passed ? 'succeeded' : 'failed', finalMessage: passed ? 'Verification passed for this code snapshot. Ready for review.' : reason,
         errorMessage: reason, structuredResult: { version: 1, command: 'npm run verify', identity, passed, exitCode: result.exitCode, durationMs: result.durationMs, reason,
           outcome, ...(passed ? {} : { outputSummary: summarizeVerificationOutput(`${result.stdout}\n${result.stderr}`) }) } });

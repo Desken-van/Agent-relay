@@ -677,21 +677,48 @@ retained provider. If the retained runtime's identity changes, is stopped
 independently (`localInference:stop`), or the process exits, the run
 terminates without ever calling `start()` or falling back to Claude or Codex.
 
-**Verification output is summarized, never stored or forwarded raw.** What a
+**Verification output is sanitized before it ever reaches storage, the live
+renderer, or a model — for Ornith's own in-loop `run_verification` and for
+Agent Relay's own automatic and manually-triggered verification alike.** What a
 verification command printed is untrusted text that may contain a credential, a
-machine path or terminal control codes. `summarizeVerificationOutput`
-(`src/shared/domain/ornith-verification.ts`) is the only thing that ever leaves
-the process layer: it removes ANSI escapes and control characters, redacts
-credentials with the shared `redactSecrets`, replaces absolute machine paths,
-clips every line, keeps only the failing-test lines and the tail, and hard-caps
-the result at `maxVerificationSummaryChars` (1,500). It examines only the first
-32 KiB and last 256 KiB of the output, so a multi-megabyte log costs a bounded
-amount of main-thread time. That summary — not the
-output — is what the loop returns to the model, what the run event and
-`counters.verificationAttempts` (at most six attempts, each with a 400-character
-reason) store, and what Agent Relay's own verification record keeps as
-`outputSummary`. A record written before these fields existed still reads: they
-are optional, and a damaged or oversized one is skipped, not rendered.
+machine path or terminal control codes, and three tiers keep it from crossing
+that boundary raw:
+
+- **A bounded raw buffer, held only inside the process layer.**
+  `ProcessRunner.run()` (`src/main/adapters/process/process-runner.ts`)
+  captures a command's stdout/stderr — redacted for secret shapes and capped at
+  `maxOutputBytes` — into the `ProcessResult` it returns. That buffer lives
+  only in the caller's local variable; it is never itself persisted,
+  broadcast, or rendered.
+- **The safe summary, the only thing allowed to leave that boundary.**
+  `summarizeVerificationOutput` (`src/shared/domain/ornith-verification.ts`)
+  reduces the buffer to a further-sanitized, bounded text: it removes ANSI
+  escapes and control characters, redacts credentials with the shared
+  `redactSecrets`, replaces absolute machine paths, clips every line, keeps
+  only the failing-test lines and the tail, and hard-caps the result at
+  `maxVerificationSummaryChars` (1,500), examining only the first 32 KiB and
+  last 256 KiB of the input so a multi-megabyte log costs a bounded amount of
+  main-thread time. This summary — never the buffer — is what the Ornith loop
+  returns to the model, what a `run_verification` event and
+  `counters.verificationAttempts` (at most six attempts, each with a
+  400-character reason) store, and what a verification record keeps as
+  `outputSummary`.
+- **Generic, Relay-authored progress events, which never carry a byte of
+  child-process output.** While the command is running, the only events
+  persisted to `run_events` and pushed live to the renderer are fixed lines
+  Relay itself writes — `Command: npm run verify (existing worktree; no
+  implementation agent)` before it starts, `Verification finished: <outcome>
+  (exit <code>, <duration>)` after it ends, built from the classified outcome —
+  never from a line the command printed. `WorktreeVerification.execute`
+  (`src/main/services/worktree-verification.ts`) does not stream the child's
+  stdout/stderr line-by-line at all: no `onLine`/`onStderrLine` is ever passed
+  to the process runner for this command, because a streaming callback is both
+  persisted and broadcast the instant it arrives — before the command has even
+  finished, let alone been classified or summarized — which would defeat every
+  guarantee above.
+
+A record written before these fields existed still reads: they are optional,
+and a damaged or oversized one is skipped, not rendered.
 
 **Two read-only Git questions, fixed and internal.** After a run the loop asks
 `git status --porcelain=v1 --untracked-files=all` (a changed-file *count*, stderr

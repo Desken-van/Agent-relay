@@ -1608,6 +1608,13 @@ used elsewhere, but only as diagnostic evidence folded into the loop's own
 assessment — the authoritative gate remains Agent Relay's own post-provider
 snapshot verification, run exactly as it is for Claude and Codex.
 
+The same output-handling rule covers both: the command's own stdout/stderr is
+never streamed as a progress event, in either path — only a fixed,
+Relay-authored line before and after it runs — and only the bounded, sanitized
+summary a completed run produces is ever persisted, broadcast live, or shown.
+See docs/security.md §5c ("Verification output is sanitized...") for the exact
+boundary between the raw buffer, the safe summary, and generic progress.
+
 **What a verification attempt is.** Dispatching the action and the command
 passing are different facts, and the record keeps them apart
 (`src/shared/domain/ornith-verification.ts`). The executor returns raw facts
