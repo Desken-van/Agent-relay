@@ -480,7 +480,17 @@ export class Orchestrator {
     const project = this.requireProject(task.projectId);
     let identity: string;
     try {
-      identity = await executor.identity({ task, settings, project });
+      // Same exclusivity every other read of the worktree's identity runs under (`runVerification` holds it
+      // for its own `identity()` call too): not because a read-only `git rev-parse`/`ls-files` can corrupt
+      // anything, but so this never reads mid-write alongside an operation that spawns real npm/agent
+      // processes into the same directory. Contention (another operation already running for this task) is
+      // exactly as unremarkable as any other reason the worktree could not be read right now.
+      this.beginExclusive(taskId);
+      try {
+        identity = await executor.identity({ task, settings, project });
+      } finally {
+        this.endExclusive(taskId);
+      }
     } catch {
       return { state: 'unavailable', cause: policy.cause, detail: 'Agent Relay could not read the task worktree to check whether the files changed.' };
     }
