@@ -76,10 +76,12 @@ export function verificationNeedsImplementationRepair(run: Run | null): run is R
  *   so the next run is offered only once the files or the verification settings change, and
  *   {@link verificationRerunRefusal} enforces that where the snapshot is known.
  */
+export type VerificationRerunCause = 'output_limit' | 'unknown_exhausted';
+
 export type VerificationRerunPolicy =
   | { readonly state: 'open' }
   | { readonly state: 'diagnostic' }
-  | { readonly state: 'changes_required'; readonly cause: 'output_limit' | 'unknown_exhausted' };
+  | { readonly state: 'changes_required'; readonly cause: VerificationRerunCause };
 
 /** The finished verification runs since the last implementation round, oldest first: the runs on this snapshot sequence. */
 function verificationsSinceImplementation(runs: readonly Run[]): Run[] {
@@ -138,4 +140,37 @@ export function verificationRerunRefusal(
     : 'Verification was not started: the last two runs on these exact files ended without a classifiable result, and ' +
       'neither the files nor the verification settings have changed since. Change the files or the verification settings ' +
       '(time limit, stored log budget) first, or stop the task.';
+}
+
+/**
+ * Whether the operator's next verification may run RIGHT NOW, decided in the main process from the current
+ * worktree identity and the current verification settings — the same two values {@link verificationRerunRefusal}
+ * compares — and carried to the renderer as this value alone: never an identity, a fingerprint, a path or a
+ * line of output. The Run screen offers a verification control only on `ready`; the gate in the main
+ * process still decides again, immediately before execution, against the values of that moment.
+ */
+export type VerificationReadiness =
+  | { readonly state: 'not_blocked' }
+  | { readonly state: 'blocked'; readonly cause: VerificationRerunCause }
+  | { readonly state: 'ready'; readonly cause: VerificationRerunCause; readonly filesChanged: boolean; readonly settingsChanged: boolean }
+  /** The check itself could not be made (no worktree to read); `detail` is fixed prose, never a path. */
+  | { readonly state: 'unavailable'; readonly cause: VerificationRerunCause; readonly detail: string };
+
+/** Pure: the readiness for the given current values, by exactly the comparison the refusal makes. */
+export function verificationReadinessFor(
+  runs: readonly Run[],
+  current: { readonly identity: string; readonly configurationFingerprint: string }
+): VerificationReadiness {
+  const policy = verificationRerunPolicy(runs);
+  if (policy.state !== 'changes_required') return { state: 'not_blocked' };
+  if (verificationRerunRefusal(runs, current) !== null) return { state: 'blocked', cause: policy.cause };
+  const latest = verificationsSinceImplementation(runs).at(-1);
+  const record = latest === undefined ? null : readVerification(latest);
+  const data = record !== null && record.success ? record.data : null;
+  return {
+    state: 'ready',
+    cause: policy.cause,
+    filesChanged: data === null || data.identity !== current.identity,
+    settingsChanged: data === null || data.configurationFingerprint === undefined || data.configurationFingerprint !== current.configurationFingerprint
+  };
 }

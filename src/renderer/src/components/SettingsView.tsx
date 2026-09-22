@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   COAI_CONNECTION_PROBE_SETTINGS_KEYS,
   type CoaiConnectionDiagnostic
@@ -24,7 +24,7 @@ import {
 import { containsSecretShape } from '@shared/util/redact';
 import { call, expect } from '../lib/api';
 import { formatDateTime } from '../lib/format';
-import { useStore } from '../state/store';
+import { useStore, type SettingsFocus } from '../state/store';
 import { LocalInferenceLifecyclePanel } from './LocalInferenceLifecyclePanel';
 import { Card, Field, Notice, Spinner, ToolDot } from './primitives';
 
@@ -62,7 +62,20 @@ const TOOL_TITLES: Record<string, string> = {
   ornith: 'Ornith'
 };
 
+/** Element ids of the controls another screen can send the operator to. */
+const SETTINGS_FOCUS_IDS: Record<SettingsFocus, string> = { maxStoredLogBytes: 'setting-stored-log-budget' };
+
 export function SettingsView(): React.JSX.Element {
+  const { settingsFocus, clearSettingsFocus } = useStore();
+  // Arrived from a screen that named one control (the Run screen's output-limit notice): bring it into view
+  // and focus it, once. Navigation only — nothing is read or written here.
+  useEffect(() => {
+    if (settingsFocus === null) return;
+    const field = document.getElementById(SETTINGS_FOCUS_IDS[settingsFocus]);
+    field?.scrollIntoView?.({ block: 'center' });
+    field?.querySelector('input')?.focus();
+    clearSettingsFocus();
+  }, [settingsFocus, clearSettingsFocus]);
   const { settings, diagnostics, refreshDiagnostics, refreshSettings, refreshCodexModels, perform, notify } =
     useStore();
 
@@ -893,6 +906,7 @@ export function SettingsView(): React.JSX.Element {
                 </Field>
 
                 <Field
+                  id={SETTINGS_FOCUS_IDS.maxStoredLogBytes}
                   label={`Stored log budget: ${(draft.maxStoredLogBytes / 1000).toLocaleString()}k characters per run`}
                   hint="Beyond this, events stream live but are not persisted."
                 >

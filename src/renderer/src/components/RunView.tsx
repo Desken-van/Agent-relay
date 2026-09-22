@@ -21,6 +21,7 @@ import {
   type OrnithVerificationOutcome
 } from '@shared/domain/ornith-verification';
 import { isBusy, isTerminal } from '@shared/domain/workflow';
+import { verificationRerunPolicy, type VerificationReadiness } from '@shared/domain/verification';
 import {
   WORKTREE_DEPENDENCY_INSTALLABLE_BLOCKER_STATES,
   type WorktreeDependencyStatus
@@ -268,7 +269,7 @@ function CompletedHistory({ runs }: { runs: readonly Run[] }): React.JSX.Element
 
 export function RunView(): React.JSX.Element {
   const store = useStore();
-  const { selectedTaskId, detail, refreshDetail, openTaskDetail, acceptTask, perform, notify, busy, codexModels, settings } = store;
+  const { selectedTaskId, detail, refreshDetail, openTaskDetail, acceptTask, perform, notify, busy, codexModels, settings, openSettings } = store;
 
   const [changes, setChanges] = useState<GitChangeSet | null>(null);
   const [planReviewPreparation, setPlanReviewPreparation] = useState<{
@@ -378,6 +379,39 @@ export function RunView(): React.JSX.Element {
     };
   }, [implementationProviderForReadiness, selectedTaskId]);
 
+  // Passive, read-only: whether a verification the re-run policy has gated may start NOW — the main
+  // process's answer from the current worktree identity and settings, the same values its gate compares —
+  // so this screen never offers a step that gate would refuse. Re-read whenever the gated run, the task or
+  // the verification settings change, and on demand ("Check for changes") after edits made outside the app.
+  const gatedVerificationRunId = detail !== null && detail.task.status === 'READY_FOR_IMPLEMENTATION' &&
+    verificationRerunPolicy(detail.runs).state === 'changes_required'
+    ? [...detail.runs].reverse().find((run) => run.runType === 'verification')?.id ?? null
+    : null;
+  const [verificationReadiness, setVerificationReadiness] = useState<{
+    taskId: string;
+    runId: string;
+    readiness: VerificationReadiness;
+  } | null>(null);
+  const [readinessCheck, setReadinessCheck] = useState(0);
+  const verificationSettingsRevision = settings === null ? null : `${settings.processTimeoutMs}:${settings.maxStoredLogBytes}`;
+  useEffect(() => {
+    if (selectedTaskId === null || gatedVerificationRunId === null) return undefined;
+    let cancelled = false;
+    const taskId = selectedTaskId;
+    const runId = gatedVerificationRunId;
+    void call('workflow:verificationReadiness', { taskId }).then((response) => {
+      if (cancelled || !response.ok) return;
+      setVerificationReadiness({ taskId, runId, readiness: response.data });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedTaskId, gatedVerificationRunId, verificationSettingsRevision, readinessCheck]);
+  const currentVerificationReadiness =
+    verificationReadiness !== null && verificationReadiness.taskId === selectedTaskId && verificationReadiness.runId === gatedVerificationRunId
+      ? verificationReadiness.readiness
+      : null;
+
   // Passive, read-only: shows the dependency blocker (and its install action)
   // before the user ever attempts implementation, rather than only after a
   // failed attempt. Refetched whenever the task changes; `installDependencies`
@@ -464,7 +498,8 @@ export function RunView(): React.JSX.Element {
       continuationCreationStatus: detail.continuationCreationStatus,
       continuationEntryAction: detail.continuationEntryAction,
       isContinuation: detail.continuationOf !== null,
-      ornithLocalInferenceState: ornithReadiness?.taskId === task.id ? ornithReadiness.kind : null
+      ornithLocalInferenceState: ornithReadiness?.taskId === task.id ? ornithReadiness.kind : null,
+      verificationReadiness: currentVerificationReadiness
     }
   );
   const running = isBusy(task.status);
@@ -729,6 +764,32 @@ export function RunView(): React.JSX.Element {
                 <p className="hint">Install dependencies in this task worktree first (above) before running {providerLabel(task.implementationProvider)}.</p>
               ) : null}
             </div>
+          ) : null}
+
+          {guidance.action === null && currentVerificationReadiness !== null &&
+          (currentVerificationReadiness.state === 'blocked' || currentVerificationReadiness.state === 'unavailable') ? (
+            // A waiting state, not a workflow step: what the operator must change, a way to Settings when a setting
+            // is what must change, and a re-check for changes made outside the app. Neither control runs anything.
+            <Notice tone="warn" role="status">
+              <div className="stack">
+                <p>
+                  <strong>User action required.</strong>{' '}
+                  {currentVerificationReadiness.cause === 'output_limit'
+                    ? 'Verification output exceeded the Stored log budget, so its result could not be classified. Raise the budget in Settings or reduce what npm run verify prints; verification is offered again once the files or that setting have changed.'
+                    : 'One diagnostic re-run was already used for these exact files and ended the same way. Change the files or the verification settings (time limit, stored log budget) before another run, or stop the task; verification is offered again once something has changed.'}
+                </p>
+                <div className="actions">
+                  {currentVerificationReadiness.cause === 'output_limit' ? (
+                    <button type="button" className="btn btn--sm" onClick={() => openSettings('maxStoredLogBytes')}>
+                      Open Settings · Stored log budget
+                    </button>
+                  ) : null}
+                  <button type="button" className="btn btn--sm btn--ghost" onClick={() => setReadinessCheck((value) => value + 1)}>
+                    Check for changes
+                  </button>
+                </div>
+              </div>
+            </Notice>
           ) : null}
 
           {publishing || detail.runs.some(isPublishRun) ? (

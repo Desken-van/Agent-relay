@@ -267,6 +267,7 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
       }),
 
     'dependencies:status': (input) => app.orchestrator.dependencyStatus(input.taskId),
+    'workflow:verificationReadiness': (input) => app.orchestrator.verificationReadiness(input.taskId),
     'workflow:installDependencies': (input) => app.orchestrator.installDependencies(input.taskId),
 
     'workflow:generateSpecification': (input) =>

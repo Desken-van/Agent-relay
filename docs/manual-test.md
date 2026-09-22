@@ -766,10 +766,15 @@ task this section creates.
      unclassifiable failure or a legacy record → *Run verification to
      diagnose*, once per snapshot; a second materially identical unclassifiable
      result on the same files and settings, or an output that overflowed the
-     *Stored log budget* → *Run verification after changes*, which Agent Relay
-     refuses (no run row, no round, an error message naming what must change)
-     until the files or the verification settings differ from the recorded run.
-     Never two of these at once.
+     *Stored log budget* → NO workflow button at all: the guide reads *User
+     action required* and names what must change, a notice offers *Open
+     Settings · Stored log budget* (output overflow only; it focuses that
+     control) and *Check for changes*, and neither starts anything. Raise the
+     budget, change the time limit, or edit a file, then return (or press
+     *Check for changes*): exactly one **Run verification** appears. Changing
+     things back before pressing it is still refused by Agent Relay (no run
+     row, no round, an error naming what must change). Never two of these at
+     once.
    - Press **Run verification**: **Expect** it to run against the *existing*
      worktree — no new worktree, no Ornith call, no round consumed — and, on a
      pass, the task to move to `READY_FOR_REVIEW`; on a failure, to stay

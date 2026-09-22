@@ -8,18 +8,25 @@
  */
 import { useEffect, useRef } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, screen } from '@testing-library/react';
+import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import { RunView } from '../../src/renderer/src/components/RunView';
 import { useStore } from '../../src/renderer/src/state/store';
 import { runSchema, taskSchema, type Run, type Task } from '../../src/shared/domain/models';
 import type { TaskDetail } from '../../src/shared/ipc';
 import type { TaskSpecification } from '../../src/shared/schemas/codex';
-import { installBridge, ok, renderApp } from './harness';
+import { deferred, installBridge, ok, renderApp } from './harness';
+import type { VerificationReadiness } from '../../src/shared/domain/verification';
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
+
+/** Where the store says the operator is, and which Settings control was named — navigation is observable, not guessed. */
+function SectionProbe(): React.JSX.Element {
+  const { section, settingsFocus } = useStore();
+  return <span data-testid="section">{section}|{settingsFocus ?? ''}</span>;
+}
 
 function SeededRun({ detail }: { detail: TaskDetail }): React.JSX.Element {
   const { openTaskDetail } = useStore();
@@ -112,6 +119,15 @@ const UNKNOWN_REASON = 'npm run verify failed (exit 1), but the output does not 
 const OUTPUT_LIMIT_REASON = "Verification output exceeded Agent Relay's configured retention limit (2000k characters per run), so the result could not be classified safely: the command was stopped at the limit and only the output up to it was kept. Raise \"Stored log budget\" in Settings or reduce what npm run verify prints; running it again unchanged would stop at the same limit.";
 /** Both fingerprints the record keeps for the re-run policy; equal on two runs means "materially the same". */
 const FINGERPRINTS = { configurationFingerprint: 'c'.repeat(16), evidenceFingerprint: 'e'.repeat(16) };
+const OVERFLOW_DETAIL = detail({ lastError: OUTPUT_LIMIT_REASON }, [
+  ornithRun(1),
+  relayVerification({ failureKind: 'output_limit', exitCode: null, reason: OUTPUT_LIMIT_REASON, ...FINGERPRINTS })
+]);
+const EXHAUSTED_DETAIL = detail({ lastError: UNKNOWN_REASON }, [
+  ornithRun(1),
+  relayVerification({ failureKind: 'unknown', reason: UNKNOWN_REASON, ...FINGERPRINTS }, 'failed', 'verification-1'),
+  relayVerification({ failureKind: 'unknown', reason: UNKNOWN_REASON, ...FINGERPRINTS }, 'failed', 'verification-2')
+]);
 
 describe('Run screen — exactly one workflow control, chosen by the evidence', () => {
   it.each([
@@ -131,18 +147,16 @@ describe('Run screen — exactly one workflow control, chosen by the evidence', 
       'Run verification to diagnose'
     ],
     [
-      'an output that overflowed the stored log budget (never a plain re-run)',
-      detail({ lastError: OUTPUT_LIMIT_REASON }, [ornithRun(1), relayVerification({ failureKind: 'output_limit', exitCode: null, reason: OUTPUT_LIMIT_REASON, ...FINGERPRINTS })]),
-      'Run verification after changes'
+      'an output that overflowed the stored log budget, once the main process says the files changed',
+      OVERFLOW_DETAIL,
+      'Run verification',
+      { state: 'ready', cause: 'output_limit', filesChanged: true, settingsChanged: false } satisfies VerificationReadiness
     ],
     [
-      'a second materially identical unclassifiable failure on the same snapshot (diagnostic re-run exhausted)',
-      detail({ lastError: UNKNOWN_REASON }, [
-        ornithRun(1),
-        relayVerification({ failureKind: 'unknown', reason: UNKNOWN_REASON, ...FINGERPRINTS }, 'failed', 'verification-1'),
-        relayVerification({ failureKind: 'unknown', reason: UNKNOWN_REASON, ...FINGERPRINTS }, 'failed', 'verification-2')
-      ]),
-      'Run verification after changes'
+      'an exhausted diagnostic re-run, once the main process says the verification settings changed',
+      EXHAUSTED_DETAIL,
+      'Run verification',
+      { state: 'ready', cause: 'unknown_exhausted', filesChanged: false, settingsChanged: true } satisfies VerificationReadiness
     ],
     [
       'a record written before classification existed (fails closed)',
@@ -174,9 +188,10 @@ describe('Run screen — exactly one workflow control, chosen by the evidence', 
       detail({ status: 'READY_FOR_REVIEW' }, [ornithRun(1), relayVerification({ passed: true, exitCode: 0, reason: null, outcome: 'passed' }, 'succeeded')]),
       'Run review · Codex'
     ]
-  ])('after %s renders exactly one workflow control: %s', async (_state, taskDetail, expected) => {
+  ])('after %s renders exactly one workflow control: %s', async (_state, taskDetail, expected, readiness?: VerificationReadiness) => {
     installBridge({
-      'dependencies:status': () => ok<'dependencies:status'>({ state: 'not_node_project', detail: 'No package.json.' })
+      'dependencies:status': () => ok<'dependencies:status'>({ state: 'not_node_project', detail: 'No package.json.' }),
+      ...(readiness === undefined ? {} : { 'workflow:verificationReadiness': () => ok<'workflow:verificationReadiness'>(readiness) })
     });
     renderApp(<SeededRun detail={taskDetail} />);
 
@@ -200,23 +215,85 @@ describe('Run screen — exactly one workflow control, chosen by the evidence', 
     expect(document.body.textContent).not.toContain('Retry implementation');
     expect(document.body.textContent).toContain('no implementation round is spent');
   });
+});
 
-  it('after an exhausted diagnostic re-run renders neither "to diagnose" nor "again", and says the step is gated', async () => {
+describe('Run screen — waiting states: a gated verification with nothing changed renders NO workflow control', () => {
+  const bridgeWith = (readiness: () => Promise<unknown> | unknown) =>
     installBridge({
-      'dependencies:status': () => ok<'dependencies:status'>({ state: 'not_node_project', detail: 'No package.json.' })
+      'dependencies:status': () => ok<'dependencies:status'>({ state: 'not_node_project', detail: 'No package.json.' }),
+      'workflow:verificationReadiness': () => readiness()
     });
-    renderApp(<SeededRun detail={detail({ lastError: UNKNOWN_REASON }, [
-      ornithRun(1),
-      relayVerification({ failureKind: 'unknown', reason: UNKNOWN_REASON, ...FINGERPRINTS }, 'failed', 'verification-1'),
-      relayVerification({ failureKind: 'unknown', reason: UNKNOWN_REASON, ...FINGERPRINTS }, 'failed', 'verification-2')
-    ])} />);
 
-    await screen.findByRole('button', { name: 'Run verification after changes' });
-    expect(workflowControls()).toEqual(['Run verification after changes']);
-    expect(screen.queryByRole('button', { name: 'Run verification to diagnose' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Run verification again' })).toBeNull();
-    expect(document.body.textContent).toContain('not offered again');
-    expect(document.body.textContent).toContain('no implementation round is spent');
+  it('an output overflow with unchanged files and settings: "User action required", a Settings link and a re-check — and no button that could be refused', async () => {
+    const bridge = bridgeWith(() => ok<'workflow:verificationReadiness'>({ state: 'blocked', cause: 'output_limit' }));
+    renderApp(<><SeededRun detail={OVERFLOW_DETAIL} /><SectionProbe /></>);
+
+    await screen.findAllByText(/User action required/); // said in the guide's next step and in the notice
+    expect(workflowControls()).toEqual([]);
+    expect(document.body.textContent).toContain('Stored log budget');
+    expect(document.body.textContent).toContain('no verification step is offered');
+    expect(screen.queryByRole('button', { name: /Run verification/ })).toBeNull();
     expect(screen.getByRole('button', { name: /Stop task/ })).toBeTruthy();
+
+    // The Settings link navigates — observable in the store — and starts nothing.
+    fireEvent.click(screen.getByRole('button', { name: 'Open Settings · Stored log budget' }));
+    await waitFor(() => expect(screen.getByTestId('section').textContent).toBe('settings|maxStoredLogBytes'));
+    // The re-check asks the main process again — and starts nothing either.
+    const reads = bridge.callsTo('workflow:verificationReadiness').length;
+    fireEvent.click(screen.getByRole('button', { name: 'Check for changes' }));
+    await waitFor(() => expect(bridge.callsTo('workflow:verificationReadiness').length).toBeGreaterThan(reads));
+    expect(bridge.callsTo('workflow:verify')).toEqual([]);
+    expect(bridge.callsTo('workflow:implement')).toEqual([]);
+    expect(workflowControls()).toEqual([]);
+  });
+
+  it('an exhausted diagnostic re-run with unchanged files and settings: "User action required", no Settings link, no recommendation of the provider', async () => {
+    const bridge = bridgeWith(() => ok<'workflow:verificationReadiness'>({ state: 'blocked', cause: 'unknown_exhausted' }));
+    renderApp(<SeededRun detail={EXHAUSTED_DETAIL} />);
+
+    await screen.findAllByText(/User action required/); // said in the guide's next step and in the notice
+    expect(workflowControls()).toEqual([]);
+    expect(document.body.textContent).toContain('One diagnostic re-run was already used');
+    expect(document.body.textContent).toContain('change the files or the verification settings');
+    expect(screen.queryByRole('button', { name: /Open Settings/ })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Check for changes' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Stop task/ })).toBeTruthy();
+    for (const forbidden of ['Run verification to diagnose', 'Run verification again', 'Fix verification failures', 'Retry implementation']) {
+      expect(document.body.textContent).not.toContain(forbidden);
+    }
+    expect(bridge.callsTo('workflow:verify')).toEqual([]);
+  });
+
+  it('while the main process has not answered, and when it cannot check, there is no control either', async () => {
+    const never = deferred<unknown>();
+    bridgeWith(() => never.promise);
+    renderApp(<SeededRun detail={OVERFLOW_DETAIL} />);
+    await screen.findByText(/Checking whether the files or the verification settings changed/);
+    expect(workflowControls()).toEqual([]);
+    cleanup();
+
+    bridgeWith(() => ok<'workflow:verificationReadiness'>({ state: 'unavailable', cause: 'unknown_exhausted', detail: 'The task worktree cannot be checked for changes right now.' }));
+    renderApp(<SeededRun detail={EXHAUSTED_DETAIL} />);
+    await screen.findAllByText(/User action required/); // said in the guide's next step and in the notice
+    expect(document.body.textContent).toContain('cannot be checked for changes right now');
+    expect(workflowControls()).toEqual([]);
+    expect(screen.getByRole('button', { name: 'Check for changes' })).toBeTruthy();
+  });
+
+  it('a re-check that finds the files changed replaces the waiting state with exactly one "Run verification"', async () => {
+    let answer: VerificationReadiness = { state: 'blocked', cause: 'output_limit' };
+    const bridge = bridgeWith(() => ok<'workflow:verificationReadiness'>(answer));
+    renderApp(<SeededRun detail={OVERFLOW_DETAIL} />);
+    await screen.findAllByText(/User action required/); // said in the guide's next step and in the notice
+    expect(workflowControls()).toEqual([]);
+
+    answer = { state: 'ready', cause: 'output_limit', filesChanged: true, settingsChanged: false };
+    fireEvent.click(screen.getByRole('button', { name: 'Check for changes' }));
+
+    await screen.findByRole('button', { name: 'Run verification' });
+    expect(workflowControls()).toEqual(['Run verification']);
+    expect(document.body.textContent).toContain('The files changed since that run');
+    expect(document.body.textContent).not.toContain('User action required');
+    expect(bridge.callsTo('workflow:verify')).toEqual([]);
   });
 });

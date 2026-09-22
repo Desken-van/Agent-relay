@@ -38,6 +38,8 @@ import { call, describeError, expect } from '../lib/api';
  * exist. Its state lives in its own provider, not in this store.
  */
 export type Section = 'projects' | 'tasks' | 'run' | 'operations' | 'settings';
+/** A Settings control another screen can send the operator to; the Settings screen scrolls to and focuses it once. */
+export type SettingsFocus = 'maxStoredLogBytes';
 
 export interface Toast {
   readonly id: number;
@@ -49,6 +51,7 @@ export interface Toast {
 
 interface State {
   section: Section;
+  settingsFocus: SettingsFocus | null;
   projects: Project[];
   selectedProjectId: string | null;
   tasks: Task[];
@@ -68,6 +71,7 @@ interface State {
 
 type Action =
   | { type: 'section'; section: Section }
+  | { type: 'settings-focus'; focus: SettingsFocus | null }
   | { type: 'projects'; projects: Project[] }
   | { type: 'project-upserted'; project: Project }
   | { type: 'select-project'; projectId: string | null }
@@ -91,6 +95,7 @@ type Action =
 /** Exported only for focused reducer-level tests. */
 export const initialState: State = {
   section: 'projects',
+  settingsFocus: null,
   projects: [],
   selectedProjectId: null,
   tasks: [],
@@ -113,6 +118,8 @@ export function reducer(state: State, action: Action): State {
   switch (action.type) {
     case 'section':
       return { ...state, section: action.section };
+    case 'settings-focus':
+      return { ...state, settingsFocus: action.focus };
 
     case 'projects':
       return { ...state, projects: action.projects };
@@ -256,6 +263,9 @@ function parseStored<T>(raw: string | null, schema: { safeParse(value: unknown):
 export interface StoreValue extends State {
   readonly selectedProject: Project | null;
   setSection(section: Section): void;
+  /** Navigate to Settings, naming the one control to bring into view. Navigation only: starts nothing. */
+  openSettings(focus: SettingsFocus | null): void;
+  clearSettingsFocus(): void;
   selectProject(projectId: string | null): void;
   selectTask(taskId: string | null): void;
   /** Select and display an already-fetched task detail, e.g. after `workflow:continue`. */
@@ -422,6 +432,11 @@ export function StoreProvider({ children }: { children: ReactNode }): React.JSX.
       ...state,
       selectedProject: state.projects.find((p) => p.id === state.selectedProjectId) ?? null,
       setSection: (section) => dispatch({ type: 'section', section }),
+      openSettings: (focus) => {
+        dispatch({ type: 'settings-focus', focus });
+        dispatch({ type: 'section', section: 'settings' });
+      },
+      clearSettingsFocus: () => dispatch({ type: 'settings-focus', focus: null }),
       selectProject: (projectId) => dispatch({ type: 'select-project', projectId }),
       selectTask: (taskId) => dispatch({ type: 'select-task', taskId }),
       openTaskDetail: (detail) => dispatch({ type: 'open-task-detail', detail }),

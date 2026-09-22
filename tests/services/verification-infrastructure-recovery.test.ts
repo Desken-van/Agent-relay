@@ -26,7 +26,7 @@ import type {
 } from '../../src/main/services/ornith-implementation';
 import { ExecaProcessRunner, type ProcessResult, type ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { WorktreeVerification } from '../../src/main/services/worktree-verification';
-import { readVerification } from '../../src/shared/domain/verification';
+import { readVerification, type VerificationReadiness } from '../../src/shared/domain/verification';
 import type { OrnithVerificationExecution } from '../../src/shared/domain/ornith-verification';
 import { runGuidance } from '../../src/shared/domain/run-guidance';
 import { buildBranchName, buildWorktreeDirName } from '../../src/shared/util/slug';
@@ -170,8 +170,8 @@ async function approvedOrnithTask(): Promise<Scenario> {
 }
 
 const sha256 = (path: string): string => createHash('sha256').update(readFileSync(path)).digest('hex');
-const guidanceOf = (s: Scenario) =>
-  runGuidance(s.h.tasks.findById(s.taskId)!, s.h.runs.listByTask(s.taskId), true, false, 'not_required', { ornithLocalInferenceState: 'healthy' });
+const guidanceOf = (s: Scenario, verificationReadiness: VerificationReadiness | null = null) =>
+  runGuidance(s.h.tasks.findById(s.taskId)!, s.h.runs.listByTask(s.taskId), true, false, 'not_required', { ornithLocalInferenceState: 'healthy', verificationReadiness });
 
 describe('the production sequence: implementation → lease released → verification fails on the runner → one step → retry passes → review', () => {
   it('runs exactly as the live task should have', async () => {
@@ -292,16 +292,26 @@ describe('the production sequence: implementation → lease released → verific
     if (!record.success) return;
     expect(record.data.outputSummary).not.toContain(PLANTED_SECRET);
     expect(record.data.outputSummary).not.toContain(PLANTED_PATH);
-    const guidance = guidanceOf(s);
-    expect(guidance.action).toMatchObject({ key: 'run_verification', label: 'Run verification after changes', enabled: true });
-    expect(JSON.stringify(guidance)).not.toContain('Run verification again');
-    expect(JSON.stringify(guidance)).not.toContain('Fix verification failures');
-    expect(JSON.stringify(guidance)).not.toContain('Retry implementation');
-
-    // Unchanged files (real identity) and settings: the gated step is refused before any row is written or round spent.
+    // Unchanged files (the real worktree identity) and settings: the main process says blocked, the screen is a
+    // waiting state with no workflow control, and the same request is refused before any row is written.
+    const blocked = await s.h.orchestrator.verificationReadiness(s.taskId);
+    expect(blocked).toEqual({ state: 'blocked', cause: 'output_limit' });
+    const waiting = guidanceOf(s, blocked);
+    expect(waiting.action).toBeNull();
+    expect(waiting.next).toContain('User action required');
+    expect(JSON.stringify(waiting)).not.toContain('Run verification again');
+    expect(JSON.stringify(waiting)).not.toContain('Fix verification failures');
+    expect(JSON.stringify(waiting)).not.toContain('Retry implementation');
     await expect(s.h.orchestrator.runVerification(s.taskId)).rejects.toThrow(/exceeded the stored log budget/);
     expect(s.h.runs.listByTask(s.taskId).filter((run) => run.runType === 'verification')).toHaveLength(1);
     expect(s.h.tasks.findById(s.taskId)).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 1 });
+
+    // The operator edits a file in the worktree: the real identity differs, readiness is ready, one Run verification.
+    writeFileSync(s.target, `${readFileSync(s.target, 'utf8')}\nTrimmed the verify output.\n`, 'utf8');
+    const ready = await s.h.orchestrator.verificationReadiness(s.taskId);
+    expect(ready).toEqual({ state: 'ready', cause: 'output_limit', filesChanged: true, settingsChanged: false });
+    expect(JSON.stringify(ready)).not.toMatch(/[a-f0-9]{16}/);
+    expect(guidanceOf(s, ready).action).toMatchObject({ key: 'run_verification', label: 'Run verification', enabled: true });
 
     // A round started anyway carries no correction evidence from it.
     s.probe.run = null;

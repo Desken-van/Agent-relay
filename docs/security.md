@@ -748,6 +748,12 @@ gated, and `runVerification` refuses it while the files and the verification
 settings equal the recorded run's. The re-run policy compares two 16-hex
 fingerprints kept on the record — of the settings, and of the sanitized summary
 with numbers blanked — so nothing raw is persisted for that comparison either.
+Whether that gate would refuse is also what the Run screen asks before it
+offers anything: `workflow:verificationReadiness` (input: the task id, strict)
+is answered in the main process from the same two values and returns only a
+readiness state — never the identity, a fingerprint, a path or output — so the
+renderer shows a waiting state ("User action required") rather than a button
+the gate would refuse, and the gate still decides again at execution time.
 
 **The project's verification runs with the project's own environment, not the
 application's.** `WorktreeVerification.execute` omits `NODE_ENV` from the

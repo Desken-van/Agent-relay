@@ -115,7 +115,8 @@ import {
 import {
   latestVerification,
   readVerification,
-  verificationNeedsImplementationRepair, verificationRerunRefusal
+  verificationNeedsImplementationRepair, verificationRerunRefusal, verificationReadinessFor, verificationRerunPolicy,
+  type VerificationReadiness
 } from '../../shared/domain/verification';
 import type { VerificationExecutor } from './worktree-verification';
 import type { WorktreeDependencyInstaller, WorktreeDependencyPreparer } from './worktree-dependencies';
@@ -457,6 +458,33 @@ export class Orchestrator {
       if (this.requireTask(taskId).status === 'VERIFYING') this.applyEvent(this.requireTask(taskId), 'verification_aborted', { lastError: message });
       throw error;
     } finally { this.endExclusive(taskId); }
+  }
+
+  /**
+   * Read-only: whether the operator's next verification may start right now, decided from the same two values
+   * the gate in {@link runVerification} compares — the current worktree identity and the verification
+   * settings — so the Run screen never offers a step that gate would refuse. Carries no identity, fingerprint,
+   * path or output to the renderer. Spawns only the read-only git commands `identity()` issues, never the
+   * verification command, and moves no state; the gate itself still decides again immediately before a run.
+   */
+  async verificationReadiness(taskId: string): Promise<VerificationReadiness> {
+    const task = this.requireTask(taskId);
+    const runs = this.deps.runs.listByTask(taskId);
+    const policy = verificationRerunPolicy(runs);
+    if (policy.state !== 'changes_required') return { state: 'not_blocked' };
+    const executor = this.deps.verification;
+    if (!executor || !task.worktreePath) {
+      return { state: 'unavailable', cause: policy.cause, detail: 'The task worktree cannot be checked for changes right now.' };
+    }
+    const settings = this.deps.settings.get();
+    const project = this.requireProject(task.projectId);
+    let identity: string;
+    try {
+      identity = await executor.identity({ task, settings, project });
+    } catch {
+      return { state: 'unavailable', cause: policy.cause, detail: 'Agent Relay could not read the task worktree to check whether the files changed.' };
+    }
+    return verificationReadinessFor(runs, { identity, configurationFingerprint: verificationConfigurationFingerprint(settings) });
   }
 
   /** Read-only: never spawns anything, safe to call anytime a worktree exists. */

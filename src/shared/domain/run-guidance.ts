@@ -10,7 +10,10 @@ import {
   type OrnithRunEvidence,
   type OrnithVerificationOutcome
 } from './ornith-verification';
-import { latestVerification, readVerification, verificationFailureKind, verificationRerunPolicy } from './verification';
+import {
+  latestVerification, readVerification, verificationFailureKind, verificationRerunPolicy,
+  type VerificationReadiness, type VerificationRerunCause
+} from './verification';
 
 /**
  * The one workflow transition Run → Actions may offer right now.
@@ -140,6 +143,14 @@ export interface RunGuidanceExtra {
    * says. `null`/`undefined` means "not read yet", and is treated as not ready.
    */
   readonly ornithLocalInferenceState?: LocalInferenceStateKind | null;
+  /**
+   * The renderer's last read of `workflow:verificationReadiness` for the gated verification it is showing:
+   * the main process's answer, from the current worktree identity and settings, to whether a verification
+   * the re-run policy gated may start now. Consulted only in those two states. `null`/`undefined` means
+   * "not read yet" and renders no control, exactly like a `blocked` answer: a button the main-process gate
+   * would refuse is not a next step.
+   */
+  readonly verificationReadiness?: VerificationReadiness | null;
 }
 
 const ORNITH_NOT_READY_REASON =
@@ -331,6 +342,66 @@ function waiting(input: Omit<RunGuidance, 'action' | 'next'> & { readonly next: 
 /** A guidance record whose `next` is always exactly the action's label. */
 function acting(input: Omit<RunGuidance, 'action' | 'next'> & { readonly action: RunPrimaryAction }): RunGuidance {
   return { ...input, next: input.action.label };
+}
+
+const GATED_VERIFICATION_STAGE = 'Step 3 of 5 · Verification';
+
+/**
+ * The two states in which running the same verification again cannot end differently: an output that
+ * overflowed the stored log budget, and a diagnostic re-run that ended in a materially identical unknown
+ * result. Whether a run may start NOW is the main process's answer (`workflow:verificationReadiness`, from
+ * the current worktree identity and settings — the same values its gate compares). Until it has answered,
+ * while it says no, and while the check itself is unavailable, there is no workflow control at all — a
+ * button the gate would refuse is not a next step — and the text says what the operator must change. On
+ * `ready` there is exactly one: Run verification. Stop task stays throughout.
+ */
+function gatedVerification(input: {
+  readonly cause: VerificationRerunCause;
+  readonly finding: string;
+  readonly readiness: VerificationReadiness | null | undefined;
+  readonly relayDetail: RunVerificationDetail | null;
+}): RunGuidance {
+  const { cause, finding, relayDetail } = input;
+  // An answer about another state (read before the newest run was recorded) is no answer for this one.
+  const readiness = input.readiness != null && input.readiness.state !== 'not_blocked' && input.readiness.cause === cause
+    ? input.readiness
+    : null;
+  const happened = cause === 'output_limit'
+    ? 'Agent Relay ran verification, but its output exceeded the stored log budget before the result could be judged.'
+    : 'Agent Relay ran verification twice on these exact files, and neither result could be classified.';
+  const why = cause === 'output_limit'
+    ? 'Running it again under the same files and settings would stop at the same limit, so no verification step is ' +
+      'offered and no implementation round is spent.'
+    : 'The one diagnostic re-run for this snapshot was already used and ended the same way, so no verification step is ' +
+      'offered and no implementation round is spent; the failure was not classified as a defect of the files, so no ' +
+      'implementation round is recommended either. The Verification attempt panel holds the bounded output.';
+  const required = cause === 'output_limit'
+    ? 'User action required: raise "Stored log budget" in Settings or reduce what npm run verify prints. This screen ' +
+      're-checks and offers Run verification once the files or that setting have changed.'
+    : 'User action required: change the files or the verification settings (time limit, stored log budget) before ' +
+      'another run, or stop the task. This screen re-checks and offers Run verification once something has changed.';
+  const base = { happened, stage: GATED_VERIFICATION_STAGE, activeStep: 2, tone: 'warning' as const, verification: relayDetail };
+  switch (readiness?.state) {
+    case 'ready': {
+      const changed = readiness.filesChanged && readiness.settingsChanged
+        ? 'The files and the verification settings changed'
+        : readiness.filesChanged
+          ? 'The files changed'
+          : 'The verification settings changed';
+      return acting({
+        ...base,
+        result: `${finding} ${changed} since that run, so verification can run again on the current conditions. No ` +
+          'implementation round is spent.',
+        action: action('run_verification', 'Run verification')
+      });
+    }
+    case 'blocked':
+      return waiting({ ...base, result: `${finding} ${why}`, next: required });
+    case 'unavailable':
+      return waiting({ ...base, result: `${finding} ${why}`, next: `${required} (${readiness.detail} Use Check for changes to try again.)` });
+    default:
+      return waiting({ ...base, result: `${finding} ${why}`, next: 'Checking whether the files or the verification settings changed since that run…' });
+  }
 }
 
 /**
@@ -609,41 +680,11 @@ export function runGuidance(
               verification: relayDetail
             };
           case 'output_limit':
-            // The same command under the same settings would stop at the same limit, so a plain re-run is never
-            // offered. The one step is a gated run: the orchestrator starts it only once the files or the
-            // verification settings differ from the recorded run, and says so otherwise.
-            return {
-              ...acting({
-                happened: 'Agent Relay ran verification, but its output exceeded the stored log budget before the result could be judged.',
-                stage: 'Step 3 of 5 · Verification',
-                result: `${finding} Nothing is retried automatically and no implementation round is spent; this step runs ` +
-                  'verification only once the files or that setting have changed.',
-                action: action('run_verification', 'Run verification after changes'),
-                activeStep: 2,
-                tone: 'warning'
-              }),
-              verification: relayDetail
-            };
+            return gatedVerification({ cause: 'output_limit', finding, readiness: extra.verificationReadiness, relayDetail });
           case 'unknown': {
-            const policy = verificationRerunPolicy(runs);
-            if (policy.state === 'changes_required') {
-              // The one diagnostic re-run for this snapshot already ended in a materially identical result: the
-              // same retry is not offered a third time. Fail closed on a gated run — the orchestrator refuses it
-              // while neither the files nor the settings have changed — and say what must change.
-              return {
-                ...acting({
-                  happened: 'Agent Relay ran verification twice on these exact files, and neither result could be classified.',
-                  stage: 'Step 3 of 5 · Verification',
-                  result: `${finding} The one diagnostic re-run for this snapshot ended the same way, so it is not offered again ` +
-                    'and no implementation round is spent. Change the files or the verification settings (time limit, stored ' +
-                    'log budget), or stop the task; this step runs verification only once something has changed. The ' +
-                    'Verification attempt panel holds the bounded output.',
-                  action: action('run_verification', 'Run verification after changes'),
-                  activeStep: 2,
-                  tone: 'warning'
-                }),
-                verification: relayDetail
-              };
+            if (verificationRerunPolicy(runs).state === 'changes_required') {
+              // The one diagnostic re-run for this snapshot already ended in a materially identical result.
+              return gatedVerification({ cause: 'unknown_exhausted', finding, readiness: extra.verificationReadiness, relayDetail });
             }
             return {
               ...acting({

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { runSchema, taskSchema, type Run, type Task } from '../../src/shared/domain/models';
 import type { OrnithVerificationAttempt } from '../../src/shared/domain/ornith-verification';
-import { runGuidance, type RunGuidance } from '../../src/shared/domain/run-guidance';
+import { runGuidance, type RunGuidance, type RunGuidanceExtra } from '../../src/shared/domain/run-guidance';
 
 const APPROVED = '2026-09-11T00:00:00.000Z';
 
@@ -337,45 +337,86 @@ describe('after Agent Relay’s own verification of the worktree', () => {
     expect(value.result).toContain('no implementation round is spent');
   });
 
-  it('an OUTPUT-LIMIT failure never offers the plain re-run: the one action is the gated "Run verification after changes"', () => {
+  it('an OUTPUT-LIMIT failure is a WAITING state until the main process says the files or settings changed — never an enabled button the gate would refuse', () => {
     const reason = OUTPUT_LIMIT_REASON;
-    const value = guidance(
-      task({ lastError: reason }),
-      [
-        ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }),
-        relayRecord({ outcome: 'failed', exitCode: null, failureKind: 'output_limit', reason, configurationFingerprint: 'c'.repeat(16), evidenceFingerprint: 'e'.repeat(16) })
-      ]
-    );
+    const runs = [
+      ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }),
+      relayRecord({ outcome: 'failed', exitCode: null, failureKind: 'output_limit', reason, configurationFingerprint: 'c'.repeat(16), evidenceFingerprint: 'e'.repeat(16) })
+    ];
+    const withReadiness = (readiness: RunGuidanceExtra['verificationReadiness']): RunGuidance =>
+      runGuidance(task({ lastError: reason }), runs, true, false, 'not_required', { ornithLocalInferenceState: 'healthy', verificationReadiness: readiness });
 
-    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification after changes', enabled: true });
-    expect('secondaryAction' in value).toBe(false);
-    expect(JSON.stringify(value)).not.toContain('Run verification again');
-    expect(JSON.stringify(value)).not.toContain('Fix verification failures');
-    expect(JSON.stringify(value)).not.toContain('Retry implementation');
-    expect(value.happened).toContain('stored log budget');
-    expect(value.result).toContain('retention limit');
-    expect(value.result).toContain('no implementation round is spent');
-    expect(value.result).toContain('only once the files or that setting have changed');
-    expect(value.verification).toMatchObject({ source: 'relay', outcome: 'failed', exitCode: null });
+    // Not read yet: waiting, no control.
+    const pending = withReadiness(null);
+    expect(pending.action).toBeNull();
+    expect(pending.next).toContain('Checking whether the files or the verification settings changed');
+    expect(pending.result).toContain('no verification step is offered and no implementation round is spent');
+
+    // Blocked: waiting, "User action required", the setting named; no repair, no retry, no verification control.
+    const blocked = withReadiness({ state: 'blocked', cause: 'output_limit' });
+    expect(blocked.action).toBeNull();
+    expect(blocked.next).toContain('User action required');
+    expect(blocked.next).toContain('Stored log budget');
+    expect(blocked.happened).toContain('stored log budget');
+    expect(blocked.result).toContain('retention limit');
+    expect(JSON.stringify(blocked)).not.toContain('Fix verification failures');
+    expect(JSON.stringify(blocked)).not.toContain('Retry implementation');
+    expect(blocked.verification).toMatchObject({ source: 'relay', outcome: 'failed', exitCode: null });
+
+    // The check itself unavailable: still waiting, still no control, the fixed detail shown.
+    const unavailable = withReadiness({ state: 'unavailable', cause: 'output_limit', detail: 'The task worktree cannot be checked for changes right now.' });
+    expect(unavailable.action).toBeNull();
+    expect(unavailable.next).toContain('User action required');
+    expect(unavailable.next).toContain('cannot be checked for changes right now');
+
+    // An answer about another state is no answer for this one.
+    expect(withReadiness({ state: 'not_blocked' }).action).toBeNull();
+    expect(withReadiness({ state: 'blocked', cause: 'unknown_exhausted' }).action).toBeNull();
+    expect(withReadiness({ state: 'ready', cause: 'unknown_exhausted', filesChanged: true, settingsChanged: false }).action).toBeNull();
+
+    // Ready: exactly one enabled Run verification, saying what changed.
+    const files = withReadiness({ state: 'ready', cause: 'output_limit', filesChanged: true, settingsChanged: false });
+    expect(files.action).toMatchObject({ key: 'run_verification', label: 'Run verification', enabled: true });
+    expect(files.result).toContain('The files changed since that run');
+    expect(files.result).toContain('No implementation round is spent');
+    const settings = withReadiness({ state: 'ready', cause: 'output_limit', filesChanged: false, settingsChanged: true });
+    expect(settings.action).toMatchObject({ key: 'run_verification', label: 'Run verification', enabled: true });
+    expect(settings.result).toContain('The verification settings changed since that run');
+    const both = withReadiness({ state: 'ready', cause: 'output_limit', filesChanged: true, settingsChanged: true });
+    expect(both.result).toContain('The files and the verification settings changed');
   });
 
-  it('a SECOND materially identical unknown result on the same snapshot exhausts the one diagnostic re-run: "Run verification after changes", never "to diagnose" again', () => {
+  it('a SECOND materially identical unknown result on the same snapshot exhausts the one diagnostic re-run: a WAITING state, never "to diagnose" again, never a repair', () => {
     const reason = 'npm run verify failed (exit 1), but the output does not show which check failed or why.';
     const same = { outcome: 'failed', failureKind: 'unknown', reason, configurationFingerprint: 'c'.repeat(16), evidenceFingerprint: 'e'.repeat(16) };
     const first = guidance(task({ lastError: reason }), [ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }), relayRecord(same)]);
     expect(first.action).toMatchObject({ label: 'Run verification to diagnose' });
     expect(first.result).toContain('one diagnostic re-run');
 
-    const second = guidance(task({ lastError: reason }), [ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }), relayRecord(same), relayRecord(same)]);
-    expect(second.action).toMatchObject({ key: 'run_verification', label: 'Run verification after changes', enabled: true });
-    expect('secondaryAction' in second).toBe(false);
-    expect(JSON.stringify(second)).not.toContain('to diagnose');
-    expect(JSON.stringify(second)).not.toContain('Run verification again');
-    expect(JSON.stringify(second)).not.toContain('Fix verification failures');
-    expect(JSON.stringify(second)).not.toContain('Retry implementation');
-    expect(second.happened).toContain('twice');
-    expect(second.result).toContain('not offered again');
-    expect(second.result).toContain('no implementation round is spent');
+    const exhausted = [ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }), relayRecord(same), relayRecord(same)];
+    const withReadiness = (readiness: RunGuidanceExtra['verificationReadiness']): RunGuidance =>
+      runGuidance(task({ lastError: reason }), exhausted, true, false, 'not_required', { ornithLocalInferenceState: 'healthy', verificationReadiness: readiness });
+
+    const pending = withReadiness(null);
+    expect(pending.action).toBeNull();
+    expect(pending.next).toContain('Checking whether');
+
+    const blocked = withReadiness({ state: 'blocked', cause: 'unknown_exhausted' });
+    expect(blocked.action).toBeNull();
+    expect('secondaryAction' in blocked).toBe(false);
+    expect(blocked.next).toContain('User action required');
+    expect(blocked.next).toContain('change the files or the verification settings');
+    expect(blocked.happened).toContain('twice');
+    expect(blocked.result).toContain('one diagnostic re-run for this snapshot was already used');
+    expect(blocked.result).toContain('not classified as a defect of the files');
+    expect(blocked.result).toContain('no implementation round is spent');
+    for (const forbidden of ['to diagnose', 'Run verification again', 'Fix verification failures', 'Retry implementation', 'Ornith']) {
+      expect(JSON.stringify(blocked)).not.toContain(forbidden);
+    }
+
+    const ready = withReadiness({ state: 'ready', cause: 'unknown_exhausted', filesChanged: false, settingsChanged: true });
+    expect(ready.action).toMatchObject({ key: 'run_verification', label: 'Run verification', enabled: true });
+    expect(ready.result).toContain('The verification settings changed since that run');
 
     // A changed snapshot, changed settings or a materially different result starts a fresh allowance.
     for (const fresh of [{ identity: 'b'.repeat(64) }, { configurationFingerprint: 'd'.repeat(16) }, { evidenceFingerprint: 'f'.repeat(16), exitCode: 2 }]) {
@@ -474,7 +515,7 @@ describe('the same recovery for other providers', () => {
 });
 
 describe('exactly one action, from a fixed set, in every recovery combination', () => {
-  const VERIFICATION_STAGE_LABELS = new Set(['Run verification', 'Run verification again', 'Run verification to diagnose', 'Run verification after changes']);
+  const VERIFICATION_STAGE_LABELS = new Set(['Run verification', 'Run verification again', 'Run verification to diagnose']);
   const IMPLEMENTATION_STAGE_LABELS = new Set(
     ['Ornith', 'Claude', 'Codex'].flatMap((provider) => [`Fix verification failures · ${provider}`, `Retry implementation · ${provider}`, `Run implementation · ${provider}`])
   );
@@ -509,6 +550,12 @@ describe('exactly one action, from a fixed set, in every recovery combination', 
                 runs, true, false, 'not_required', { ornithLocalInferenceState: 'healthy' }
               );
               expectConsistent(value);
+              if (relay?.['failureKind'] === 'output_limit') {
+                // A gated state with no readiness read yet is a WAITING state: no control at all, never a guess.
+                expect(value.action, JSON.stringify({ provider, changedFiles, reasonCodes, relay })).toBeNull();
+                expect(value.next).toContain('Checking whether the files or the verification settings changed');
+                continue;
+              }
               expect(value.action, JSON.stringify({ provider, changedFiles, reasonCodes, relay })).not.toBeNull();
               expect('secondaryAction' in value).toBe(false);
               const label = value.action!.label;

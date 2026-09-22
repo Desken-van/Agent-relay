@@ -321,8 +321,9 @@ record written before the kind existed is read as `unknown`.
 | Verification failed, kind `infrastructure` (e.g. Vitest worker timeout) | **Run verification again**       | none  | none            |
 | Verification failed, kind `cancelled`                            | **Run verification**                    | none  | none            |
 | Verification failed, kind `unknown` (incl. a Relay timeout, a legacy record), first time on this snapshot | **Run verification to diagnose** | none | none |
-| Verification failed, kind `unknown`, materially the same as the previous one on the same snapshot and settings | **Run verification after changes** (gated) | none | none |
-| Verification failed, kind `output_limit`                         | **Run verification after changes** (gated) | none | none      |
+| Verification failed, kind `unknown`, materially the same as the previous one, files and settings unchanged | *waiting: User action required* (no workflow control) | none | none |
+| Verification failed, kind `output_limit`, files and settings unchanged | *waiting: User action required* (no workflow control; a Settings link) | none | none |
+| Either of the two above, once the files or the verification settings changed | **Run verification** | none | none |
 | Implementation left files, no verification yet                   | **Run verification**                    | none  | none            |
 | Implementation attempt provably left nothing behind              | **Retry implementation · <impl.>**      | attempt returned | none    |
 | Approved specification, no attempt yet                           | **Run implementation · <impl.>**        | new round | —           |
@@ -350,6 +351,26 @@ state moves or anything is spent — while both equal the recorded run's, with a
 sentence that says what must change (the files, or the settings the reason
 names). A changed snapshot, changed settings or a materially different failure
 starts a fresh allowance. A record without fingerprints never refuses.
+
+**The Run screen never offers what the gate would refuse.** In those two states
+`runGuidance` consults `RunGuidanceExtra.verificationReadiness`, the renderer's
+last read of the read-only `workflow:verificationReadiness` channel, which
+`Orchestrator.verificationReadiness` answers from the SAME two values the gate
+compares — the current worktree identity (read with the same `identity()` the
+verification uses) and the current configuration fingerprint — through the
+shared `verificationReadinessFor`. The answer is one of `not_blocked`,
+`blocked`, `ready` (with which of files/settings changed) or `unavailable`
+(fixed prose): no identity, fingerprint, path or output ever crosses to the
+renderer. Until it has answered, and while it says `blocked` or `unavailable`,
+the guidance is a *waiting* state — "User action required", no workflow
+control, *Stop task* still available — with a notice carrying two navigation
+controls that run nothing: *Open Settings · Stored log budget* (for an output
+overflow; it focuses that control on the Settings screen) and *Check for
+changes* (re-reads readiness after edits made outside the app). Readiness is
+also re-read whenever the gated run, the task or the verification settings
+change. On `ready` the one workflow control is **Run verification**; the gate
+in `runVerification` still decides again, against the values of that moment, so
+conditions that revert between the read and the click are refused.
 
 ### Recovering from an abrupt exit
 

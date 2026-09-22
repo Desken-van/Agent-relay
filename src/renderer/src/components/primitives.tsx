@@ -65,14 +65,17 @@ export function ToolDot({ status }: { status: ToolStatus }): React.JSX.Element {
 export function Field({
   label,
   hint,
+  id,
   children
 }: {
   label: string;
   hint?: string;
+  /** Set when another screen may send the operator to this control (see `SettingsFocus`). */
+  id?: string;
   children: ReactNode;
 }): React.JSX.Element {
   return (
-    <label className="field">
+    <label className="field" id={id}>
       <span className="field__label">{label}</span>
       {children}
       {hint ? <span className="field__hint">{hint}</span> : null}

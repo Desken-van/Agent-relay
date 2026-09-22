@@ -8,21 +8,27 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createHarness, type Harness } from '../helpers/harness';
 import type { ProcessResult } from '../../src/main/adapters/process/process-runner';
 import { runGuidance } from '../../src/shared/domain/run-guidance';
-import { readVerification, verificationRerunPolicy } from '../../src/shared/domain/verification';
+import { readVerification, verificationRerunPolicy, type VerificationReadiness } from '../../src/shared/domain/verification';
 import { PLANTED_PATH, PLANTED_SECRET, VITEST_ASSERTION_FAILURE_OUTPUT } from '../helpers/verification-output-fixtures';
 
 let h: Harness;
 let identity: string;
+/** When set, `identity()` throws — the worktree cannot be read. */
+let identityError: Error | null;
 let executed: number;
 let results: ProcessResult[];
 
 beforeEach(() => {
   identity = 'a'.repeat(64);
+  identityError = null;
   executed = 0;
   results = [];
   h = createHarness({
     verification: {
-      identity: async () => identity,
+      identity: async () => {
+        if (identityError !== null) throw identityError;
+        return identity;
+      },
       execute: async (_target, _signal, progress) => {
         executed += 1;
         progress({ type: 'log', text: 'npm run verify' });
@@ -59,8 +65,18 @@ const puzzling = (exitCode = 1): ProcessResult => ({
   stdout: `something ended badly near ${PLANTED_PATH}\nnpm error code ELIFECYCLE\ntoken=${PLANTED_SECRET}`
 });
 
-const guidanceOf = (taskId: string) =>
-  runGuidance(h.tasks.findById(taskId)!, h.runs.listByTask(taskId), true, false, 'not_required', { ornithLocalInferenceState: 'healthy' });
+const guidanceOf = (taskId: string, verificationReadiness: VerificationReadiness | null = null) =>
+  runGuidance(h.tasks.findById(taskId)!, h.runs.listByTask(taskId), true, false, 'not_required', { ornithLocalInferenceState: 'healthy', verificationReadiness });
+/** The Run screen's readiness read, from the real orchestrator — and proof it carries nothing sensitive. */
+async function readinessOf(taskId: string): Promise<VerificationReadiness> {
+  const readiness = await h.orchestrator.verificationReadiness(taskId);
+  const text = JSON.stringify(readiness);
+  expect(text).not.toMatch(/[a-f0-9]{16}/); // no identity, no fingerprint
+  expect(text).not.toContain(h.worktreesRoot);
+  expect(text).not.toContain(PLANTED_SECRET);
+  expect(text).not.toContain(PLANTED_PATH);
+  return readiness;
+}
 const verifications = (taskId: string) => h.runs.listByTask(taskId).filter((run) => run.runType === 'verification');
 const latestRecord = (taskId: string) => {
   const record = readVerification(verifications(taskId).at(-1)!);
@@ -104,12 +120,17 @@ describe('an output that overflowed the stored log budget', () => {
     expect(record.failureKind).not.toBe('implementation');
     expectNothingRaw(taskId);
 
-    const guidance = guidanceOf(taskId);
-    expect(guidance.action).toMatchObject({ key: 'run_verification', label: 'Run verification after changes', enabled: true });
-    expect(JSON.stringify(guidance)).not.toContain('Run verification again');
-    expect(JSON.stringify(guidance)).not.toContain('Fix verification failures');
-    expect(JSON.stringify(guidance)).not.toContain('Retry implementation');
-    expect(guidance.result).toContain('no implementation round is spent');
+    // Nothing changed: the main process says blocked, and the screen is a WAITING state — no workflow control.
+    expect(await readinessOf(taskId)).toEqual({ state: 'blocked', cause: 'output_limit' });
+    const waiting = guidanceOf(taskId, await readinessOf(taskId));
+    expect(waiting.action).toBeNull();
+    expect(waiting.next).toContain('User action required');
+    expect(waiting.next).toContain('Stored log budget');
+    expect(JSON.stringify(waiting)).not.toContain('Run verification again');
+    expect(JSON.stringify(waiting)).not.toContain('Fix verification failures');
+    expect(JSON.stringify(waiting)).not.toContain('Retry implementation');
+    expect(waiting.result).toContain('no implementation round is spent');
+    expect(guidanceOf(taskId).action).toBeNull(); // and before the read has answered
 
     // Same files, same settings: refused before any row is written — nothing executed, nothing recorded, nothing spent.
     await expect(h.orchestrator.runVerification(taskId)).rejects.toThrow(/output exceeded the stored log budget, and neither the files nor the verification settings have changed/);
@@ -118,8 +139,12 @@ describe('an output that overflowed the stored log budget', () => {
     expect(h.tasks.findById(taskId)).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 1 });
     expect(h.runs.listByTask(taskId).some((run) => run.status === 'running')).toBe(false);
 
-    // The setting the reason names is raised: the conditions changed, so the run proceeds — and still costs no round.
+    // The setting the reason names is raised: the main process now says ready (settings changed), the screen
+    // offers exactly one Run verification, and the run proceeds — still costing no round.
     h.settings.update({ maxStoredLogBytes: h.settings.get().maxStoredLogBytes * 2 });
+    const ready = await readinessOf(taskId);
+    expect(ready).toEqual({ state: 'ready', cause: 'output_limit', filesChanged: false, settingsChanged: true });
+    expect(guidanceOf(taskId, ready).action).toMatchObject({ key: 'run_verification', label: 'Run verification', enabled: true });
     results.push(passing());
     const passed = await h.orchestrator.runVerification(taskId);
     expect(executed).toBe(2);
@@ -133,9 +158,37 @@ describe('an output that overflowed the stored log budget', () => {
     await expect(h.orchestrator.runVerification(taskId)).rejects.toThrow(/stored log budget/);
 
     identity = 'b'.repeat(64);
+    const ready = await readinessOf(taskId);
+    expect(ready).toEqual({ state: 'ready', cause: 'output_limit', filesChanged: true, settingsChanged: false });
+    expect(guidanceOf(taskId, ready).action).toMatchObject({ key: 'run_verification', label: 'Run verification' });
     results.push(passing());
     expect((await h.orchestrator.runVerification(taskId)).status).toBe('READY_FOR_REVIEW');
     expect(executed).toBe(2);
+  });
+
+  it('is refused when the conditions revert between the readiness read and the click — the gate decides at execution time', async () => {
+    const taskId = await prepared();
+    results.push(overflowed());
+    await h.orchestrator.runVerification(taskId);
+
+    identity = 'b'.repeat(64);
+    expect((await readinessOf(taskId)).state).toBe('ready'); // the screen would now show Run verification
+    identity = 'a'.repeat(64); // …but the files are put back before the click lands
+    await expect(h.orchestrator.runVerification(taskId)).rejects.toThrow(/stored log budget/);
+    expect(executed).toBe(1);
+    expect(verifications(taskId)).toHaveLength(1);
+  });
+
+  it('reports the check as unavailable — still no control — when the worktree cannot be read', async () => {
+    const taskId = await prepared();
+    results.push(overflowed());
+    await h.orchestrator.runVerification(taskId);
+
+    identityError = new Error(`spawn git ENOENT at ${PLANTED_PATH}`);
+    const unavailable = await readinessOf(taskId);
+    expect(unavailable).toEqual({ state: 'unavailable', cause: 'output_limit', detail: 'Agent Relay could not read the task worktree to check whether the files changed.' });
+    expect(guidanceOf(taskId, unavailable).action).toBeNull();
+    expect(guidanceOf(taskId, unavailable).next).toContain('User action required');
   });
 
   it('never becomes correction evidence for the implementation provider', async () => {
@@ -161,6 +214,7 @@ describe('an unclassifiable failure and its one diagnostic re-run', () => {
     expect(first).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 1 });
     expect(latestRecord(taskId).failureKind).toBe('unknown');
     expect(verificationRerunPolicy(h.runs.listByTask(taskId))).toEqual({ state: 'diagnostic' });
+    expect(await readinessOf(taskId)).toEqual({ state: 'not_blocked' });
     expect(guidanceOf(taskId).action).toMatchObject({ label: 'Run verification to diagnose', enabled: true });
     expect(guidanceOf(taskId).result).toContain('one diagnostic re-run');
 
@@ -173,12 +227,14 @@ describe('an unclassifiable failure and its one diagnostic re-run', () => {
     expect(a?.evidenceFingerprint).toBe(b?.evidenceFingerprint);
     expect(a?.configurationFingerprint).toBe(b?.configurationFingerprint);
     expect(verificationRerunPolicy(h.runs.listByTask(taskId))).toEqual({ state: 'changes_required', cause: 'unknown_exhausted' });
-    const exhausted = guidanceOf(taskId);
-    expect(exhausted.action).toMatchObject({ key: 'run_verification', label: 'Run verification after changes', enabled: true });
+    expect(await readinessOf(taskId)).toEqual({ state: 'blocked', cause: 'unknown_exhausted' });
+    const exhausted = guidanceOf(taskId, await readinessOf(taskId));
+    expect(exhausted.action).toBeNull();
+    expect(exhausted.next).toContain('User action required');
     expect(JSON.stringify(exhausted)).not.toContain('to diagnose');
     expect(JSON.stringify(exhausted)).not.toContain('Run verification again');
     expect(JSON.stringify(exhausted)).not.toContain('Fix verification failures');
-    expect(exhausted.result).toContain('not offered again');
+    expect(exhausted.result).toContain('already used');
     expectNothingRaw(taskId);
 
     // A third identical attempt is refused: nothing executed, recorded or spent.
@@ -187,8 +243,12 @@ describe('an unclassifiable failure and its one diagnostic re-run', () => {
     expect(verifications(taskId)).toHaveLength(2);
     expect(h.tasks.findById(taskId)).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 1 });
 
-    // The files change: a fresh allowance — the run proceeds, and an unknown result again is a first one.
+    // The files change: the main process says ready, the screen offers exactly one Run verification, the run
+    // proceeds — and an unknown result again is a first one.
     identity = 'c'.repeat(64);
+    const changed = await readinessOf(taskId);
+    expect(changed).toEqual({ state: 'ready', cause: 'unknown_exhausted', filesChanged: true, settingsChanged: false });
+    expect(guidanceOf(taskId, changed).action).toMatchObject({ key: 'run_verification', label: 'Run verification', enabled: true });
     results.push(puzzling());
     await h.orchestrator.runVerification(taskId);
     expect(executed).toBe(3);
@@ -211,6 +271,9 @@ describe('an unclassifiable failure and its one diagnostic re-run', () => {
     await expect(h.orchestrator.runVerification(taskId)).rejects.toThrow(/without a classifiable result/);
 
     h.settings.update({ processTimeoutMs: h.settings.get().processTimeoutMs + 60_000 });
+    const ready = await readinessOf(taskId);
+    expect(ready).toEqual({ state: 'ready', cause: 'unknown_exhausted', filesChanged: false, settingsChanged: true });
+    expect(guidanceOf(taskId, ready).action).toMatchObject({ key: 'run_verification', label: 'Run verification' });
     results.push(passing());
     expect((await h.orchestrator.runVerification(taskId)).status).toBe('READY_FOR_REVIEW');
     expect(executed).toBe(3);
@@ -222,7 +285,7 @@ describe('an unclassifiable failure and its one diagnostic re-run', () => {
     results.push(puzzling(), puzzling());
     await h.orchestrator.runVerification(taskId);
     await h.orchestrator.runVerification(taskId);
-    expect(guidanceOf(taskId).action).toMatchObject({ label: 'Run verification after changes' });
+    expect(guidanceOf(taskId, await readinessOf(taskId)).action).toBeNull();
 
     await h.orchestrator.sendToClaude(taskId);
     expect(h.claude.calls).toHaveLength(1);
