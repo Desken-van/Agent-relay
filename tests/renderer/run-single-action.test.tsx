@@ -60,8 +60,8 @@ const ornithRun = (changedFiles: number): Run => run({
   })
 });
 
-const relayVerification = (extra: Record<string, unknown>, status: Run['status'] = 'failed'): Run => run({
-  id: 'verification', agent: 'system', runType: 'verification', status,
+const relayVerification = (extra: Record<string, unknown>, status: Run['status'] = 'failed', id = 'verification'): Run => run({
+  id, agent: 'system', runType: 'verification', status,
   structuredResult: JSON.stringify({
     version: 1, command: 'npm run verify', identity: 'a'.repeat(64), passed: false, exitCode: 1, durationMs: 580_014,
     reason: 'npm run verify failed (exit 1).', outcome: 'failed', ...extra
@@ -109,6 +109,9 @@ function workflowControls(): string[] {
 const INFRASTRUCTURE_REASON = 'Verification could not complete: a Vitest worker stopped answering (worker timeout). That is a failure of the test infrastructure, not of the current files.';
 const IMPLEMENTATION_REASON = 'npm run verify failed (exit 1): a test assertion failed. The current files did not pass.';
 const UNKNOWN_REASON = 'npm run verify failed (exit 1), but the output does not show which check failed or why.';
+const OUTPUT_LIMIT_REASON = "Verification output exceeded Agent Relay's configured retention limit (2000k characters per run), so the result could not be classified safely: the command was stopped at the limit and only the output up to it was kept. Raise \"Stored log budget\" in Settings or reduce what npm run verify prints; running it again unchanged would stop at the same limit.";
+/** Both fingerprints the record keeps for the re-run policy; equal on two runs means "materially the same". */
+const FINGERPRINTS = { configurationFingerprint: 'c'.repeat(16), evidenceFingerprint: 'e'.repeat(16) };
 
 describe('Run screen — exactly one workflow control, chosen by the evidence', () => {
   it.each([
@@ -126,6 +129,20 @@ describe('Run screen — exactly one workflow control, chosen by the evidence', 
       'an unclassifiable failure (fails closed)',
       detail({ lastError: UNKNOWN_REASON }, [ornithRun(1), relayVerification({ failureKind: 'unknown', reason: UNKNOWN_REASON })]),
       'Run verification to diagnose'
+    ],
+    [
+      'an output that overflowed the stored log budget (never a plain re-run)',
+      detail({ lastError: OUTPUT_LIMIT_REASON }, [ornithRun(1), relayVerification({ failureKind: 'output_limit', exitCode: null, reason: OUTPUT_LIMIT_REASON, ...FINGERPRINTS })]),
+      'Run verification after changes'
+    ],
+    [
+      'a second materially identical unclassifiable failure on the same snapshot (diagnostic re-run exhausted)',
+      detail({ lastError: UNKNOWN_REASON }, [
+        ornithRun(1),
+        relayVerification({ failureKind: 'unknown', reason: UNKNOWN_REASON, ...FINGERPRINTS }, 'failed', 'verification-1'),
+        relayVerification({ failureKind: 'unknown', reason: UNKNOWN_REASON, ...FINGERPRINTS }, 'failed', 'verification-2')
+      ]),
+      'Run verification after changes'
     ],
     [
       'a record written before classification existed (fails closed)',
@@ -182,5 +199,24 @@ describe('Run screen — exactly one workflow control, chosen by the evidence', 
     expect(screen.queryByRole('button', { name: /Retry implementation/ })).toBeNull();
     expect(document.body.textContent).not.toContain('Retry implementation');
     expect(document.body.textContent).toContain('no implementation round is spent');
+  });
+
+  it('after an exhausted diagnostic re-run renders neither "to diagnose" nor "again", and says the step is gated', async () => {
+    installBridge({
+      'dependencies:status': () => ok<'dependencies:status'>({ state: 'not_node_project', detail: 'No package.json.' })
+    });
+    renderApp(<SeededRun detail={detail({ lastError: UNKNOWN_REASON }, [
+      ornithRun(1),
+      relayVerification({ failureKind: 'unknown', reason: UNKNOWN_REASON, ...FINGERPRINTS }, 'failed', 'verification-1'),
+      relayVerification({ failureKind: 'unknown', reason: UNKNOWN_REASON, ...FINGERPRINTS }, 'failed', 'verification-2')
+    ])} />);
+
+    await screen.findByRole('button', { name: 'Run verification after changes' });
+    expect(workflowControls()).toEqual(['Run verification after changes']);
+    expect(screen.queryByRole('button', { name: 'Run verification to diagnose' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Run verification again' })).toBeNull();
+    expect(document.body.textContent).toContain('not offered again');
+    expect(document.body.textContent).toContain('no implementation round is spent');
+    expect(screen.getByRole('button', { name: /Stop task/ })).toBeTruthy();
   });
 });

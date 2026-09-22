@@ -10,7 +10,7 @@ import {
   type OrnithRunEvidence,
   type OrnithVerificationOutcome
 } from './ornith-verification';
-import { latestVerification, readVerification, verificationFailureKind } from './verification';
+import { latestVerification, readVerification, verificationFailureKind, verificationRerunPolicy } from './verification';
 
 /**
  * The one workflow transition Run → Actions may offer right now.
@@ -608,21 +608,59 @@ export function runGuidance(
               }),
               verification: relayDetail
             };
-          case 'unknown':
+          case 'output_limit':
+            // The same command under the same settings would stop at the same limit, so a plain re-run is never
+            // offered. The one step is a gated run: the orchestrator starts it only once the files or the
+            // verification settings differ from the recorded run, and says so otherwise.
+            return {
+              ...acting({
+                happened: 'Agent Relay ran verification, but its output exceeded the stored log budget before the result could be judged.',
+                stage: 'Step 3 of 5 · Verification',
+                result: `${finding} Nothing is retried automatically and no implementation round is spent; this step runs ` +
+                  'verification only once the files or that setting have changed.',
+                action: action('run_verification', 'Run verification after changes'),
+                activeStep: 2,
+                tone: 'warning'
+              }),
+              verification: relayDetail
+            };
+          case 'unknown': {
+            const policy = verificationRerunPolicy(runs);
+            if (policy.state === 'changes_required') {
+              // The one diagnostic re-run for this snapshot already ended in a materially identical result: the
+              // same retry is not offered a third time. Fail closed on a gated run — the orchestrator refuses it
+              // while neither the files nor the settings have changed — and say what must change.
+              return {
+                ...acting({
+                  happened: 'Agent Relay ran verification twice on these exact files, and neither result could be classified.',
+                  stage: 'Step 3 of 5 · Verification',
+                  result: `${finding} The one diagnostic re-run for this snapshot ended the same way, so it is not offered again ` +
+                    'and no implementation round is spent. Change the files or the verification settings (time limit, stored ' +
+                    'log budget), or stop the task; this step runs verification only once something has changed. The ' +
+                    'Verification attempt panel holds the bounded output.',
+                  action: action('run_verification', 'Run verification after changes'),
+                  activeStep: 2,
+                  tone: 'warning'
+                }),
+                verification: relayDetail
+              };
+            }
             return {
               ...acting({
                 happened: relayDetail?.outcome === 'timed_out'
                   ? 'Agent Relay ran verification and it did not finish within its time limit.'
                   : 'Agent Relay ran verification and it failed for a reason the output does not make clear.',
                 stage: 'Step 3 of 5 · Verification',
-                result: `${finding} Nothing is retried automatically and no implementation round is spent: verification is run ` +
-                  'again to obtain a classified result. The Verification attempt panel holds the bounded output.',
+                result: `${finding} Nothing is retried automatically and no implementation round is spent: one diagnostic ` +
+                  're-run is offered for this snapshot to obtain a classified result; if it ends the same way, the files or ' +
+                  'the verification settings must change before another. The Verification attempt panel holds the bounded output.',
                 action: action('run_verification', 'Run verification to diagnose'),
                 activeStep: 2,
                 tone: 'warning'
               }),
               verification: relayDetail
             };
+          }
         }
       }
       const implementationAttempt = latestRun(runs, ['implementation', 'correction']);

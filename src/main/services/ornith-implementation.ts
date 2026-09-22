@@ -1348,6 +1348,7 @@ export class OrnithImplementationService {
                 outcome: classified.outcome,
                 exitCode: execution.exitCode,
                 durationMs: execution.durationMs,
+                outputLimitExceeded: execution.outputLimitExceeded === true,
                 output: execution.output
               });
           const attempt: OrnithVerificationAttempt = {
@@ -1795,10 +1796,14 @@ function verificationForModel(attempt: OrnithVerificationAttempt, maxToolResultB
     command: attempt.command,
     exitCode: attempt.exitCode,
     durationMs: attempt.durationMs,
-    // A runner failure is said in so many words: the model must not "fix" files over it.
+    // A runner failure, or an output that overflowed the retention limit, is said in so many words: the model
+    // must not "fix" files over either, and must not simply run the overflowing command again.
     reason: attempt.failureKind === 'infrastructure'
       ? `${attempt.reason ?? ''} This is a failure of the test runner itself, not of the files: do not change files because of it.`.trim()
-      : attempt.reason
+      : attempt.failureKind === 'output_limit'
+        ? `${attempt.reason ?? ''} The verification output exceeded Agent Relay's retention limit, so it could not be classified: ` +
+          'this is not a failure of the files, and running it again unchanged would stop at the same limit.'
+        : attempt.reason
   };
   const room = maxToolResultBytes - Buffer.byteLength(JSON.stringify({ ...base, summary: '' }), 'utf8') - 32;
   if (room <= 0 || attempt.summary.length === 0) return { ...base, summary: '' };

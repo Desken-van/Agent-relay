@@ -8,6 +8,7 @@
  * its output, and reads it back for the timeline and the Run screen. It is pure: no I/O, no clock.
  */
 
+import { VERIFICATION_FAILURE_KINDS, type VerificationFailureKind } from './verification-failure-kind';
 import { z } from 'zod';
 import { redactSecrets } from '../util/redact';
 import type { Run } from './models';
@@ -45,7 +46,7 @@ export const ornithVerificationAttemptSchema = z.object({
    * What a failed attempt was classified as from its bounded output (see `verification-failure.ts`), so the
    * model is not told to change files over a test-runner failure. Optional: older attempts have none.
    */
-  failureKind: z.enum(['implementation', 'infrastructure', 'cancelled', 'unknown']).optional()
+  failureKind: z.enum(VERIFICATION_FAILURE_KINDS).optional()
 });
 export type OrnithVerificationAttempt = z.infer<typeof ornithVerificationAttemptSchema>;
 
@@ -61,6 +62,12 @@ export interface OrnithVerificationExecution {
   readonly durationMs: number;
   /** Raw stdout/stderr text; never stored as is — {@link summarizeVerificationOutput} bounds and sanitizes it. */
   readonly output: string;
+  /**
+   * The process layer stopped the command because its output reached the retention limit
+   * (`ProcessResult.outputLimitExceeded`). Carried through so the loop classifies it as `output_limit`, never
+   * as a runner failure to retry; absent when the layer did not report it.
+   */
+  readonly outputLimitExceeded?: boolean;
 }
 
 /** `8m32s`, `45s`, `320ms` — the same words everywhere a duration is shown. */
@@ -356,7 +363,7 @@ export interface OrnithVerificationEventData {
     readonly reason: string | null;
     readonly summary: string;
     /** Present for a failed attempt written since classification existed; absent on older events. */
-    readonly failureKind?: 'implementation' | 'infrastructure' | 'cancelled' | 'unknown';
+    readonly failureKind?: VerificationFailureKind;
   };
 }
 

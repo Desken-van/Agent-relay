@@ -38,7 +38,9 @@ describe('verification-only workflow', () => {
       version: 1, command: 'npm run verify', identity, passed: true,
       exitCode: 0, durationMs: 15, reason: null,
       // Recorded since the outcome became explicit; the reviewer prompt renders none of it.
-      outcome: 'passed'
+      outcome: 'passed',
+      // The settings the command ran under, kept for the re-run policy; the reviewer prompt renders none of it either.
+      configurationFingerprint: expect.stringMatching(/^[a-f0-9]{16}$/)
     });
   });
   it('prepares local dependencies before capturing and executing verification', async () => {

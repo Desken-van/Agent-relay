@@ -66,6 +66,8 @@ const relayRecord = (overrides: Record<string, unknown>): Run =>
 const guidance = (t: Task, runs: readonly Run[]): RunGuidance =>
   runGuidance(t, runs, true, false, 'not_required', { ornithLocalInferenceState: 'healthy' });
 
+const OUTPUT_LIMIT_REASON = "Verification output exceeded Agent Relay's configured retention limit (2000k characters per run), so the result could not be classified safely: the command was stopped at the limit and only the output up to it was kept. Raise \"Stored log budget\" in Settings or reduce what npm run verify prints; running it again unchanged would stop at the same limit.";
+
 function expectConsistent(value: RunGuidance): void {
   if (value.action) expect(value.next).toBe(value.action.label);
 }
@@ -335,6 +337,53 @@ describe('after Agent Relay’s own verification of the worktree', () => {
     expect(value.result).toContain('no implementation round is spent');
   });
 
+  it('an OUTPUT-LIMIT failure never offers the plain re-run: the one action is the gated "Run verification after changes"', () => {
+    const reason = OUTPUT_LIMIT_REASON;
+    const value = guidance(
+      task({ lastError: reason }),
+      [
+        ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }),
+        relayRecord({ outcome: 'failed', exitCode: null, failureKind: 'output_limit', reason, configurationFingerprint: 'c'.repeat(16), evidenceFingerprint: 'e'.repeat(16) })
+      ]
+    );
+
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification after changes', enabled: true });
+    expect('secondaryAction' in value).toBe(false);
+    expect(JSON.stringify(value)).not.toContain('Run verification again');
+    expect(JSON.stringify(value)).not.toContain('Fix verification failures');
+    expect(JSON.stringify(value)).not.toContain('Retry implementation');
+    expect(value.happened).toContain('stored log budget');
+    expect(value.result).toContain('retention limit');
+    expect(value.result).toContain('no implementation round is spent');
+    expect(value.result).toContain('only once the files or that setting have changed');
+    expect(value.verification).toMatchObject({ source: 'relay', outcome: 'failed', exitCode: null });
+  });
+
+  it('a SECOND materially identical unknown result on the same snapshot exhausts the one diagnostic re-run: "Run verification after changes", never "to diagnose" again', () => {
+    const reason = 'npm run verify failed (exit 1), but the output does not show which check failed or why.';
+    const same = { outcome: 'failed', failureKind: 'unknown', reason, configurationFingerprint: 'c'.repeat(16), evidenceFingerprint: 'e'.repeat(16) };
+    const first = guidance(task({ lastError: reason }), [ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }), relayRecord(same)]);
+    expect(first.action).toMatchObject({ label: 'Run verification to diagnose' });
+    expect(first.result).toContain('one diagnostic re-run');
+
+    const second = guidance(task({ lastError: reason }), [ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }), relayRecord(same), relayRecord(same)]);
+    expect(second.action).toMatchObject({ key: 'run_verification', label: 'Run verification after changes', enabled: true });
+    expect('secondaryAction' in second).toBe(false);
+    expect(JSON.stringify(second)).not.toContain('to diagnose');
+    expect(JSON.stringify(second)).not.toContain('Run verification again');
+    expect(JSON.stringify(second)).not.toContain('Fix verification failures');
+    expect(JSON.stringify(second)).not.toContain('Retry implementation');
+    expect(second.happened).toContain('twice');
+    expect(second.result).toContain('not offered again');
+    expect(second.result).toContain('no implementation round is spent');
+
+    // A changed snapshot, changed settings or a materially different result starts a fresh allowance.
+    for (const fresh of [{ identity: 'b'.repeat(64) }, { configurationFingerprint: 'd'.repeat(16) }, { evidenceFingerprint: 'f'.repeat(16), exitCode: 2 }]) {
+      const value = guidance(task({ lastError: reason }), [ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }), relayRecord(same), relayRecord({ ...same, ...fresh })]);
+      expect(value.action, JSON.stringify(fresh)).toMatchObject({ label: 'Run verification to diagnose' });
+    }
+  });
+
   it('a record written before classification existed also fails closed, to "Run verification to diagnose"', () => {
     const value = guidance(
       task({ lastError: 'npm run verify failed (exit 1). See command output.' }),
@@ -425,7 +474,7 @@ describe('the same recovery for other providers', () => {
 });
 
 describe('exactly one action, from a fixed set, in every recovery combination', () => {
-  const VERIFICATION_STAGE_LABELS = new Set(['Run verification', 'Run verification again', 'Run verification to diagnose']);
+  const VERIFICATION_STAGE_LABELS = new Set(['Run verification', 'Run verification again', 'Run verification to diagnose', 'Run verification after changes']);
   const IMPLEMENTATION_STAGE_LABELS = new Set(
     ['Ornith', 'Claude', 'Codex'].flatMap((provider) => [`Fix verification failures · ${provider}`, `Retry implementation · ${provider}`, `Run implementation · ${provider}`])
   );
@@ -443,6 +492,7 @@ describe('exactly one action, from a fixed set, in every recovery combination', 
       { failureKind: 'implementation' },
       { failureKind: 'infrastructure' },
       { failureKind: 'unknown' },
+      { failureKind: 'output_limit', exitCode: null },
       { failureKind: 'cancelled', exitCode: null, outcome: 'cancelled' }
     ];
     for (const provider of ['ornith', 'claude', 'codex'] as const) {

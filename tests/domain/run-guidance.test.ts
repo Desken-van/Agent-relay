@@ -468,6 +468,7 @@ describe('run guidance — every action label is one of the fixed set', () => {
     'Run verification',
     'Run verification again',
     'Run verification to diagnose',
+    'Run verification after changes',
     'Run review · Claude',
     'Run review · Codex',
     'Send corrections',

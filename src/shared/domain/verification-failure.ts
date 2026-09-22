@@ -8,8 +8,10 @@
  * and asking a model to "fix" it would spend a round and a correction prompt on nothing. So the two must be
  * told apart — but only on positive evidence. The rules here are deliberately narrow: `implementation` needs
  * an explicit lint, typecheck, build or test-assertion failure in the output; `infrastructure` needs a known
- * runner-level signature and NO such failure beside it; everything else is `unknown`, which fails closed
- * (verification is simply run again to obtain a clear result; no implementation round is spent).
+ * runner-level signature and NO such failure beside it; a command the process layer stopped at the output
+ * retention limit is `output_limit` (nothing about the files is established, and the same command under the
+ * same settings would stop at the same limit, so it is never simply re-run); everything else is `unknown`,
+ * which fails closed (one diagnostic re-run; no implementation round is spent).
  *
  * Pure: no I/O, no clock. Every reason returned is a fixed, Relay-authored sentence plus at most an exit code
  * and a duration — never a line the command printed.
@@ -17,8 +19,8 @@
 
 import { boundedVerificationOutputWindow, formatVerificationDuration, type ExecutedVerificationOutcome } from './ornith-verification';
 
-export const VERIFICATION_FAILURE_KINDS = ['implementation', 'infrastructure', 'cancelled', 'unknown'] as const;
-export type VerificationFailureKind = (typeof VERIFICATION_FAILURE_KINDS)[number];
+import type { VerificationFailureKind } from './verification-failure-kind';
+export { VERIFICATION_FAILURE_KINDS, type VerificationFailureKind } from './verification-failure-kind';
 
 export interface VerificationFailureClassification {
   readonly kind: VerificationFailureKind;
@@ -32,6 +34,10 @@ export interface VerificationFailureInput {
   readonly durationMs: number;
   /** The worktree's identity differed after the command from before it: the result cannot stand. */
   readonly identityChanged?: boolean;
+  /** The process layer stopped the command because its output reached the caller's `maxOutputBytes`. */
+  readonly outputLimitExceeded?: boolean;
+  /** That limit, when the caller knows it, so the reason can name it the way Settings does. */
+  readonly outputLimitBytes?: number;
   /** The command's stdout and stderr as the process layer returned them (already secret-redacted, bounded). */
   readonly output: string;
 }
@@ -62,6 +68,14 @@ const IMPLEMENTATION_SIGNATURES: readonly { readonly pattern: RegExp; readonly l
 
 const CANCELLED_REASON = 'Verification cancelled; success was not established.';
 
+/** Names the limit the way the Settings screen does ("Stored log budget: N k characters per run"). */
+function outputLimitReason(limitBytes: number | undefined): string {
+  const limit = limitBytes === undefined || !Number.isFinite(limitBytes) ? '' : ` (${Math.round(limitBytes / 1000)}k characters per run)`;
+  return `Verification output exceeded Agent Relay's configured retention limit${limit}, so the result could not be ` +
+    'classified safely: the command was stopped at the limit and only the output up to it was kept. Raise "Stored log ' +
+    'budget" in Settings or reduce what npm run verify prints; running it again unchanged would stop at the same limit.';
+}
+
 function labelsMatching(
   signatures: readonly { readonly pattern: RegExp; readonly label: string }[],
   text: string
@@ -74,14 +88,18 @@ function joinLabels(labels: readonly string[]): string {
 }
 
 /**
- * Decide the kind of a verification that did not pass. The order is the safety order: a cancellation and an
- * invalidated result are known before any output is read; a real failure of the files outranks a runner
- * hiccup that happened beside it; a runner hiccup alone is retryable; anything else is unknown and fails
- * closed.
+ * Decide the kind of a verification that did not pass. The order is the safety order: a cancellation, a
+ * command stopped at the output limit and an invalidated result are known before any output is read (an
+ * output that overflowed is incomplete by definition, so nothing in it — not even an assertion beside the
+ * cut — is taken as evidence about the files); a real failure of the files outranks a runner hiccup that
+ * happened beside it; a runner hiccup alone is retryable; anything else is unknown and fails closed.
  */
 export function classifyVerificationFailure(input: VerificationFailureInput): VerificationFailureClassification {
   if (input.outcome === 'cancelled') {
     return { kind: 'cancelled', reason: CANCELLED_REASON };
+  }
+  if (input.outputLimitExceeded === true) {
+    return { kind: 'output_limit', reason: outputLimitReason(input.outputLimitBytes) };
   }
   if (input.identityChanged === true) {
     return {

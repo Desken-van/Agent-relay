@@ -40,6 +40,7 @@ import {
 } from '../../shared/domain/ornith-verification';
 import type { VerificationRecord } from '../../shared/domain/verification';
 import { classifyVerificationFailure } from '../../shared/domain/verification-failure';
+import { verificationConfigurationFingerprint, verificationEvidenceFingerprint } from './verification-fingerprints';
 import type { WorktreeDependencyStatus } from '../../shared/domain/worktree-dependencies';
 import {
   parsePlanReviewDecisions,
@@ -114,7 +115,7 @@ import {
 import {
   latestVerification,
   readVerification,
-  verificationNeedsImplementationRepair
+  verificationNeedsImplementationRepair, verificationRerunRefusal
 } from '../../shared/domain/verification';
 import type { VerificationExecutor } from './worktree-verification';
 import type { WorktreeDependencyInstaller, WorktreeDependencyPreparer } from './worktree-dependencies';
@@ -373,6 +374,13 @@ export class Orchestrator {
       });
       identity = await executor.identity({ task, settings, project });
       if (controller.signal.aborted) throw new AgentRelayError('CANCELLED', 'Verification cancelled before execution.');
+      // The re-run policy, enforced where the snapshot is known: a verification whose last result cannot end
+      // differently under these same files and settings (output stopped at the retention limit; a diagnostic
+      // re-run that ended in the same unclassifiable result) is refused here — before any row is written or
+      // any state moves, and without spending anything — with the sentence that says what must change.
+      const configurationFingerprint = verificationConfigurationFingerprint(settings);
+      const refusal = verificationRerunRefusal(this.deps.runs.listByTask(taskId), { identity, configurationFingerprint });
+      if (refusal !== null) throw new AgentRelayError('VALIDATION_FAILED', refusal);
       completeContinuationStart = await this.deps.continuationGuard?.prepareFirstAction(
         taskId,
         'verification',
@@ -414,9 +422,14 @@ export class Orchestrator {
             exitCode: result.exitCode,
             durationMs: result.durationMs,
             identityChanged: after !== identity,
+            outputLimitExceeded: result.outputLimitExceeded === true,
+            outputLimitBytes: settings.maxStoredLogBytes,
             output: `${result.stdout}\n${result.stderr}`
           });
       const reason = failure === null ? null : failure.reason;
+      // Only the sanitized, bounded summary ever leaves this method: it is what the record keeps and what the
+      // evidence fingerprint is taken from. The raw buffer is dropped here.
+      const outputSummary = failure === null ? null : summarizeVerificationOutput(`${result.stdout}\n${result.stderr}`);
       // (The bounded, sanitized tail of the output goes with the record, so the screen can say why.)
       // A generic, Relay-authored line — the classified outcome, exit code and duration, never the
       // command's own text — so the timeline shows that the run ended and how, without the raw
@@ -427,7 +440,11 @@ export class Orchestrator {
       });
       handle.finish({ status: passed ? 'succeeded' : 'failed', finalMessage: passed ? 'Verification passed for this code snapshot. Ready for review.' : reason,
         errorMessage: reason, structuredResult: { version: 1, command: 'npm run verify', identity, passed, exitCode: result.exitCode, durationMs: result.durationMs, reason,
-          outcome, ...(failure === null ? {} : { outputSummary: summarizeVerificationOutput(`${result.stdout}\n${result.stderr}`), failureKind: failure.kind }) } });
+          outcome, configurationFingerprint,
+          ...(failure === null || outputSummary === null ? {} : {
+            outputSummary, failureKind: failure.kind,
+            evidenceFingerprint: verificationEvidenceFingerprint({ failureKind: failure.kind, outcome, exitCode: result.exitCode, outputSummary })
+          }) } });
       if (this.requireTask(taskId).status !== 'VERIFYING') return this.requireTask(taskId);
       return this.applyEvent(this.requireTask(taskId), passed ? 'verification_completed' : 'verification_aborted', { lastError: reason });
     } catch (error) {
@@ -1348,7 +1365,9 @@ export class Orchestrator {
             timedOut: outcome.timedOut,
             cancelled: outcome.cancelled,
             durationMs: outcome.durationMs,
-            output: `${outcome.stdout}\n${outcome.stderr}`
+            output: `${outcome.stdout}\n${outcome.stderr}`,
+            // A command stopped at the retention limit is said so: the loop must not read it as a runner failure.
+            ...(outcome.outputLimitExceeded === true ? { outputLimitExceeded: true } : {})
           };
         },
         lease,

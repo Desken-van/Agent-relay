@@ -308,8 +308,11 @@ positive evidence: `implementation` needs an explicit test assertion, `error
 TS…`, ESLint error or build failure in the output; `infrastructure` needs a
 known test-runner signature (vitest's own pool messages, a command that ended
 without an exit code, files that changed under the run) and NO such failure
-beside it; anything else is `unknown` and fails closed. A record written before
-the kind existed is read as `unknown`.
+beside it; `output_limit` is a command the process layer stopped because its
+output reached the stored log budget (`ProcessResult.outputLimitExceeded`,
+read before the exit code, and whatever the retained part says — it is
+incomplete by definition); anything else is `unknown` and fails closed. A
+record written before the kind existed is read as `unknown`.
 
 | Evidence on the task                                             | The one action                          | Round | Provider prompt |
 |------------------------------------------------------------------|-----------------------------------------|-------|-----------------|
@@ -317,7 +320,9 @@ the kind existed is read as `unknown`.
 | Verification failed, kind `implementation`                       | **Fix verification failures · <impl.>** | new round | repair prompt from the record's `outputSummary` only |
 | Verification failed, kind `infrastructure` (e.g. Vitest worker timeout) | **Run verification again**       | none  | none            |
 | Verification failed, kind `cancelled`                            | **Run verification**                    | none  | none            |
-| Verification failed, kind `unknown` (incl. a Relay timeout, a legacy record) | **Run verification to diagnose** | none | none         |
+| Verification failed, kind `unknown` (incl. a Relay timeout, a legacy record), first time on this snapshot | **Run verification to diagnose** | none | none |
+| Verification failed, kind `unknown`, materially the same as the previous one on the same snapshot and settings | **Run verification after changes** (gated) | none | none |
+| Verification failed, kind `output_limit`                         | **Run verification after changes** (gated) | none | none      |
 | Implementation left files, no verification yet                   | **Run verification**                    | none  | none            |
 | Implementation attempt provably left nothing behind              | **Retry implementation · <impl.>**      | attempt returned | none    |
 | Approved specification, no attempt yet                           | **Run implementation · <impl.>**        | new round | —           |
@@ -326,8 +331,25 @@ A generic **Retry implementation** is never offered while verification is the
 stage, and **Fix verification failures** and **Run verification again** are
 never offered together. Retrying verification consumes no implementation round,
 touches no file, and — because only an `implementation` kind supplies repair
-evidence — an infrastructure, cancelled or unknown failure never becomes a
-correction prompt for any provider.
+evidence — an infrastructure, cancelled, output-limit or unknown failure never
+becomes a correction prompt for any provider.
+
+**The re-run policy** (`verificationRerunPolicy` in
+`src/shared/domain/verification.ts`) bounds the diagnostic re-run. Each failed
+record keeps two 16-hex fingerprints, never raw output: `configurationFingerprint`
+(the time limit and stored log budget the command ran under) and
+`evidenceFingerprint` (kind, outcome, exit code and the already sanitized summary
+with numbers blanked). A first `unknown` result on a snapshot has one diagnostic
+re-run; a second `unknown` that is materially the same (same identity, same two
+fingerprints, a cancelled run in between ignored) exhausts it, and an
+`output_limit` result has none. The guidance then offers the one gated step, **Run
+verification after changes**, and `Orchestrator.runVerification` enforces the
+gate where the snapshot is known: it computes the worktree identity and the
+configuration fingerprint first and refuses — before any row is written, any
+state moves or anything is spent — while both equal the recorded run's, with a
+sentence that says what must change (the files, or the settings the reason
+names). A changed snapshot, changed settings or a materially different failure
+starts a fresh allowance. A record without fingerprints never refuses.
 
 ### Recovering from an abrupt exit
 

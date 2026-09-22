@@ -290,4 +290,35 @@ describe('manual verification never streams, persists or broadcasts raw command 
       expect(payload).not.toContain(PLANTED_SECRET);
     }
   });
+
+  it('an output that overflowed the stored log budget: classified output_limit with a fixed reason, nothing raw stored or broadcast, and never simply re-run', async () => {
+    script = () => processResult({ exitCode: null, failed: true, outputLimitExceeded: true, stdout: `${RAW_STDOUT}\n${VITEST_WORKER_TIMEOUT_OUTPUT}\n${MARKER}-tail`, stderr: RAW_STDERR });
+    const taskId = await prepared();
+
+    const after = await h.orchestrator.runVerification(taskId);
+
+    expect(after.status).toBe('READY_FOR_IMPLEMENTATION');
+    expect(after.currentRound).toBe(1);
+    expect(after.lastError).toBe(
+      `Verification output exceeded Agent Relay's configured retention limit (${Math.round(h.settings.get().maxStoredLogBytes / 1000)}k characters per run), ` +
+        'so the result could not be classified safely: the command was stopped at the limit and only the output up to it was kept. Raise ' +
+        '"Stored log budget" in Settings or reduce what npm run verify prints; running it again unchanged would stop at the same limit.'
+    );
+    const run = h.runs.listByTask(taskId).find((candidate) => candidate.runType === 'verification')!;
+    const record = readVerification(run);
+    expect(record.success).toBe(true);
+    if (!record.success) return;
+    // The runner marker in the retained part does not make it an ordinary infrastructure failure: the output was incomplete.
+    expect(record.data).toMatchObject({ passed: false, exitCode: null, outcome: 'failed', failureKind: 'output_limit' });
+    expect(record.data.configurationFingerprint).toMatch(/^[a-f0-9]{16}$/);
+    expect(record.data.evidenceFingerprint).toMatch(/^[a-f0-9]{16}$/);
+    for (const banned of [...BANNED, PLANTED_PATH, PLANTED_SECRET]) expect(record.data.reason).not.toContain(banned);
+    for (const banned of [...SENSITIVE, PLANTED_PATH, PLANTED_SECRET]) expect(record.data.outputSummary).not.toContain(banned);
+    expectNoLeak(allEventPayloads(taskId, run.id));
+
+    // The same command under the same settings would stop at the same limit: refused before any row is written.
+    await expect(h.orchestrator.runVerification(taskId)).rejects.toThrow(/exceeded the stored log budget, and neither the files nor the verification settings have changed/);
+    expect(h.runs.listByTask(taskId).filter((candidate) => candidate.runType === 'verification')).toHaveLength(1);
+    expect(h.tasks.findById(taskId)).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 1 });
+  });
 });

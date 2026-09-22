@@ -32,6 +32,29 @@ describe('classifyVerificationFailure', () => {
     expect(classified.reason).toContain('not of the current files');
   });
 
+  it('reads a command the process layer stopped at the output retention limit as output_limit — before the exit code, and whatever the retained part says', () => {
+    const overflowed = `${VITEST_ASSERTION_FAILURE_OUTPUT}\n${PLANTED_SECRET}\n${PLANTED_PATH}\n${'x'.repeat(10_000)}`;
+    const classified = classifyVerificationFailure(failed(overflowed, { exitCode: null, outputLimitExceeded: true, outputLimitBytes: 2_000_000 }));
+
+    expect(classified.kind).toBe('output_limit');
+    expect(classified.reason).toBe(
+      "Verification output exceeded Agent Relay's configured retention limit (2000k characters per run), so the result could not be " +
+        'classified safely: the command was stopped at the limit and only the output up to it was kept. Raise "Stored log budget" in ' +
+        'Settings or reduce what npm run verify prints; running it again unchanged would stop at the same limit.'
+    );
+    expect(classified.reason).not.toContain(PLANTED_SECRET);
+    expect(classified.reason).not.toContain(PLANTED_PATH);
+    expect(classified.reason).not.toContain('AssertionError');
+    // Never the ordinary "ended without an exit code" reading, which would invite a plain re-run.
+    expect(classified.reason).not.toContain('not a failure of the current files');
+    // The same result without the flag IS that reading: the flag is what tells them apart.
+    expect(classifyVerificationFailure(failed(overflowed, { exitCode: null })).kind).toBe('infrastructure');
+    // A caller that does not know the limit's value gets the same sentence without it.
+    expect(classifyVerificationFailure(failed('', { exitCode: null, outputLimitExceeded: true })).reason).toContain('retention limit, so the result');
+    // Only a cancellation outranks it.
+    expect(classifyVerificationFailure(failed('', { outcome: 'cancelled', exitCode: null, outputLimitExceeded: true })).kind).toBe('cancelled');
+  });
+
   it.each([
     ['a test assertion', VITEST_ASSERTION_FAILURE_OUTPUT, 'a test assertion failed'],
     ['a TypeScript error', TYPECHECK_FAILURE_OUTPUT, 'the TypeScript check reported errors'],
@@ -132,7 +155,7 @@ describe('what a stored verification run is read back as', () => {
   });
 
   it('follows the recorded kind, and only an implementation failure supplies repair evidence', () => {
-    for (const kind of ['implementation', 'infrastructure', 'cancelled', 'unknown'] as const) {
+    for (const kind of ['implementation', 'infrastructure', 'output_limit', 'cancelled', 'unknown'] as const) {
       const run = verificationRun(record({ failureKind: kind }));
       expect(verificationFailureKind(run)).toBe(kind);
       expect(verificationNeedsImplementationRepair(run)).toBe(kind === 'implementation');

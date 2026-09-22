@@ -764,7 +764,12 @@ task this section creates.
      `[vitest-pool-runner]: Timeout waiting for worker to respond` → *Run
      verification again* (no round is spent, the files are untouched); an
      unclassifiable failure or a legacy record → *Run verification to
-     diagnose*. Never two of these at once.
+     diagnose*, once per snapshot; a second materially identical unclassifiable
+     result on the same files and settings, or an output that overflowed the
+     *Stored log budget* → *Run verification after changes*, which Agent Relay
+     refuses (no run row, no round, an error message naming what must change)
+     until the files or the verification settings differ from the recorded run.
+     Never two of these at once.
    - Press **Run verification**: **Expect** it to run against the *existing*
      worktree — no new worktree, no Ornith call, no round consumed — and, on a
      pass, the task to move to `READY_FOR_REVIEW`; on a failure, to stay

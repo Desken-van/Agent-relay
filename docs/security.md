@@ -724,16 +724,30 @@ and a damaged or oversized one is skipped, not rendered.
 and the classification fails closed.** `classifyVerificationFailure`
 (`src/shared/domain/verification-failure.ts`) reads the head-and-tail window
 of the locally held output and records one of `implementation`,
-`infrastructure`, `cancelled` or `unknown` on the verification record. Its
-reason is always a fixed, Relay-authored sentence plus at most an exit code
-and a duration — never a line the command printed. Only an `implementation`
-kind (an explicit assertion, `error TS…`, ESLint or build failure in the
-output) ever supplies repair evidence to a provider, and that evidence is the
-record's sanitized `outputSummary`, never a run event and never the raw
-buffer; a test-runner failure (vitest's own pool messages), a cancellation and
-anything unclassifiable produce no prompt at all and are simply re-verified.
-So an unexplained failure can never be turned into a model's correction round
-on evidence nobody has read.
+`infrastructure`, `output_limit`, `cancelled` or `unknown` on the verification
+record. Its reason is always a fixed, Relay-authored sentence plus at most an
+exit code, a duration or the configured limit — never a line the command
+printed. Only an `implementation` kind (an explicit assertion, `error TS…`,
+ESLint or build failure in the output) ever supplies repair evidence to a
+provider, and that evidence is the record's sanitized `outputSummary`, never a
+run event and never the raw buffer; a test-runner failure (vitest's own pool
+messages), a cancellation and anything unclassifiable produce no prompt at all
+and are simply re-verified. So an unexplained failure can never be turned into
+a model's correction round on evidence nobody has read.
+
+**An output that overflowed the stored log budget is never read as a
+retryable failure, and never as evidence.** The process layer reports the cap
+it applied on purpose (`ProcessResult.outputLimitExceeded`), and both producers
+carry that flag into the classifier — the Ornith loop through
+`OrnithVerificationExecution.outputLimitExceeded`, mapped by the orchestrator's
+callback — where it is read before the exit code and before any signature: the
+retained part is incomplete by definition, so an assertion or a runner message
+inside it proves nothing about the files. The kind is `output_limit`, the reason
+names the setting to raise, and a plain re-run is not offered: the one step is
+gated, and `runVerification` refuses it while the files and the verification
+settings equal the recorded run's. The re-run policy compares two 16-hex
+fingerprints kept on the record — of the settings, and of the sanitized summary
+with numbers blanked — so nothing raw is persisted for that comparison either.
 
 **The project's verification runs with the project's own environment, not the
 application's.** `WorktreeVerification.execute` omits `NODE_ENV` from the

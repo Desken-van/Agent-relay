@@ -27,6 +27,7 @@ import type {
 import { ExecaProcessRunner, type ProcessResult, type ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { WorktreeVerification } from '../../src/main/services/worktree-verification';
 import { readVerification } from '../../src/shared/domain/verification';
+import type { OrnithVerificationExecution } from '../../src/shared/domain/ornith-verification';
 import { runGuidance } from '../../src/shared/domain/run-guidance';
 import { buildBranchName, buildWorktreeDirName } from '../../src/shared/util/slug';
 import { createHarness, type Harness } from '../helpers/harness';
@@ -59,6 +60,11 @@ const workerTimeoutRun = (): ProcessResult => ({ ...passingRun(), exitCode: 1, f
 const assertionFailureRun = (): ProcessResult => ({
   ...passingRun(), exitCode: 1, failed: true, stdout: `${VITEST_ASSERTION_FAILURE_OUTPUT}\nnpm error token=${PLANTED_SECRET}`, durationMs: 590_556
 });
+/** The process layer stopped `npm run verify` at the stored log budget: no exit code, flagged, retained part cut mid-way. */
+const outputLimitRun = (): ProcessResult => ({
+  ...passingRun(), exitCode: null, failed: true, outputLimitExceeded: true, durationMs: 42_000,
+  stdout: `${'noise\n'.repeat(2_000)}${VITEST_ASSERTION_FAILURE_OUTPUT}\n${PLANTED_SECRET}\n${PLANTED_PATH}`
+});
 
 interface Scenario {
   readonly h: Harness;
@@ -71,6 +77,8 @@ interface Scenario {
   /** Results the next `npm run verify` spawns return, in order. */
   readonly scripts: ProcessResult[];
   readonly stop: ReturnType<typeof vi.fn>;
+  /** Runs inside the fake Ornith round, with the real request the orchestrator built — to exercise the boundary. */
+  readonly probe: { run: ((request: OrnithImplementationRequest) => Promise<void>) | null };
 }
 
 let scenario: Scenario | null = null;
@@ -84,6 +92,7 @@ async function approvedOrnithTask(): Promise<Scenario> {
   const requests: OrnithImplementationRequest[] = [];
   const scripts: ProcessResult[] = [];
   const stop = vi.fn();
+  const probe: Scenario['probe'] = { run: null };
   const lease = (): OrnithHealthyLease => ({
     runtimeInstanceId: 'runtime-1', providerId: 'local-llama-cpp', modelId: 'test-model',
     contextLimitTokens: 32_768, maxOutputTokens: 1_024,
@@ -104,6 +113,7 @@ async function approvedOrnithTask(): Promise<Scenario> {
       const target = join(request.worktreePath, 'docs', 'manual-test.md');
       writeFileSync(target, `${readFileSync(target, 'utf8')}${CHECKLIST}`, 'utf8');
       events.push('ornith changed docs/manual-test.md');
+      await probe.run?.(request);
       return {
         sessionId: null,
         finalMessage: 'Added the checklist.',
@@ -156,7 +166,7 @@ async function approvedOrnithTask(): Promise<Scenario> {
   const worktree = join(h.worktreesRoot, buildWorktreeDirName(task.id, task.title));
   mkdirSync(h.worktreesRoot, { recursive: true });
   git(repo, 'worktree', 'add', '-b', buildBranchName(task.id, task.title), worktree);
-  return { h, taskId: created.id, target: join(worktree, 'docs', 'manual-test.md'), worktree, events, requests, scripts, stop };
+  return { h, taskId: created.id, target: join(worktree, 'docs', 'manual-test.md'), worktree, events, requests, scripts, stop, probe };
 }
 
 const sha256 = (path: string): string => createHash('sha256').update(readFileSync(path)).digest('hex');
@@ -261,5 +271,43 @@ describe('the production sequence: implementation → lease released → verific
     expect(prompt).not.toContain('AssertionError');
     expect(prompt).not.toContain(PLANTED_SECRET);
     expect(prompt).not.toContain(PLANTED_PATH);
+  }, 60_000);
+
+  it("carries the output-limit flag across the Ornith boundary, records Relay's own run as output_limit, offers only the gated step, and hands Ornith nothing", async () => {
+    scenario = await approvedOrnithTask();
+    const s = scenario;
+    const executions: OrnithVerificationExecution[] = [];
+    s.probe.run = async (request) => { executions.push(await request.runVerification(new AbortController().signal)); };
+    s.scripts.push(outputLimitRun(), outputLimitRun()); // one for the in-loop probe, one for Relay's own verification
+
+    const after = await s.h.orchestrator.sendToClaude(s.taskId);
+
+    // The boundary: what the loop receives says the output overflowed — not merely "failed without an exit code".
+    expect(executions).toHaveLength(1);
+    expect(executions[0]).toMatchObject({ exitCode: null, failed: true, outputLimitExceeded: true });
+
+    expect(after).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 1 });
+    const record = readVerification(s.h.runs.listByTask(s.taskId).find((run) => run.runType === 'verification')!);
+    expect(record.success && record.data).toMatchObject({ failureKind: 'output_limit', exitCode: null, outcome: 'failed' });
+    if (!record.success) return;
+    expect(record.data.outputSummary).not.toContain(PLANTED_SECRET);
+    expect(record.data.outputSummary).not.toContain(PLANTED_PATH);
+    const guidance = guidanceOf(s);
+    expect(guidance.action).toMatchObject({ key: 'run_verification', label: 'Run verification after changes', enabled: true });
+    expect(JSON.stringify(guidance)).not.toContain('Run verification again');
+    expect(JSON.stringify(guidance)).not.toContain('Fix verification failures');
+    expect(JSON.stringify(guidance)).not.toContain('Retry implementation');
+
+    // Unchanged files (real identity) and settings: the gated step is refused before any row is written or round spent.
+    await expect(s.h.orchestrator.runVerification(s.taskId)).rejects.toThrow(/exceeded the stored log budget/);
+    expect(s.h.runs.listByTask(s.taskId).filter((run) => run.runType === 'verification')).toHaveLength(1);
+    expect(s.h.tasks.findById(s.taskId)).toMatchObject({ status: 'READY_FOR_IMPLEMENTATION', currentRound: 1 });
+
+    // A round started anyway carries no correction evidence from it.
+    s.probe.run = null;
+    s.scripts.push(passingRun());
+    await s.h.orchestrator.sendToClaude(s.taskId);
+    expect(s.requests).toHaveLength(2);
+    expect(s.requests[1]!.correctionFindings).toBeNull();
   }, 60_000);
 });
