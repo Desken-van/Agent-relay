@@ -422,6 +422,16 @@ export function RunView(): React.JSX.Element {
     void call('workflow:verificationReadiness', { taskId }).then(
       (response) => {
         if (cancelled) return;
+        if (response.ok && response.data.state === 'not_blocked') {
+          // The main process no longer agrees this task is even gated — its own view of the runs has moved
+          // on (typically another window's own click landed first). Nothing here can be "ready" or "blocked"
+          // for a run that, by the backend's own current account, is not gated at all; pulling a fresh
+          // `TaskDetail` is what makes `gatedVerificationRunId` recompute from what is actually true, rather
+          // than leaving this screen's own stale idea of "gated" stuck showing the ordinary pending text with
+          // nothing to press.
+          void refreshDetail(taskId);
+          return;
+        }
         setVerificationReadiness({ key, readiness: response.ok ? response.data : unavailable });
       },
       () => {
@@ -429,10 +439,19 @@ export function RunView(): React.JSX.Element {
         setVerificationReadiness({ key, readiness: unavailable });
       }
     );
+    // A `blocked`/`unavailable` answer is not necessarily true a moment later — lock contention with another
+    // in-flight operation for this task clears in well under this interval, and the backend gate might simply
+    // now agree conditions changed. Same interval `ornithLocalInferenceState`'s own poll above uses, and for
+    // the same reason: the operator should never have to press a button just to find out something resolved
+    // on its own.
+    const timer = window.setInterval(() => {
+      if (!cancelled) setReadinessCheck((value) => value + 1);
+    }, 2_000);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
     };
-  }, [selectedTaskId, gatedVerificationCause, verificationReadinessKey]);
+  }, [selectedTaskId, gatedVerificationCause, verificationReadinessKey, refreshDetail]);
   // Applied only when it answers the CURRENT key: an answer for an earlier task/run/cause/settings/generation
   // renders as nothing (the ordinary pending state below), never as a stale `ready` a click could still reach.
   const currentVerificationReadiness =
