@@ -36,6 +36,14 @@ export interface ProcessRunOptions {
    * so tools cannot see each other's secrets.
    */
   readonly passthroughEnvNames?: readonly string[];
+  /**
+   * Environment variables the child must NOT inherit from this process, even though they are not
+   * credential-shaped. For a command that is the project's own tooling (its verification script), the
+   * host application's runtime environment is not the environment a developer's terminal has: a
+   * `NODE_ENV` the app carries would, for instance, switch a test run's React or Vite into production
+   * mode and fail every test that relies on development-only APIs. Opt-in per call; no other caller changes.
+   */
+  readonly omitEnvNames?: readonly string[];
   /** Text written to stdin, then closed. */
   readonly input?: string;
   /** Cap on retained stdout/stderr. Excess is dropped, not buffered. */
@@ -360,6 +368,16 @@ function assertSpawnable(file: string, args: readonly string[]): void {
  * these flags into three call sites is how two of them eventually drift, and
  * `shell: false` is not a setting anyone should be able to lose by accident.
  */
+function childEnvironment(options: ProcessRunOptions): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...scrubEnvironment(process.env, options.passthroughEnvNames ?? []),
+    ...(options.env ?? {})
+  };
+  // Removed, not blanked: a key set to an empty string is still "set" to every tool that reads it.
+  for (const name of options.omitEnvNames ?? []) delete env[name];
+  return env;
+}
+
 function baseExecaOptions(options: ProcessRunOptions): Options {
   return {
     cwd: options.cwd,
@@ -367,10 +385,7 @@ function baseExecaOptions(options: ProcessRunOptions): Options {
     cancelSignal: options.signal,
     // Kill the whole tree; agent CLIs spawn helpers of their own.
     forceKillAfterDelay: 5_000,
-    env: {
-      ...scrubEnvironment(process.env, options.passthroughEnvNames ?? []),
-      ...(options.env ?? {})
-    },
+    env: childEnvironment(options),
     extendEnv: false,
     // Never, under any circumstance, interpret the command as a shell string.
     shell: false,

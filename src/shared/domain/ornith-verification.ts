@@ -8,6 +8,7 @@
  * its output, and reads it back for the timeline and the Run screen. It is pure: no I/O, no clock.
  */
 
+import { VERIFICATION_FAILURE_KINDS, type VerificationFailureKind } from './verification-failure-kind';
 import { z } from 'zod';
 import { redactSecrets } from '../util/redact';
 import type { Run } from './models';
@@ -40,7 +41,12 @@ export const ornithVerificationAttemptSchema = z.object({
   /** The denial code when the attempt was refused before it started; null otherwise. */
   code: z.string().max(80).nullable(),
   /** Short fingerprint of the files the attempt ran against; null when it could not be taken. */
-  fingerprint: z.string().max(64).nullable()
+  fingerprint: z.string().max(64).nullable(),
+  /**
+   * What a failed attempt was classified as from its bounded output (see `verification-failure.ts`), so the
+   * model is not told to change files over a test-runner failure. Optional: older attempts have none.
+   */
+  failureKind: z.enum(VERIFICATION_FAILURE_KINDS).optional()
 });
 export type OrnithVerificationAttempt = z.infer<typeof ornithVerificationAttemptSchema>;
 
@@ -56,6 +62,12 @@ export interface OrnithVerificationExecution {
   readonly durationMs: number;
   /** Raw stdout/stderr text; never stored as is — {@link summarizeVerificationOutput} bounds and sanitizes it. */
   readonly output: string;
+  /**
+   * The process layer stopped the command because its output reached the retention limit
+   * (`ProcessResult.outputLimitExceeded`). Carried through so the loop classifies it as `output_limit`, never
+   * as a runner failure to retry; absent when the layer did not report it.
+   */
+  readonly outputLimitExceeded?: boolean;
 }
 
 /** `8m32s`, `45s`, `320ms` — the same words everywhere a duration is shown. */
@@ -123,6 +135,14 @@ const SUMMARY_INPUT_TAIL_CHARS = 256 * 1024;
 function boundInput(raw: string): string {
   if (raw.length <= SUMMARY_INPUT_HEAD_CHARS + SUMMARY_INPUT_TAIL_CHARS) return raw;
   return `${raw.slice(0, SUMMARY_INPUT_HEAD_CHARS)}\n${raw.slice(raw.length - SUMMARY_INPUT_TAIL_CHARS)}`;
+}
+
+/**
+ * The same bounded head-and-tail window the summary is built from, for any other reader of a command's
+ * output (the failure classifier): whatever is decided about a log is decided from at most this much of it.
+ */
+export function boundedVerificationOutputWindow(raw: string): string {
+  return boundInput(raw);
 }
 
 function stripControlCharacters(value: string): string {
@@ -342,6 +362,8 @@ export interface OrnithVerificationEventData {
     readonly durationMs: number;
     readonly reason: string | null;
     readonly summary: string;
+    /** Present for a failed attempt written since classification existed; absent on older events. */
+    readonly failureKind?: VerificationFailureKind;
   };
 }
 

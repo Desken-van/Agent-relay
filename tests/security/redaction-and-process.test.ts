@@ -262,6 +262,19 @@ describe('process runner', () => {
     }
   });
 
+  it('omits exactly the variables a caller names, and only for that call', async () => {
+    process.env.AGENT_RELAY_TEST_PLAIN = 'inherited';
+    try {
+      const probe = ['-e', 'console.log(("AGENT_RELAY_TEST_PLAIN" in process.env) ? process.env.AGENT_RELAY_TEST_PLAIN : "absent")'];
+      const omitted = await runner.run(process.execPath, probe, { omitEnvNames: ['AGENT_RELAY_TEST_PLAIN'] });
+      expect(omitted.stdout.trim()).toBe('absent'); // removed, not blanked: the key itself is gone
+      const inherited = await runner.run(process.execPath, probe);
+      expect(inherited.stdout.trim()).toBe('inherited'); // every other caller is unaffected
+    } finally {
+      delete process.env.AGENT_RELAY_TEST_PLAIN;
+    }
+  });
+
   it('caps retained output at the requested budget', async () => {
     const result = await runner.run(
       process.execPath,

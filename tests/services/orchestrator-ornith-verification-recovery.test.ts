@@ -218,7 +218,7 @@ describe('an Ornith round that changed files and hit its time limit during verif
 
     const value = guidanceFor(h, task);
     expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification', enabled: true });
-    expect(value.secondaryAction).toMatchObject({ key: 'run_implementation', label: 'Retry implementation · Ornith' });
+    expect('secondaryAction' in value).toBe(false); // verification is the stage: no retry of the implementation beside it
     expect(value.happened).toBe('The implementation time limit expired. Implementation changed 1 file.');
     expect(value.verification).toMatchObject({ source: 'ornith', outcome: 'failed', exitCode: 1, command: 'npm run verify' });
   });
@@ -282,10 +282,11 @@ describe('an Ornith round that changed files and hit its time limit during verif
     expect(record.data.outputSummary).not.toContain('someone');
     expect(failedRun.structuredResult!.length).toBeLessThan(4_000); // bounded as stored
 
-    // What the Run screen leads with now: the repair, with checking again one click away.
+    // An assertion failed: classified as the files' own failure, so the ONE action is the repair.
+    expect(record.data.failureKind).toBe('implementation');
     const value = guidanceFor(h, failed);
     expect(value.action).toMatchObject({ key: 'run_implementation', label: 'Fix verification failures · Ornith' });
-    expect(value.secondaryAction).toMatchObject({ key: 'run_verification', label: 'Run verification again' });
+    expect('secondaryAction' in value).toBe(false);
     expect(value.verification).toMatchObject({ source: 'relay', outcome: 'failed', exitCode: 1, durationMs: 42_000 });
 
     // And it is genuinely still recoverable: a second manual verification runs and passes.
@@ -305,8 +306,8 @@ describe('an Ornith round that changed files and hit its time limit during verif
     const after = await h.orchestrator.runVerification(task.id);
 
     const record = readVerification(h.runs.listByTask(task.id).at(-1)!);
-    expect(record.success && record.data).toMatchObject({ passed: false, exitCode: null, outcome: 'timed_out' });
-    expect(after.lastError).toBe('Verification timed out; success was not established.');
+    expect(record.success && record.data).toMatchObject({ passed: false, exitCode: null, outcome: 'timed_out', failureKind: 'unknown' });
+    expect(after.lastError).toContain('Verification timed out; success was not established.');
   });
 
   it('a timed-out manual verification is recorded as timed out (no exit code) and leaves Run verification as the action', async () => {
@@ -318,7 +319,7 @@ describe('an Ornith round that changed files and hit its time limit during verif
     const after = await h.orchestrator.runVerification(task.id);
 
     expect(after.status).toBe('READY_FOR_IMPLEMENTATION');
-    expect(after.lastError).toBe('Verification timed out; success was not established.');
+    expect(after.lastError).toContain('Verification timed out; success was not established.');
     const record = readVerification(h.runs.listByTask(task.id).at(-1)!);
     expect(record.success && record.data).toMatchObject({ passed: false, exitCode: null, outcome: 'timed_out' });
     const value = guidanceFor(h, after);
@@ -353,7 +354,10 @@ describe('an Ornith round that finished normally after its own verification fail
     expect(task.lastError).toContain('npm run verify failed (exit 1)');
     const value = guidanceFor(h, task);
     expect(value.verification).toMatchObject({ source: 'relay', outcome: 'failed', exitCode: 1 });
-    expect(value.secondaryAction).toMatchObject({ key: 'run_verification', label: 'Run verification again' });
+    // A bare FAIL line names no assertion, type, lint or build error: unclassified, so it fails closed to a
+    // diagnostic re-run — never a repair round on evidence nobody has read.
+    expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification to diagnose' });
+    expect('secondaryAction' in value).toBe(false);
   });
 });
 
@@ -378,7 +382,7 @@ describe('an Ornith round that made no new edits over files an earlier attempt l
 
     const value = guidanceFor(h, task);
     expect(value.action).toMatchObject({ key: 'run_verification', label: 'Run verification' });
-    expect(value.secondaryAction).toMatchObject({ key: 'run_implementation', label: 'Retry implementation · Ornith' });
+    expect('secondaryAction' in value).toBe(false);
     expect(value.happened).toBe('Implementation changed 1 file; verification has not run.');
   });
 });
@@ -419,8 +423,8 @@ describe('an Ornith round that changed nothing', () => {
     expect(task.lastError).toContain('stopped before changing any files');
     expect(verification.calls).toBe(0);
     const value = guidanceFor(h, task);
-    expect(value.action).toMatchObject({ key: 'run_implementation', label: 'Run implementation · Ornith' });
-    expect(value.secondaryAction ?? null).toBeNull();
+    expect(value.action).toMatchObject({ key: 'run_implementation', label: 'Retry implementation · Ornith' });
+    expect('secondaryAction' in value).toBe(false);
     expect(value.verification ?? null).toBeNull();
   });
 });

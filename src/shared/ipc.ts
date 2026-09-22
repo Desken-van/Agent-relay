@@ -21,6 +21,7 @@ import type { SerializedError } from './domain/errors';
 import type { PublishRefusalCode } from './domain/claude-assessment';
 import type { GitChangeSet, ProjectValidation, RepositoryInfo, WorktreeInfo } from './domain/git';
 import type { WorktreeDependencyStatus } from './domain/worktree-dependencies';
+import type { VerificationReadiness } from './domain/verification';
 import { localInferencePromptSchema } from './domain/local-inference';
 import type {
   LocalInferenceCapabilities,
@@ -405,6 +406,10 @@ export const ipcInputSchemas = {
   // durable task state inside the main process — never accepted from the
   // renderer.
   'dependencies:status': byTask,
+  // Read-only, strict on purpose: whether a verification the re-run policy gated may start now, decided in
+  // the main process from the current worktree identity and settings. Nothing but the task id is accepted;
+  // nothing but a readiness value (no identity, fingerprint, path or output) comes back.
+  'workflow:verificationReadiness': byTask,
   // Strict on purpose, same as `workflow:continue`: only the task id. The
   // worktree path, package manager, and executable/argv are all resolved
   // from durable state inside the main process.
@@ -660,6 +665,7 @@ export interface IpcResponseMap {
   'runs:events': RunEvent[];
 
   'dependencies:status': WorktreeDependencyStatus;
+  'workflow:verificationReadiness': VerificationReadiness;
   'workflow:installDependencies': Task;
 
   'workflow:generateSpecification': Task;

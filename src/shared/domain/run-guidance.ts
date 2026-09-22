@@ -10,7 +10,10 @@ import {
   type OrnithRunEvidence,
   type OrnithVerificationOutcome
 } from './ornith-verification';
-import { latestVerification, readVerification, verificationNeedsImplementationRepair } from './verification';
+import {
+  latestVerification, readVerification, verificationFailureKind, verificationRerunPolicy,
+  type VerificationReadiness, type VerificationRerunCause
+} from './verification';
 
 /**
  * The one workflow transition Run → Actions may offer right now.
@@ -97,14 +100,13 @@ export interface RunGuidance {
   readonly result: string;
   /** Free text while `action` is null; otherwise exactly `action.label`. */
   readonly next: string;
-  /** The one primary workflow control to render, or null to render none. */
-  readonly action: RunPrimaryAction | null;
   /**
-   * A deliberate alternative to the primary action, rendered less prominently — for example re-running the
-   * implementation after a preserved change, or re-checking a verification that failed. Null/absent: none.
-   * Never the same key as `action`.
+   * The one workflow control to render, or null to render none. Exactly one, by product decision: two
+   * "next steps" side by side (a repair beside a re-run, a retry beside a verification) sent operators down
+   * the wrong one, so which single step is right is decided here, from the recorded evidence, and the
+   * `result` text says why it is the right one.
    */
-  readonly secondaryAction?: RunPrimaryAction | null;
+  readonly action: RunPrimaryAction | null;
   /** The verification attempt behind this state, when there is one. */
   readonly verification?: RunVerificationDetail | null;
   readonly activeStep: number;
@@ -141,6 +143,14 @@ export interface RunGuidanceExtra {
    * says. `null`/`undefined` means "not read yet", and is treated as not ready.
    */
   readonly ornithLocalInferenceState?: LocalInferenceStateKind | null;
+  /**
+   * The renderer's last read of `workflow:verificationReadiness` for the gated verification it is showing:
+   * the main process's answer, from the current worktree identity and settings, to whether a verification
+   * the re-run policy gated may start now. Consulted only in those two states. `null`/`undefined` means
+   * "not read yet" and renders no control, exactly like a `blocked` answer: a button the main-process gate
+   * would refuse is not a next step.
+   */
+  readonly verificationReadiness?: VerificationReadiness | null;
 }
 
 const ORNITH_NOT_READY_REASON =
@@ -332,6 +342,66 @@ function waiting(input: Omit<RunGuidance, 'action' | 'next'> & { readonly next: 
 /** A guidance record whose `next` is always exactly the action's label. */
 function acting(input: Omit<RunGuidance, 'action' | 'next'> & { readonly action: RunPrimaryAction }): RunGuidance {
   return { ...input, next: input.action.label };
+}
+
+const GATED_VERIFICATION_STAGE = 'Step 3 of 5 · Verification';
+
+/**
+ * The two states in which running the same verification again cannot end differently: an output that
+ * overflowed the stored log budget, and a diagnostic re-run that ended in a materially identical unknown
+ * result. Whether a run may start NOW is the main process's answer (`workflow:verificationReadiness`, from
+ * the current worktree identity and settings — the same values its gate compares). Until it has answered,
+ * while it says no, and while the check itself is unavailable, there is no workflow control at all — a
+ * button the gate would refuse is not a next step — and the text says what the operator must change. On
+ * `ready` there is exactly one: Run verification. Stop task stays throughout.
+ */
+function gatedVerification(input: {
+  readonly cause: VerificationRerunCause;
+  readonly finding: string;
+  readonly readiness: VerificationReadiness | null | undefined;
+  readonly relayDetail: RunVerificationDetail | null;
+}): RunGuidance {
+  const { cause, finding, relayDetail } = input;
+  // An answer about another state (read before the newest run was recorded) is no answer for this one.
+  const readiness = input.readiness != null && input.readiness.state !== 'not_blocked' && input.readiness.cause === cause
+    ? input.readiness
+    : null;
+  const happened = cause === 'output_limit'
+    ? 'Agent Relay ran verification, but its output exceeded the stored log budget before the result could be judged.'
+    : 'Agent Relay ran verification twice on these exact files, and neither result could be classified.';
+  const why = cause === 'output_limit'
+    ? 'Running it again under the same files and settings would stop at the same limit, so no verification step is ' +
+      'offered and no implementation round is spent.'
+    : 'The one diagnostic re-run for this snapshot was already used and ended the same way, so no verification step is ' +
+      'offered and no implementation round is spent; the failure was not classified as a defect of the files, so no ' +
+      'implementation round is recommended either. The Verification attempt panel holds the bounded output.';
+  const required = cause === 'output_limit'
+    ? 'User action required: raise "Stored log budget" in Settings or reduce what npm run verify prints. This screen ' +
+      're-checks and offers Run verification once the files or that setting have changed.'
+    : 'User action required: change the files or the verification settings (time limit, stored log budget) before ' +
+      'another run, or stop the task. This screen re-checks and offers Run verification once something has changed.';
+  const base = { happened, stage: GATED_VERIFICATION_STAGE, activeStep: 2, tone: 'warning' as const, verification: relayDetail };
+  switch (readiness?.state) {
+    case 'ready': {
+      const changed = readiness.filesChanged && readiness.settingsChanged
+        ? 'The files and the verification settings changed'
+        : readiness.filesChanged
+          ? 'The files changed'
+          : 'The verification settings changed';
+      return acting({
+        ...base,
+        result: `${finding} ${changed} since that run, so verification can run again on the current conditions. No ` +
+          'implementation round is spent.',
+        action: action('run_verification', 'Run verification')
+      });
+    }
+    case 'blocked':
+      return waiting({ ...base, result: `${finding} ${why}`, next: required });
+    case 'unavailable':
+      return waiting({ ...base, result: `${finding} ${why}`, next: `${required} (${readiness.detail} Use Check for changes to try again.)` });
+    default:
+      return waiting({ ...base, result: `${finding} ${why}`, next: 'Checking whether the files or the verification settings changed since that run…' });
+  }
 }
 
 /**
@@ -560,31 +630,94 @@ export function runGuidance(
       }
       const verification = latestVerification(runs);
       const relayDetail = verification === null ? null : relayVerificationDetail(verification);
-      if (verificationNeedsImplementationRepair(verification)) {
-        const repairLabel = `Fix verification failures · ${providerLabel(task.implementationProvider)}`;
-        return {
-          ...acting({
-            happened: 'Agent Relay ran verification and the current files did not pass.',
-            stage: 'Step 2 of 5 · Fix verification failures',
-            result: task.lastError ?? verification.errorMessage ?? 'The verification output is saved for the implementation provider.',
-            action: guardOrnithReadiness(action('run_implementation', repairLabel), task, extra),
-            activeStep: 1,
-            tone: 'warning'
-          }),
-          // A nonzero exit is not always the code's fault (a busy machine, a flaky test): checking again
-          // must not require another implementation round.
-          secondaryAction: action('run_verification', 'Run verification again'),
-          verification: relayDetail
-        };
+      const failureKind = verificationFailureKind(verification);
+      if (verification !== null && failureKind !== null) {
+        // Agent Relay's own verification ran on the current files and did not pass. WHAT it found — recorded
+        // by the classifier before the result was stored — decides the one next step, and the explanation
+        // says why that step and not another. Never two: a re-run beside a repair sent operators down the
+        // wrong one.
+        const finding = task.lastError ?? verification.errorMessage ?? relayDetail?.reason ?? 'The verification result was not recorded.';
+        switch (failureKind) {
+          case 'implementation':
+            return {
+              ...acting({
+                happened: 'Agent Relay ran verification and the current files did not pass.',
+                stage: 'Step 2 of 5 · Fix verification failures',
+                result: `${finding} The failing output is handed to ${providerLabel(task.implementationProvider)} as correction ` +
+                  'evidence; running the same command on the same files again would fail the same way.',
+                action: guardOrnithReadiness(
+                  action('run_implementation', `Fix verification failures · ${providerLabel(task.implementationProvider)}`),
+                  task,
+                  extra
+                ),
+                activeStep: 1,
+                tone: 'warning'
+              }),
+              verification: relayDetail
+            };
+          case 'infrastructure':
+            return {
+              ...acting({
+                happened: 'Agent Relay ran verification, but the verification tooling failed before it could judge the files.',
+                stage: 'Step 3 of 5 · Verification',
+                result: `${finding} The files are untouched and no implementation round is spent: the same command is simply run again.`,
+                action: action('run_verification', 'Run verification again'),
+                activeStep: 2,
+                tone: 'warning'
+              }),
+              verification: relayDetail
+            };
+          case 'cancelled':
+            return {
+              ...acting({
+                happened: 'Verification was stopped before it finished.',
+                stage: 'Step 3 of 5 · Verification',
+                result: `${finding} The files were not judged; run verification to completion.`,
+                action: action('run_verification', 'Run verification'),
+                activeStep: 2,
+                tone: 'warning'
+              }),
+              verification: relayDetail
+            };
+          case 'output_limit':
+            return gatedVerification({ cause: 'output_limit', finding, readiness: extra.verificationReadiness, relayDetail });
+          case 'unknown': {
+            if (verificationRerunPolicy(runs).state === 'changes_required') {
+              // The one diagnostic re-run for this snapshot already ended in a materially identical result.
+              return gatedVerification({ cause: 'unknown_exhausted', finding, readiness: extra.verificationReadiness, relayDetail });
+            }
+            return {
+              ...acting({
+                happened: relayDetail?.outcome === 'timed_out'
+                  ? 'Agent Relay ran verification and it did not finish within its time limit.'
+                  : 'Agent Relay ran verification and it failed for a reason the output does not make clear.',
+                stage: 'Step 3 of 5 · Verification',
+                result: `${finding} Nothing is retried automatically and no implementation round is spent: one diagnostic ` +
+                  're-run is offered for this snapshot to obtain a classified result; if it ends the same way, the files or ' +
+                  'the verification settings must change before another. The Verification attempt panel holds the bounded output.',
+                action: action('run_verification', 'Run verification to diagnose'),
+                activeStep: 2,
+                tone: 'warning'
+              }),
+              verification: relayDetail
+            };
+          }
+        }
       }
       const implementationAttempt = latestRun(runs, ['implementation', 'correction']);
       const preserved = preservedOrnithChanges(runs);
       if (failedOrnithAttemptProvedNoChanges(implementationAttempt) && preserved === 0) {
+        // A retry, not a first run: an attempt exists and provably left nothing behind, so running the
+        // provider again is the only step that can make progress — and it is the only one offered.
         return acting({
           happened: 'Ornith stopped before changing any files.',
           stage: 'Step 2 of 5 · Implementation',
-          result: task.lastError ?? implementationAttempt.errorMessage ?? 'No worktree changes were made.',
-          action: guardOrnithReadiness(action('run_implementation', implementationLabel), task, extra),
+          result: `${task.lastError ?? implementationAttempt.errorMessage ?? 'No worktree changes were made.'} There is nothing to verify; the round is retried.`,
+          action: guardOrnithReadiness(
+            action('run_implementation', `Retry implementation · ${providerLabel(task.implementationProvider)}`),
+            task,
+            extra
+          ),
           activeStep: 1,
           tone: 'warning'
         });
@@ -602,12 +735,8 @@ export function runGuidance(
             activeStep: 2,
             tone: 'warning'
           }),
-          // Deliberate, never the default: it runs the provider again on top of the preserved changes.
-          secondaryAction: guardOrnithReadiness(
-            action('run_implementation', `Retry implementation · ${providerLabel(task.implementationProvider)}`),
-            task,
-            extra
-          ),
+          // Verification is the stage: the preserved files are judged first, and only a failure of the files
+          // themselves (classified above once it has run) ever leads back to the provider.
           verification: detail
         };
       }

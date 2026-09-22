@@ -287,15 +287,90 @@ handed back. A round that provably
 changed nothing is unchanged: `implementation_aborted`, round returned, and the
 primary action stays **Run implementation**.
 
-From that state the operator's primary action is **Run verification**, which
+From that state the operator's one action is **Run verification**, which
 runs `npm run verify` against the existing worktree — no new worktree, no new
-attempt, no provider call, no discarded diff. A pass advances to
+attempt, no provider call, no discarded diff, no round consumed. A pass advances to
 `READY_FOR_REVIEW`; a failure or timeout stays in `READY_FOR_IMPLEMENTATION` with
-the outcome, exit code, duration, reason and a bounded, sanitized output tail
-recorded on the verification run. A nonzero exit keeps *Fix verification
-failures* as the primary action with **Run verification again** beside it;
-**Retry implementation** is always a deliberate secondary control, never the
-only visible one.
+the outcome, exit code, duration, reason, a bounded sanitized output tail and a
+**failure kind** recorded on the verification run.
+
+### One next step, decided by what the verification found
+
+The Run screen renders exactly one workflow control at a time (plus the
+separate *Stop task* safety control). Two "next steps" side by side — a repair
+beside a re-run, a retry beside a verification — sent operators down the wrong
+one, so there is no secondary action anywhere in `runGuidance`. Which single
+step is right is decided from the recorded evidence, and the status text says
+why it is the right one. The failure kind is classified by
+`classifyVerificationFailure` (`src/shared/domain/verification-failure.ts`)
+from the locally held, bounded output BEFORE the record is stored, and only on
+positive evidence: `implementation` needs an explicit test assertion, `error
+TS…`, ESLint error or build failure in the output; `infrastructure` needs a
+known test-runner signature (vitest's own pool messages, a command that ended
+without an exit code, files that changed under the run) and NO such failure
+beside it; `output_limit` is a command the process layer stopped because its
+output reached the stored log budget (`ProcessResult.outputLimitExceeded`,
+read before the exit code, and whatever the retained part says — it is
+incomplete by definition); anything else is `unknown` and fails closed. A
+record written before the kind existed is read as `unknown`.
+
+| Evidence on the task                                             | The one action                          | Round | Provider prompt |
+|------------------------------------------------------------------|-----------------------------------------|-------|-----------------|
+| Verification passed                                              | **Run review · <reviewer>**             | —     | —               |
+| Verification failed, kind `implementation`                       | **Fix verification failures · <impl.>** | new round | repair prompt from the record's `outputSummary` only |
+| Verification failed, kind `infrastructure` (e.g. Vitest worker timeout) | **Run verification again**       | none  | none            |
+| Verification failed, kind `cancelled`                            | **Run verification**                    | none  | none            |
+| Verification failed, kind `unknown` (incl. a Relay timeout, a legacy record), first time on this snapshot | **Run verification to diagnose** | none | none |
+| Verification failed, kind `unknown`, materially the same as the previous one, files and settings unchanged | *waiting: User action required* (no workflow control) | none | none |
+| Verification failed, kind `output_limit`, files and settings unchanged | *waiting: User action required* (no workflow control; a Settings link) | none | none |
+| Either of the two above, once the files or the verification settings changed | **Run verification** | none | none |
+| Implementation left files, no verification yet                   | **Run verification**                    | none  | none            |
+| Implementation attempt provably left nothing behind              | **Retry implementation · <impl.>**      | attempt returned | none    |
+| Approved specification, no attempt yet                           | **Run implementation · <impl.>**        | new round | —           |
+
+A generic **Retry implementation** is never offered while verification is the
+stage, and **Fix verification failures** and **Run verification again** are
+never offered together. Retrying verification consumes no implementation round,
+touches no file, and — because only an `implementation` kind supplies repair
+evidence — an infrastructure, cancelled, output-limit or unknown failure never
+becomes a correction prompt for any provider.
+
+**The re-run policy** (`verificationRerunPolicy` in
+`src/shared/domain/verification.ts`) bounds the diagnostic re-run. Each failed
+record keeps two 16-hex fingerprints, never raw output: `configurationFingerprint`
+(the time limit and stored log budget the command ran under) and
+`evidenceFingerprint` (kind, outcome, exit code and the already sanitized summary
+with numbers blanked). A first `unknown` result on a snapshot has one diagnostic
+re-run; a second `unknown` that is materially the same (same identity, same two
+fingerprints, a cancelled run in between ignored) exhausts it, and an
+`output_limit` result has none. The guidance then offers the one gated step, **Run
+verification after changes**, and `Orchestrator.runVerification` enforces the
+gate where the snapshot is known: it computes the worktree identity and the
+configuration fingerprint first and refuses — before any row is written, any
+state moves or anything is spent — while both equal the recorded run's, with a
+sentence that says what must change (the files, or the settings the reason
+names). A changed snapshot, changed settings or a materially different failure
+starts a fresh allowance. A record without fingerprints never refuses.
+
+**The Run screen never offers what the gate would refuse.** In those two states
+`runGuidance` consults `RunGuidanceExtra.verificationReadiness`, the renderer's
+last read of the read-only `workflow:verificationReadiness` channel, which
+`Orchestrator.verificationReadiness` answers from the SAME two values the gate
+compares — the current worktree identity (read with the same `identity()` the
+verification uses) and the current configuration fingerprint — through the
+shared `verificationReadinessFor`. The answer is one of `not_blocked`,
+`blocked`, `ready` (with which of files/settings changed) or `unavailable`
+(fixed prose): no identity, fingerprint, path or output ever crosses to the
+renderer. Until it has answered, and while it says `blocked` or `unavailable`,
+the guidance is a *waiting* state — "User action required", no workflow
+control, *Stop task* still available — with a notice carrying two navigation
+controls that run nothing: *Open Settings · Stored log budget* (for an output
+overflow; it focuses that control on the Settings screen) and *Check for
+changes* (re-reads readiness after edits made outside the app). Readiness is
+also re-read whenever the gated run, the task or the verification settings
+change. On `ready` the one workflow control is **Run verification**; the gate
+in `runVerification` still decides again, against the values of that moment, so
+conditions that revert between the read and the click are refused.
 
 ### Recovering from an abrupt exit
 

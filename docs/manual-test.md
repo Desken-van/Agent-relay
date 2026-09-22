@@ -753,9 +753,28 @@ task this section creates.
      with the exact command, outcome (Failed / Timed out / Cancelled / Not
      started), exit code, duration, the reason and, collapsed, a bounded output
      tail with no token, path or terminal escape in it. **Run verification** is
-     the one highlighted button; **Retry implementation · Ornith** is a plain
-     button below it. In the timeline, the `run_verification` event reads
-     *FAILED*/*TIMED OUT* — never *ok* — for a failed command.
+     the one and only workflow button (besides *Stop task*); no *Retry
+     implementation* appears anywhere while verification is the stage. In the
+     timeline, the `run_verification` event reads *FAILED*/*TIMED OUT* — never
+     *ok* — for a failed command.
+   - **After a failed Relay verification, expect exactly one button, chosen by
+     what failed:** a test assertion, type, lint or build error → *Fix
+     verification failures · Ornith* (and only then does the next round carry
+     the failing output as a correction prompt); a test-runner failure such as
+     `[vitest-pool-runner]: Timeout waiting for worker to respond` → *Run
+     verification again* (no round is spent, the files are untouched); an
+     unclassifiable failure or a legacy record → *Run verification to
+     diagnose*, once per snapshot; a second materially identical unclassifiable
+     result on the same files and settings, or an output that overflowed the
+     *Stored log budget* → NO workflow button at all: the guide reads *User
+     action required* and names what must change, a notice offers *Open
+     Settings · Stored log budget* (output overflow only; it focuses that
+     control) and *Check for changes*, and neither starts anything. Raise the
+     budget, change the time limit, or edit a file, then return (or press
+     *Check for changes*): exactly one **Run verification** appears. Changing
+     things back before pressing it is still refused by Agent Relay (no run
+     row, no round, an error naming what must change). Never two of these at
+     once.
    - Press **Run verification**: **Expect** it to run against the *existing*
      worktree — no new worktree, no Ornith call, no round consumed — and, on a
      pass, the task to move to `READY_FOR_REVIEW`; on a failure, to stay

@@ -720,6 +720,50 @@ that boundary raw:
 A record written before these fields existed still reads: they are optional,
 and a damaged or oversized one is skipped, not rendered.
 
+**A failure is classified from that same bounded buffer, before it is stored,
+and the classification fails closed.** `classifyVerificationFailure`
+(`src/shared/domain/verification-failure.ts`) reads the head-and-tail window
+of the locally held output and records one of `implementation`,
+`infrastructure`, `output_limit`, `cancelled` or `unknown` on the verification
+record. Its reason is always a fixed, Relay-authored sentence plus at most an
+exit code, a duration or the configured limit — never a line the command
+printed. Only an `implementation` kind (an explicit assertion, `error TS…`,
+ESLint or build failure in the output) ever supplies repair evidence to a
+provider, and that evidence is the record's sanitized `outputSummary`, never a
+run event and never the raw buffer; a test-runner failure (vitest's own pool
+messages), a cancellation and anything unclassifiable produce no prompt at all
+and are simply re-verified. So an unexplained failure can never be turned into
+a model's correction round on evidence nobody has read.
+
+**An output that overflowed the stored log budget is never read as a
+retryable failure, and never as evidence.** The process layer reports the cap
+it applied on purpose (`ProcessResult.outputLimitExceeded`), and both producers
+carry that flag into the classifier — the Ornith loop through
+`OrnithVerificationExecution.outputLimitExceeded`, mapped by the orchestrator's
+callback — where it is read before the exit code and before any signature: the
+retained part is incomplete by definition, so an assertion or a runner message
+inside it proves nothing about the files. The kind is `output_limit`, the reason
+names the setting to raise, and a plain re-run is not offered: the one step is
+gated, and `runVerification` refuses it while the files and the verification
+settings equal the recorded run's. The re-run policy compares two 16-hex
+fingerprints kept on the record — of the settings, and of the sanitized summary
+with numbers blanked — so nothing raw is persisted for that comparison either.
+Whether that gate would refuse is also what the Run screen asks before it
+offers anything: `workflow:verificationReadiness` (input: the task id, strict)
+is answered in the main process from the same two values and returns only a
+readiness state — never the identity, a fingerprint, a path or output — so the
+renderer shows a waiting state ("User action required") rather than a button
+the gate would refuse, and the gate still decides again at execution time.
+
+**The project's verification runs with the project's own environment, not the
+application's.** `WorktreeVerification.execute` omits `NODE_ENV` from the
+child's environment (`omitEnvNames`, an opt-in `ProcessRunner` option that
+changes nothing for other callers). A live run had inherited
+`NODE_ENV=production` from the app process, which made Vite resolve React's
+production build for the test run and fail 528 renderer tests
+(`React.act is not a function`) with no change to the files under test. As in
+a developer's terminal, the project's tooling now picks its own defaults.
+
 **Two read-only Git questions, fixed and internal.** After a run the loop asks
 `git status --porcelain=v1 --untracked-files=all` (a changed-file *count*, stderr
 discarded) and, before a verification, hashes `git diff HEAD --no-ext-diff

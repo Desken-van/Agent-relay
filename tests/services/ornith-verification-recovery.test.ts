@@ -72,7 +72,9 @@ type VerificationScript =
   /** Runs until the loop aborts it, as a real process the loop's budget kills. */
   | { readonly kind: 'hangs' }
   /** Ignores the abort and keeps going for `durationMs` — a process that does not die when told to. */
-  | { readonly kind: 'ignores-abort'; readonly durationMs: number; readonly exitCode: number };
+  | { readonly kind: 'ignores-abort'; readonly durationMs: number; readonly exitCode: number }
+  /** The process layer stopped the command at the output retention limit: no exit code, `outputLimitExceeded`. */
+  | { readonly kind: 'output-limit'; readonly durationMs: number; readonly output?: string };
 
 const exits = (exitCode: number, durationMs: number, output?: string): VerificationScript => ({ kind: 'exit', durationMs, exitCode, output });
 
@@ -118,6 +120,8 @@ function executionFor(script: VerificationScript, durationMs: number): OrnithVer
       return failedExecution(script.exitCode, durationMs);
     case 'hangs':
       return cancelledExecution(durationMs);
+    case 'output-limit':
+      return { ...failedExecution(1, durationMs, script.output), exitCode: null, outputLimitExceeded: true };
   }
 }
 
@@ -192,7 +196,7 @@ async function runScenario(scenario: Scenario): Promise<Outcome> {
         const timer = Number.isFinite(durationMs)
           ? setTimeout(() => resolve(executionFor(script, Date.now() - begun)), durationMs)
           : null;
-        if (script.kind === 'hangs' || script.kind === 'exit' || script.kind === 'own-timeout') {
+        if (script.kind === 'hangs' || script.kind === 'exit' || script.kind === 'own-timeout' || script.kind === 'output-limit') {
           signal.addEventListener('abort', () => {
             if (timer !== null) clearTimeout(timer);
             resolve(cancelledExecution(Date.now() - begun));
@@ -293,6 +297,23 @@ describe('the live sequence: replace_text succeeds, verification fails, a second
 });
 
 describe('what a verification that ran says about itself', () => {
+  it('an output that overflowed the retention limit is output_limit — not a runner failure to retry — and the model is told not to change files or simply run it again', async () => {
+    const outcome = await runScenario({
+      steps: [read, editSentence, verify],
+      verifications: [{ kind: 'output-limit', durationMs: 90_000, output: `${'noise line\n'.repeat(20_000)}AssertionError: expected 1 to be 2` }]
+    });
+
+    const [event] = toolEvents(outcome, 'run_verification');
+    expect(isOrnithVerificationEventData(event ?? null)).toBe(true);
+    expect(event).toMatchObject({ ok: false, dispatched: true, verification: { outcome: 'failed', exitCode: null, failureKind: 'output_limit' } });
+    expect(outcome.result.ornithAudit.verificationAttempts.at(-1)).toMatchObject({ outcome: 'failed', exitCode: null, failureKind: 'output_limit' });
+    expect(outcome.result.assessment.verificationStatus).toBe('failed');
+    // What the model was shown after the attempt: the fixed sentence, and no invitation to treat it as the files' fault.
+    const shown = outcome.prompts.find((prompt) => prompt.includes('would stop at the same limit'));
+    expect(shown).toBeDefined();
+    expect(shown).toContain('not a failure of the files');
+  }, REAL_GIT_TEST_TIMEOUT_MS);
+
   it('a nonzero exit is failed — command, exit code, duration, reason — with a bounded, sanitized summary, and is not ok', async () => {
     const secret = `ghp_${'A1b2C3d4E5f6G7h8'}`;
     const output = [

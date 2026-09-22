@@ -21,6 +21,7 @@ import {
   type OrnithVerificationOutcome
 } from '@shared/domain/ornith-verification';
 import { isBusy, isTerminal } from '@shared/domain/workflow';
+import { latestVerification, verificationConfigurationFields, verificationRerunPolicy, type VerificationReadiness } from '@shared/domain/verification';
 import {
   WORKTREE_DEPENDENCY_INSTALLABLE_BLOCKER_STATES,
   type WorktreeDependencyStatus
@@ -131,22 +132,19 @@ export function PrimaryActionButton({
   action,
   onClick,
   pending,
-  blocked,
-  secondary = false
+  blocked
 }: {
   action: RunPrimaryAction;
   onClick: () => void;
   pending: boolean;
   /** True while an unrelated operation (another busy flag, Stop, …) is in flight. */
   blocked: boolean;
-  /** A deliberate alternative to the recommended action: same single-click guarantee, less prominent. */
-  secondary?: boolean;
 }): React.JSX.Element {
   const claim = useRef(false);
   return (
     <button
       type="button"
-      className={secondary ? 'btn btn--wide' : 'btn btn--wide btn--primary btn--recommended'}
+      className="btn btn--wide btn--primary btn--recommended"
       disabled={!action.enabled || pending || blocked}
       title={action.disabledReason ?? undefined}
       onClick={() => {
@@ -271,7 +269,7 @@ function CompletedHistory({ runs }: { runs: readonly Run[] }): React.JSX.Element
 
 export function RunView(): React.JSX.Element {
   const store = useStore();
-  const { selectedTaskId, detail, refreshDetail, openTaskDetail, acceptTask, perform, notify, busy, codexModels, settings } = store;
+  const { selectedTaskId, detail, refreshDetail, openTaskDetail, acceptTask, perform, notify, busy, codexModels, settings, openSettings } = store;
 
   const [changes, setChanges] = useState<GitChangeSet | null>(null);
   const [planReviewPreparation, setPlanReviewPreparation] = useState<{
@@ -381,6 +379,88 @@ export function RunView(): React.JSX.Element {
     };
   }, [implementationProviderForReadiness, selectedTaskId]);
 
+  // Passive, read-only: whether a verification the re-run policy has gated may start NOW — the main
+  // process's answer from the current worktree identity and settings, the same values its gate compares —
+  // so this screen never offers a step that gate would refuse. Re-read whenever the gated run, the task or
+  // the verification settings change, and on demand ("Check for changes") after edits made outside the app.
+  const gatedVerificationRerun = detail !== null && detail.task.status === 'READY_FOR_IMPLEMENTATION'
+    ? verificationRerunPolicy(detail.runs)
+    : null;
+  const gatedVerificationRunId = detail !== null && gatedVerificationRerun?.state === 'changes_required'
+    ? latestVerification(detail.runs)?.id ?? null
+    : null;
+  const gatedVerificationCause = gatedVerificationRerun?.state === 'changes_required' ? gatedVerificationRerun.cause : null;
+  const [readinessCheck, setReadinessCheck] = useState(0);
+  // The one list of which Settings fields change verification's conditions lives in `verificationConfigurationFields`
+  // (shared with `verificationConfigurationFingerprint` in main); reading it here, rather than naming the fields
+  // again, is what keeps a future field added there from being a field this key silently never notices.
+  const verificationSettingsRevision = settings === null ? null : verificationConfigurationFields(settings).join(':');
+  // Everything a readiness answer is good FOR: the task, the gated run, its cause, the verification settings
+  // it was computed against, and which "Check for changes" generation asked for it. A settings edit or a
+  // manual re-check changes this key without necessarily changing the run id, and the answer this screen
+  // renders must not survive that — an enabled "Run verification" is worse than a moment of "Checking…".
+  const verificationReadinessKey = selectedTaskId === null || gatedVerificationRunId === null || gatedVerificationCause === null
+    ? null
+    : `${selectedTaskId}|${gatedVerificationRunId}|${gatedVerificationCause}|${verificationSettingsRevision}|${readinessCheck}`;
+  const [verificationReadiness, setVerificationReadiness] = useState<{
+    key: string;
+    readiness: VerificationReadiness;
+  } | null>(null);
+  useEffect(() => {
+    if (selectedTaskId === null || gatedVerificationCause === null || verificationReadinessKey === null) return undefined;
+    let cancelled = false;
+    const taskId = selectedTaskId;
+    const key = verificationReadinessKey;
+    // The IPC call itself failing (rejected, or the main process answering `{ok:false}`) is distinct from a
+    // domain-level "cannot check" answer, which `verificationReadiness` already returns as `unavailable` —
+    // but the operator must see the same thing either way: a fixed message and, critically, the "Check for
+    // changes" retry control, never silently stuck on "Checking…" forever with nothing to press.
+    const unavailable: VerificationReadiness = {
+      state: 'unavailable', cause: gatedVerificationCause,
+      detail: 'Agent Relay could not confirm whether verification may run yet.'
+    };
+    void call('workflow:verificationReadiness', { taskId }).then(
+      (response) => {
+        if (cancelled) return;
+        if (response.ok && response.data.state === 'not_blocked') {
+          // The main process no longer agrees this task is even gated — its own view of the runs has moved
+          // on (typically another window's own click landed first). A PRIOR answer under this same key —
+          // most importantly a `ready` one — must not keep authorizing a click for a run the backend's own
+          // current account no longer considers gated at all: clear it first, before `refreshDetail` even
+          // starts, so this render already falls back to the safe pending state with no enabled button.
+          // Pulling a fresh `TaskDetail` is then what makes `gatedVerificationRunId` recompute from what is
+          // actually true, rather than leaving this screen's own stale idea of "gated" stuck.
+          setVerificationReadiness(null);
+          void refreshDetail(taskId);
+          return;
+        }
+        setVerificationReadiness({ key, readiness: response.ok ? response.data : unavailable });
+      },
+      () => {
+        if (cancelled) return;
+        setVerificationReadiness({ key, readiness: unavailable });
+      }
+    );
+    // A `blocked`/`unavailable` answer is not necessarily true a moment later — lock contention with another
+    // in-flight operation for this task clears in well under this interval, and the backend gate might simply
+    // now agree conditions changed. Same interval `ornithLocalInferenceState`'s own poll above uses, and for
+    // the same reason: the operator should never have to press a button just to find out something resolved
+    // on its own.
+    const timer = window.setInterval(() => {
+      if (!cancelled) setReadinessCheck((value) => value + 1);
+    }, 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [selectedTaskId, gatedVerificationCause, verificationReadinessKey, refreshDetail]);
+  // Applied only when it answers the CURRENT key: an answer for an earlier task/run/cause/settings/generation
+  // renders as nothing (the ordinary pending state below), never as a stale `ready` a click could still reach.
+  const currentVerificationReadiness =
+    verificationReadiness !== null && verificationReadiness.key === verificationReadinessKey
+      ? verificationReadiness.readiness
+      : null;
+
   // Passive, read-only: shows the dependency blocker (and its install action)
   // before the user ever attempts implementation, rather than only after a
   // failed attempt. Refetched whenever the task changes; `installDependencies`
@@ -467,7 +547,8 @@ export function RunView(): React.JSX.Element {
       continuationCreationStatus: detail.continuationCreationStatus,
       continuationEntryAction: detail.continuationEntryAction,
       isContinuation: detail.continuationOf !== null,
-      ornithLocalInferenceState: ornithReadiness?.taskId === task.id ? ornithReadiness.kind : null
+      ornithLocalInferenceState: ornithReadiness?.taskId === task.id ? ornithReadiness.kind : null,
+      verificationReadiness: currentVerificationReadiness
     }
   );
   const running = isBusy(task.status);
@@ -503,10 +584,7 @@ export function RunView(): React.JSX.Element {
     });
   };
 
-  /**
-   * Every non-plan-review action, primary or secondary: exactly one bounded IPC call, then one read-only
-   * refresh. The secondary action is a deliberate alternative and goes through the same single-flight path.
-   */
+  /** Every non-plan-review action: exactly one bounded IPC call, then one read-only refresh. */
   const dispatchAction = (action: RunPrimaryAction | null | undefined): void => {
     if (!action || !action.enabled) return;
     switch (action.key) {
@@ -545,6 +623,15 @@ export function RunView(): React.JSX.Element {
               tone: result.status === 'READY_FOR_REVIEW' ? 'success' : 'info',
               title: result.status === 'READY_FOR_REVIEW' ? 'Verification passed' : 'Verification did not pass'
             });
+          } catch (error) {
+            // The gate in `runVerification` refuses at execution time, and it can refuse a request the
+            // Run screen showed as `ready` a moment ago — the files or settings that made it ready can be
+            // reverted before the click lands. Asking for a fresh read changes `verificationReadinessKey`
+            // (via `readinessCheck`), which by itself makes the answer that authorized this click stop
+            // applying — right or wrong, it no longer describes what the gate just decided — rather than
+            // leaving an enabled button that would fail again the same way.
+            setReadinessCheck((value) => value + 1);
+            throw error;
           } finally {
             setPrimaryPending(null);
           }
@@ -614,7 +701,6 @@ export function RunView(): React.JSX.Element {
     }
   };
   const dispatchPrimary = (): void => dispatchAction(guidance.action);
-  const dispatchSecondary = (): void => dispatchAction(guidance.secondaryAction);
 
   // Reasonable per-stage defaults for the sidebar's collapsible sections.
   // Each `key` includes the condition that drives its default so the panel
@@ -735,25 +821,30 @@ export function RunView(): React.JSX.Element {
               (guidance.action.key === 'run_implementation' || guidance.action.key === 'send_corrections') ? (
                 <p className="hint">Install dependencies in this task worktree first (above) before running {providerLabel(task.implementationProvider)}.</p>
               ) : null}
-              {guidance.secondaryAction ? (
-                <div className="run-guide__secondary">
-                  <PrimaryActionButton
-                    secondary
-                    action={guidance.secondaryAction}
-                    pending={primaryPending === guidance.secondaryAction.key}
-                    blocked={otherOperationBusy || (
-                      dependencyBlocker !== null && guidance.secondaryAction.key === 'run_implementation'
-                    )}
-                    onClick={dispatchSecondary}
-                  />
-                  <p className="hint">
-                    {guidance.secondaryAction.key === 'run_implementation'
-                      ? 'Runs the implementation provider again on top of the preserved changes. Nothing is discarded.'
-                      : 'Checks the current files again. No implementation round is used.'}
-                  </p>
-                </div>
-              ) : null}
             </div>
+          ) : null}
+
+          {guidance.action === null && currentVerificationReadiness !== null &&
+          (currentVerificationReadiness.state === 'blocked' || currentVerificationReadiness.state === 'unavailable') ? (
+            // A waiting state, not a workflow step: what the operator must change, a way to Settings when a setting
+            // is what must change, and a re-check for changes made outside the app. Neither control runs anything.
+            <Notice tone="warn" role="status">
+              <div className="stack">
+                {/* The one place this sentence is authored is `gatedVerification` in run-guidance.ts (`next`,
+                    rendered above as "Next action" too); repeating it here from a second copy would drift. */}
+                <p>{guidance.next}</p>
+                <div className="actions">
+                  {currentVerificationReadiness.cause === 'output_limit' ? (
+                    <button type="button" className="btn btn--sm" onClick={() => openSettings('maxStoredLogBytes')}>
+                      Open Settings · Stored log budget
+                    </button>
+                  ) : null}
+                  <button type="button" className="btn btn--sm btn--ghost" onClick={() => setReadinessCheck((value) => value + 1)}>
+                    Check for changes
+                  </button>
+                </div>
+              </div>
+            </Notice>
           ) : null}
 
           {publishing || detail.runs.some(isPublishRun) ? (
