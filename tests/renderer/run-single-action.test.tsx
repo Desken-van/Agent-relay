@@ -15,6 +15,8 @@ import { runSchema, taskSchema, type Run, type Task } from '../../src/shared/dom
 import type { TaskDetail } from '../../src/shared/ipc';
 import type { TaskSpecification } from '../../src/shared/schemas/codex';
 import { deferred, installBridge, ok, renderApp } from './harness';
+import type { Settings } from '../../src/shared/domain/models';
+import { defaultLocalInferenceSettings } from '../../src/shared/domain/local-inference';
 import type { VerificationReadiness } from '../../src/shared/domain/verification';
 
 afterEach(() => {
@@ -26,6 +28,26 @@ afterEach(() => {
 function SectionProbe(): React.JSX.Element {
   const { section, settingsFocus } = useStore();
   return <span data-testid="section">{section}|{settingsFocus ?? ''}</span>;
+}
+
+/** A trigger the test controls directly: re-fetches `settings:get`, exactly like Settings screen's own Save. */
+function RefreshSettingsButton(): React.JSX.Element {
+  const { refreshSettings } = useStore();
+  return <button type="button" onClick={() => void refreshSettings()}>Refresh settings (test)</button>;
+}
+
+function baseSettings(): Settings {
+  return {
+    localInference: defaultLocalInferenceSettings(),
+    claudeExecutablePath: null, codexExecutablePath: null, ghExecutablePath: null,
+    externalPlanReviewEnabled: false, externalCodeReviewEnabled: false,
+    coaiMcpExecutablePath: null, coaiMcpArguments: [], coaiMcpWorkingDirectory: null,
+    coaiLastKnownContractFingerprint: null, coaiLastKnownContractCheckedAt: null,
+    conventionsRepositoryPath: null, conventionsExpectedRevision: null, conventionsRulePaths: [],
+    githubOwner: 'acme', projectsRoot: 'C:\\projects', worktreesRoot: 'C:\\worktrees',
+    maxReviewRounds: 3, processTimeoutMs: 30 * 60_000, maxStoredLogBytes: 2_000_000, maxDiffBytes: 400_000,
+    claudeMaxTurns: 80, claudeAllowedTools: [], claudeVerificationTools: [], codexModel: null, claudeModel: null
+  };
 }
 
 function SeededRun({ detail }: { detail: TaskDetail }): React.JSX.Element {
@@ -253,7 +275,9 @@ describe('Run screen — waiting states: a gated verification with nothing chang
 
     await screen.findAllByText(/User action required/); // said in the guide's next step and in the notice
     expect(workflowControls()).toEqual([]);
-    expect(document.body.textContent).toContain('One diagnostic re-run was already used');
+    // The Result field explains what happened; the notice (now sourced from the very same `guidance.next`
+    // the guide's own "Next action" row shows, never a second copy) says what must change.
+    expect(document.body.textContent).toContain('one diagnostic re-run for this snapshot was already used');
     expect(document.body.textContent).toContain('change the files or the verification settings');
     expect(screen.queryByRole('button', { name: /Open Settings/ })).toBeNull();
     expect(screen.getByRole('button', { name: 'Check for changes' })).toBeTruthy();
@@ -278,6 +302,51 @@ describe('Run screen — waiting states: a gated verification with nothing chang
     expect(document.body.textContent).toContain('cannot be checked for changes right now');
     expect(workflowControls()).toEqual([]);
     expect(screen.getByRole('button', { name: 'Check for changes' })).toBeTruthy();
+  });
+
+  it('a stale "ready" answer does not survive a genuine settings change: no enabled button while the fresh check is pending', async () => {
+    // The exact scenario the code round found: readiness answers `ready` because the verification settings
+    // differ from the recorded run; the operator then changes the setting BACK (a real settings reload, the
+    // same path Settings screen's own Save takes) before the click lands. The new check has not resolved
+    // yet — this proves the STALE `ready` does not remain applied for that whole window.
+    const original = baseSettings();
+    const changed = { ...original, maxStoredLogBytes: original.maxStoredLogBytes * 2 };
+    let settings = original;
+    const pendingChangedCheck = deferred<unknown>();
+    let readinessCallsForChanged = 0;
+    // Keyed on the settings VALUE, not a call count: the store's own initial load also triggers a readiness
+    // read once settings arrive, which must not consume a scripted slot meant for the operator's own change.
+    const bridge = installBridge({
+      'dependencies:status': () => ok<'dependencies:status'>({ state: 'not_node_project', detail: 'No package.json.' }),
+      'settings:get': () => ok<'settings:get'>(settings),
+      'workflow:verificationReadiness': () => {
+        if (settings.maxStoredLogBytes === original.maxStoredLogBytes) {
+          return ok<'workflow:verificationReadiness'>({ state: 'ready', cause: 'output_limit', filesChanged: false, settingsChanged: true });
+        }
+        readinessCallsForChanged += 1;
+        return pendingChangedCheck.promise;
+      }
+    });
+    renderApp(<><SeededRun detail={OVERFLOW_DETAIL} /><RefreshSettingsButton /></>);
+
+    await screen.findByRole('button', { name: 'Run verification' });
+
+    // The operator reverts the setting and the screen reloads it — a real dependency change, not a stub.
+    settings = changed;
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh settings (test)' }));
+
+    // While the new check is still in flight: no "Run verification" (the stale `ready` is gone), and
+    // nothing else stale either — the ordinary pending message, not a click-able waiting state.
+    await waitFor(() => expect(readinessCallsForChanged).toBeGreaterThan(0));
+    await waitFor(() => expect(workflowControls()).toEqual([]));
+    expect(screen.queryByRole('button', { name: 'Run verification' })).toBeNull();
+    expect(document.body.textContent).toContain('Checking whether the files or the verification settings changed');
+
+    // Only once the fresh answer actually lands does a control reappear — and it reflects that answer.
+    pendingChangedCheck.resolve({ ok: true, data: { state: 'blocked', cause: 'output_limit' } });
+    await screen.findAllByText(/User action required/);
+    expect(workflowControls()).toEqual([]);
+    expect(bridge.callsTo('workflow:verify')).toEqual([]);
   });
 
   it('a refused "Run verification" click discards the stale ready answer and re-reads it, landing on whatever the fresh read says — not the click repeated on the same stale belief', async () => {

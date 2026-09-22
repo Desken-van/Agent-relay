@@ -21,7 +21,7 @@ import {
   type OrnithVerificationOutcome
 } from '@shared/domain/ornith-verification';
 import { isBusy, isTerminal } from '@shared/domain/workflow';
-import { verificationRerunPolicy, type VerificationReadiness } from '@shared/domain/verification';
+import { latestVerification, verificationRerunPolicy, type VerificationReadiness } from '@shared/domain/verification';
 import {
   WORKTREE_DEPENDENCY_INSTALLABLE_BLOCKER_STATES,
   type WorktreeDependencyStatus
@@ -387,21 +387,27 @@ export function RunView(): React.JSX.Element {
     ? verificationRerunPolicy(detail.runs)
     : null;
   const gatedVerificationRunId = detail !== null && gatedVerificationRerun?.state === 'changes_required'
-    ? [...detail.runs].reverse().find((run) => run.runType === 'verification')?.id ?? null
+    ? latestVerification(detail.runs)?.id ?? null
     : null;
   const gatedVerificationCause = gatedVerificationRerun?.state === 'changes_required' ? gatedVerificationRerun.cause : null;
-  const [verificationReadiness, setVerificationReadiness] = useState<{
-    taskId: string;
-    runId: string;
-    readiness: VerificationReadiness;
-  } | null>(null);
   const [readinessCheck, setReadinessCheck] = useState(0);
   const verificationSettingsRevision = settings === null ? null : `${settings.processTimeoutMs}:${settings.maxStoredLogBytes}`;
+  // Everything a readiness answer is good FOR: the task, the gated run, its cause, the verification settings
+  // it was computed against, and which "Check for changes" generation asked for it. A settings edit or a
+  // manual re-check changes this key without necessarily changing the run id, and the answer this screen
+  // renders must not survive that — an enabled "Run verification" is worse than a moment of "Checking…".
+  const verificationReadinessKey = selectedTaskId === null || gatedVerificationRunId === null || gatedVerificationCause === null
+    ? null
+    : `${selectedTaskId}|${gatedVerificationRunId}|${gatedVerificationCause}|${verificationSettingsRevision}|${readinessCheck}`;
+  const [verificationReadiness, setVerificationReadiness] = useState<{
+    key: string;
+    readiness: VerificationReadiness;
+  } | null>(null);
   useEffect(() => {
-    if (selectedTaskId === null || gatedVerificationRunId === null || gatedVerificationCause === null) return undefined;
+    if (selectedTaskId === null || gatedVerificationCause === null || verificationReadinessKey === null) return undefined;
     let cancelled = false;
     const taskId = selectedTaskId;
-    const runId = gatedVerificationRunId;
+    const key = verificationReadinessKey;
     // The IPC call itself failing (rejected, or the main process answering `{ok:false}`) is distinct from a
     // domain-level "cannot check" answer, which `verificationReadiness` already returns as `unavailable` —
     // but the operator must see the same thing either way: a fixed message and, critically, the "Check for
@@ -413,19 +419,21 @@ export function RunView(): React.JSX.Element {
     void call('workflow:verificationReadiness', { taskId }).then(
       (response) => {
         if (cancelled) return;
-        setVerificationReadiness({ taskId, runId, readiness: response.ok ? response.data : unavailable });
+        setVerificationReadiness({ key, readiness: response.ok ? response.data : unavailable });
       },
       () => {
         if (cancelled) return;
-        setVerificationReadiness({ taskId, runId, readiness: unavailable });
+        setVerificationReadiness({ key, readiness: unavailable });
       }
     );
     return () => {
       cancelled = true;
     };
-  }, [selectedTaskId, gatedVerificationRunId, gatedVerificationCause, verificationSettingsRevision, readinessCheck]);
+  }, [selectedTaskId, gatedVerificationCause, verificationReadinessKey]);
+  // Applied only when it answers the CURRENT key: an answer for an earlier task/run/cause/settings/generation
+  // renders as nothing (the ordinary pending state below), never as a stale `ready` a click could still reach.
   const currentVerificationReadiness =
-    verificationReadiness !== null && verificationReadiness.taskId === selectedTaskId && verificationReadiness.runId === gatedVerificationRunId
+    verificationReadiness !== null && verificationReadiness.key === verificationReadinessKey
       ? verificationReadiness.readiness
       : null;
 
@@ -594,11 +602,10 @@ export function RunView(): React.JSX.Element {
           } catch (error) {
             // The gate in `runVerification` refuses at execution time, and it can refuse a request the
             // Run screen showed as `ready` a moment ago — the files or settings that made it ready can be
-            // reverted before the click lands. The cached readiness answer that authorized this click is
-            // stale either way (right or wrong, it no longer describes what the gate just decided), so it
-            // is discarded and a fresh read is asked for, rather than leaving an enabled button that would
-            // fail again the same way.
-            setVerificationReadiness(null);
+            // reverted before the click lands. Asking for a fresh read changes `verificationReadinessKey`
+            // (via `readinessCheck`), which by itself makes the answer that authorized this click stop
+            // applying — right or wrong, it no longer describes what the gate just decided — rather than
+            // leaving an enabled button that would fail again the same way.
             setReadinessCheck((value) => value + 1);
             throw error;
           } finally {
@@ -799,12 +806,9 @@ export function RunView(): React.JSX.Element {
             // is what must change, and a re-check for changes made outside the app. Neither control runs anything.
             <Notice tone="warn" role="status">
               <div className="stack">
-                <p>
-                  <strong>User action required.</strong>{' '}
-                  {currentVerificationReadiness.cause === 'output_limit'
-                    ? 'Verification output exceeded the Stored log budget, so its result could not be classified. Raise the budget in Settings or reduce what npm run verify prints; verification is offered again once the files or that setting have changed.'
-                    : 'One diagnostic re-run was already used for these exact files and ended the same way. Change the files or the verification settings (time limit, stored log budget) before another run, or stop the task; verification is offered again once something has changed.'}
-                </p>
+                {/* The one place this sentence is authored is `gatedVerification` in run-guidance.ts (`next`,
+                    rendered above as "Next action" too); repeating it here from a second copy would drift. */}
+                <p>{guidance.next}</p>
                 <div className="actions">
                   {currentVerificationReadiness.cause === 'output_limit' ? (
                     <button type="button" className="btn btn--sm" onClick={() => openSettings('maxStoredLogBytes')}>

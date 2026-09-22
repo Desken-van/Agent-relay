@@ -67,15 +67,6 @@ const SETTINGS_FOCUS_IDS: Record<SettingsFocus, string> = { maxStoredLogBytes: '
 
 export function SettingsView(): React.JSX.Element {
   const { settingsFocus, clearSettingsFocus } = useStore();
-  // Arrived from a screen that named one control (the Run screen's output-limit notice): bring it into view
-  // and focus it, once. Navigation only — nothing is read or written here.
-  useEffect(() => {
-    if (settingsFocus === null) return;
-    const field = document.getElementById(SETTINGS_FOCUS_IDS[settingsFocus]);
-    field?.scrollIntoView?.({ block: 'center' });
-    field?.querySelector('input')?.focus();
-    clearSettingsFocus();
-  }, [settingsFocus, clearSettingsFocus]);
   const { settings, diagnostics, refreshDiagnostics, refreshSettings, refreshCodexModels, perform, notify } =
     useStore();
 
@@ -84,6 +75,20 @@ export function SettingsView(): React.JSX.Element {
   // cannot silently clobber an in-progress edit, and there is no sync effect.
   const [edits, setEdits] = useState<Settings | null>(null);
   const draft = edits ?? settings;
+  // Arrived from a screen that named one control (the Run screen's output-limit notice): bring it into view
+  // and focus it, once. Navigation only — nothing is read or written here. `draft` is a dependency, not
+  // just `settingsFocus`, because the field this targets renders only once settings have loaded (below,
+  // `{!draft ? … : …}`); an operator can reach Settings before that IPC round-trip finishes, and clearing
+  // the flag on a `document.getElementById` miss then would discard the request permanently. Retrying as
+  // `draft` changes catches the field the moment it mounts, without a timer.
+  useEffect(() => {
+    if (settingsFocus === null) return;
+    const field = document.getElementById(SETTINGS_FOCUS_IDS[settingsFocus]);
+    if (field === null) return;
+    field.scrollIntoView?.({ block: 'center' });
+    field.querySelector('input')?.focus();
+    clearSettingsFocus();
+  }, [settingsFocus, clearSettingsFocus, draft]);
   const [checking, setChecking] = useState(false);
   // Raw textarea contents for the permission rules, kept separately so partially
   // typed lines survive; null means "show whatever the draft holds".
