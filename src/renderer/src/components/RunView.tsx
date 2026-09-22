@@ -424,11 +424,13 @@ export function RunView(): React.JSX.Element {
         if (cancelled) return;
         if (response.ok && response.data.state === 'not_blocked') {
           // The main process no longer agrees this task is even gated — its own view of the runs has moved
-          // on (typically another window's own click landed first). Nothing here can be "ready" or "blocked"
-          // for a run that, by the backend's own current account, is not gated at all; pulling a fresh
-          // `TaskDetail` is what makes `gatedVerificationRunId` recompute from what is actually true, rather
-          // than leaving this screen's own stale idea of "gated" stuck showing the ordinary pending text with
-          // nothing to press.
+          // on (typically another window's own click landed first). A PRIOR answer under this same key —
+          // most importantly a `ready` one — must not keep authorizing a click for a run the backend's own
+          // current account no longer considers gated at all: clear it first, before `refreshDetail` even
+          // starts, so this render already falls back to the safe pending state with no enabled button.
+          // Pulling a fresh `TaskDetail` is then what makes `gatedVerificationRunId` recompute from what is
+          // actually true, rather than leaving this screen's own stale idea of "gated" stuck.
+          setVerificationReadiness(null);
           void refreshDetail(taskId);
           return;
         }

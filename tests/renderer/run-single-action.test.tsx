@@ -8,7 +8,7 @@
  */
 import { useEffect, useRef } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import { RunView } from '../../src/renderer/src/components/RunView';
 import { useStore } from '../../src/renderer/src/state/store';
 import { runSchema, taskSchema, type Run, type Task } from '../../src/shared/domain/models';
@@ -436,5 +436,37 @@ describe('Run screen — waiting states: a gated verification with nothing chang
     expect(document.body.textContent).toContain('The files changed since that run');
     expect(document.body.textContent).not.toContain('User action required');
     expect(bridge.callsTo('workflow:verify')).toEqual([]);
+  });
+
+  it('a not_blocked poll while "Run verification" is showing clears it immediately, before refreshDetail settles — never a stale click', async () => {
+    // The exact case the code round found: this window still holds a `ready` answer and its enabled button;
+    // the NEXT poll (2s later, the self-healing timer, not a click — there is no button to click while ready)
+    // learns the backend no longer considers the run gated at all. The stale `ready` must not keep the button
+    // alive for even one more render while `refreshDetail` is in flight.
+    vi.useFakeTimers();
+    let answer: 'ready' | 'not_blocked' = 'ready';
+    const refreshed = deferred<unknown>();
+    const bridge = installBridge({
+      'dependencies:status': () => ok<'dependencies:status'>({ state: 'not_node_project', detail: 'No package.json.' }),
+      'workflow:verificationReadiness': () => ok<'workflow:verificationReadiness'>(
+        answer === 'ready'
+          ? { state: 'ready', cause: 'output_limit', filesChanged: true, settingsChanged: false }
+          : { state: 'not_blocked' }
+      ),
+      'tasks:get': () => refreshed.promise
+    });
+    renderApp(<SeededRun detail={OVERFLOW_DETAIL} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole('button', { name: 'Run verification' })).toBeTruthy();
+
+    answer = 'not_blocked';
+    await act(async () => { vi.advanceTimersByTime(2_000); await Promise.resolve(); await Promise.resolve(); });
+
+    // refreshDetail has NOT resolved yet (the deferred is still pending) — and already no stale button.
+    expect(screen.queryByRole('button', { name: 'Run verification' })).toBeNull();
+    expect(workflowControls()).toEqual([]);
+    expect(bridge.callsTo('workflow:verify')).toEqual([]);
+
+    vi.useRealTimers();
   });
 });
