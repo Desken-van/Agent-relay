@@ -280,6 +280,40 @@ describe('Run screen — waiting states: a gated verification with nothing chang
     expect(screen.getByRole('button', { name: 'Check for changes' })).toBeTruthy();
   });
 
+  it('a refused "Run verification" click discards the stale ready answer and re-reads it, landing on whatever the fresh read says — not the click repeated on the same stale belief', async () => {
+    // The readiness that made the button appear can go stale between the read and the click (the operator
+    // reverted the file, or the backend simply disagrees for its own reasons); the backend's own gate is
+    // what actually refused it. This does not merely re-arm the same stale "ready": it discards it and asks
+    // again, and the SECOND read here deliberately answers differently (`blocked`) to prove the new answer
+    // — not the old one — is what ends up on screen.
+    let reads = 0;
+    const bridge = installBridge({
+      'dependencies:status': () => ok<'dependencies:status'>({ state: 'not_node_project', detail: 'No package.json.' }),
+      'workflow:verificationReadiness': () => {
+        reads += 1;
+        return ok<'workflow:verificationReadiness'>(
+          reads === 1
+            ? { state: 'ready', cause: 'output_limit', filesChanged: true, settingsChanged: false }
+            : { state: 'blocked', cause: 'output_limit' }
+        );
+      },
+      'workflow:verify': () => ({ ok: false, error: { code: 'VALIDATION_FAILED', message: "Verification was not started: the last run's output exceeded the stored log budget." } })
+    });
+    renderApp(<SeededRun detail={OVERFLOW_DETAIL} />);
+
+    await screen.findByRole('button', { name: 'Run verification' });
+    expect(reads).toBe(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Run verification' }));
+
+    // The refused click discarded the stale `ready` answer (an immediate "Checking…" render) and asked
+    // again; the second read answers `blocked`, and that is what the screen now shows — no workflow
+    // control, and the click is not repeated on its own.
+    await waitFor(() => expect(reads).toBeGreaterThanOrEqual(2));
+    await screen.findAllByText(/User action required/);
+    expect(workflowControls()).toEqual([]);
+    expect(bridge.callsTo('workflow:verify')).toHaveLength(1);
+  });
+
   it('a rejected or failed readiness IPC call is read the same as "cannot check": a retry control appears, never a silent stall', async () => {
     // Distinct from the domain-level `unavailable` answer (which `Orchestrator.verificationReadiness` itself
     // returns): here the CALL fails — thrown, or the main process answered `{ok:false}` — and the renderer

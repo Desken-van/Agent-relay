@@ -591,6 +591,16 @@ export function RunView(): React.JSX.Element {
               tone: result.status === 'READY_FOR_REVIEW' ? 'success' : 'info',
               title: result.status === 'READY_FOR_REVIEW' ? 'Verification passed' : 'Verification did not pass'
             });
+          } catch (error) {
+            // The gate in `runVerification` refuses at execution time, and it can refuse a request the
+            // Run screen showed as `ready` a moment ago — the files or settings that made it ready can be
+            // reverted before the click lands. The cached readiness answer that authorized this click is
+            // stale either way (right or wrong, it no longer describes what the gate just decided), so it
+            // is discarded and a fresh read is asked for, rather than leaving an enabled button that would
+            // fail again the same way.
+            setVerificationReadiness(null);
+            setReadinessCheck((value) => value + 1);
+            throw error;
           } finally {
             setPrimaryPending(null);
           }
