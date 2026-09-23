@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildSpecificationRevisionPrompt } from '../../src/main/adapters/codex/prompts';
+import { buildSpecificationPrompt, buildSpecificationRevisionPrompt } from '../../src/main/adapters/codex/prompts';
 import type { AcceptedPlanFinding } from '../../src/shared/domain/plan-correction';
 import { makeSpecification } from '../helpers/fakes';
 
@@ -14,6 +14,9 @@ const accepted: AcceptedPlanFinding = {
   fix: 'Require synthetic fixtures in the constraints and in the instruction.',
   operatorNote: ''
 };
+
+const generation = (): string =>
+  buildSpecificationPrompt({ projectPath: 'C:\\repo', taskTitle: 'Add a section', originalRequest: 'Add it.' });
 
 const revision = (): string =>
   buildSpecificationRevisionPrompt({
@@ -48,5 +51,32 @@ describe('the specification revision prompt: what "addressed" must contain', () 
 
   it('no longer asks for one entry per finding, which cannot describe a finding fixed in two fields', () => {
     expect(flat(revision())).not.toMatch(/one entry for EACH accepted finding/i);
+  });
+});
+
+describe('verification evidence a specification may require', () => {
+  it.each([
+    ['generation', generation],
+    ['revision', revision]
+  ] as const)('the %s prompt requires Relay’s own verification record, never raw output', (_name, build) => {
+    const prompt = flat(build());
+
+    expect(prompt).toContain('require Agent Relay\'s own verification — its "Run verification" action');
+    expect(prompt).toContain('`npm run verify` in the task worktree');
+    expect(prompt).toContain('its exit code and classified outcome (passed, failed, timed_out or cancelled)');
+    expect(prompt).toContain(
+      'for a failed run, its failure kind and the bounded, sanitized output summary where one is available'
+    );
+    expect(prompt).toContain("never stores a command's raw stdout/stderr or a complete log");
+    expect(prompt).toContain(
+      'may require the actual, full or raw command output to be stored in, attached to, or shown by Agent Relay'
+    );
+  });
+
+  it('tells the revision that an accepted finding asking for such output is met by the persisted record', () => {
+    expect(flat(revision())).toContain(
+      'a finding that asks for such output is addressed by requiring that persisted record instead'
+    );
+    expect(flat(generation())).not.toContain('accepted findings too');
   });
 });
