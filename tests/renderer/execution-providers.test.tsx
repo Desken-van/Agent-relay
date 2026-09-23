@@ -124,7 +124,8 @@ describe('provider selection controls', () => {
     expect(screen.queryByRole('button', { name: 'Apply providers' })).toBeNull();
     fireEvent.click(screen.getByText('AI providers'));
     fireEvent.change(screen.getByLabelText('Implementation provider'), { target: { value: 'codex' } });
-    expect(bridge.calls).toHaveLength(0);
+    // The mount-time profile list (read-only, never a mutation) is the only call so far.
+    expect(bridge.calls.map((call) => call.channel)).toEqual(['localInference:listProfiles']);
 
     await burstClick(screen.getByRole('button', { name: 'Apply providers' }));
     expect(bridge.callsTo('workflow:configureProviders')).toEqual([{ channel: 'workflow:configureProviders', input: { taskId: 't', expectedRevision: 0, implementationProvider: 'codex', reviewProvider: 'codex' } }]);

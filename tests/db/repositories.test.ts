@@ -92,7 +92,18 @@ describe('migrations', () => {
       legacy.exec(`CREATE TABLE schema_migrations (
         version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
       )`);
-      for (const migration of MIGRATIONS.filter((entry) => entry.version < 12)) {
+      // Migrations 12 and 22 are applied early, out of order relative to 13 (the one still pending and
+      // actually under test here): 12 first because it rebuilds the `tasks` table (a fresh CREATE TABLE
+      // that predates the two Ornith-profile columns) and would otherwise silently drop them again, then 22
+      // for the columns themselves, so the CURRENT `SqliteTaskRepository` — which always writes them — can
+      // create these historical fixture rows below. Neither's own effects matter to this test: no task
+      // here uses 'ornith', so 12's new allowed value and 22's backfill are both no-ops. `runMigrations`
+      // below still applies 13–21 in order and skips 12 and 22, already recorded.
+      for (const migration of [
+        ...MIGRATIONS.filter((entry) => entry.version < 12),
+        ...MIGRATIONS.filter((entry) => entry.version === 12),
+        ...MIGRATIONS.filter((entry) => entry.version === 22)
+      ]) {
         migration.up(legacy);
         legacy.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
           .run(migration.version, migration.name, '2026-09-13T00:00:00.000Z');
@@ -122,10 +133,8 @@ describe('migrations', () => {
         lastReviewJson: null, lastError: 'Process exited with code 1.', codexModel: null, claudeModel: null
       });
 
-      // Migrations 12 (Ornith), 13 (this test's review-limit subject),
-      // 14 (review-blocked-status), 15 (compatibility repair), 16
-      // (Coai contract fingerprint), 17 (plan-review triage), and 18
-      // (code-review triage) are pending.
+      // Migrations 13 (this test's review-limit subject) through 21 (local-inference-profiles) are
+      // pending — 12 and 22 were already applied early, above.
       expect(runMigrations(legacy)).toBe(9);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_LIMIT_REACHED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');
@@ -147,7 +156,14 @@ describe('migrations', () => {
       legacy.exec(`CREATE TABLE schema_migrations (
         version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
       )`);
-      for (const migration of MIGRATIONS.filter((entry) => entry.version < 13)) {
+      // Migration 22 is applied early, out of its natural order, purely so the CURRENT
+      // `SqliteTaskRepository` — which always writes its two Ornith-profile columns — can create these
+      // historical fixture rows below. Its backfill step is a no-op here: no task exists yet, let alone an
+      // Ornith one. `runMigrations` below still applies 13–21 in order and skips 22, already recorded.
+      for (const migration of [
+        ...MIGRATIONS.filter((entry) => entry.version < 13),
+        ...MIGRATIONS.filter((entry) => entry.version === 22)
+      ]) {
         migration.up(legacy);
         legacy.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
           .run(migration.version, migration.name, '2026-09-13T00:00:00.000Z');
@@ -195,11 +211,9 @@ describe('migrations', () => {
         lastReviewJson: null, lastError: 'Process exited with code 1.', codexModel: null, claudeModel: null
       });
 
-      // Migrations 13 (review-limit-status), 14 (this test's review-blocked
-      // subject), 15 (compatibility repair), 16 (Coai contract
-      // fingerprint), 17 (plan-review triage), and 18 (code-review triage)
-      // are still pending.
-      expect(runMigrations(legacy)).toBe(8);
+      // Migrations 13 (review-limit-status) through 21 (local-inference-profiles) are still
+      // pending — 22 was already applied early, above.
+      expect(runMigrations(legacy)).toBe(9);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_BLOCKED');
       expect(tasks.findById(staleEvidence.id)?.status).toBe('FAILED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');

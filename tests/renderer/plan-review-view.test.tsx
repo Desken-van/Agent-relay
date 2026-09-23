@@ -22,6 +22,8 @@ const task = (status: Task['status'] = 'DRAFT'): Task => ({
   reviewProvider: 'codex',
   providerRevision: 0,
   implementationThreadId: null,
+  ornithModelProfileId: null,
+  ornithModelProfileFingerprint: null,
   worktreePath: null,
   branchName: null,
   baseBranch: null,

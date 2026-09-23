@@ -68,6 +68,8 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     reviewProvider: 'codex',
     providerRevision: 0,
     implementationThreadId: null,
+    ornithModelProfileId: null,
+    ornithModelProfileFingerprint: null,
     worktreePath: 'C:\\worktrees\\task-1',
     branchName: 'agent-relay/task-1',
     baseBranch: 'main',

@@ -32,6 +32,7 @@ import type { OrnithInferenceLeaseService } from '../../src/main/ports';
 import type { OrnithImplementationService } from '../../src/main/services/ornith-implementation';
 import type { ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { TaskOperationRegistry } from '../../src/main/services/task-operations';
+import { localInferenceProfileFingerprint } from '../../src/main/services/local-inference-profile-fingerprint';
 import type { Project, Settings, Task } from '../../src/shared/domain/models';
 import {
   FakeClaudeAdapter,
@@ -258,6 +259,26 @@ export function createHarness(
     },
 
     createTask(projectId, overrides = {}) {
+      // A caller asking for `implementationProvider: 'ornith'` without naming a profile gets bound to
+      // whichever profile Settings currently marks default — exactly what `configureProviders`/`create()`
+      // would have resolved and snapshotted for a real task, so every existing Ornith-routing test keeps
+      // working without each one having to name a profile explicitly. An override that already sets either
+      // profile field is left untouched.
+      const ornithBinding =
+        overrides.implementationProvider === 'ornith' &&
+        overrides.ornithModelProfileId === undefined &&
+        overrides.ornithModelProfileFingerprint === undefined
+          ? (() => {
+              const localInference = settings.get().localInference;
+              const profile = localInference.profiles.find((p) => p.id === localInference.defaultProfileId);
+              return profile === undefined
+                ? null
+                : {
+                    ornithModelProfileId: profile.id,
+                    ornithModelProfileFingerprint: localInferenceProfileFingerprint(profile)
+                  };
+            })()
+          : null;
       return tasks.create({
         id: ids.next(),
         projectId,
@@ -277,6 +298,7 @@ export function createHarness(
         specificationApprovedAt: null,
         lastReviewJson: null,
         lastError: null,
+        ...(ornithBinding ?? {}),
         ...overrides
       });
     },

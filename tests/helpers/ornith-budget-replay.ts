@@ -172,6 +172,8 @@ export function lease(overrides: Partial<OrnithHealthyLease> = {}): OrnithHealth
   return {
     providerId: 'llama.cpp',
     modelId: 'ornith-fixture',
+    modelProfileId: 'default',
+    modelProfileDisplayName: 'Local model',
     runtimeInstanceId: 'runtime-fixture',
     contextLimitTokens: 32_768,
     maxOutputTokens: 1_024,

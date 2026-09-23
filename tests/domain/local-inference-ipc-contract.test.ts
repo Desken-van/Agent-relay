@@ -10,6 +10,7 @@ import {
   LOCAL_INFERENCE_PROTOCOL,
   type LocalInferenceCapabilities,
   type LocalInferenceOutcome,
+  type LocalInferenceProfileSummary,
   type LocalInferenceState
 } from '../../src/shared/domain/local-inference';
 
@@ -21,13 +22,36 @@ const LIFECYCLE_CHANNELS = [
   'localInference:stop'
 ] as const;
 
-const ALL_CHANNELS = [...LIFECYCLE_CHANNELS, 'localInference:runTestInference'] as const;
+/** Read-only or profile-selection channels: additive alongside the five lifecycle ones, never a path,
+ *  identity, executable or fingerprint — see `listProfiles`'s own doc comment in `shared/ipc.ts`. */
+const PROFILE_CHANNELS = ['localInference:listProfiles', 'localInference:selectProfile'] as const;
+
+const ALL_CHANNELS = [
+  ...LIFECYCLE_CHANNELS,
+  'localInference:runTestInference',
+  ...PROFILE_CHANNELS
+] as const;
 
 describe('local-inference IPC contract', () => {
-  it('contains exactly the five lifecycle channels plus the one additive prompt channel', () => {
+  it('contains exactly the five lifecycle channels plus the additive prompt and profile channels', () => {
     expect(IPC_CHANNELS.filter((channel) => channel.startsWith('localInference:')).sort()).toEqual(
       [...ALL_CHANNELS].sort()
     );
+  });
+
+  it('localInference:listProfiles accepts only a strict empty object', () => {
+    const schema = ipcInputSchemas['localInference:listProfiles'];
+    expect(schema.safeParse({}).success).toBe(true);
+    expect(schema.safeParse({ profileId: 'default' }).success).toBe(false);
+  });
+
+  it('localInference:selectProfile accepts only a bounded profileId and nothing else', () => {
+    const schema = ipcInputSchemas['localInference:selectProfile'];
+    expect(schema.safeParse({ profileId: 'default' }).success).toBe(true);
+    expect(schema.safeParse({}).success).toBe(false);
+    expect(schema.safeParse({ profileId: '' }).success).toBe(false);
+    expect(schema.safeParse({ profileId: 'x'.repeat(65) }).success).toBe(false);
+    expect(schema.safeParse({ profileId: 'default', path: 'C:\\models\\model.gguf' }).success).toBe(false);
   });
 
   it('accepts only strict empty objects on every lifecycle channel', () => {
@@ -136,5 +160,20 @@ describe('local-inference IPC contract', () => {
     };
     const response: IpcResponseMap['localInference:runTestInference'] = outcome;
     expect(response).toBe(outcome);
+  });
+
+  it('maps localInference:listProfiles to a readonly array of summaries, and selectProfile to null', () => {
+    const summary: LocalInferenceProfileSummary = {
+      id: 'default',
+      displayName: 'Local model',
+      enabled: true,
+      isDefault: true,
+      activity: 'inactive',
+      activeStateKind: null
+    };
+    const profilesResponse: IpcResponseMap['localInference:listProfiles'] = [summary];
+    const selectResponse: IpcResponseMap['localInference:selectProfile'] = null;
+    expect(profilesResponse).toEqual([summary]);
+    expect(selectResponse).toBeNull();
   });
 });
