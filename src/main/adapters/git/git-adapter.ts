@@ -24,7 +24,7 @@ import type {
 } from '../../../shared/domain/git';
 import type { ToolDiagnostic } from '../../../shared/domain/diagnostics';
 import { redactSecrets } from '../../../shared/util/redact';
-import type { CreateWorktreeRequest, GitAdapter } from '../../ports';
+import type { CreateDetachedCheckoutRequest, CreateWorktreeRequest, GitAdapter } from '../../ports';
 import { locateExecutable } from '../process/executable-locator';
 import type { ProcessResult, ProcessRunner } from '../process/process-runner';
 
@@ -62,6 +62,15 @@ const FORBIDDEN: ReadonlyArray<{ test: (args: readonly string[]) => boolean; why
     why: 'History rewriting is out of scope for Agent Relay.'
   }
 ];
+
+/** A full SHA-1 or SHA-256 commit id — never a ref, never an option. */
+const COMMIT_ID = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+
+function assertCommitId(value: string): void {
+  if (!COMMIT_ID.test(value)) {
+    throw new AgentRelayError('VALIDATION_FAILED', 'Expected a full Git commit id.', { details: value.slice(0, 80) });
+  }
+}
 
 function assertAllowed(args: readonly string[]): void {
   for (const rule of FORBIDDEN) {
@@ -248,8 +257,42 @@ export class CliGitAdapter implements GitAdapter {
     return result.exitCode === 0;
   }
 
+  async resolveCommit(repositoryPath: string, ref: string): Promise<string | null> {
+    if (ref.startsWith('-')) throw new AgentRelayError('VALIDATION_FAILED', 'A Git ref may not start with "-".');
+    const result = await this.git(
+      repositoryPath,
+      ['rev-parse', '--verify', '--quiet', '--end-of-options', `${ref}^{commit}`],
+      { allowFailure: true }
+    );
+    const commit = result.stdout.trim();
+    return result.exitCode === 0 && COMMIT_ID.test(commit) ? commit : null;
+  }
+
+  async isAncestor(repositoryPath: string, ancestor: string, descendant: string): Promise<boolean> {
+    assertCommitId(ancestor);
+    assertCommitId(descendant);
+    const result = await this.git(repositoryPath, ['merge-base', '--is-ancestor', ancestor, descendant], {
+      allowFailure: true
+    });
+    // 1 is Git's definite "no"; anything else is a failure to answer, never a "no".
+    if (result.exitCode === 0) return true;
+    if (result.exitCode === 1) return false;
+    throw new AgentRelayError('GIT_FAILED', 'git merge-base failed.', {
+      details: redactSecrets((result.stderr || result.stdout).slice(0, 2000))
+    });
+  }
+
+  async createDetachedCheckout(request: CreateDetachedCheckoutRequest): Promise<void> {
+    assertCommitId(request.commit);
+    mkdirSync(dirname(request.checkoutPath), { recursive: true });
+    await this.git(request.repositoryPath, ['worktree', 'add', '--detach', request.checkoutPath, request.commit], {
+      timeoutMs: 300_000
+    });
+  }
+
   async createWorktree(request: CreateWorktreeRequest): Promise<WorktreeInfo> {
-    const { repositoryPath, baseBranch, branchName, worktreePath } = request;
+    const { repositoryPath, baseBranch, branchName, worktreePath, startPoint } = request;
+    if (startPoint !== undefined) assertCommitId(startPoint);
 
     if (await this.branchExists(repositoryPath, branchName)) {
       throw new AgentRelayError('WORKTREE_CONFLICT', `Branch "${branchName}" already exists.`, {
@@ -266,7 +309,7 @@ export class CliGitAdapter implements GitAdapter {
     mkdirSync(dirname(worktreePath), { recursive: true });
 
     // `worktree add -b` creates the branch and the checkout in one atomic step.
-    await this.git(repositoryPath, ['worktree', 'add', '-b', branchName, worktreePath, baseBranch], {
+    await this.git(repositoryPath, ['worktree', 'add', '-b', branchName, worktreePath, startPoint ?? baseBranch], {
       timeoutMs: 300_000
     });
 

@@ -282,6 +282,9 @@ function lateBound(factories: ReturnType<typeof adapterFactories>): {
     git: {
       inspect: (path) => factories.git().inspect(path),
       branchExists: (path, branch) => factories.git().branchExists(path, branch),
+      resolveCommit: (path, ref) => factories.git().resolveCommit(path, ref),
+      isAncestor: (path, ancestor, descendant) => factories.git().isAncestor(path, ancestor, descendant),
+      createDetachedCheckout: (request) => factories.git().createDetachedCheckout(request),
       createWorktree: (request) => factories.git().createWorktree(request),
       listWorktrees: (path) => factories.git().listWorktrees(path),
       removeWorktree: (repo, path) => factories.git().removeWorktree(repo, path),

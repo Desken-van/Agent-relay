@@ -1732,11 +1732,29 @@ export interface CreateWorktreeRequest {
   readonly baseBranch: string;
   readonly branchName: string;
   readonly worktreePath: string;
+  /**
+   * The commit the new branch starts at: the one a specification was generated
+   * against. Absent, the branch starts at the base branch's current tip.
+   */
+  readonly startPoint?: string;
+}
+
+export interface CreateDetachedCheckoutRequest {
+  readonly repositoryPath: string;
+  /** A full commit id. The checkout is detached: no branch is created or moved. */
+  readonly commit: string;
+  readonly checkoutPath: string;
 }
 
 export interface GitAdapter {
   inspect(repositoryPath: string): Promise<RepositoryInfo>;
   branchExists(repositoryPath: string, branch: string): Promise<boolean>;
+  /** The full commit id a ref names, or null when it names no commit. Read-only. */
+  resolveCommit(repositoryPath: string, ref: string): Promise<string | null>;
+  /** Whether `ancestor` is reachable from `descendant` (a commit is its own ancestor). Read-only. */
+  isAncestor(repositoryPath: string, ancestor: string, descendant: string): Promise<boolean>;
+  /** A detached checkout of exactly one commit, for reading only; removed with `removeWorktree`. */
+  createDetachedCheckout(request: CreateDetachedCheckoutRequest): Promise<void>;
   createWorktree(request: CreateWorktreeRequest): Promise<WorktreeInfo>;
   listWorktrees(repositoryPath: string): Promise<WorktreeInfo[]>;
   /** Non-destructive: refuses when the worktree has uncommitted changes. */
