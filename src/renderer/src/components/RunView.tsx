@@ -584,7 +584,10 @@ export function RunView(): React.JSX.Element {
     });
   };
 
-  /** Every non-plan-review action: exactly one bounded IPC call, then one read-only refresh. */
+  /**
+   * Every non-plan-review action: exactly one bounded IPC call, then one read-only refresh. Plan-review
+   * actions are forwarded to the dispatcher the plan-review panel registers.
+   */
   const dispatchAction = (action: RunPrimaryAction | null | undefined): void => {
     if (!action || !action.enabled) return;
     switch (action.key) {
@@ -696,8 +699,15 @@ export function RunView(): React.JSX.Element {
       case 'reconcile_plan_review':
       case 'retry_plan_review':
       case 'resolve_plan_review':
+      case 'continue_plan_correction':
         planPrimaryDispatch.current?.(action.key);
         return;
+      default: {
+        // The panel renders no primary button here, so a key this switch does not handle
+        // would be an enabled button that does nothing.
+        const exhaustive: never = action.key;
+        return exhaustive;
+      }
     }
   };
   const dispatchPrimary = (): void => dispatchAction(guidance.action);
