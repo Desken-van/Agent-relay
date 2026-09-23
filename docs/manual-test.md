@@ -545,6 +545,29 @@ else { $env:AGENT_RELAY_DATA_DIR = $previousDataDir }
 
 ---
 
+## Configured provider smoke-test checklist
+
+Smoke-test the configured provider against this workspace before relying on it.
+Record every field below with evidence; leave nothing to a display name alone.
+
+| Item | Record |
+|---|---|
+| Configured provider | e.g. `<provider name>` |
+| Exact model / runtime | e.g. `<model name> + <runtime version>` — not a friendly label |
+| plan-review available | required capability: yes / no, with how it was demonstrated |
+| code-review available | required capability: yes / no, with how it was demonstrated |
+| Implementation outcome | what was built and the evidence (command / output / link) |
+| Verification outcome | `npm run verify` command and result, or equivalent evidence |
+| Final result | `PASS` or `BLOCKED / NOT PASSED` |
+
+`plan-review` and `code-review` are required. If either is unavailable or
+cannot be demonstrated, or if implementation or verification fails, times out,
+or is otherwise unsuccessful, record `BLOCKED / NOT PASSED` — never `PASS`. A
+`PASS` requires both required capabilities demonstrated and both implementation
+and verification to succeed, with recorded evidence for each conclusion.
+
+---
+
 ## 13. External plan review — opt-in real-provider acceptance
 
 This test is deliberately separate from `npm run verify`. It starts the built
