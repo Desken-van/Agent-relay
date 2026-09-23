@@ -17,6 +17,7 @@ import type { GitChangeSet, RepositoryInfo, WorktreeInfo } from '../shared/domai
 import type {
   LocalInferenceCapabilities,
   LocalInferenceOutcome,
+  LocalInferenceProfileSummary,
   LocalInferenceRequest,
   LocalInferenceState
 } from '../shared/domain/local-inference';
@@ -119,8 +120,8 @@ export interface ProjectRepository {
   delete(id: string): void;
 }
 
-export type NewTask = Omit<Task, 'createdAt' | 'updatedAt' | 'implementationProvider' | 'reviewProvider' | 'providerRevision' | 'implementationThreadId'> &
-  Partial<Pick<Task, 'implementationProvider' | 'reviewProvider' | 'providerRevision' | 'implementationThreadId'>>;
+export type NewTask = Omit<Task, 'createdAt' | 'updatedAt' | 'implementationProvider' | 'reviewProvider' | 'providerRevision' | 'implementationThreadId' | 'ornithModelProfileId' | 'ornithModelProfileFingerprint'> &
+  Partial<Pick<Task, 'implementationProvider' | 'reviewProvider' | 'providerRevision' | 'implementationThreadId' | 'ornithModelProfileId' | 'ornithModelProfileFingerprint'>>;
 export type TaskPatch = Partial<Omit<Task, 'id' | 'projectId' | 'createdAt' | 'updatedAt'>>;
 
 export interface TaskRepository {
@@ -132,10 +133,19 @@ export interface TaskRepository {
    * running, and after a crash the rows saying so are the only trace left.
    */
   listBusy(): Task[];
+  /** Every task not yet in a terminal status, across all projects — used to guard a Settings removal that would orphan one. */
+  listNonTerminal(): Task[];
   findById(id: string): Task | null;
   create(task: NewTask): Task;
   update(id: string, patch: TaskPatch): Task;
-  changeProviders(id: string, expectedRevision: number, implementation: Task['implementationProvider'], review: Task['reviewProvider']): Task;
+  changeProviders(
+    id: string,
+    expectedRevision: number,
+    implementation: Task['implementationProvider'],
+    review: Task['reviewProvider'],
+    ornithModelProfileId: string | null,
+    ornithModelProfileFingerprint: string | null
+  ): Task;
   /** Tasks whose worktree is currently allocated — used to prevent sharing. */
   listActiveWorktreePaths(): { taskId: string; worktreePath: string }[];
   delete(id: string): void;
@@ -1600,6 +1610,22 @@ export interface LocalInferenceLifecycleService {
   health(): Promise<LocalInferenceState>;
   stop(): Promise<LocalInferenceState>;
   runTestInference(prompt: string): Promise<LocalInferenceOutcome>;
+  /**
+   * Which configured profile the retained runtime is, or would next be started as. `null` means none is
+   * selected yet — `start()` then answers `unavailable` regardless of whether local inference is enabled.
+   */
+  activeProfileId(): string | null;
+  /** Read-only, bounded and safe for the renderer: every configured profile's selectability and activity. */
+  listProfiles(): readonly LocalInferenceProfileSummary[];
+  /**
+   * Choose which profile `start()` binds next. Read-only otherwise: never constructs, launches or
+   * contacts anything.
+   *
+   * @throws {AgentRelayError} `NOT_FOUND` when `profileId` names no configured profile; `BUSY` while the
+   * retained runtime is starting, healthy, inferring or stopping — switching profiles requires an
+   * explicit `stop()` first, never an implicit restart of whatever was running.
+   */
+  selectActiveProfile(profileId: string): void;
 }
 
 /**
@@ -1617,6 +1643,9 @@ export interface OrnithHealthyLease {
   readonly runtimeInstanceId: string;
   readonly providerId: string;
   readonly modelId: string;
+  /** The profile this lease was acquired against — the exact identity `acquireOrnithLease` was asked for. */
+  readonly modelProfileId: string;
+  readonly modelProfileDisplayName: string;
   /**
    * The exact context/output limits of the retained runtime configuration.
    * Captured with the provider identity so the Ornith loop can prove every
@@ -1656,12 +1685,23 @@ export interface OrnithInferenceLeaseService {
    * Acquire the one application-wide Ornith execution lease and perform one
    * bounded `health(signal)` check against the already-retained provider.
    *
+   * `expectedProfileId` is the profile the CALLER'S task is bound to (never omitted — there is no
+   * "any profile will do" caller). Acquisition fails unless the retained runtime's active profile is
+   * exactly that one, so a task can never silently run against a different model than the one it was
+   * approved against.
+   *
    * @throws {AgentRelayError} with code `BUSY` when another Ornith run
    * already holds the lease, or `VALIDATION_FAILED` when no provider is
-   * retained, the retained provider is not `healthy`, or the health check
-   * does not confirm it. Never calls `start()`.
+   * retained, the retained provider is not `healthy`, the health check does
+   * not confirm it, the active profile does not match `expectedProfileId`, or that profile's
+   * configuration no longer matches `expectedProfileFingerprint` (an operator edited it after this task
+   * was bound). Never calls `start()`.
    */
-  acquireOrnithLease(signal?: AbortSignal): Promise<OrnithHealthyLease>;
+  acquireOrnithLease(
+    expectedProfileId: string,
+    expectedProfileFingerprint: string,
+    signal?: AbortSignal
+  ): Promise<OrnithHealthyLease>;
   /**
    * Re-confirm the lease is still valid: the same provider/model identity is
    * still configured and the retained provider is still healthy right now.

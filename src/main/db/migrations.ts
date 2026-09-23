@@ -7,10 +7,13 @@
  * existing one, because a user's database may already have applied it.
  */
 
+import { createHash } from 'node:crypto';
 import type { SqliteDatabase } from './sqlite';
 import {
   defaultLocalInferenceSettings,
-  upgradeLegacyLocalInferenceSettings
+  localInferenceProfilesSettingsSchema,
+  upgradeLegacyLocalInferenceSettings,
+  upgradeLocalInferenceProfilesSettings
 } from '../../shared/domain/local-inference';
 
 export interface Migration {
@@ -697,6 +700,14 @@ export const MIGRATIONS: readonly Migration[] = [
         parsed = undefined;
       }
 
+      // `defaultLocalInferenceSettings()` now returns the profiles shape migration 21 introduced, so on a
+      // build that ships both migrations, migration 9's fresh-install seed already IS that shape — this
+      // migration's own single-runtime upgrade does not recognise it and must leave it untouched for
+      // migration 21 to own, rather than reading it as unparseable and collapsing it back to a bare default.
+      // No real historical row (from any build that shipped before this one) can already be profile-shaped,
+      // so every actual upgrade this migration was ever written for is unaffected.
+      if (localInferenceProfilesSettingsSchema.safeParse(parsed).success) return;
+
       const upgraded = upgradeLegacyLocalInferenceSettings(parsed);
       db.prepare('UPDATE settings SET value = ? WHERE key = ?').run(
         JSON.stringify(upgraded),
@@ -1182,6 +1193,83 @@ export const MIGRATIONS: readonly Migration[] = [
         ALTER TABLE plan_review_gates ADD COLUMN failure_kind TEXT;
         ALTER TABLE plan_review_gates ADD COLUMN superseded_by TEXT;
       `);
+    }
+  },
+  {
+    version: 21,
+    name: 'local-inference-profiles',
+    up(db) {
+      // Exactly migration 11's own shape: read the row, upgrade it, write it back. Nothing to upgrade on
+      // a fresh install — migration 9's seed is already current-shaped by the time this build runs.
+      const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as
+        | { value: string }
+        | undefined;
+      if (row === undefined) return;
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(row.value);
+      } catch {
+        parsed = undefined;
+      }
+
+      const upgraded = upgradeLocalInferenceProfilesSettings(parsed);
+      db.prepare('UPDATE settings SET value = ? WHERE key = ?').run(
+        JSON.stringify(upgraded),
+        'localInference'
+      );
+    }
+  },
+  {
+    version: 22,
+    name: 'ornith-model-profile',
+    up(db) {
+      // Nullable, no CHECK — a profile id is validated at the application layer, where the full profile
+      // list is available, exactly like `codex_model`/`claude_model` today. No table rebuild: SQLite can
+      // add a column without one.
+      db.exec(`
+        ALTER TABLE tasks ADD COLUMN ornith_model_profile_id TEXT;
+        ALTER TABLE tasks ADD COLUMN ornith_model_profile_fingerprint TEXT;
+      `);
+
+      // Backfill every EXISTING task whose implementation provider is already 'ornith': it was created,
+      // and may already be approved or mid-round, under the single configuration migration 21 just wrapped
+      // as the 'default' profile — bind it to exactly that, explicitly, rather than leaving it NULL and
+      // letting a later round re-resolve against whatever the default profile happens to be by then. A
+      // task that predates 'ornith' entirely, or was never switched to it, gets no binding (NULL), exactly
+      // as a brand-new non-ornith task does.
+      const settingsRow = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as
+        | { value: string }
+        | undefined;
+      if (settingsRow === undefined) return;
+      let settings: unknown;
+      try {
+        settings = JSON.parse(settingsRow.value);
+      } catch {
+        settings = undefined;
+      }
+      const upgraded = upgradeLocalInferenceProfilesSettings(settings);
+      const defaultProfile = upgraded.profiles.find((profile) => profile.id === upgraded.defaultProfileId);
+      if (!defaultProfile) return;
+      // Deliberately inlined rather than importing the main-process fingerprint helper (node:crypto) into
+      // the migration path: the exact same shape and hash the runtime uses at every later comparison.
+      const shape = {
+        executable: defaultProfile.executable,
+        model: defaultProfile.model,
+        fixedArguments: defaultProfile.fixedArguments,
+        port: defaultProfile.port,
+        contextLimitTokens: defaultProfile.contextLimitTokens,
+        startupTimeoutMs: defaultProfile.startupTimeoutMs,
+        healthTimeoutMs: defaultProfile.healthTimeoutMs,
+        inferenceTimeoutMs: defaultProfile.inferenceTimeoutMs,
+        shutdownTimeoutMs: defaultProfile.shutdownTimeoutMs,
+        requestDefaults: defaultProfile.requestDefaults
+      };
+      const fingerprint = createHash('sha256').update(JSON.stringify(shape), 'utf8').digest('hex').slice(0, 16);
+      db.prepare(
+        `UPDATE tasks SET ornith_model_profile_id = ?, ornith_model_profile_fingerprint = ?
+          WHERE implementation_provider = 'ornith' AND ornith_model_profile_id IS NULL`
+      ).run(defaultProfile.id, fingerprint);
     }
   }
 ];

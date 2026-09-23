@@ -212,7 +212,26 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
 
   return {
     'settings:get': () => app.settings.get(),
-    'settings:update': (input) => app.settings.update(input),
+    'settings:update': (input) => {
+      // A profile a non-terminal task is bound to may not be removed from Settings — that task's own
+      // lease acquisition is the ONLY place that should ever discover its profile is gone, and it must
+      // discover that once the task itself has finished, not mid-life because an unrelated Settings edit
+      // deleted the row out from under it. Checked here, at the one IPC layer that already holds both
+      // `app.settings` and `app.tasks`, rather than coupling the two repositories to each other.
+      if (input.localInference !== undefined) {
+        const keptIds = new Set(input.localInference.profiles.map((profile) => profile.id));
+        const orphaned = app.tasks.listNonTerminal()
+          .find((task) => task.ornithModelProfileId !== null && !keptIds.has(task.ornithModelProfileId));
+        if (orphaned) {
+          throw new AgentRelayError(
+            'VALIDATION_FAILED',
+            `Task "${orphaned.title}" is still bound to a local-model profile this change would remove.`,
+            { remediation: 'Keep that profile, or wait until the task completes, then remove it.' }
+          );
+        }
+      }
+      return app.settings.update(input);
+    },
 
     'localInference:getCapabilities': () => app.localInference.capabilities(),
     'localInference:start': () => app.localInference.start(),
@@ -220,6 +239,11 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     'localInference:checkHealth': () => app.localInference.health(),
     'localInference:stop': () => app.localInference.stop(),
     'localInference:runTestInference': (input) => app.localInference.runTestInference(input.prompt),
+    'localInference:listProfiles': () => app.localInference.listProfiles(),
+    'localInference:selectProfile': (input) => {
+      app.localInference.selectActiveProfile(input.profileId);
+      return null;
+    },
 
     'diagnostics:run': (input) => app.diagnostics.run(input.force ?? false),
 

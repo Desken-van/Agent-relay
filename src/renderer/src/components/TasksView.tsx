@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react';
 import { CLAUDE_MODEL_ALIASES } from '@shared/domain/models';
 import type { ImplementationProvider, ReviewProvider } from '@shared/domain/execution-providers';
+import type { LocalInferenceProfileSummary } from '@shared/domain/local-inference';
 import {
   choiceFromModel,
   choiceToModel,
   isChoiceIncomplete,
   type ModelChoice
 } from '@shared/domain/model-choice';
-import { expect } from '../lib/api';
+import { call, expect } from '../lib/api';
 import { formatDateTime, truncateMiddle } from '../lib/format';
 import { useStore } from '../state/store';
 import { Card, Empty, Field, Notice, Rounds, Scope, StatusBadge } from './primitives';
@@ -32,6 +33,26 @@ export function TasksView(): React.JSX.Element {
   const [request, setRequest] = useState('');
   const [implementationProvider, setImplementationProvider] = useState<ImplementationProvider>('claude');
   const [reviewProvider, setReviewProvider] = useState<ReviewProvider>('codex');
+
+  // `null` means "untouched": defer to whichever profile Settings currently
+  // marks as default, the same pattern used for the model choices below.
+  const [ornithModelProfileId, setOrnithModelProfileId] = useState<string | null>(null);
+  const [localInferenceProfiles, setLocalInferenceProfiles] = useState<
+    readonly LocalInferenceProfileSummary[]
+  >([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const response = await call('localInference:listProfiles', {});
+      if (!cancelled && response.ok) setLocalInferenceProfiles(response.data);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Mount-only: the New-task form is short-lived, and Settings already
+    // surfaces its own always-current profile list.
+  }, []);
 
   // The round budget is derived, not synchronised: the settings ceiling is the
   // default, and an explicit choice is clamped to it. Lowering the ceiling in
@@ -64,6 +85,34 @@ export function TasksView(): React.JSX.Element {
   // instead of quietly submitting null.
   const modelsIncomplete =
     isChoiceIncomplete(codexSelection) || isChoiceIncomplete(claudeSelection);
+
+  const defaultOrnithProfile =
+    localInferenceProfiles.find((profile) => profile.isDefault) ?? null;
+  const selectedOrnithProfile =
+    ornithModelProfileId === null
+      ? defaultOrnithProfile
+      : (localInferenceProfiles.find((profile) => profile.id === ornithModelProfileId) ?? null);
+
+  // Never silently falls back to a different profile or provider: Create stays
+  // disabled with a visible, specific reason for every way Ornith could be
+  // unready, mirroring `resolveOrnithModelProfileBinding`'s own checks.
+  function ornithUnavailableReason(): string | null {
+    if (implementationProvider !== 'ornith') return null;
+    if (!(settings?.localInference.enabled ?? false)) {
+      return 'Local inference is disabled. Enable it in Settings → Local inference.';
+    }
+    if (localInferenceProfiles.length === 0) {
+      return 'No local-model profile is configured. Add one in Settings → Local inference.';
+    }
+    if (selectedOrnithProfile === null) {
+      return 'Choose a local-model profile, or set a default in Settings → Local inference.';
+    }
+    if (!selectedOrnithProfile.enabled) {
+      return `The profile "${selectedOrnithProfile.displayName}" is disabled. Enable it in Settings, or choose another.`;
+    }
+    return null;
+  }
+  const ornithReason = ornithUnavailableReason();
 
   useEffect(() => {
     if (selectedProject) void refreshTasks(selectedProject.id);
@@ -167,11 +216,39 @@ export function TasksView(): React.JSX.Element {
               </select>
             </Field>
             {implementationProvider === 'ornith' ? (
-              <Notice tone="info">
-                Ornith implements using the local runtime configured under Settings → Local
-                inference. Start it and confirm it is Healthy before running implementation —
-                Agent Relay never starts or restarts it automatically.
-              </Notice>
+              <>
+                <Notice tone="info">
+                  Ornith implements through Agent Relay&apos;s own local coding-agent protocol,
+                  against whichever model profile you pick below. Start that profile&apos;s
+                  runtime under Settings → Local inference and confirm it is Healthy before
+                  running implementation — Agent Relay never starts or restarts it automatically.
+                </Notice>
+                <Field
+                  label="Local-model profile"
+                  hint="Bound to this task at creation. A later Settings edit never silently changes it."
+                >
+                  <select
+                    className="input"
+                    aria-label="Local-model profile"
+                    value={ornithModelProfileId ?? ''}
+                    onChange={(e) => setOrnithModelProfileId(e.target.value === '' ? null : e.target.value)}
+                  >
+                    <option value="">
+                      {defaultOrnithProfile
+                        ? `Use default (${defaultOrnithProfile.displayName})`
+                        : 'Use default (none configured)'}
+                    </option>
+                    {localInferenceProfiles.map((profile) => (
+                      <option key={profile.id} value={profile.id} disabled={!profile.enabled}>
+                        {profile.displayName}
+                        {profile.isDefault ? ' (default)' : ''}
+                        {profile.enabled ? '' : ' — disabled'}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                {ornithReason ? <Notice tone="warn">{ornithReason}</Notice> : null}
+              </>
             ) : null}
             <Field label="Review provider">
               <select className="input" aria-label="Review provider" value={reviewProvider} onChange={(e) => setReviewProvider(e.target.value as ReviewProvider)}>
@@ -235,7 +312,7 @@ export function TasksView(): React.JSX.Element {
             <button
               type="button"
               className="btn btn--primary"
-              disabled={!title.trim() || !request.trim() || modelsIncomplete}
+              disabled={!title.trim() || !request.trim() || modelsIncomplete || ornithReason !== null}
               onClick={() =>
                 void perform('create-task', 'Could not create the task', async () => {
                   const task = await expect('tasks:create', {
@@ -249,13 +326,20 @@ export function TasksView(): React.JSX.Element {
                     codexModel,
                     claudeModel,
                     implementationProvider,
-                    reviewProvider
+                    reviewProvider,
+                    // Omitted (not an explicit null) when the operator left it on
+                    // "Use default": the server resolves and snapshots whichever
+                    // profile Settings currently marks default at creation time.
+                    ...(implementationProvider === 'ornith' && ornithModelProfileId !== null
+                      ? { ornithModelProfileId }
+                      : {})
                   });
                   setTitle('');
                   setRequest('');
                   // Back to whatever Settings currently defaults to.
                   setCodexChoice(null);
                   setClaudeChoice(null);
+                  setOrnithModelProfileId(null);
                   await refreshTasks(selectedProject.id);
                   selectTask(task.id);
                   setSection('run');

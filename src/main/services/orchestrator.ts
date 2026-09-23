@@ -41,6 +41,7 @@ import {
 import type { VerificationRecord } from '../../shared/domain/verification';
 import { classifyVerificationFailure } from '../../shared/domain/verification-failure';
 import { verificationConfigurationFingerprint, verificationEvidenceFingerprint } from './verification-fingerprints';
+import { resolveOrnithModelProfileBinding } from './ornith-model-profile-binding';
 import type { WorktreeDependencyStatus } from '../../shared/domain/worktree-dependencies';
 import {
   parsePlanReviewDecisions,
@@ -579,14 +580,34 @@ export class Orchestrator {
     return record.data;
   }
 
-  configureProviders(input: { taskId: string; expectedRevision: number; implementationProvider: ImplementationProvider; reviewProvider: ReviewProvider }): Task {
+  configureProviders(input: {
+    taskId: string;
+    expectedRevision: number;
+    implementationProvider: ImplementationProvider;
+    reviewProvider: ReviewProvider;
+    /** Omitted while already `ornith` and not asking for a different profile: keeps the current binding untouched. */
+    ornithModelProfileId?: string;
+  }): Task {
     const task = this.requireTask(input.taskId);
     if (this.isRunning(task.id) || !canChangeProviders(task.status) || this.deps.runs.listByTask(task.id).some((r) => r.status === 'running')) {
       throw new AgentRelayError('INVALID_TRANSITION', 'Providers can only change while the task is idle and not approved for publication.');
     }
     const implementation = implementationProviderSchema.parse(input.implementationProvider);
     const review = reviewProviderSchema.parse(input.reviewProvider);
-    const updated = this.deps.tasks.changeProviders(task.id, input.expectedRevision, implementation, review);
+    // No explicit profile requested and the task is already ornith: keep its existing binding exactly as
+    // it is, rather than re-resolving (and possibly re-refusing) it just because providers were reapplied.
+    // Every other case — switching TO ornith, or naming a different profile while already ornith —
+    // resolves and snapshots a fresh binding.
+    const ornithBinding = implementation !== 'ornith'
+      ? null
+      : input.ornithModelProfileId === undefined && task.implementationProvider === 'ornith' &&
+        task.ornithModelProfileId !== null && task.ornithModelProfileFingerprint !== null
+        ? { profileId: task.ornithModelProfileId, profileFingerprint: task.ornithModelProfileFingerprint }
+        : resolveOrnithModelProfileBinding(this.deps.settings.get().localInference, input.ornithModelProfileId);
+    const updated = this.deps.tasks.changeProviders(
+      task.id, input.expectedRevision, implementation, review,
+      ornithBinding?.profileId ?? null, ornithBinding?.profileFingerprint ?? null
+    );
     this.deps.events.publishTask(updated);
     return updated;
   }
@@ -1192,7 +1213,21 @@ export class Orchestrator {
     if (!this.deps.ornithLease) {
       throw new AgentRelayError('TOOL_MISSING', 'Ornith is not configured in this build.');
     }
-    const lease = await this.deps.ornithLease.acquireOrnithLease(controller.signal);
+    // Bound once, at task creation or at the provider switch that made this task `ornith` — never
+    // resolved here. A task reaching this method without a binding predates that requirement (a data
+    // inconsistency the startup/migration path is responsible for preventing) and fails closed rather
+    // than guessing a profile.
+    if (task.ornithModelProfileId === null || task.ornithModelProfileFingerprint === null) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'This task has no local-model profile bound. Switch its implementation provider to re-bind one.'
+      );
+    }
+    const lease = await this.deps.ornithLease.acquireOrnithLease(
+      task.ornithModelProfileId,
+      task.ornithModelProfileFingerprint,
+      controller.signal
+    );
     // The independently callable `localInference:stop` may stop the runtime
     // this lease is using. When it does, abort this task's own controller so
     // the Ornith loop unwinds through its normal cancellation path — release
@@ -1454,6 +1489,10 @@ export class Orchestrator {
           runtimeProviderId: lease.providerId,
           runtimeInstanceId: lease.runtimeInstanceId,
           modelId: lease.modelId,
+          // Which named profile actually served this run — what a run evidence reader answers "what ran
+          // this" with, distinct from `modelId` (the wire-protocol identity the runtime itself reports).
+          modelProfileId: lease.modelProfileId,
+          modelProfileDisplayName: lease.modelProfileDisplayName,
           counters: result.ornithAudit,
           providerFailure: result.providerFailure ?? null,
           assessment: result.assessment

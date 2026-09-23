@@ -493,7 +493,9 @@ export class ContinuationService {
         lastReviewJson: source.lastReviewJson,
         lastError: null,
         codexModel: source.codexModel,
-        claudeModel: source.claudeModel
+        claudeModel: source.claudeModel,
+        ornithModelProfileId: source.ornithModelProfileId,
+        ornithModelProfileFingerprint: source.ornithModelProfileFingerprint
       });
 
       this.cloneRuleEvidenceAndGate(source.id, continuationId);

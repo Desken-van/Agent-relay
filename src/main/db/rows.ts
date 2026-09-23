@@ -88,6 +88,8 @@ export interface TaskRow {
   last_error: string | null;
   codex_model: string | null;
   claude_model: string | null;
+  ornith_model_profile_id: string | null;
+  ornith_model_profile_fingerprint: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -116,6 +118,8 @@ export function toTask(row: TaskRow): Task {
     lastError: row.last_error,
     codexModel: row.codex_model,
     claudeModel: row.claude_model,
+    ornithModelProfileId: row.ornith_model_profile_id,
+    ornithModelProfileFingerprint: row.ornith_model_profile_fingerprint,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };

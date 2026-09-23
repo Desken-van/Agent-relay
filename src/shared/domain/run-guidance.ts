@@ -92,6 +92,8 @@ export interface RunVerificationDetail {
   readonly durationMs: number | null;
   readonly reason: string | null;
   readonly output: string | null;
+  /** Which local-model profile actually served this attempt. Null for `source: 'relay'`, or when unrecorded. */
+  readonly modelProfileDisplayName: string | null;
 }
 
 export interface RunGuidance {
@@ -221,7 +223,8 @@ function ornithVerificationDetail(evidence: OrnithRunEvidence): RunVerificationD
     exitCode: attempt.exitCode,
     durationMs: attempt.outcome === 'not_run' ? null : attempt.durationMs,
     reason: attempt.reason,
-    output: attempt.summary.length > 0 ? attempt.summary : null
+    output: attempt.summary.length > 0 ? attempt.summary : null,
+    modelProfileDisplayName: evidence.modelProfileDisplayName
   };
 }
 
@@ -251,7 +254,8 @@ function relayVerificationDetail(run: Run): RunVerificationDetail | null {
     exitCode: data.exitCode,
     durationMs: data.durationMs,
     reason: data.reason,
-    output: data.outputSummary !== undefined && data.outputSummary.length > 0 ? data.outputSummary : null
+    output: data.outputSummary !== undefined && data.outputSummary.length > 0 ? data.outputSummary : null,
+    modelProfileDisplayName: null
   };
 }
 

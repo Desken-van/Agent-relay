@@ -1,6 +1,6 @@
 import { AgentRelayError } from '../../../shared/domain/errors';
 import type { Task } from '../../../shared/domain/models';
-import { BUSY_STATUSES } from '../../../shared/domain/workflow';
+import { BUSY_STATUSES, TERMINAL_STATUSES } from '../../../shared/domain/workflow';
 import type { Clock, NewTask, TaskPatch, TaskRepository } from '../../ports';
 import type { Db } from '../database';
 import { toTask, type TaskRow } from '../rows';
@@ -8,7 +8,8 @@ import { toTask, type TaskRow } from '../rows';
 const COLUMNS = `id, project_id, title, original_request, status, current_round, max_rounds,
                  codex_thread_id, claude_session_id, worktree_path, branch_name, base_branch,
                  specification_json, specification_approved_at, last_review_json, last_error,
-                 codex_model, claude_model, implementation_provider, review_provider,
+                 codex_model, claude_model, ornith_model_profile_id, ornith_model_profile_fingerprint,
+                 implementation_provider, review_provider,
                  provider_revision, implementation_thread_id, created_at, updated_at`;
 
 /**
@@ -50,6 +51,14 @@ export class SqliteTaskRepository implements TaskRepository {
     return rows.map(toTask);
   }
 
+  listNonTerminal(): Task[] {
+    const placeholders = TERMINAL_STATUSES.map(() => '?').join(', ');
+    const rows = this.db
+      .prepare(`SELECT ${COLUMNS} FROM tasks WHERE status NOT IN (${placeholders}) ORDER BY id ASC`)
+      .all(...TERMINAL_STATUSES) as TaskRow[];
+    return rows.map(toTask);
+  }
+
   findById(id: string): Task | null {
     const row = this.db.prepare(`SELECT ${COLUMNS} FROM tasks WHERE id = ?`).get(id) as
       | TaskRow
@@ -66,15 +75,18 @@ export class SqliteTaskRepository implements TaskRepository {
                             max_rounds, codex_thread_id, claude_session_id, worktree_path,
                             branch_name, base_branch, specification_json, specification_approved_at,
                             last_review_json, last_error, codex_model, claude_model,
+                            ornith_model_profile_id, ornith_model_profile_fingerprint,
                             implementation_provider, review_provider, provider_revision, implementation_thread_id, created_at, updated_at)
          VALUES (@id, @projectId, @title, @originalRequest, @status, @currentRound,
                  @maxRounds, @codexThreadId, @claudeSessionId, @worktreePath,
                  @branchName, @baseBranch, @specificationJson, @specificationApprovedAt,
                  @lastReviewJson, @lastError, @codexModel, @claudeModel,
+                 @ornithModelProfileId, @ornithModelProfileFingerprint,
                  @implementationProvider, @reviewProvider, @providerRevision, @implementationThreadId, @createdAt, @updatedAt)`
       )
         .run({ implementationProvider: 'claude', reviewProvider: 'codex', providerRevision: 0,
-          implementationThreadId: null, ...task, createdAt: now, updatedAt: now });
+          implementationThreadId: null, ornithModelProfileId: null, ornithModelProfileFingerprint: null,
+          ...task, createdAt: now, updatedAt: now });
     } catch (error) {
       throwWorktreeConflict(error, task.worktreePath);
     }
@@ -112,6 +124,8 @@ export class SqliteTaskRepository implements TaskRepository {
                 last_error = @lastError,
                 codex_model = @codexModel,
                 claude_model = @claudeModel,
+                ornith_model_profile_id = @ornithModelProfileId,
+                ornith_model_profile_fingerprint = @ornithModelProfileFingerprint,
                 implementation_provider = @implementationProvider,
                 review_provider = @reviewProvider,
                 provider_revision = @providerRevision,
@@ -148,19 +162,30 @@ export class SqliteTaskRepository implements TaskRepository {
     this.db.prepare('DELETE FROM tasks WHERE id = ?').run(id);
   }
 
-  changeProviders(id: string, expectedRevision: number, implementation: Task['implementationProvider'], review: Task['reviewProvider']): Task {
+  changeProviders(
+    id: string,
+    expectedRevision: number,
+    implementation: Task['implementationProvider'],
+    review: Task['reviewProvider'],
+    ornithModelProfileId: string | null,
+    ornithModelProfileFingerprint: string | null
+  ): Task {
     let result: Task | undefined;
     this.db.transaction(() => {
       const task = this.findById(id);
       if (!task || task.providerRevision !== expectedRevision) {
         throw new AgentRelayError('VALIDATION_FAILED', 'Provider selection changed. Refresh the task.');
       }
-      if (task.implementationProvider === implementation && task.reviewProvider === review) { result = task; return; }
+      if (
+        task.implementationProvider === implementation && task.reviewProvider === review &&
+        task.ornithModelProfileId === ornithModelProfileId && task.ornithModelProfileFingerprint === ornithModelProfileFingerprint
+      ) { result = task; return; }
       const revision = expectedRevision + 1;
       this.db.prepare(`INSERT INTO task_provider_changes VALUES (?, ?, ?, ?, ?, ?, ?)`)
         .run(id, revision, task.implementationProvider, implementation, task.reviewProvider, review, this.clock.nowIso());
       result = this.update(id, {
         implementationProvider: implementation, reviewProvider: review, providerRevision: revision,
+        ornithModelProfileId, ornithModelProfileFingerprint,
         ...(task.implementationProvider === implementation ? {} : { implementationThreadId: null, claudeSessionId: null })
       });
     })();
