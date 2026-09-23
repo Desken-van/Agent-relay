@@ -321,6 +321,20 @@ export class LocalInferenceService implements LocalInferenceLifecycleService, Or
           { remediation: 'Stop the runtime, review Settings → Local inference, then start it again.' }
         );
       }
+      // Refused only here, at the start of a NEW round — never inside `recheckOrnithLease` or
+      // `inferForOrnith`, which only ever act on a lease this same method already granted. Disabling a
+      // profile mid-round must not yank a turn already in flight; it must stop the NEXT round from
+      // starting against it, exactly like a deleted or edited profile already does.
+      if (!profile.enabled) {
+        throw new AgentRelayError(
+          'VALIDATION_FAILED',
+          `This task’s bound local-model profile "${profile.displayName}" is disabled.`,
+          {
+            remediation:
+              'Re-enable the profile in Settings → Local inference, or switch this task to a different one.'
+          }
+        );
+      }
       const currentFingerprint = localInferenceProfileFingerprint(profile);
       if (this.boundProfileFingerprint !== currentFingerprint) {
         throw new AgentRelayError(

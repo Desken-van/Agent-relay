@@ -171,6 +171,7 @@ export function PrimaryActionButton({
 }
 
 export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: boolean; onChanged: (task: Task) => void | Promise<void> }): React.JSX.Element {
+  const { settings } = useStore();
   const [implementation, setImplementation] = useState<ImplementationProvider | null>(null);
   const [review, setReview] = useState<ReviewProvider | null>(null);
   // `null` = untouched: keep the task's existing binding (if already ornith)
@@ -206,6 +207,31 @@ export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: 
     task.ornithModelProfileId !== null
       ? (profiles.find((profile) => profile.id === task.ornithModelProfileId) ?? null)
       : null;
+
+  // Never silently falls back: Apply stays disabled with a visible, specific reason for every way the
+  // EFFECTIVE choice (what would actually be sent) is unready. Keeping an already-bound task's EXISTING
+  // profile (`ornithProfileId === null` while already ornith) is always fine regardless of current
+  // settings — `configureProviders` reuses that binding unchanged rather than re-resolving it, mirroring
+  // the New-task form's own `resolveOrnithModelProfileBinding` checks for every other case.
+  function ornithUnavailableReason(): string | null {
+    if (implementationValue !== 'ornith') return null;
+    if (task.implementationProvider === 'ornith' && ornithProfileId === null) return null;
+    if (!(settings?.localInference.enabled ?? false)) {
+      return 'Local inference is disabled. Enable it in Settings → Local inference.';
+    }
+    if (profiles.length === 0) {
+      return 'No local-model profile is configured. Add one in Settings → Local inference.';
+    }
+    const effective = ornithProfileId === null ? defaultProfile : profiles.find((profile) => profile.id === ornithProfileId);
+    if (!effective) {
+      return 'Choose a local-model profile, or set a default in Settings → Local inference.';
+    }
+    if (!effective.enabled) {
+      return `The profile "${effective.displayName}" is disabled. Enable it in Settings, or choose another.`;
+    }
+    return null;
+  }
+  const ornithReason = ornithUnavailableReason();
 
   return <details className="provider-controls" aria-label="AI provider settings">
     <summary>
@@ -264,6 +290,7 @@ export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: 
               ))}
             </select>
           </Field>
+          {ornithReason ? <Notice tone="warn">{ornithReason}</Notice> : null}
         </>
       ) : null}
       <Field label="Review provider">
@@ -275,7 +302,7 @@ export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: 
           persisted providers — there is nothing to apply, so there is no
           control to show. It reappears the moment either selection differs. */}
       {differs || saving ? (
-        <button type="button" className="btn btn--sm" disabled={disabled} onClick={() => {
+        <button type="button" className="btn btn--sm" disabled={disabled || ornithReason !== null} onClick={() => {
           if (claim.current) return;
           claim.current = true; setSaving(true); setError(null);
           void (async () => {

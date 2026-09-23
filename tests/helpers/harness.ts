@@ -271,12 +271,16 @@ export function createHarness(
           ? (() => {
               const localInference = settings.get().localInference;
               const profile = localInference.profiles.find((p) => p.id === localInference.defaultProfileId);
-              return profile === undefined
-                ? null
-                : {
-                    ornithModelProfileId: profile.id,
-                    ornithModelProfileFingerprint: localInferenceProfileFingerprint(profile)
-                  };
+              if (profile === undefined) return null;
+              // A real task can only ever have bound to an ENABLED profile — `resolveOrnithModelProfileBinding`
+              // requires it at creation time. Match that here so a later round's lease acquisition (which
+              // re-checks `enabled`, not just the fingerprint) succeeds exactly as it would for a real task,
+              // without each Ornith-routing test having to enable the profile itself first.
+              if (!profile.enabled) settings.update({ localInference: { ...localInference, profiles: localInference.profiles.map((p) => p.id === profile.id ? { ...p, enabled: true } : p) } });
+              return {
+                ornithModelProfileId: profile.id,
+                ornithModelProfileFingerprint: localInferenceProfileFingerprint(profile)
+              };
             })()
           : null;
       return tasks.create({

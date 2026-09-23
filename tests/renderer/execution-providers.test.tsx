@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 import { useEffect, useRef } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import { ProviderControls, RunView } from '../../src/renderer/src/components/RunView';
 import { useStore } from '../../src/renderer/src/state/store';
 import { taskSchema } from '../../src/shared/domain/models';
@@ -59,13 +59,23 @@ describe('provider selection controls', () => {
 
   it('is absent while the selection matches the persisted providers', () => {
     installBridge();
-    render(<ProviderControls task={task} busy={false} onChanged={async () => {}} />);
+    renderApp(<ProviderControls task={task} busy={false} onChanged={async () => {}} />);
     expect(screen.getAllByText('AI providers')).toHaveLength(1);
     expect(screen.getByText('Claude implements · Codex reviews')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Apply providers' })).toBeNull();
     fireEvent.click(screen.getByText('AI providers'));
     expect(Array.from((screen.getByLabelText('Implementation provider') as HTMLSelectElement).options).map((option) => option.value)).toEqual(['claude', 'codex', 'ornith']);
     expect(Array.from((screen.getByLabelText('Review provider') as HTMLSelectElement).options).map((option) => option.value)).toEqual(['codex', 'claude']);
+  });
+
+  it('blocks Apply with a visible reason when switching to Ornith with no usable local-model profile', async () => {
+    installBridge();
+    renderApp(<ProviderControls task={task} busy={false} onChanged={async () => {}} />);
+    fireEvent.click(screen.getByText('AI providers'));
+    fireEvent.change(screen.getByLabelText('Implementation provider'), { target: { value: 'ornith' } });
+
+    expect(await screen.findByText(/Local inference is disabled/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Apply providers' })).toHaveProperty('disabled', true);
   });
 
   it('passively refreshes Ornith readiness without lifecycle mutations or health checks', async () => {
@@ -119,13 +129,14 @@ describe('provider selection controls', () => {
     const pending = deferred<ReturnType<typeof ok<'workflow:configureProviders'>>>();
     const bridge = installBridge({ 'workflow:configureProviders': () => pending.promise });
     const changed = vi.fn(async () => {});
-    render(<ProviderControls task={task} busy={false} onChanged={changed} />);
+    renderApp(<ProviderControls task={task} busy={false} onChanged={changed} />);
 
     expect(screen.queryByRole('button', { name: 'Apply providers' })).toBeNull();
     fireEvent.click(screen.getByText('AI providers'));
     fireEvent.change(screen.getByLabelText('Implementation provider'), { target: { value: 'codex' } });
-    // The mount-time profile list (read-only, never a mutation) is the only call so far.
-    expect(bridge.calls.map((call) => call.channel)).toEqual(['localInference:listProfiles']);
+    // Only read-only mount-time traffic (the store's own bootstrap, the profile list) so far — changing
+    // the selection alone must never dispatch a mutation.
+    expect(bridge.callsTo('workflow:configureProviders')).toHaveLength(0);
 
     await burstClick(screen.getByRole('button', { name: 'Apply providers' }));
     expect(bridge.callsTo('workflow:configureProviders')).toEqual([{ channel: 'workflow:configureProviders', input: { taskId: 't', expectedRevision: 0, implementationProvider: 'codex', reviewProvider: 'codex' } }]);
@@ -137,7 +148,7 @@ describe('provider selection controls', () => {
 
   it('disables selection during a running task', () => {
     installBridge();
-    render(<ProviderControls task={{ ...task, status: 'IMPLEMENTING' }} busy={false} onChanged={async () => {}} />);
+    renderApp(<ProviderControls task={{ ...task, status: 'IMPLEMENTING' }} busy={false} onChanged={async () => {}} />);
     fireEvent.click(screen.getByText('AI providers'));
     expect((screen.getByLabelText('Implementation provider') as HTMLSelectElement).disabled).toBe(true);
     expect((screen.getByLabelText('Review provider') as HTMLSelectElement).disabled).toBe(true);

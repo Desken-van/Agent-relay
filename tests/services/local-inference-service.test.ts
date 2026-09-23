@@ -619,6 +619,38 @@ describe('LocalInferenceService: Ornith lease profile identity', () => {
     lease.release();
   });
 
+  it('refuses a NEW round against a profile disabled since this task last ran, without touching its fingerprint', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    const fingerprint = settings.defaultFingerprint();
+
+    // Disabling alone must not change the fingerprint — `enabled` is deliberately excluded from it — so
+    // this is purely the new `enabled` check, not a stale-config rejection.
+    settings.patchDefaultProfile({ enabled: false });
+    expect(settings.defaultFingerprint()).toBe(fingerprint);
+
+    await expect(service.acquireOrnithLease('default', fingerprint)).rejects.toThrow(
+      'This task’s bound local-model profile "Local model" is disabled.'
+    );
+  });
+
+  it('does not interrupt a round already holding a lease when its profile is disabled mid-round', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    const lease = await service.acquireOrnithLease('default', settings.defaultFingerprint());
+
+    settings.patchDefaultProfile({ enabled: false });
+
+    // `recheckOrnithLease`/`inferForOrnith` never re-check `enabled` — only a NEW `acquireOrnithLease`
+    // call does. The turn already granted keeps working.
+    expect(await service.recheckOrnithLease(lease)).toBe(true);
+    lease.release();
+  });
+
   it('a second, untouched profile’s edits never invalidate a lease bound to the first', async () => {
     const settings = new MutableSettings();
     const localInference = settings.get().localInference;

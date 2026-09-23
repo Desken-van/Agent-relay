@@ -30,6 +30,7 @@ import {
 import { IPC_INVOKE_CHANNEL } from '../../shared/ipc-channels';
 import type { Application } from '../container';
 import { assertKnownPath } from '../services/path-safety';
+import { findTaskOrphanedByProfileRemoval } from '../services/local-inference-profile-deletion-guard';
 import {
   parsePlanReviewAutoDecisions,
   parsePlanReviewFindings,
@@ -213,15 +214,12 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
   return {
     'settings:get': () => app.settings.get(),
     'settings:update': (input) => {
-      // A profile a non-terminal task is bound to may not be removed from Settings — that task's own
-      // lease acquisition is the ONLY place that should ever discover its profile is gone, and it must
-      // discover that once the task itself has finished, not mid-life because an unrelated Settings edit
-      // deleted the row out from under it. Checked here, at the one IPC layer that already holds both
-      // `app.settings` and `app.tasks`, rather than coupling the two repositories to each other.
+      // Checked here, at the one IPC layer that already holds both `app.settings` and `app.tasks`,
+      // rather than coupling the two repositories to each other — see the guard's own doc comment.
       if (input.localInference !== undefined) {
-        const keptIds = new Set(input.localInference.profiles.map((profile) => profile.id));
-        const orphaned = app.tasks.listNonTerminal()
-          .find((task) => task.ornithModelProfileId !== null && !keptIds.has(task.ornithModelProfileId));
+        const currentIds = new Set(app.settings.get().localInference.profiles.map((profile) => profile.id));
+        const nextIds = new Set(input.localInference.profiles.map((profile) => profile.id));
+        const orphaned = findTaskOrphanedByProfileRemoval(currentIds, nextIds, () => app.tasks.listNonTerminal());
         if (orphaned) {
           throw new AgentRelayError(
             'VALIDATION_FAILED',

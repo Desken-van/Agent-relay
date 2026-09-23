@@ -1238,13 +1238,17 @@ export const MIGRATIONS: readonly Migration[] = [
       // letting a later round re-resolve against whatever the default profile happens to be by then. A
       // task that predates 'ornith' entirely, or was never switched to it, gets no binding (NULL), exactly
       // as a brand-new non-ornith task does.
+      //
+      // No early return on a missing or malformed row: migration 9 always seeds one before this migration
+      // ever runs, but `upgradeLocalInferenceProfilesSettings` already falls back to the shipped default
+      // for anything it cannot read, so backfilling still proceeds against that default rather than
+      // silently skipping every existing Ornith task if the row were ever missing or corrupt.
       const settingsRow = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as
         | { value: string }
         | undefined;
-      if (settingsRow === undefined) return;
       let settings: unknown;
       try {
-        settings = JSON.parse(settingsRow.value);
+        settings = settingsRow === undefined ? undefined : JSON.parse(settingsRow.value);
       } catch {
         settings = undefined;
       }
