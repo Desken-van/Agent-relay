@@ -557,6 +557,54 @@ validated envelope is passed to Codex specification, Claude implementation and
 corrections, and Codex final review rather than re-reading files at different
 moments.
 
+A source's `revision` and `clean` describe the checkout its rule files were read from
+at capture, and the rendered envelope says so: they are never a statement about the
+task's worktree or the specification's target.
+
+### Specification grounding: one target for every stage
+
+A specification is written about ONE tree, and every later stage uses that tree. The
+project's source checkout is never it: it can be on another branch, at another commit,
+with uncommitted edits, and the task branch is cut from the base branch, not from it.
+
+- **Generation** (`SpecificationGroundingService.open`). When the task already has its
+  worktree, Codex reads that worktree (after the path-safety check, a branch check, and a
+  check that the project's own `refs/heads/<task branch>` names the same commit); before
+  any round, a task worktree with uncommitted changes is refused, because no commit could
+  name what Codex would read. Otherwise Codex reads a temporary, clean, detached checkout
+  of `refs/heads/<base branch>` at `<worktrees root>/.agent-relay-specification/<task id>`,
+  removed afterwards with a non-force `git worktree remove` (a leftover is removed the same
+  way before the next generation; one that cannot be is refused, never forced). A
+  regeneration against a different target starts a fresh Codex thread.
+- **The record.** `tasks.specification_grounding_json` (migration 21) holds a
+  `SpecificationGrounding` — checkout kind, base branch, task branch, commit, cleanliness,
+  the implementer it was written for, capture time, and a `stale` mark. It is written in
+  the same row update as `specificationJson`; a plan-correction revision keeps it; a
+  continuation does not copy it.
+- **The task branch.** `ensureWorktree` creates the branch from the recorded commit, not
+  from wherever the base branch is now, and refuses (and marks stale) when the base branch
+  no longer contains that commit. So the external plan review — which reads the task
+  branch — and the implementation start from exactly the tree the specifier read.
+- **Plan review, triage and revision.** The plan text names the target and the
+  implementer's capabilities; Codex triage and the plan-correction revision run in the
+  task worktree, never in `project.localPath`.
+- **Mismatch.** `verifySpecificationGrounding` (run by the approval IPC before the
+  synchronous approval, and by the first implementation round before a branch, lease or
+  round exists) requires the task worktree to be on its branch at the recorded commit and,
+  when recorded clean, still clean; without a worktree, the recorded commit must still be
+  on the base branch. A definite mismatch is written as `stale` on the record it checked
+  (never on a newer one) and refused; a Git failure is only an error. Approval also
+  refuses, without Git, a missing, stale or wrong-implementer record.
+- **Implementer.** Claude and Codex can carry out anything a specification written for
+  the other, or for Ornith, asks; Ornith cannot run commands. So only a move to Ornith
+  from another implementer requires regeneration.
+- **Existing tasks.** A specification generated before this existed has no record. It is
+  never rewritten, approved or implemented automatically: before the first round the Run
+  screen's one action is **Regenerate specification**, the backend refuses approval and
+  the first round, and the plan-correction loop refuses to revise it without opening a
+  correction. Later rounds and continuations are not re-checked: their files have moved
+  on by design.
+
 ### External plan-review gate
 
 Migration 4 adds two separate records. `task_rule_evidence` owns the immutable

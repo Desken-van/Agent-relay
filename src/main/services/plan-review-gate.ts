@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { AgentRelayError, PlanReviewNotDispatchedError } from '../../shared/domain/errors';
 import type { Project, Task } from '../../shared/domain/models';
+import { specificationGroundingState } from '../../shared/domain/specification-grounding';
+import { implementerCapabilitiesSection, specificationTargetSection } from '../adapters/codex/implementer-contract';
 import { assertSafeWorktreePath } from './path-safety';
 import { gateHasAcceptedDecisions, type PlanAutoDecideOutcome } from '../../shared/domain/plan-correction';
 import {
@@ -515,10 +517,26 @@ function stoppedOutcome(stop: PlanReviewTriageRecommendation): PlanAutoDecideOut
   return { kind: 'needs_user', reason: stop.reason, evidenceRef: stop.evidenceRef, confidence: stop.confidence };
 }
 
-function planText(specification: TaskSpecification, snapshot: RuleEvidenceSnapshot): string {
+function planText(
+  specification: TaskSpecification,
+  snapshot: RuleEvidenceSnapshot,
+  task: Pick<Task, 'specificationJson' | 'specificationGroundingJson' | 'implementationProvider'>
+): string {
+  // The reviewer reads the task's branch. It is told which commit the specification was
+  // written against and exactly what the implementer can do, so it judges the plan
+  // against the same tree and the same capabilities the specifier was given.
+  const grounding = specificationGroundingState(task);
   const text = [
     '## Specification under review',
     JSON.stringify(specification),
+    '',
+    '## Target checkout',
+    grounding.kind === 'none' || grounding.kind === 'ungrounded'
+      ? 'Agent Relay has no record of which checkout this specification was written against; its file facts may not describe the task branch.'
+      : specificationTargetSection(grounding.grounding, 'reviewer'),
+    '',
+    '## Implementer',
+    implementerCapabilitiesSection(task.implementationProvider, 'reviewer'),
     '',
     '## Immutable project rule evidence',
     renderRuleEvidence(snapshot)
@@ -823,7 +841,7 @@ export class PlanReviewGateService {
     // Built before anything is dispatched. A refusal here — an oversized plan
     // or credential-shaped rule text — leaves the gate exactly where it was,
     // and provably without any external effect.
-    const text = planText(specification.specification, snapshot);
+    const text = planText(specification.specification, snapshot, task);
     // Before the first write: a stop that already happened must leave the gate
     // exactly as it was, not in an `opening` phase for a call that never went out.
     this.assertStillActive(taskId, signal, false);

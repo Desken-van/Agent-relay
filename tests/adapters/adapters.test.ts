@@ -33,7 +33,7 @@ import {
   wingetClaudePackageCandidates
 } from '../../src/main/adapters/process/executable-locator';
 import { extractTestOutput } from '../../src/main/services/orchestrator';
-import { makeChangeSet, makeReview, makeSpecification } from '../helpers/fakes';
+import { makeChangeSet, makeGrounding, makeReview, makeSpecification } from '../helpers/fakes';
 
 /* -------------------------------------------------------------------------- */
 /* Claude stream parser                                                        */
@@ -1173,6 +1173,8 @@ describe('prompt construction', () => {
   it('tells the specifier it is read-only and names the repository', () => {
     const prompt = buildSpecificationPrompt({
       projectPath: 'C:\\repo\\demo',
+      target: makeGrounding(),
+      implementationProvider: 'claude',
       taskTitle: 'Add health endpoint',
       originalRequest: 'please add /health'
     });
@@ -1188,6 +1190,8 @@ describe('prompt construction', () => {
   it('tells the specifier to return an empty scopedFilePaths array rather than omit it', () => {
     const prompt = buildSpecificationPrompt({
       projectPath: 'C:\\repo\\demo',
+      target: makeGrounding(),
+      implementationProvider: 'claude',
       taskTitle: 'Document the manual test',
       originalRequest: 'update docs/manual-test.md'
     });

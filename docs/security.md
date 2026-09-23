@@ -237,6 +237,16 @@ containment, so `…/worktrees-evil` is not inside `…/worktrees`), not equal t
 inside the repository, and not a filesystem root. Two live tasks can never share
 a worktree directory.
 
+A specification is generated from a checkout of the task's target, never from your
+checkout. When the task has no worktree yet, that is a temporary, detached,
+read-only-sandboxed checkout of one base-branch commit under the worktrees root
+(`.agent-relay-specification/<task id>`), subject to the same `assertSafeWorktreePath()`
+check, created with `git worktree add --detach <path> <commit id>` and removed with a
+non-force `git worktree remove`. Commit ids handed to Git are validated as 40 or 64 hex
+digits. Your uncommitted files are never read for a specification, never copied, and
+never touched; a leftover checkout that has somehow changed is refused rather than
+deleted.
+
 ### A plan-review subject is the one object Agent Relay writes for a review
 
 Reviewing a corrected plan needs a review identity that no earlier review used (see

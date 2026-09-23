@@ -6,33 +6,29 @@
  * scattered through the orchestrator.
  */
 
+import type { ImplementationProvider } from '../../../shared/domain/execution-providers';
 import type { GitChangeSet } from '../../../shared/domain/git';
 import type { AcceptedPlanFinding } from '../../../shared/domain/plan-correction';
+import type { SpecificationGrounding } from '../../../shared/domain/specification-grounding';
 import type { VerificationRecord } from '../../../shared/domain/verification';
 import type { CodexReviewResult, TaskSpecification, TriageRefKind } from '../../../shared/schemas/codex';
 import type { TriageableDecision, TriageableFinding } from '../../ports';
+import {
+  implementerCapabilitiesSection,
+  specificationTargetSection,
+  transientFactsRule,
+  VERIFICATION_EVIDENCE_RULE
+} from './implementer-contract';
 
 /* -------------------------------------------------------------------------- */
 /* Codex: specification                                                        */
 /* -------------------------------------------------------------------------- */
 
-/**
- * What a specification may ask for as verification evidence. Agent Relay persists a bounded record of its
- * own verification and never the command's raw output (docs/security.md), so a specification demanding that
- * the "actual" or full output be stored in Relay could never be satisfied. Shared by generation and revision.
- */
-const VERIFICATION_EVIDENCE_RULE = `- Verification evidence: where the specification asks for proof that the project's checks pass
-  (in "acceptanceCriteria", "suggestedTests" or "implementationPrompt"), require Agent Relay's own
-  verification — its "Run verification" action, which runs \`npm run verify\` in the task worktree —
-  and the record Agent Relay persists for that run: its exit code and classified outcome (passed,
-  failed, timed_out or cancelled) and, for a failed run, its failure kind and the bounded, sanitized
-  output summary where one is available. Agent Relay deliberately never stores a command's raw
-  stdout/stderr or a complete log, so no acceptance criterion, constraint, suggested test or
-  instruction may require the actual, full or raw command output to be stored in, attached to, or
-  shown by Agent Relay.`;
-
 export interface SpecificationPromptInput {
+  /** The checkout being read: the task worktree or a clean checkout of the target commit. */
   readonly projectPath: string;
+  readonly target: SpecificationGrounding;
+  readonly implementationProvider: ImplementationProvider;
   readonly taskTitle: string;
   readonly originalRequest: string;
   readonly ruleEvidence?: string;
@@ -47,6 +43,10 @@ Repository under discussion: ${input.projectPath}
 You have read-only access. Inspect the repository before specifying anything: read the
 build files, the existing tests, and the code the task touches, so your specification
 matches how this project is actually written rather than how a generic project is.
+
+${specificationTargetSection(input.target)}
+
+${implementerCapabilitiesSection(input.implementationProvider)}
 
 TASK TITLE
 ${input.taskTitle}
@@ -78,6 +78,7 @@ Produce a single JSON object matching the required schema, with these rules:
   instead of first scanning the whole repository to find them. Otherwise return an empty
   array ([]) — whenever more than a few files might be touched, a new file might need to be
   created, or you are not fully certain of the exact set of paths. Never omit the field.
+${transientFactsRule(input.target)}
 ${VERIFICATION_EVIDENCE_RULE}
 
 Scope discipline: specify the change the user asked for. Do not add refactors, upgrades,
@@ -91,7 +92,10 @@ Return only the JSON object.`;
 /* -------------------------------------------------------------------------- */
 
 export interface SpecificationRevisionPromptInput {
+  /** The task worktree: the specification's target. */
   readonly projectPath: string;
+  readonly target: SpecificationGrounding;
+  readonly implementationProvider: ImplementationProvider;
   readonly taskTitle: string;
   readonly originalRequest: string;
   readonly currentSpecification: TaskSpecification;
@@ -130,6 +134,10 @@ state. You may read the repository to make the revision accurate.
 
 Repository under discussion: ${input.projectPath}
 This is correction round ${input.round} of at most ${input.maxRounds}.
+
+${specificationTargetSection(input.target)}
+
+${implementerCapabilitiesSection(input.implementationProvider)}
 
 TASK TITLE
 ${input.taskTitle}
@@ -181,9 +189,11 @@ Rules for the revision:
 - Acceptance criteria stay objectively checkable.
 - "scopedFilePaths" must always be present, following the same rule as before: a small
   explicit list only when the whole implementation is confidently confined to it, else [].
+${transientFactsRule(input.target)}
 ${VERIFICATION_EVIDENCE_RULE}
-  This holds for the accepted findings too: a finding that asks for such output is addressed
-  by requiring that persisted record instead.
+  This holds for the accepted findings too: a finding that asks for such output, or for the
+  implementer to start or read Agent Relay's verification, is addressed by an acceptance
+  criterion on that stage's persisted record instead.
 
 Return only the JSON object.`;
 }
@@ -597,6 +607,15 @@ ${specification.constraints.length > 0 ? specification.constraints.map((c) => ` 
 Assumptions the specification made:
 ${specification.assumptions.length > 0 ? specification.assumptions.map((a) => `  - ${a}`).join('\n') : '  (none stated)'}
 
+Suggested tests:
+${specification.suggestedTests.length > 0 ? specification.suggestedTests.map((t) => `  - ${t}`).join('\n') : '  (none suggested)'}
+
+Scoped file paths:
+${specification.scopedFilePaths.length > 0 ? specification.scopedFilePaths.map((p) => `  - ${p}`).join('\n') : '  (none declared)'}
+
+Implementation prompt (handed verbatim to the implementer):
+${specification.implementationPrompt}
+
 === PRIOR DECISIONS ALREADY RECORDED (context only — these findings are not yours to re-triage) ===
 ${input.priorDecisions.length > 0 ? input.priorDecisions.map(renderTriageDecision).join('\n') : '  (none)'}
 
@@ -616,10 +635,18 @@ recommendation = "needs_user"
   Deciding requires a product or architecture choice, the evidence here is insufficient,
   or you are genuinely uncertain.
 
+Judge each finding against the WHOLE specification above. What a finding describes can sit
+in any field — a wording or content problem is often only in the implementation prompt,
+which the implementer receives verbatim. Before recommending "reject" because something is
+absent, already satisfied or out of scope, check EVERY field above, and never reject a
+finding by citing a different field that does not contain what the finding is about.
+
 For every finding, also give:
 - "reason": one concise sentence explaining the recommendation.
 - "evidenceRef": a concrete reference into the material above that supports it (e.g. an
   acceptance criterion number, a constraint, or a quoted phrase from the finding itself).
+  For a "reject" that says something is absent or already satisfied, name the field(s) you
+  checked.
 - "confidence": "high", "medium", "low", or "uncertain".
 
 Return only the JSON object, with a "results" array containing exactly one entry per

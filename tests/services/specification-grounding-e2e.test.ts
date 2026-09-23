@@ -248,7 +248,7 @@ describe('a target that changed after the specification is detected, surfaced an
 });
 
 describe('plan review, triage and revision read the same target', () => {
-  it('triage and the revision read the task worktree, never the source checkout', async () => {
+  it('names the target in the plan text, and triage and the revision read the task worktree', async () => {
     const value = scenario();
     const reviewer = new FakePlanReviewer();
     const claims = new PlanReviewClaims();
@@ -290,6 +290,15 @@ describe('plan review, triage and revision read the same target', () => {
     reviewer.roundQueue = [{ ...reviewer.round, verdict: 'revise', gatingCount: 1, threshold: 1, findings: [finding('Name the tools')] }];
     reviewer.resolutionQueue = [{ ...reviewer.resolution, stage: 'PlanReview', awaitingResolve: false }];
     await gateService.review(task.id);
+
+    // Hard-wrapped prose: compared as running text.
+    const planText = reviewer.reviewCalls[0]!.planText.replace(/\s+/g, ' ');
+    expect(planText).toContain(`The specification was written by reading a clean, detached checkout of base branch main at commit ${value.base}`);
+    expect(planText).toContain('The task branch under review starts from exactly this commit.');
+    expect(planText).toContain('The implementer is Claude Code');
+    expect(planText).toContain('one this implementer cannot carry out is a defect of the plan');
+    // The rule evidence's revision and clean flag are said to describe where the rules were read — not this tree.
+    expect(planText).toContain("Each source's revision and clean flag describe the checkout its rule files were read from");
 
     const gate = harness.planReviewGates.findByTask(task.id)!;
     await gateService.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision });
