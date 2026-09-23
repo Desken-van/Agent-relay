@@ -131,13 +131,23 @@ ${input.acceptedFindings.map(renderAcceptedFinding).join('\n\n')}
 
 Produce a single JSON object matching the required schema, with two parts:
 - "specification": the COMPLETE revised specification, every field present.
-- "addressed": one entry for EACH accepted finding above — its number exactly as listed
-  ("Finding N" is N), the specification field in which you addressed it, and one or two
-  sentences saying what you changed there. That field must really differ from the current
-  specification: a finding you claim but did not change is refused, and so is an accepted
-  finding you do not mention. List EVERY field you changed: a field that differs from the
-  current specification but is not tied to an accepted finding is an unrequested change and
-  the whole revision is refused.
+- "addressed": one entry for every (accepted finding, changed field) PAIR. Each entry gives the
+  finding's number exactly as listed ("Finding N" is N), ONE specification field you changed
+  for it, and one or two sentences saying what you changed in that field for that finding.
+  - A finding that required changes to several fields gets one entry per field, repeating the
+    same finding number: a finding addressed in "constraints" and in "implementationPrompt" is
+    two entries, both with its number.
+  - A field changed for several findings gets one entry per finding. The field itself still
+    appears once in "specification"; one edit may serve several findings, and each entry's
+    change says what that edit does for its finding.
+  - Every accepted finding appears in at least one entry, and every field whose value differs
+    from the current specification appears in at least one entry. Name only fields that really
+    differ.
+  Before answering, compare each field of your revised specification with the current one and
+  check both rules. The whole revision is refused, and nothing is stored, when an accepted
+  finding has no entry, when an entry names a field that did not change or a finding that was
+  not accepted, or when a field changed without an entry tying it to an accepted finding — that
+  is an unrequested change.
 
 Rules for the revision:
 

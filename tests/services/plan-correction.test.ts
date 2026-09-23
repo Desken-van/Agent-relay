@@ -642,6 +642,92 @@ describe('plan correction loop: the Codex revision', () => {
       nothingStored(value, task.id, original);
     });
 
+    describe('a finding that needs changes to more than one field', () => {
+      /**
+       * The reported failure: one accepted finding, a revision that changes both
+       * "constraints" and "implementationPrompt", and a claim naming only one of them.
+       */
+      async function refusedOnce() {
+        const value = setup();
+        const task = await ready(value);
+        value.reviewer.roundQueue = [roundWith(value, ['Needs a constraint and an instruction'])];
+        value.reviewer.resolutionQueue = [revise(value)];
+        await value.gateService.review(task.id);
+        const original = specOf(value, task.id);
+        const current = specificationIdentity(original).specification;
+        const revised = makeSpecification({
+          ...current,
+          constraints: [...current.constraints, 'Use only synthetic fixtures.'],
+          implementationPrompt: `${current.implementationPrompt} Use only synthetic fixtures.`
+        });
+        value.harness.codex.revisionQueue.push(revised, revised);
+        value.harness.codex.revisionAddressed = [{ finding: 0, field: 'implementationPrompt', change: 'Named the fixtures.' }];
+
+        await expect(resolveAndRevise(value, task.id, decide([0, 'accept', 'Yes.']))).rejects.toThrow(
+          'Codex changed "constraints" without tying the change to an accepted finding.'
+        );
+
+        // Exactly what the live task showed: a failed first attempt, nothing stored, only version 1.
+        expect(value.corrections.listByTask(task.id)).toEqual([
+          expect.objectContaining({ status: 'failed', attempts: 1, addressedJson: null, toVersion: null })
+        ]);
+        expect(value.corrections.listVersions(task.id).map((entry) => entry.version)).toEqual([1]);
+        expect(specOf(value, task.id)).toBe(original);
+        expect(value.harness.planReviewGates.listByTask(task.id)).toHaveLength(1);
+        expect(value.loop.detail(task.id)).toMatchObject({
+          nextStep: 'revise',
+          latest: { status: 'failed', attempts: 1, lastError: expect.stringContaining('changed "constraints"') }
+        });
+        expect(value.harness.codex.revisionCalls).toHaveLength(1);
+        return { value, task, revised };
+      }
+
+      it('"Continue correction" asks Codex again, and a claim repeating the finding per field is stored', async () => {
+        const { value, task, revised } = await refusedOnce();
+        value.harness.codex.revisionAddressed = [
+          { finding: 0, field: 'constraints', change: 'Added the fixture constraint.' },
+          { finding: 0, field: 'implementationPrompt', change: 'Named the fixtures.' }
+        ];
+
+        const resumed = await value.loop.continueCorrection(task.id, { autoContinue: false });
+
+        expect(resumed.correctionsRun).toBe(1);
+        expect(value.harness.codex.revisionCalls).toHaveLength(2);
+        const rows = value.corrections.listByTask(task.id);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({ status: 'completed', attempts: 2, toVersion: 2, lastError: null });
+        expect(parsePlanRevisionAddressed(rows[0]!.addressedJson ?? null)).toEqual([
+          { finding: 0, field: 'constraints', change: 'Added the fixture constraint.' },
+          { finding: 0, field: 'implementationPrompt', change: 'Named the fixtures.' }
+        ]);
+        expect(JSON.parse(specOf(value, task.id))).toEqual(revised);
+        expect(value.corrections.listVersions(task.id).map((entry) => entry.version)).toEqual([1, 2]);
+        expect(value.loop.detail(task.id).latest?.addressed.map((entry) => [entry.finding, entry.field])).toEqual([
+          [0, 'constraints'],
+          [0, 'implementationPrompt']
+        ]);
+      });
+
+      it('a retry whose answer is refused again records the second attempt and its new failure', async () => {
+        const { value, task } = await refusedOnce();
+        value.harness.codex.revisionAddressed = [{ finding: 0, field: 'constraints', change: 'Only the constraint.' }];
+
+        await expect(value.loop.continueCorrection(task.id, { autoContinue: false })).rejects.toThrow(
+          'Codex changed "implementationPrompt" without tying the change to an accepted finding.'
+        );
+
+        expect(value.harness.codex.revisionCalls).toHaveLength(2);
+        expect(value.corrections.listByTask(task.id)).toEqual([
+          expect.objectContaining({ status: 'failed', attempts: 2, addressedJson: null })
+        ]);
+        expect(value.corrections.listVersions(task.id).map((entry) => entry.version)).toEqual([1]);
+        expect(value.loop.detail(task.id)).toMatchObject({
+          nextStep: 'revise',
+          latest: { status: 'failed', attempts: 2, lastError: expect.stringContaining('changed "implementationPrompt"') }
+        });
+      });
+    });
+
     it('lets the operator retry the same correction after such a refusal, and then completes it', async () => {
       const { value, task } = await twoAccepted();
       value.harness.codex.revisionAddressed = [{ finding: 0, field: 'summary', change: 'Only the first.' }];

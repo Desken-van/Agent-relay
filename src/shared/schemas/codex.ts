@@ -94,11 +94,13 @@ export type SpecificationFieldName = (typeof SPECIFICATION_FIELD_NAMES)[number];
 
 /**
  * What Codex returns when it revises a specification from accepted external
- * review findings: the complete revised specification AND, for every accepted
- * finding, the field in which it was addressed. The claim is checked (the field
- * must really differ from the specification being revised, and every accepted
- * finding must be named) and recorded with the version, so a revision that
- * changed something unrelated is refused instead of being carried forward.
+ * review findings: the complete revised specification AND one entry per
+ * (accepted finding, changed field) pair — a finding addressed in several fields
+ * is named once per field. The claim is checked (every named field must really
+ * differ from the specification being revised, every accepted finding must be
+ * named, and every changed field must be tied to one) and recorded with the
+ * version, so a revision that changed something unrelated is refused instead of
+ * being carried forward.
  */
 export const specificationRevisionResponseSchema = z.object({
   specification: taskSpecificationResponseSchema,
@@ -109,19 +111,26 @@ export const specificationRevisionResponseSchema = z.object({
           .number()
           .int()
           .nonnegative()
-          .describe('The number of an accepted finding, exactly as it was listed to you.'),
+          .describe(
+            'The number of an accepted finding, exactly as it was listed to you. Repeat it in one entry per field you changed for that finding.'
+          ),
         field: z
           .enum(SPECIFICATION_FIELD_NAMES)
-          .describe('The specification field in which you addressed it. That field MUST differ from the current specification.'),
+          .describe(
+            'ONE specification field you changed for this finding. It MUST differ from the current specification.'
+          ),
         change: z
           .string()
           .min(1)
           .max(1_000)
-          .describe('One or two sentences: what you changed in that field and why it addresses the finding.')
+          .describe('One or two sentences: what you changed in that field for this finding and why it addresses it.')
       })
     )
     .min(1)
     .max(256)
+    .describe(
+      'One entry per (accepted finding, changed field) pair. Every accepted finding and every field that differs from the current specification must appear in at least one entry.'
+    )
 });
 
 export type SpecificationRevisionResponse = z.infer<typeof specificationRevisionResponseSchema>;
