@@ -35,6 +35,8 @@ import type {
   ContinuationClaim
 } from '../shared/domain/models';
 import type { TaskStatus } from '../shared/domain/workflow';
+import type { ImplementationProvider } from '../shared/domain/execution-providers';
+import type { SpecificationGrounding } from '../shared/domain/specification-grounding';
 import type {
   OperationEnvironment,
   OperationTarget,
@@ -254,7 +256,15 @@ export interface AgentRunContext {
 }
 
 export interface CodexSpecificationRequest {
+  /**
+   * The checkout Codex reads, as the read-only sandbox root: the task worktree, or a
+   * clean temporary checkout of the base commit. Never the project's source checkout.
+   */
   readonly projectPath: string;
+  /** Which checkout and commit that is. Stated in the prompt and recorded with the result. */
+  readonly target: SpecificationGrounding;
+  /** Who will implement it; the prompt states exactly what that implementer can do. */
+  readonly implementationProvider: ImplementationProvider;
   readonly taskTitle: string;
   readonly originalRequest: string;
   /** Immutable, validated project/convention evidence bound to this task. */
@@ -367,8 +377,11 @@ export interface CodexTriageOutcome {
  * (or Auto decide) ACCEPTED — and from nothing else.
  */
 export interface CodexRevisionRequest {
-  /** The project checkout, used as the read-only sandbox root. */
+  /** The task worktree — the specification's target — used as the read-only sandbox root. */
   readonly projectPath: string;
+  /** The checkout and commit the specification being revised was generated against. */
+  readonly target: SpecificationGrounding;
+  readonly implementationProvider: ImplementationProvider;
   readonly taskTitle: string;
   /** What the user originally asked for. The revision must stay faithful to it. */
   readonly originalRequest: string;

@@ -73,6 +73,11 @@ import {
 import { planReviewRecovery } from '../../shared/domain/plan-review';
 import { renderRuleEvidence } from './rule-evidence';
 import { specificationIdentity } from './specification-identity';
+import { assertSafeWorktreePath } from './path-safety';
+import {
+  specificationGroundingProblem,
+  specificationGroundingState
+} from '../../shared/domain/specification-grounding';
 
 const LOOP_STOPPED = 'The plan-correction loop was stopped. Nothing further was changed.';
 const STOPPED_DURING_REVISION =
@@ -575,6 +580,24 @@ export class PlanCorrectionService {
     if (accepted.length === 0) {
       throw new AgentRelayError('VALIDATION_FAILED', 'This round accepted no finding, so there is nothing to revise.');
     }
+    // A revision reads the same tree the specification was generated against — the task's
+    // worktree — and keeps that target. One with no trustworthy record is not revised: it is
+    // regenerated, and nothing (not even a correction row) is opened for it here.
+    const grounding = specificationGroundingState(task);
+    if (grounding.kind !== 'recorded') {
+      throw new AgentRelayError('VALIDATION_FAILED', specificationGroundingProblem(grounding) ?? 'The specification is not grounded.', {
+        remediation: 'Choose "Regenerate specification". Nothing was revised.'
+      });
+    }
+    const settingsForTarget = this.deps.settings.get();
+    if (task.worktreePath === null) {
+      throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to revise the specification against.');
+    }
+    assertSafeWorktreePath({
+      worktreePath: task.worktreePath,
+      worktreesRoot: settingsForTarget.worktreesRoot,
+      repositoryPath: project.localPath
+    });
 
     const correction = this.deps.corrections.begin({
       id: this.deps.ids.next(),
@@ -608,7 +631,9 @@ export class PlanCorrectionService {
     try {
       const outcome = await this.deps.codex.reviseSpecification(
         {
-          projectPath: project.localPath,
+          projectPath: task.worktreePath,
+          target: grounding.grounding,
+          implementationProvider: task.implementationProvider,
           taskTitle: task.title,
           originalRequest: task.originalRequest,
           currentSpecification: current.specification,

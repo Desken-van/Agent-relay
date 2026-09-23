@@ -99,10 +99,11 @@ function seedStuckPair(db: SqliteDatabase): void {
 }
 
 describe('migration 20 (plan-review-isolated-subjects)', () => {
-  it('is the last migration, follows the previous one, and is applied exactly once', () => {
-    expect(MIGRATIONS.at(-1)).toMatchObject({ version: 20, name: 'plan-review-isolated-subjects' });
+  it('follows the previous one, and is applied exactly once', () => {
+    expect(MIGRATIONS[19]).toMatchObject({ version: 20, name: 'plan-review-isolated-subjects' });
     const db = databaseAt(19);
-    expect(runMigrations(db)).toBe(1);
+    // 20, and 21 (specification grounding) after it.
+    expect(runMigrations(db)).toBe(2);
     expect(runMigrations(db)).toBe(0);
   });
 
@@ -111,7 +112,7 @@ describe('migration 20 (plan-review-isolated-subjects)', () => {
     seedStuckPair(db);
     const before = db.prepare('SELECT * FROM plan_review_gates ORDER BY id').all() as Record<string, unknown>[];
 
-    expect(runMigrations(db)).toBe(1);
+    expect(runMigrations(db)).toBe(2);
 
     const after = db.prepare('SELECT * FROM plan_review_gates ORDER BY id').all() as Record<string, unknown>[];
     expect(after).toHaveLength(2);

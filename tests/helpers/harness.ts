@@ -28,7 +28,7 @@ import { ProjectService } from '../../src/main/services/project-service';
 import { PublishService } from '../../src/main/services/publish-service';
 import { TaskService } from '../../src/main/services/task-service';
 import { defaultSettings } from '../../src/main/container';
-import type { OrnithInferenceLeaseService } from '../../src/main/ports';
+import type { GitAdapter, OrnithInferenceLeaseService } from '../../src/main/ports';
 import type { OrnithImplementationService } from '../../src/main/services/ornith-implementation';
 import type { ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { TaskOperationRegistry } from '../../src/main/services/task-operations';
@@ -87,6 +87,11 @@ export function createHarness(
     processRunner?: ProcessRunner;
     /** Findings accepted from an external code review; absent in every test that is not about them. */
     externalCodeRequirements?: OrchestratorDeps['externalCodeRequirements'];
+    /**
+     * A real Git adapter for the orchestrator, for tests that drive a real temporary
+     * repository end to end. `harness.git` stays the fake and is then unused by it.
+     */
+    orchestratorGit?: GitAdapter;
   } = {}
 ): Harness {
   const tempRoot = mkdtempSync(join(tmpdir(), 'agent-relay-test-'));
@@ -155,7 +160,7 @@ export function createHarness(
     settings,
     codex,
     claude,
-    git,
+    git: options.orchestratorGit ?? git,
     clock,
     ids,
     events,
@@ -167,7 +172,8 @@ export function createHarness(
       prepareFirstAction: (...args) => continuationService.prepareFirstAction(...args),
       retargetFirstActionToVerification: (...args) =>
         continuationService.retargetFirstActionToVerification(...args),
-      assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId)
+      assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId),
+      isContinuation: (taskId) => continuationService.isContinuation(taskId)
     },
     ornith: options.ornith,
     ornithLease: options.ornithLease,

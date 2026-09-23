@@ -465,7 +465,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
       prepareFirstAction: (...args) => continuationService.prepareFirstAction(...args),
       retargetFirstActionToVerification: (...args) =>
         continuationService.retargetFirstActionToVerification(...args),
-      assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId)
+      assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId),
+      isContinuation: (taskId) => continuationService.isContinuation(taskId)
     },
     // Ornith reuses the same LocalInferenceService instance the Local
     // inference lifecycle IPC handlers use; the Ornith surface it exposes

@@ -45,7 +45,8 @@ describe('migrations 9 and 11 through 15', () => {
       { version: 17, name: 'plan-review-triage' },
       { version: 18, name: 'code-review-triage' },
       { version: 19, name: 'plan-auto-decisions-and-corrections' },
-      { version: 20, name: 'plan-review-isolated-subjects' }
+      { version: 20, name: 'plan-review-isolated-subjects' },
+      { version: 21, name: 'specification-grounding' }
     ]);
 
     const db = createSqliteDatabase(':memory:');
@@ -69,7 +70,7 @@ describe('migrations 9 and 11 through 15', () => {
       'localInference',
       JSON.stringify(existing)
     );
-    expect(runMigrations(db)).toBe(12);
+    expect(runMigrations(db)).toBe(13);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };
@@ -119,7 +120,7 @@ describe('migrations 9 and 11 through 15', () => {
       JSON.stringify('kept-across-migration')
     );
 
-    expect(runMigrations(db)).toBe(10);
+    expect(runMigrations(db)).toBe(11);
 
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
@@ -156,7 +157,7 @@ describe('migrations 9 and 11 through 15', () => {
     }
     db.prepare('UPDATE settings SET value = ? WHERE key = ?').run('{not valid json', 'localInference');
 
-    expect(runMigrations(db)).toBe(10);
+    expect(runMigrations(db)).toBe(11);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };

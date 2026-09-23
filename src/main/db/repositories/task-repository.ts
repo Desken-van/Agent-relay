@@ -9,7 +9,8 @@ const COLUMNS = `id, project_id, title, original_request, status, current_round,
                  codex_thread_id, claude_session_id, worktree_path, branch_name, base_branch,
                  specification_json, specification_approved_at, last_review_json, last_error,
                  codex_model, claude_model, implementation_provider, review_provider,
-                 provider_revision, implementation_thread_id, created_at, updated_at`;
+                 provider_revision, implementation_thread_id, specification_grounding_json,
+                 created_at, updated_at`;
 
 /**
  * Persistence for tasks.
@@ -66,15 +67,18 @@ export class SqliteTaskRepository implements TaskRepository {
                             max_rounds, codex_thread_id, claude_session_id, worktree_path,
                             branch_name, base_branch, specification_json, specification_approved_at,
                             last_review_json, last_error, codex_model, claude_model,
-                            implementation_provider, review_provider, provider_revision, implementation_thread_id, created_at, updated_at)
+                            implementation_provider, review_provider, provider_revision, implementation_thread_id,
+                            specification_grounding_json, created_at, updated_at)
          VALUES (@id, @projectId, @title, @originalRequest, @status, @currentRound,
                  @maxRounds, @codexThreadId, @claudeSessionId, @worktreePath,
                  @branchName, @baseBranch, @specificationJson, @specificationApprovedAt,
                  @lastReviewJson, @lastError, @codexModel, @claudeModel,
-                 @implementationProvider, @reviewProvider, @providerRevision, @implementationThreadId, @createdAt, @updatedAt)`
+                 @implementationProvider, @reviewProvider, @providerRevision, @implementationThreadId,
+                 @specificationGroundingJson, @createdAt, @updatedAt)`
       )
         .run({ implementationProvider: 'claude', reviewProvider: 'codex', providerRevision: 0,
-          implementationThreadId: null, ...task, createdAt: now, updatedAt: now });
+          implementationThreadId: null, ...task, specificationGroundingJson: task.specificationGroundingJson ?? null,
+          createdAt: now, updatedAt: now });
     } catch (error) {
       throwWorktreeConflict(error, task.worktreePath);
     }
@@ -116,10 +120,11 @@ export class SqliteTaskRepository implements TaskRepository {
                 review_provider = @reviewProvider,
                 provider_revision = @providerRevision,
                 implementation_thread_id = @implementationThreadId,
+                specification_grounding_json = @specificationGroundingJson,
                 updated_at = @updatedAt
           WHERE id = @id`
       )
-        .run(next);
+        .run({ ...next, specificationGroundingJson: next.specificationGroundingJson ?? null });
     } catch (error) {
       throwWorktreeConflict(error, next.worktreePath);
     }

@@ -114,6 +114,12 @@ export const taskSchema = z.object({
   specificationJson: z.string().nullable(),
   /** Set when the user explicitly approves the specification. */
   specificationApprovedAt: isoDateTime.nullable(),
+  /**
+   * JSON-serialised `SpecificationGrounding`: the checkout and commit the current
+   * specification was generated against. Null for a specification generated before
+   * this was recorded (read as "not grounded"). Optional so older payloads still parse.
+   */
+  specificationGroundingJson: z.string().nullable().optional(),
   /** JSON-serialised `CodexReviewResult` from the most recent review. */
   lastReviewJson: z.string().nullable(),
   lastError: z.string().nullable(),

@@ -276,7 +276,12 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     'workflow:verify': (input) => app.orchestrator.runVerification(input.taskId),
     'workflow:implement': (input) => app.orchestrator.sendToClaude(input.taskId, { acceptDirtyWorkingTree: input.acceptDirtyWorkingTree ?? false }),
     'workflow:review': (input) => app.orchestrator.reviewWithCodex(input.taskId),
-    'workflow:approveSpecification': (input) => app.orchestrator.approveSpecification(input.taskId),
+    // The Git-level check first: consent is never recorded for a specification whose
+    // target checkout no longer matches it. The first round checks again before it starts.
+    'workflow:approveSpecification': async (input) => {
+      await app.orchestrator.verifySpecificationGrounding(input.taskId);
+      return app.orchestrator.approveSpecification(input.taskId);
+    },
     'workflow:sendToClaude': (input) =>
       app.orchestrator.sendToClaude(input.taskId, {
         acceptDirtyWorkingTree: input.acceptDirtyWorkingTree ?? false

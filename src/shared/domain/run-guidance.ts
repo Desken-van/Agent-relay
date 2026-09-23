@@ -14,6 +14,7 @@ import {
   latestVerification, readVerification, verificationFailureKind, verificationRerunPolicy,
   type VerificationReadiness, type VerificationRerunCause
 } from './verification';
+import { specificationGroundingProblem, specificationGroundingState } from './specification-grounding';
 
 /**
  * The one workflow transition Run → Actions may offer right now.
@@ -499,6 +500,24 @@ export function runGuidance(
           tone: 'warning'
         });
       }
+      // A specification that cannot be tied to the task's target — no record of which checkout
+      // it was written from, a target that changed since, or an implementer it was not written
+      // for — is regenerated before anything else: never reviewed, approved or implemented as it
+      // stands. Only before the first round: later rounds work on files earlier ones changed, by
+      // design, and a continuation inherits an implemented task. The backend refuses the same cases.
+      const groundingProblem =
+        task.currentRound === 0 && extra.isContinuation !== true
+          ? specificationGroundingProblem(specificationGroundingState(task))
+          : null;
+      const regenerate = (problem: string): RunGuidance =>
+        acting({
+          happened: problem,
+          stage: 'Step 1 of 5 · Regenerate the specification',
+          result: 'It cannot be reviewed, approved or implemented as it stands. Regenerating writes it again from the task’s own checkout; approval and the external plan review then start again for the new text.',
+          action: action('generate_specification', 'Regenerate specification'),
+          activeStep: 0,
+          tone: 'warning'
+        });
       if (!task.specificationApprovedAt) {
         if (planReviewPreparation === 'loading') {
           return waiting({
@@ -520,6 +539,7 @@ export function runGuidance(
             tone: 'active'
           });
         }
+        if (groundingProblem !== null) return regenerate(groundingProblem);
         if (planReviewPreparation === 'unavailable') {
           return waiting({
             happened: 'The specification exists, but its External plan review cannot continue safely.',
@@ -628,6 +648,7 @@ export function runGuidance(
           tone: 'active'
         });
       }
+      if (groundingProblem !== null) return regenerate(groundingProblem);
       const verification = latestVerification(runs);
       const relayDetail = verification === null ? null : relayVerificationDetail(verification);
       const failureKind = verificationFailureKind(verification);

@@ -3,7 +3,8 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { AgentRelayError, PlanReviewNotDispatchedError } from '../../shared/domain/errors';
-import type { Task } from '../../shared/domain/models';
+import type { Project, Task } from '../../shared/domain/models';
+import { assertSafeWorktreePath } from './path-safety';
 import { gateHasAcceptedDecisions, type PlanAutoDecideOutcome } from '../../shared/domain/plan-correction';
 import {
   parsePlanReviewAutoDecisions,
@@ -1554,7 +1555,7 @@ export class PlanReviewGateService {
       throw new AgentRelayError('VALIDATION_FAILED', 'One or more requested finding indexes do not exist in the current round.');
     }
 
-    const validated = await this.analyzeFindings(task, project.localPath, findings, requestedIndexes, signal);
+    const validated = await this.analyzeFindings(task, project, findings, requestedIndexes, signal);
     // A result that arrives after a stop is discarded, not stored.
     this.assertStillActive(taskId, signal, false);
 
@@ -1595,7 +1596,7 @@ export class PlanReviewGateService {
    */
   private async analyzeFindings(
     task: Task,
-    projectPath: string,
+    project: Project,
     findings: ReturnType<typeof parsePlanReviewFindings>,
     requestedIndexes: readonly number[],
     signal?: AbortSignal
@@ -1603,6 +1604,18 @@ export class PlanReviewGateService {
     if (!this.deps.codex || !this.deps.settings) {
       throw new AgentRelayError('TOOL_MISSING', 'Automatic finding triage is not configured in this build.');
     }
+    // The findings are about the task's branch — what the external reviewer read and what
+    // the specification describes — so the analysis reads that tree too, never the
+    // project's own folder, which can be on another commit and carry uncommitted edits.
+    if (task.worktreePath === null) {
+      throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to analyze the findings against.');
+    }
+    assertSafeWorktreePath({
+      worktreePath: task.worktreePath,
+      worktreesRoot: this.deps.settings.get().worktreesRoot,
+      repositoryPath: project.localPath
+    });
+    const projectPath = task.worktreePath;
     const snapshot = readBoundRuleEvidence(task.id, this.deps.ruleEvidence);
     if (snapshot === null) throw new AgentRelayError('VALIDATION_FAILED', 'No rule evidence is bound.');
     const specification = specificationIdentity(task.specificationJson);
@@ -1712,7 +1725,7 @@ export class PlanReviewGateService {
     // A stopped task dispatches nothing, and a result that arrives after a stop is
     // dropped: no automatic decision or stop is recorded for a task that has ended.
     this.assertStillActive(taskId, signal, false);
-    const validated = await this.analyzeFindings(task, project.localPath, findings, [request.findingIndex], signal);
+    const validated = await this.analyzeFindings(task, project, findings, [request.findingIndex], signal);
     this.assertStillActive(taskId, signal, false);
     const recommendation = validated.recommendations[0]!;
 

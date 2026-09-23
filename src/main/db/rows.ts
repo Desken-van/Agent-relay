@@ -84,6 +84,7 @@ export interface TaskRow {
   base_branch: string | null;
   specification_json: string | null;
   specification_approved_at: string | null;
+  specification_grounding_json: string | null;
   last_review_json: string | null;
   last_error: string | null;
   codex_model: string | null;
@@ -112,6 +113,7 @@ export function toTask(row: TaskRow): Task {
     baseBranch: row.base_branch,
     specificationJson: row.specification_json,
     specificationApprovedAt: row.specification_approved_at,
+    specificationGroundingJson: row.specification_grounding_json,
     lastReviewJson: row.last_review_json,
     lastError: row.last_error,
     codexModel: row.codex_model,

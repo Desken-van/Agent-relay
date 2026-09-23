@@ -243,6 +243,10 @@ export class ContinuationService {
     return { task, continuation: link };
   }
 
+  isContinuation(taskId: string): boolean {
+    return this.deps.continuations.findByContinuation(taskId) !== null;
+  }
+
   /** Specification generation is never a continuation's protected first action. */
   assertSpecificationAllowed(taskId: string): void {
     const claim = this.deps.continuations.findClaimByContinuation(taskId);

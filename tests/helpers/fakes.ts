@@ -8,6 +8,7 @@
 
 import type { ToolDiagnostic } from '../../src/shared/domain/diagnostics';
 import type { GitChangeSet, RepositoryInfo, WorktreeInfo } from '../../src/shared/domain/git';
+import type { SpecificationGrounding } from '../../src/shared/domain/specification-grounding';
 import type { PublishConfirmation } from '../../src/shared/ipc';
 import {
   SPECIFICATION_FIELD_NAMES,
@@ -312,6 +313,22 @@ export class FakeClaudeAdapter implements ClaudeAdapter {
 /* -------------------------------------------------------------------------- */
 /* Git                                                                         */
 /* -------------------------------------------------------------------------- */
+
+/** A specification's target, as Agent Relay records it: a clean checkout of the base commit by default. */
+export function makeGrounding(overrides: Partial<SpecificationGrounding> = {}): SpecificationGrounding {
+  return {
+    version: 1,
+    checkout: 'base_commit',
+    baseBranch: 'main',
+    branch: null,
+    commit: 'a'.repeat(40),
+    clean: true,
+    implementationProvider: 'claude',
+    capturedAt: '2026-01-01T00:00:00.000Z',
+    stale: null,
+    ...overrides
+  };
+}
 
 export function makeRepositoryInfo(overrides: Partial<RepositoryInfo> = {}): RepositoryInfo {
   return {

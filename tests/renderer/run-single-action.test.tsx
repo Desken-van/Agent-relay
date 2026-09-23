@@ -97,12 +97,19 @@ const relayVerification = (extra: Record<string, unknown>, status: Run['status']
   })
 });
 
+/** The specification was generated from the task's own worktree, for Ornith — as Agent Relay records it. */
+const GROUNDED = JSON.stringify({
+  version: 1, checkout: 'task_worktree', baseBranch: 'main', branch: 'agent/task', commit: 'a'.repeat(40), clean: true,
+  implementationProvider: 'ornith', capturedAt: '2026-09-22T09:30:00.000Z', stale: null
+});
+
 function detail(task: Partial<Task>, runs: readonly Run[]): TaskDetail {
   const parsed = taskSchema.parse({
     id: 't', projectId: 'p', title: specification.title, originalRequest: 'Add it.',
     status: 'READY_FOR_IMPLEMENTATION', currentRound: 1, maxRounds: 3, codexThreadId: 'spec', claudeSessionId: null,
     worktreePath: 'C:\\worktree', branchName: 'agent/task', baseBranch: 'main',
     specificationJson: JSON.stringify(specification), specificationApprovedAt: '2026-09-22T10:00:00.000Z',
+    specificationGroundingJson: GROUNDED,
     lastReviewJson: null, lastError: null, codexModel: null, claudeModel: null,
     implementationProvider: 'ornith', reviewProvider: 'codex',
     createdAt: '2026-09-22T09:00:00.000Z', updatedAt: '2026-09-22T11:09:55.000Z', ...task
@@ -468,5 +475,62 @@ describe('Run screen — waiting states: a gated verification with nothing chang
     expect(bridge.callsTo('workflow:verify')).toEqual([]);
 
     vi.useRealTimers();
+  });
+});
+
+describe('Run screen — a specification that cannot be tied to the task’s target is regenerated, never approved or run', () => {
+  const stale = JSON.stringify({
+    ...JSON.parse(GROUNDED),
+    stale: { detectedAt: '2026-09-22T12:00:00.000Z', reason: 'the task branch moved from aaaaaaaaaaaa to bbbbbbbbbbbb.' }
+  });
+  const bridgeFor = () =>
+    installBridge({
+      'dependencies:status': () => ok<'dependencies:status'>({ state: 'not_node_project', detail: 'No package.json.' })
+    });
+
+  it.each([
+    ['generated before Agent Relay recorded its checkout (an existing task)', { specificationGroundingJson: null }, 'no record of which checkout'],
+    ['whose target changed after it was generated', { specificationGroundingJson: stale }, 'the task branch moved from aaaaaaaaaaaa'],
+    ['written for Claude on a task that now uses Ornith', {
+      specificationGroundingJson: JSON.stringify({ ...JSON.parse(GROUNDED), implementationProvider: 'claude' })
+    }, 'cannot run commands']
+  ] as const)('an approved specification %s offers only "Regenerate specification" before the first round', async (_case, overrides, reason) => {
+    const bridge = bridgeFor();
+    bridge.set('workflow:generateSpecification', () => ok<'workflow:generateSpecification'>(detail({ currentRound: 0 }, []).task));
+    renderApp(<SeededRun detail={detail({ currentRound: 0, ...overrides }, [])} />);
+
+    const regenerate = await screen.findByRole('button', { name: /Regenerate specification/ }, { timeout: 10_000 });
+    expect(workflowControls()).toEqual([]);
+    expect(document.body.textContent).toContain(reason);
+
+    fireEvent.click(regenerate);
+    await waitFor(() => expect(bridge.callsTo('workflow:generateSpecification')).toHaveLength(1));
+    expect(bridge.callsTo('workflow:generateSpecification')[0]!.input).toEqual({ taskId: 't' });
+    expect(bridge.callsTo('workflow:implement')).toEqual([]);
+    expect(bridge.callsTo('workflow:sendToClaude')).toEqual([]);
+  });
+
+  it('an unapproved one is not offered for approval either', async () => {
+    bridgeFor();
+    renderApp(<SeededRun detail={detail({ currentRound: 0, specificationApprovedAt: null, specificationGroundingJson: null }, [])} />);
+    await screen.findByRole('button', { name: /Regenerate specification/ }, { timeout: 10_000 });
+    expect(screen.queryByRole('button', { name: /Approve specification/ })).toBeNull();
+  });
+
+  it('leaves later rounds and continuations alone: their files have moved on by design', async () => {
+    bridgeFor();
+    renderApp(<SeededRun detail={{
+      ...detail({ currentRound: 0, specificationGroundingJson: null }, []),
+      continuationOf: { taskId: 'source', title: 'Source', status: 'COMPLETED', createdAt: '2026-09-22T09:00:00.000Z' }
+    }} />);
+    // A continuation's own entry step, as before: it inherits an implemented task's files.
+    await screen.findByRole('button', { name: 'Run verification' }, { timeout: 10_000 });
+    expect(screen.queryByRole('button', { name: /Regenerate specification/ })).toBeNull();
+    cleanup();
+
+    bridgeFor();
+    renderApp(<SeededRun detail={detail({ currentRound: 1, specificationGroundingJson: null, lastError: 'Ornith changed 1 file. Verification did not run in this round.' }, [ornithRun(1)])} />);
+    await screen.findByRole('button', { name: 'Run verification' }, { timeout: 10_000 });
+    expect(screen.queryByRole('button', { name: /Regenerate specification/ })).toBeNull();
   });
 });

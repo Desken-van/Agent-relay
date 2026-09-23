@@ -51,6 +51,37 @@ function seedProject(repo: SqliteProjectRepository): string {
   return project.id;
 }
 
+interface LegacyTask {
+  readonly id: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly status: string;
+  readonly currentRound: number;
+  readonly worktreePath: string;
+  readonly branchName: string;
+  readonly baseBranch: string;
+  readonly lastReviewJson: string | null;
+  readonly lastError: string;
+}
+
+/**
+ * A task row as a database that stopped at an early migration holds it: only the columns
+ * that existed then. The current repository names every current column, so it cannot
+ * write (or read) a row in a schema that predates one of them.
+ */
+function insertLegacyTask(db: ReturnType<typeof createSqliteDatabase>, task: LegacyTask): LegacyTask {
+  db.prepare(
+    `INSERT INTO tasks (id, project_id, title, original_request, status, current_round, max_rounds,
+                        codex_thread_id, claude_session_id, worktree_path, branch_name, base_branch,
+                        specification_json, specification_approved_at, last_review_json, last_error,
+                        codex_model, claude_model, created_at, updated_at)
+     VALUES (@id, @projectId, @title, 'Work', @status, @currentRound, 3, NULL, NULL, @worktreePath,
+             @branchName, @baseBranch, NULL, NULL, @lastReviewJson, @lastError, NULL, NULL,
+             '2026-09-13T00:00:00.000Z', '2026-09-13T00:00:00.000Z')`
+  ).run({ ...task });
+  return task;
+}
+
 function seedTask(repo: SqliteTaskRepository, projectId: string): string {
   const task = repo.create({
     id: ids.next(),
@@ -104,29 +135,24 @@ describe('migrations', () => {
       const runs = new SqliteRunRepository(legacy);
       const projectId = seedProject(projects);
       const review = { verdict: 'changes_requested', summary: 'More work', findings: [], followUpPrompt: 'Fix it' };
-      const stopped = tasks.create({
-        id: 'review-limit-source', projectId, title: 'Stopped review', originalRequest: 'Work',
-        status: 'FAILED', currentRound: 3, maxRounds: 3, codexThreadId: null,
-        claudeSessionId: null, worktreePath: 'C:\\worktrees\\shared', branchName: 'agent/review',
-        baseBranch: 'main', specificationJson: null, specificationApprovedAt: null,
-        lastReviewJson: JSON.stringify(review), lastError: 'Review round limit reached (3/3).',
-        codexModel: null, claudeModel: null
+      const stopped = insertLegacyTask(legacy, {
+        id: 'review-limit-source', projectId, title: 'Stopped review',
+        status: 'FAILED', currentRound: 3, worktreePath: 'C:\\worktrees\\shared', branchName: 'agent/review',
+        baseBranch: 'main', lastReviewJson: JSON.stringify(review), lastError: 'Review round limit reached (3/3).'
       });
       runs.create({ id: 'review-run', taskId: stopped.id, agent: 'codex', runType: 'review', status: 'running', round: 3, startedAt: legacyClock.nowIso() });
       runs.finish('review-run', { status: 'succeeded', finishedAt: legacyClock.nowIso(), structuredResult: JSON.stringify(review) });
-      const genuineFailure = tasks.create({
-        id: 'genuine-failure', projectId, title: 'Failed process', originalRequest: 'Work',
-        status: 'FAILED', currentRound: 1, maxRounds: 3, codexThreadId: null,
-        claudeSessionId: null, worktreePath: 'C:\\worktrees\\failed', branchName: 'agent/failed',
-        baseBranch: 'main', specificationJson: null, specificationApprovedAt: null,
-        lastReviewJson: null, lastError: 'Process exited with code 1.', codexModel: null, claudeModel: null
+      const genuineFailure = insertLegacyTask(legacy, {
+        id: 'genuine-failure', projectId, title: 'Failed process',
+        status: 'FAILED', currentRound: 1, worktreePath: 'C:\\worktrees\\failed', branchName: 'agent/failed',
+        baseBranch: 'main', lastReviewJson: null, lastError: 'Process exited with code 1.'
       });
 
       // Migrations 12 (Ornith), 13 (this test's review-limit subject),
       // 14 (review-blocked-status), 15 (compatibility repair), 16
-      // (Coai contract fingerprint), 17 (plan-review triage), and 18
-      // (code-review triage) are pending.
-      expect(runMigrations(legacy)).toBe(9);
+      // (Coai contract fingerprint), 17 (plan-review triage), 18
+      // (code-review triage), 19, 20 and 21 (specification grounding) are pending.
+      expect(runMigrations(legacy)).toBe(10);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_LIMIT_REACHED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');
       expect(() => tasks.create({
@@ -160,26 +186,20 @@ describe('migrations', () => {
       const projectId = seedProject(projects);
       const blocked = { verdict: 'blocked', summary: 'Wrong approach.', findings: [], followUpPrompt: 'Rework it.' };
 
-      const stopped = tasks.create({
-        id: 'review-blocked-source', projectId, title: 'Blocked review', originalRequest: 'Work',
-        status: 'FAILED', currentRound: 1, maxRounds: 3, codexThreadId: null,
-        claudeSessionId: null, worktreePath: 'C:\\worktrees\\shared-blocked', branchName: 'agent/blocked',
-        baseBranch: 'main', specificationJson: null, specificationApprovedAt: null,
-        lastReviewJson: JSON.stringify(blocked), lastError: 'Wrong approach.',
-        codexModel: null, claudeModel: null
+      const stopped = insertLegacyTask(legacy, {
+        id: 'review-blocked-source', projectId, title: 'Blocked review',
+        status: 'FAILED', currentRound: 1, worktreePath: 'C:\\worktrees\\shared-blocked', branchName: 'agent/blocked',
+        baseBranch: 'main', lastReviewJson: JSON.stringify(blocked), lastError: 'Wrong approach.'
       });
       runs.create({ id: 'blocked-review-run', taskId: stopped.id, agent: 'codex', runType: 'review', status: 'running', round: 1, startedAt: legacyClock.nowIso() });
       runs.finish('blocked-review-run', { status: 'succeeded', finishedAt: legacyClock.nowIso(), structuredResult: JSON.stringify(blocked) });
 
       // Task JSON claims 'blocked', but the task's own succeeded review run
       // disagrees (stale/mismatched evidence) — must stay FAILED.
-      const staleEvidence = tasks.create({
-        id: 'stale-blocked-claim', projectId, title: 'Stale claim', originalRequest: 'Work',
-        status: 'FAILED', currentRound: 1, maxRounds: 3, codexThreadId: null,
-        claudeSessionId: null, worktreePath: 'C:\\worktrees\\stale-blocked', branchName: 'agent/stale-blocked',
-        baseBranch: 'main', specificationJson: null, specificationApprovedAt: null,
-        lastReviewJson: JSON.stringify(blocked), lastError: 'Publish failed unexpectedly.',
-        codexModel: null, claudeModel: null
+      const staleEvidence = insertLegacyTask(legacy, {
+        id: 'stale-blocked-claim', projectId, title: 'Stale claim',
+        status: 'FAILED', currentRound: 1, worktreePath: 'C:\\worktrees\\stale-blocked', branchName: 'agent/stale-blocked',
+        baseBranch: 'main', lastReviewJson: JSON.stringify(blocked), lastError: 'Publish failed unexpectedly.'
       });
       runs.create({ id: 'stale-review-run', taskId: staleEvidence.id, agent: 'codex', runType: 'review', status: 'succeeded', round: 1, startedAt: legacyClock.nowIso() });
       runs.finish('stale-review-run', {
@@ -187,19 +207,17 @@ describe('migrations', () => {
         structuredResult: JSON.stringify({ ...blocked, verdict: 'changes_requested' })
       });
 
-      const genuineFailure = tasks.create({
-        id: 'genuine-failure-blocked', projectId, title: 'Failed process', originalRequest: 'Work',
-        status: 'FAILED', currentRound: 1, maxRounds: 3, codexThreadId: null,
-        claudeSessionId: null, worktreePath: 'C:\\worktrees\\failed-blocked', branchName: 'agent/failed-blocked',
-        baseBranch: 'main', specificationJson: null, specificationApprovedAt: null,
-        lastReviewJson: null, lastError: 'Process exited with code 1.', codexModel: null, claudeModel: null
+      const genuineFailure = insertLegacyTask(legacy, {
+        id: 'genuine-failure-blocked', projectId, title: 'Failed process',
+        status: 'FAILED', currentRound: 1, worktreePath: 'C:\\worktrees\\failed-blocked', branchName: 'agent/failed-blocked',
+        baseBranch: 'main', lastReviewJson: null, lastError: 'Process exited with code 1.'
       });
 
       // Migrations 13 (review-limit-status), 14 (this test's review-blocked
       // subject), 15 (compatibility repair), 16 (Coai contract
-      // fingerprint), 17 (plan-review triage), and 18 (code-review triage)
-      // are still pending.
-      expect(runMigrations(legacy)).toBe(8);
+      // fingerprint), 17 (plan-review triage), 18 (code-review triage),
+      // 19, 20 and 21 (specification grounding) are still pending.
+      expect(runMigrations(legacy)).toBe(9);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_BLOCKED');
       expect(tasks.findById(staleEvidence.id)?.status).toBe('FAILED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');

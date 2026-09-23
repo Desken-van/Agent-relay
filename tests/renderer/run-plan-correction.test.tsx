@@ -57,6 +57,10 @@ function taskDetail(): TaskDetail {
     status: 'READY_FOR_IMPLEMENTATION', currentRound: 0, maxRounds: 3, codexThreadId: 'spec', claudeSessionId: null,
     worktreePath: null, branchName: null, baseBranch: null,
     specificationJson: JSON.stringify(specification), specificationApprovedAt: null,
+    specificationGroundingJson: JSON.stringify({
+      version: 1, checkout: 'task_worktree', baseBranch: 'main', branch: 'agent-relay/t', commit: 'a'.repeat(40),
+      clean: true, implementationProvider: 'claude', capturedAt: NOW, stale: null
+    }),
     lastReviewJson: null, lastError: null, codexModel: null, claudeModel: null,
     implementationProvider: 'claude', reviewProvider: 'codex',
     createdAt: NOW, updatedAt: NOW

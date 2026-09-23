@@ -223,10 +223,13 @@ describe('implementation stage', () => {
 
     const project = harness.createProject();
     const task = harness.createTask(project.id);
-    await harness.orchestrator.generateSpecification(task.id);
-    harness.orchestrator.approveSpecification(task.id);
+    // There is no commit to generate the specification against, so it is refused there,
+    // before Codex is asked anything — and nothing can be approved or implemented after it.
+    await expect(harness.orchestrator.generateSpecification(task.id)).rejects.toThrow(/does not exist/i);
+    expect(harness.codex.specificationCalls).toHaveLength(0);
+    expect(() => harness.orchestrator.approveSpecification(task.id)).toThrow();
 
-    await expect(harness.orchestrator.sendToClaude(task.id)).rejects.toThrow(/does not exist/i);
+    await expect(harness.orchestrator.sendToClaude(task.id)).rejects.toThrow();
     expect(harness.claude.calls).toHaveLength(0);
   });
 
