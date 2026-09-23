@@ -190,8 +190,8 @@ export class FakeCodexAdapter implements CodexAdapter {
           ...request.acceptedFindings.map((finding) => `Addresses: ${finding.title}`)
         ]
       });
-    // Honest by default: each accepted finding is reported against the first field
-    // that really differs. A test that needs a lie sets `revisionAddressed`.
+    // Honest by default, in the shape the revision prompt asks for: one entry per
+    // (accepted finding, changed field) pair. A test that needs a lie sets `revisionAddressed`.
     const changedFields = SPECIFICATION_FIELD_NAMES.filter(
       (field) => JSON.stringify(request.currentSpecification[field]) !== JSON.stringify(specification[field])
     );

@@ -16,6 +16,21 @@ import type { TriageableDecision, TriageableFinding } from '../../ports';
 /* Codex: specification                                                        */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * What a specification may ask for as verification evidence. Agent Relay persists a bounded record of its
+ * own verification and never the command's raw output (docs/security.md), so a specification demanding that
+ * the "actual" or full output be stored in Relay could never be satisfied. Shared by generation and revision.
+ */
+const VERIFICATION_EVIDENCE_RULE = `- Verification evidence: where the specification asks for proof that the project's checks pass
+  (in "acceptanceCriteria", "suggestedTests" or "implementationPrompt"), require Agent Relay's own
+  verification — its "Run verification" action, which runs \`npm run verify\` in the task worktree —
+  and the record Agent Relay persists for that run: its exit code and classified outcome (passed,
+  failed, timed_out or cancelled) and, for a failed run, its failure kind and the bounded, sanitized
+  output summary where one is available. Agent Relay deliberately never stores a command's raw
+  stdout/stderr or a complete log, so no acceptance criterion, constraint, suggested test or
+  instruction may require the actual, full or raw command output to be stored in, attached to, or
+  shown by Agent Relay.`;
+
 export interface SpecificationPromptInput {
   readonly projectPath: string;
   readonly taskTitle: string;
@@ -63,6 +78,7 @@ Produce a single JSON object matching the required schema, with these rules:
   instead of first scanning the whole repository to find them. Otherwise return an empty
   array ([]) — whenever more than a few files might be touched, a new file might need to be
   created, or you are not fully certain of the exact set of paths. Never omit the field.
+${VERIFICATION_EVIDENCE_RULE}
 
 Scope discipline: specify the change the user asked for. Do not add refactors, upgrades,
 or "while we're here" improvements.
@@ -131,13 +147,23 @@ ${input.acceptedFindings.map(renderAcceptedFinding).join('\n\n')}
 
 Produce a single JSON object matching the required schema, with two parts:
 - "specification": the COMPLETE revised specification, every field present.
-- "addressed": one entry for EACH accepted finding above — its number exactly as listed
-  ("Finding N" is N), the specification field in which you addressed it, and one or two
-  sentences saying what you changed there. That field must really differ from the current
-  specification: a finding you claim but did not change is refused, and so is an accepted
-  finding you do not mention. List EVERY field you changed: a field that differs from the
-  current specification but is not tied to an accepted finding is an unrequested change and
-  the whole revision is refused.
+- "addressed": one entry for every (accepted finding, changed field) PAIR. Each entry gives the
+  finding's number exactly as listed ("Finding N" is N), ONE specification field you changed
+  for it, and one or two sentences saying what you changed in that field for that finding.
+  - A finding that required changes to several fields gets one entry per field, repeating the
+    same finding number: a finding addressed in "constraints" and in "implementationPrompt" is
+    two entries, both with its number.
+  - A field changed for several findings gets one entry per finding. The field itself still
+    appears once in "specification"; one edit may serve several findings, and each entry's
+    change says what that edit does for its finding.
+  - Every accepted finding appears in at least one entry, and every field whose value differs
+    from the current specification appears in at least one entry. Name only fields that really
+    differ.
+  Before answering, compare each field of your revised specification with the current one and
+  check both rules. The whole revision is refused, and nothing is stored, when an accepted
+  finding has no entry, when an entry names a field that did not change or a finding that was
+  not accepted, or when a field changed without an entry tying it to an accepted finding — that
+  is an unrequested change.
 
 Rules for the revision:
 
@@ -155,6 +181,9 @@ Rules for the revision:
 - Acceptance criteria stay objectively checkable.
 - "scopedFilePaths" must always be present, following the same rule as before: a small
   explicit list only when the whole implementation is confidently confined to it, else [].
+${VERIFICATION_EVIDENCE_RULE}
+  This holds for the accepted findings too: a finding that asks for such output is addressed
+  by requiring that persisted record instead.
 
 Return only the JSON object.`;
 }

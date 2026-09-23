@@ -5,6 +5,7 @@ import {
   revisionAddressesProblem
 } from '../../src/shared/domain/plan-correction';
 import type { PlanReviewGate, PlanReviewGateIdentity } from '../../src/shared/domain/plan-review';
+import type { TaskSpecification } from '../../src/shared/schemas/codex';
 import { makeSpecification } from '../helpers/fakes';
 
 const ACCEPTED = JSON.stringify([{ finding: 0, action: 'accept', reason: 'Valid.' }]);
@@ -186,6 +187,73 @@ describe('revisionAddressesProblem', () => {
         revised: rewritten
       })
     ).toBeNull();
+  });
+
+  describe('one entry per (accepted finding, changed field) pair', () => {
+    const before = makeSpecification({
+      acceptanceCriteria: ['The section exists.'],
+      constraints: ['Do not change the existing sections.'],
+      implementationPrompt: 'Add the section.'
+    });
+    // One accepted finding whose correction needs a new constraint AND a new instruction.
+    const after = makeSpecification({
+      acceptanceCriteria: ['The section exists.'],
+      constraints: ['Do not change the existing sections.', 'Use only synthetic fixtures.'],
+      implementationPrompt: 'Add the section, using only synthetic fixtures.'
+    });
+
+    it('reproduces the reported refusal: one entry per finding leaves the second changed field untied', () => {
+      expect(
+        revisionAddressesProblem({
+          accepted: [{ finding: 0 }],
+          addressed: [{ finding: 0, field: 'implementationPrompt', change: 'Named the fixtures.' }],
+          current: before,
+          revised: after
+        })
+      ).toBe('Codex changed "constraints" without tying the change to an accepted finding.');
+    });
+
+    it('accepts the same finding repeated once per field it changed, across several findings', () => {
+      const wider = makeSpecification({
+        ...after,
+        acceptanceCriteria: ['The section exists.', 'Only synthetic fixtures are used.']
+      });
+      expect(
+        revisionAddressesProblem({
+          accepted: [{ finding: 0 }, { finding: 3 }],
+          addressed: [
+            { finding: 0, field: 'constraints', change: 'Added the fixture constraint.' },
+            { finding: 0, field: 'implementationPrompt', change: 'Told the implementer.' },
+            { finding: 0, field: 'acceptanceCriteria', change: 'Made it checkable.' },
+            // One edit serving two findings: the field is named once per finding.
+            { finding: 3, field: 'implementationPrompt', change: 'The same instruction covers it.' }
+          ],
+          current: before,
+          revised: wider
+        })
+      ).toBeNull();
+    });
+
+    it.each<[string, Partial<TaskSpecification>]>([
+      ['title', { title: 'A rewritten title' }],
+      ['scopedFilePaths', { scopedFilePaths: ['docs/manual-test.md'] }],
+      ['assumptions', { assumptions: ['A new assumption nobody asked for.'] }]
+    ])(
+      'still refuses an unrelated change to "%s" when every finding is covered by repeated pairs',
+      (field, change) => {
+        expect(
+          revisionAddressesProblem({
+            accepted: [{ finding: 0 }],
+            addressed: [
+              { finding: 0, field: 'constraints', change: 'Added the fixture constraint.' },
+              { finding: 0, field: 'implementationPrompt', change: 'Told the implementer.' }
+            ],
+            current: before,
+            revised: makeSpecification({ ...after, ...change })
+          })
+        ).toBe(`Codex changed "${field}" without tying the change to an accepted finding.`);
+      }
+    );
   });
 
   it('refuses a claim about a finding that was not accepted', () => {

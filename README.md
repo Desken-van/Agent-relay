@@ -521,8 +521,12 @@ starting Claude/Codex or consuming an implementation round. The project must
 provide `scripts.verify` in `package.json`; Node.js and npm must be installed.
 Project scripts are trusted code and may produce local build/test artifacts.
 
-Open **Relay Timeline → Verification · npm run verify** for output, exit code,
-duration and snapshot identity. A confirmed pass opens **Run review**. Failure,
+Open **Relay Timeline → Verification · npm run verify** for the outcome, exit
+code, duration and snapshot identity, and, for a failed run, its classified
+failure kind and a bounded, sanitized output summary. The command's raw
+stdout/stderr is never stored (see [docs/security.md](docs/security.md)), so a
+specification should ask for this record as verification evidence, not for the
+full output. A confirmed pass opens **Run review**. Failure,
 cancellation, interruption or changed inputs never grant a pass. There is no
 automatic retry. Current files are checked again before review and publishing.
 This is verification, not Coai review and not live acceptance of a model.

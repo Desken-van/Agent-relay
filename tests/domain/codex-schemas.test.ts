@@ -320,6 +320,22 @@ describe('JSON Schema projection handed to Codex', () => {
     expect(description).toMatch(/not an access restriction/i);
   });
 
+  it('tells the model, in the revision schema itself, to name a finding once per field it changed', () => {
+    const schema = specificationRevisionJsonSchema() as unknown as {
+      properties: {
+        addressed: {
+          description: string;
+          items: { properties: { finding: { description: string }; field: { description: string } } };
+        };
+      };
+    };
+    const { addressed } = schema.properties;
+    expect(addressed.description).toMatch(/one entry per \(accepted finding, changed field\) pair/i);
+    expect(addressed.description).toMatch(/every field that differs from the current specification/i);
+    expect(addressed.items.properties.finding.description).toMatch(/repeat it in one entry per field/i);
+    expect(addressed.items.properties.field.description).toMatch(/^ONE specification field/);
+  });
+
   it('sends no default keyword: the schema comes from the strict contract, not the reader', () => {
     expect(JSON.stringify(taskSpecificationJsonSchema())).not.toContain('"default"');
   });
