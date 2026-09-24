@@ -66,6 +66,11 @@ export type SpecificationGroundingState =
   | { readonly kind: 'ungrounded' }
   /** A later check found the target changed after the specification was generated. */
   | { readonly kind: 'stale'; readonly grounding: SpecificationGrounding; readonly reason: string }
+  /**
+   * Read from a checkout with uncommitted changes. A commit cannot name that content, so
+   * nothing can later prove the tree is still what was read: never trusted, only regenerated.
+   */
+  | { readonly kind: 'unverifiable'; readonly grounding: SpecificationGrounding }
   /** The task's implementer became Ornith after the specification was written for one that can run commands. */
   | {
       readonly kind: 'provider_changed';
@@ -84,6 +89,7 @@ export function specificationGroundingState(task: {
   const grounding = parseSpecificationGrounding(task.specificationGroundingJson);
   if (grounding === null) return { kind: 'ungrounded' };
   if (grounding.stale !== null) return { kind: 'stale', grounding, reason: grounding.stale.reason };
+  if (!grounding.clean) return { kind: 'unverifiable', grounding };
   if (!canCarryOut(grounding.implementationProvider, task.implementationProvider)) {
     return { kind: 'provider_changed', grounding, recorded: grounding.implementationProvider, current: task.implementationProvider };
   }
@@ -112,6 +118,8 @@ export function specificationGroundingProblem(state: SpecificationGroundingState
       return 'Agent Relay has no record of which checkout this specification was written against, so its file facts may describe the project folder rather than the task’s branch.';
     case 'stale':
       return `The task’s checkout changed after the specification was generated: ${state.reason}`;
+    case 'unverifiable':
+      return 'The specification was written from a task worktree with uncommitted changes, which no commit can name, so Agent Relay cannot check that the worktree still holds what was read.';
     case 'provider_changed':
       return `The specification was written for ${PROVIDER_NAMES[state.recorded]}, but the task now uses ${PROVIDER_NAMES[state.current]}, which cannot run commands and may be unable to follow it.`;
   }

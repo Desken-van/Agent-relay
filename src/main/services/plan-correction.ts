@@ -677,6 +677,18 @@ export class PlanCorrectionService {
       this.deps.corrections.fail(correction.id, STOPPED_DURING_REVISION);
       throw new AgentRelayError('CANCELLED', STOPPED_DURING_REVISION);
     }
+    // Still the same tree after the read: a revision written from a worktree that moved or was
+    // edited while Codex read it would be stored under the old record. Refused (the check records
+    // the mismatch), the correction fails, and no new version exists.
+    try {
+      await this.deps.verifyTarget(task.id);
+    } catch (error) {
+      this.deps.corrections.fail(
+        correction.id,
+        redactAndTruncate(error instanceof Error ? error.message : String(error), 10_000)
+      );
+      throw error;
+    }
 
     if (Buffer.byteLength(revisedJson, 'utf8') > MAX_SPECIFICATION_BYTES) {
       return fail('The revised specification is larger than the external review budget allows.');

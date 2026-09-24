@@ -569,13 +569,17 @@ with uncommitted edits, and the task branch is cut from the base branch, not fro
 
 - **Generation** (`SpecificationGroundingService.open`). When the task already has its
   worktree, Codex reads that worktree (after the path-safety check, a branch check, and a
-  check that the project's own `refs/heads/<task branch>` names the same commit); before
-  any round, a task worktree with uncommitted changes is refused, because no commit could
-  name what Codex would read. Otherwise Codex reads a temporary, clean, detached checkout
-  of `refs/heads/<base branch>` at `<worktrees root>/.agent-relay-specification/<task id>`,
+  check that the project's own `refs/heads/<task branch>` names the same commit); in any
+  round, a task worktree with uncommitted changes is refused (`GIT_DIRTY`), because no
+  commit could name what Codex would read and nothing could later prove the worktree still
+  holds it — the changes are left alone. Otherwise Codex reads a temporary, clean, detached
+  checkout of `refs/heads/<base branch>` at `<worktrees root>/.agent-relay-specification/<task id>`,
   removed afterwards with a non-force `git worktree remove` (a leftover is removed the same
-  way before the next generation; one that cannot be is refused, never forced). A
-  regeneration against a different target starts a fresh Codex thread.
+  way before the next generation; one that cannot be is refused, never forced). After
+  Codex returns, and before anything is stored, `confirmUnchanged` inspects the checkout it
+  read again: a HEAD that moved, or any uncommitted change, refuses the result, so the task
+  keeps the specification and record it had. A regeneration against a different target
+  starts a fresh Codex thread.
 - **The record.** `tasks.specification_grounding_json` (migration 21) holds a
   `SpecificationGrounding` — checkout kind, base branch, task branch, commit, cleanliness,
   the implementer it was written for, capture time, and a `stale` mark. It is written in
@@ -587,19 +591,27 @@ with uncommitted edits, and the task branch is cut from the base branch, not fro
   branch — and the implementation start from exactly the tree the specifier read.
 - **Plan review, triage and revision.** The plan text names the target and the
   implementer's capabilities; Codex triage and the plan-correction revision run in the
-  task worktree, never in `project.localPath`, and each first runs the same target check
-  as approval (injected as `verifyTarget`), so a task branch that moved during plan review
-  is recorded and refused before anything reads it or a correction row is opened.
+  task worktree, never in `project.localPath`. All three run the same target check as
+  approval (injected as `verifyTarget`, required by both services): a plan round before
+  its gate row is prepared or anything is sent to the reviewer; triage and the revision
+  before Codex reads the worktree and again after it returns. A task branch that moved,
+  or a worktree edited, is recorded and refused; a change during the read discards the
+  triage (nothing is recorded on the gate) or fails the correction (no new version).
 - **Base branch names.** A project's base branch is free text; before it reaches Git it
   must be a plain branch name by Git's own rules, so `main~1` or `main^` can never
   resolve to another commit.
 - **Mismatch.** `verifySpecificationGrounding` (run by the approval IPC before the
   synchronous approval, and by the first implementation round before a branch, lease or
-  round exists) requires the task worktree to be on its branch at the recorded commit and,
-  when recorded clean, still clean; without a worktree, the recorded commit must still be
-  on the base branch. A definite mismatch is written as `stale` on the record it checked
-  (never on a newer one) and refused; a Git failure is only an error. Approval also
-  refuses, without Git, a missing, stale or wrong-implementer record.
+  round exists) requires the task worktree to be on its branch at the recorded commit and
+  still clean; without a worktree, the recorded commit must still be on the base branch.
+  A definite mismatch is written as `stale` on the record it checked (never on a newer
+  one) and refused; a Git failure is only an error. Approval also refuses, without Git,
+  a missing, stale, unverifiable or wrong-implementer record.
+- **Unverifiable.** A record with `clean: false` — written by an earlier build that let a
+  specification be regenerated after the first round from a worktree with uncommitted
+  changes — is classified `unverifiable`: no commit names what was read, so it is never
+  trusted. It is refused like a missing record (approval, verification, the first round,
+  plan review and revision), with no stale mark added, and regenerated instead.
 - **Implementer.** Claude and Codex can carry out anything a specification written for
   the other, or for Ornith, asks; Ornith cannot run commands. So only a move to Ornith
   from another implementer requires regeneration.

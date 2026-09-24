@@ -53,7 +53,7 @@ describe('the grounding record', () => {
     }
   });
 
-  it('classifies a task: none, ungrounded, stale, provider_changed or recorded', () => {
+  it('classifies a task: none, ungrounded, stale, unverifiable, provider_changed or recorded', () => {
     const base = { specificationJson: '{}', implementationProvider: 'claude' as const };
     expect(specificationGroundingState({ ...base, specificationJson: null }).kind).toBe('none');
     expect(specificationGroundingState({ ...base, specificationGroundingJson: null }).kind).toBe('ungrounded');
@@ -64,6 +64,11 @@ describe('the grounding record', () => {
         specificationGroundingJson: JSON.stringify(makeGrounding({ stale: { detectedAt: '2026-01-02T00:00:00.000Z', reason: 'it moved.' } }))
       })
     ).toMatchObject({ kind: 'stale', reason: 'it moved.' });
+    // Read from a worktree with uncommitted changes: never trusted, whichever implementer it names.
+    const dirty = makeGrounding({ checkout: 'task_worktree', branch: 'agent-relay/task', clean: false, implementationProvider: 'codex' });
+    const unverifiable = specificationGroundingState({ ...base, specificationGroundingJson: JSON.stringify(dirty), implementationProvider: 'ornith' });
+    expect(unverifiable.kind).toBe('unverifiable');
+    expect(specificationGroundingProblem(unverifiable)).toMatch(/uncommitted changes, which no commit can name/);
     expect(specificationGroundingState({ ...base, specificationGroundingJson: JSON.stringify(makeGrounding()) }).kind).toBe('recorded');
   });
 
@@ -201,6 +206,43 @@ describe('an existing task whose specification has no record', () => {
     ).rejects.toThrow(/no record of which checkout/);
     expect(harness.codex.revisionCalls).toHaveLength(0);
     expect(corrections.listByTask(created.id)).toEqual([]);
+  });
+});
+
+describe('a specification recorded from a task worktree with uncommitted changes', () => {
+  /** What an earlier build stored when it regenerated after the first round from a dirty worktree. */
+  function dirtyTask(harness: Harness) {
+    const project = harness.createProject();
+    const grounding = makeGrounding({ checkout: 'task_worktree', branch: 'agent-relay/task', clean: false });
+    return harness.createTask(project.id, {
+      status: 'READY_FOR_IMPLEMENTATION',
+      specificationJson: JSON.stringify(makeSpecification()),
+      specificationGroundingJson: JSON.stringify(grounding),
+      specificationApprovedAt: '2026-01-01T00:00:00.000Z'
+    });
+  }
+
+  it('is never approved, verified or implemented, and nothing is written for the attempt', async () => {
+    const harness = setup();
+    const task = dirtyTask(harness);
+    const recorded = task.specificationGroundingJson;
+
+    expect(() => harness.orchestrator.approveSpecification(task.id)).toThrow(/uncommitted changes, which no commit can name/);
+    await expect(harness.orchestrator.verifySpecificationGrounding(task.id)).rejects.toThrow(/uncommitted changes, which no commit can name/);
+    await expect(harness.orchestrator.sendToClaude(task.id)).rejects.toThrow(/uncommitted changes, which no commit can name/);
+    expect(harness.claude.calls).toHaveLength(0);
+    expect(harness.git.createdWorktrees).toEqual([]);
+    // Refused on the record alone: no stale mark is added to it.
+    expect(harness.tasks.findById(task.id)).toMatchObject({ specificationGroundingJson: recorded, currentRound: 0 });
+  });
+
+  it('is offered for regeneration on the Run screen', () => {
+    const harness = setup();
+    const task = dirtyTask(harness);
+    expect(runGuidance(harness.tasks.findById(task.id)!, [], true).action).toMatchObject({
+      key: 'generate_specification',
+      label: 'Regenerate specification'
+    });
   });
 });
 

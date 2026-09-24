@@ -69,9 +69,10 @@ export class SpecificationGroundingService {
 
     if (task.worktreePath !== null && task.branchName !== null) {
       const { commit, info } = await this.worktreeCommit(task, project, settings);
-      // Before any implementation, uncommitted changes here can only be someone's manual
-      // edits: content no record could name. Agent Relay never discards them.
-      if (!info.isClean && task.currentRound === 0) {
+      // In any round: uncommitted content is something no commit can name, so nothing could
+      // later prove the worktree still holds what Codex read. Refused, never read. Agent Relay
+      // never discards the changes (a person's edits, or an earlier round's work).
+      if (!info.isClean) {
         throw new AgentRelayError('GIT_DIRTY', 'The task worktree has uncommitted changes, so a specification cannot be tied to one commit.', {
           details: files(info.dirtyFiles),
           remediation: 'Commit or discard those changes in the task worktree yourself, then generate the specification again. Agent Relay never discards them.'
@@ -176,7 +177,9 @@ export class SpecificationGroundingService {
           reason: `the task branch moved from ${shortCommit(recorded.commit)} to ${shortCommit(commit)}.`
         };
       }
-      if (recorded.clean && !info.isClean) {
+      // A trusted record is always a clean checkout (`unverifiable` covers the rest), so any
+      // uncommitted change since is a change to what was read.
+      if (!info.isClean) {
         return { ok: false, kind: 'mismatch', reason: `the task worktree now has uncommitted changes (${files(info.dirtyFiles)}).` };
       }
       return { ok: true };
@@ -197,6 +200,33 @@ export class SpecificationGroundingService {
       };
     }
     return { ok: true };
+  }
+
+  /**
+   * After Codex has read `target`: is the checkout still exactly the commit its record names,
+   * and still clean? Returns why not, or null. A Git failure throws — it is not an answer.
+   * The record is only written after this says null, so a commit or an edit made while Codex
+   * was reading can never be stored under the commit that was there before it.
+   */
+  async confirmUnchanged(target: SpecificationCheckoutTarget, { task, project, settings }: Target): Promise<string | null> {
+    const recorded = target.grounding;
+    let info: RepositoryInfo;
+    if (recorded.checkout === 'task_worktree') {
+      try {
+        info = (await this.worktreeCommit(task, project, settings)).info;
+      } catch (error) {
+        if (error instanceof AgentRelayError && error.code === 'WORKTREE_INVALID') return error.message;
+        throw error;
+      }
+    } else {
+      info = await this.deps.git.inspect(target.path);
+    }
+    if (!info.isRepository || info.headCommit === null) return 'the checkout Codex read is no longer a Git checkout.';
+    if (info.headCommit !== recorded.commit) {
+      return `it moved from ${shortCommit(recorded.commit)} to ${shortCommit(info.headCommit)}.`;
+    }
+    if (!info.isClean) return `it now has uncommitted changes (${files(info.dirtyFiles)}).`;
+    return null;
   }
 
   /**

@@ -386,11 +386,12 @@ export interface PlanReviewGateDeps {
   readonly codex?: Pick<CodexAdapter, 'triageFindings'>;
   readonly settings?: SettingsRepository;
   /**
-   * For `triage()` only, like `codex`: proves the task worktree is still the tree the
-   * specification was generated against (the orchestrator's check, which records a
-   * definite mismatch) before an analysis reads it. Triage without it is refused.
+   * Proves the task's branch and worktree are still the tree the specification was generated
+   * against (the orchestrator's check, which records a definite mismatch). Run before a review
+   * is dispatched, and before and after a triage reads the worktree. Required, not optional: a
+   * service built without it would send a review of a tree the specification does not describe.
    */
-  readonly verifyTarget?: (taskId: string) => Promise<void>;
+  readonly verifyTarget: (taskId: string) => Promise<void>;
 }
 
 export interface PlanReviewTriageRequest {
@@ -827,6 +828,10 @@ export class PlanReviewGateService {
     // start — a row the screen then offers to run. Every refusal that costs
     // nothing belongs in front of the first write.
     subject(task, project.localPath);
+    // The reviewer reads the task branch; the plan text names the commit the specification
+    // was written against. Before anything is written or sent, prove they are still the same
+    // tree — a moved or edited task branch is recorded and refused, never reviewed.
+    await this.deps.verifyTarget(taskId);
     let gate = this.prepare(taskId);
     if (!STARTABLE_STATUSES.includes(gate.status as (typeof STARTABLE_STATUSES)[number])) {
       throw new AgentRelayError(
@@ -1625,7 +1630,7 @@ export class PlanReviewGateService {
     requestedIndexes: readonly number[],
     signal?: AbortSignal
   ): Promise<PlanReviewTriageResult> {
-    if (!this.deps.codex || !this.deps.settings || !this.deps.verifyTarget) {
+    if (!this.deps.codex || !this.deps.settings) {
       throw new AgentRelayError('TOOL_MISSING', 'Automatic finding triage is not configured in this build.');
     }
     // The findings are about the task's branch — what the external reviewer read and what
@@ -1682,6 +1687,9 @@ export class PlanReviewGateService {
       context
     );
 
+    // Still the same tree after the read: an analysis of a worktree that moved or was edited
+    // while Codex read it describes neither tree, so it is discarded — nothing is recorded.
+    await this.deps.verifyTarget(task.id);
     return this.validateTriageOutcome(outcome.recommendations, requestedIndexes);
   }
 

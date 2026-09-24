@@ -699,6 +699,17 @@ export class Orchestrator {
             onProgress: (event) => handle.append(event)
           }
         );
+        // Still the tree the record names? A commit or an edit made while Codex was reading
+        // would leave the specification describing something else under this commit's name.
+        // Refused before anything is stored: the task keeps what it had.
+        const drift = await this.grounding.confirmUnchanged(target, { task, project, settings });
+        if (drift !== null) {
+          throw new AgentRelayError(
+            'VALIDATION_FAILED',
+            `The checkout changed while Codex was reading it for the specification: ${drift} The specification was not saved.`,
+            { remediation: 'Generate the specification again once nothing is changing the task’s checkout.' }
+          );
+        }
       } finally {
         const leftover = await target.close();
         if (leftover !== null) {
@@ -883,7 +894,7 @@ export class Orchestrator {
     // with no record keeps the old behaviour here; approval and the first round refuse it.
     let startPoint: string | undefined;
     const grounding = specificationGroundingState(task);
-    if (grounding.kind === 'stale' || grounding.kind === 'provider_changed' || grounding.kind === 'recorded') {
+    if (grounding.kind !== 'none' && grounding.kind !== 'ungrounded') {
       await this.assertGroundingCurrent(task, project, settings);
       startPoint = grounding.grounding.commit;
     }
