@@ -265,7 +265,13 @@ export class CliGitAdapter implements GitAdapter {
       { allowFailure: true }
     );
     const commit = result.stdout.trim();
-    return result.exitCode === 0 && COMMIT_ID.test(commit) ? commit : null;
+    if (result.exitCode === 0 && COMMIT_ID.test(commit)) return commit;
+    // With --quiet, 1 is Git's definite "names no commit"; anything else (128: not a
+    // repository, a damaged one, a lock) is a failure to answer, and never reads as "missing".
+    if (result.exitCode === 1) return null;
+    throw new AgentRelayError('GIT_FAILED', 'git rev-parse failed.', {
+      details: redactSecrets((result.stderr || result.stdout).slice(0, 2000))
+    });
   }
 
   async isAncestor(repositoryPath: string, ancestor: string, descendant: string): Promise<boolean> {

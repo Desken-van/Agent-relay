@@ -1762,7 +1762,10 @@ export interface CreateDetachedCheckoutRequest {
 export interface GitAdapter {
   inspect(repositoryPath: string): Promise<RepositoryInfo>;
   branchExists(repositoryPath: string, branch: string): Promise<boolean>;
-  /** The full commit id a ref names, or null when it names no commit. Read-only. */
+  /**
+   * The full commit id a ref names, or null when it definitely names no commit. A Git
+   * failure throws — it is never reported as "missing". Read-only.
+   */
   resolveCommit(repositoryPath: string, ref: string): Promise<string | null>;
   /** Whether `ancestor` is reachable from `descendant` (a commit is its own ancestor). Read-only. */
   isAncestor(repositoryPath: string, ancestor: string, descendant: string): Promise<boolean>;

@@ -180,6 +180,12 @@ describe('the specification target: one commit, read and branched exactly', () =
     await expect(git.resolveCommit(repo, '--upload-pack=x')).rejects.toMatchObject({ code: 'VALIDATION_FAILED' });
   });
 
+  it('throws when Git cannot answer, instead of reporting the ref as missing', async () => {
+    const plain = join(root, 'not-a-repository');
+    mkdirSync(plain);
+    await expect(git.resolveCommit(plain, 'refs/heads/main')).rejects.toMatchObject({ code: 'GIT_FAILED' });
+  });
+
   it('answers ancestry for commit ids only', async () => {
     const first = head(repo);
     commitFile(repo, 'second.txt', 'two\n', 'second');

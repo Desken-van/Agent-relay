@@ -271,3 +271,21 @@ describe('the checkout a specification is generated from', () => {
     expect(harness.codex.specificationCalls).toHaveLength(0);
   });
 });
+
+describe('only a definite answer marks a specification stale', () => {
+  it('refuses, but records nothing, when Git cannot answer', async () => {
+    const harness = setup();
+    const project = harness.createProject();
+    const task = harness.createTask(project.id);
+    await harness.orchestrator.generateSpecification(task.id);
+    const recorded = harness.tasks.findById(task.id)!.specificationGroundingJson;
+    harness.git.resolveCommitError = Object.assign(new Error('git rev-parse failed.'), { code: 'GIT_FAILED' });
+
+    await expect(harness.orchestrator.verifySpecificationGrounding(task.id)).rejects.toThrow(/rev-parse failed/);
+    expect(harness.tasks.findById(task.id)!.specificationGroundingJson).toBe(recorded);
+
+    harness.git.resolveCommitError = null;
+    await harness.orchestrator.verifySpecificationGrounding(task.id);
+    expect(harness.orchestrator.approveSpecification(task.id).specificationApprovedAt).not.toBeNull();
+  });
+});

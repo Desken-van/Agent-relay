@@ -400,7 +400,11 @@ export class FakeGitAdapter implements GitAdapter {
     return this.existingBranches.has(branch);
   }
 
+  /** Set to make `resolveCommit` fail the way Git does when it cannot answer at all. */
+  resolveCommitError: Error | null = null;
+
   async resolveCommit(_repositoryPath: string, ref: string): Promise<string | null> {
+    if (this.resolveCommitError) throw this.resolveCommitError;
     const known = this.commitsByRef.get(ref);
     if (known !== undefined) return known;
     if (/^[0-9a-f]{40}$/.test(ref)) return ref;
