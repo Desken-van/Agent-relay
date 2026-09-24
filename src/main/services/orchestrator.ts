@@ -665,6 +665,12 @@ export class Orchestrator {
 
       // Never the project's source checkout: the task worktree when it exists, else a
       // temporary clean checkout of the base commit the task branch will be cut from.
+      handle.append({
+        type: 'log',
+        text: task.worktreePath === null
+          ? `Preparing a clean checkout of ${task.baseBranch ?? project.defaultBranch} for the specification…`
+          : 'Checking the task worktree the specification will describe…'
+      });
       const target = await this.grounding.open({ task, project, settings });
       handle.append({ type: 'log', text: describeSpecificationTarget(target.grounding) });
       // A thread that read another tree remembers it. Resume only one that read this one.

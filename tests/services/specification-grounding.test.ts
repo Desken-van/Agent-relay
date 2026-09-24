@@ -5,6 +5,7 @@
  * in `specification-grounding-e2e.test.ts`.
  */
 
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SqlitePlanCorrectionRepository } from '../../src/main/db/repositories/plan-correction-repository';
 import { PlanCorrectionService } from '../../src/main/services/plan-correction';
@@ -159,7 +160,8 @@ describe('an existing task whose specification has no record', () => {
       clock: harness.clock,
       ids: harness.ids,
       claims,
-      operations: harness.operations
+      operations: harness.operations,
+      verifyTarget: async (taskId: string) => { await harness.orchestrator.verifySpecificationGrounding(taskId); }
     });
     const corrections = new SqlitePlanCorrectionRepository(harness.db, harness.clock);
     const loop = new PlanCorrectionService({
@@ -174,7 +176,8 @@ describe('an existing task whose specification has no record', () => {
       claims,
       operations: harness.operations,
       clock: harness.clock,
-      ids: harness.ids
+      ids: harness.ids,
+      verifyTarget: async (taskId: string) => { await harness.orchestrator.verifySpecificationGrounding(taskId); }
     });
     const project = harness.createProject();
     const created = harness.createTask(project.id);
@@ -230,5 +233,41 @@ describe('a specification written for an implementer that can run commands, on a
 
     expect(harness.codex.specificationCalls[0]).toMatchObject({ implementationProvider: 'ornith', target: { implementationProvider: 'ornith' } });
     expect(parseSpecificationGrounding(harness.tasks.findById(task.id)!.specificationGroundingJson)!.implementationProvider).toBe('ornith');
+  });
+});
+
+describe('the checkout a specification is generated from', () => {
+  it('refuses a base branch written as a revision expression before Git resolves it to another commit', async () => {
+    const harness = setup();
+    for (const name of ['main~1', 'main^', 'main@{1}', 'HEAD:main', '-main', 'main..x']) {
+      const project = harness.createProject({ localPath: `C:\repo-${harness.ids.next()}`, defaultBranch: name });
+      const task = harness.createTask(project.id);
+      await expect(harness.orchestrator.generateSpecification(task.id)).rejects.toThrow(/is not a plain branch name/);
+    }
+    expect(harness.codex.specificationCalls).toHaveLength(0);
+    expect(harness.git.detachedCheckouts).toEqual([]);
+  });
+
+  it('accepts a branch name Git itself accepts, even outside Agent Relay’s own branch-name style', async () => {
+    const harness = setup();
+    harness.git.existingBranches.add('release/2026@q3+hotfix');
+    const project = harness.createProject({ defaultBranch: 'release/2026@q3+hotfix' });
+    const task = harness.createTask(project.id);
+
+    await harness.orchestrator.generateSpecification(task.id);
+    expect(parseSpecificationGrounding(harness.tasks.findById(task.id)!.specificationGroundingJson)!.baseBranch).toBe('release/2026@q3+hotfix');
+  });
+
+  it('removes the temporary checkout when inspecting it fails, and asks Codex nothing', async () => {
+    const harness = setup();
+    const project = harness.createProject();
+    const task = harness.createTask(project.id);
+    const checkout = join(harness.worktreesRoot, '.agent-relay-specification', task.id);
+    harness.git.inspectErrors.set(checkout, new Error('git status failed'));
+
+    await expect(harness.orchestrator.generateSpecification(task.id)).rejects.toThrow(/git status failed/);
+    expect(harness.git.detachedCheckouts.map((entry) => entry.checkoutPath)).toEqual([checkout]);
+    expect(harness.git.removedWorktrees).toEqual([checkout]);
+    expect(harness.codex.specificationCalls).toHaveLength(0);
   });
 });

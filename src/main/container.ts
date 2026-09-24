@@ -567,7 +567,10 @@ export function buildApplication(options: BuildApplicationOptions): Application 
       codex: adapters.codex,
       settings,
       clock,
-      ids
+      ids,
+      verifyTarget: async (taskId) => {
+        await orchestrator.verifySpecificationGrounding(taskId);
+      }
     });
 
   return {
@@ -619,7 +622,10 @@ export function buildApplication(options: BuildApplicationOptions): Application 
         operations: taskOperations,
         clock,
         ids,
-        events: options.events
+        events: options.events,
+        verifyTarget: async (taskId) => {
+          await orchestrator.verifySpecificationGrounding(taskId);
+        }
       }),
     reconciliation,
     close: () => closeDatabase(db)

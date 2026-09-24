@@ -386,7 +386,12 @@ export class FakeGitAdapter implements GitAdapter {
    */
   checkouts = new Map<string, Partial<RepositoryInfo>>();
 
+  /** `inspect` of one of these paths fails with the error given. */
+  inspectErrors = new Map<string, Error>();
+
   async inspect(repositoryPath: string): Promise<RepositoryInfo> {
+    const failure = this.inspectErrors.get(repositoryPath);
+    if (failure) throw failure;
     const checkout = this.checkouts.get(repositoryPath);
     return checkout === undefined ? this.repository : { ...this.repository, ...checkout };
   }

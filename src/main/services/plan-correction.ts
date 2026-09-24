@@ -116,6 +116,12 @@ export interface PlanCorrectionDeps {
   readonly clock: Clock;
   readonly ids: IdGenerator;
   readonly events?: EventPublisher;
+  /**
+   * Proves the task worktree is still the tree the specification was generated against
+   * (the orchestrator's check, which records a definite mismatch) before a revision reads
+   * it. Required: a revision written from a different tree would carry the old record.
+   */
+  readonly verifyTarget: (taskId: string) => Promise<void>;
 }
 
 interface DerivedState {
@@ -598,6 +604,9 @@ export class PlanCorrectionService {
       worktreesRoot: settingsForTarget.worktreesRoot,
       repositoryPath: project.localPath
     });
+    // Still that tree: a commit or an edit in it since the specification was generated
+    // is recorded and refused here, before a correction row or a Codex call exists.
+    await this.deps.verifyTarget(task.id);
 
     const correction = this.deps.corrections.begin({
       id: this.deps.ids.next(),

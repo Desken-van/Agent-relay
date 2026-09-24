@@ -33,7 +33,8 @@ function setup() {
       clock: harness.clock,
       ids: harness.ids,
       claims,
-      operations: harness.operations
+      operations: harness.operations,
+      verifyTarget: async (taskId: string) => { await harness.orchestrator.verifySpecificationGrounding(taskId); }
     });
   return { harness, reviewer, claims, service: build(), build };
 }

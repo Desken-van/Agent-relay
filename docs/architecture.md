@@ -587,7 +587,12 @@ with uncommitted edits, and the task branch is cut from the base branch, not fro
   branch — and the implementation start from exactly the tree the specifier read.
 - **Plan review, triage and revision.** The plan text names the target and the
   implementer's capabilities; Codex triage and the plan-correction revision run in the
-  task worktree, never in `project.localPath`.
+  task worktree, never in `project.localPath`, and each first runs the same target check
+  as approval (injected as `verifyTarget`), so a task branch that moved during plan review
+  is recorded and refused before anything reads it or a correction row is opened.
+- **Base branch names.** A project's base branch is free text; before it reaches Git it
+  must be a plain branch name by Git's own rules, so `main~1` or `main^` can never
+  resolve to another commit.
 - **Mismatch.** `verifySpecificationGrounding` (run by the approval IPC before the
   synchronous approval, and by the first implementation round before a branch, lease or
   round exists) requires the task worktree to be on its branch at the recorded commit and,

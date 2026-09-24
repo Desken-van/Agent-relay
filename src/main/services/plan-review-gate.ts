@@ -385,6 +385,12 @@ export interface PlanReviewGateDeps {
    *  so existing tests that never exercise triage need not fake it. */
   readonly codex?: Pick<CodexAdapter, 'triageFindings'>;
   readonly settings?: SettingsRepository;
+  /**
+   * For `triage()` only, like `codex`: proves the task worktree is still the tree the
+   * specification was generated against (the orchestrator's check, which records a
+   * definite mismatch) before an analysis reads it. Triage without it is refused.
+   */
+  readonly verifyTarget?: (taskId: string) => Promise<void>;
 }
 
 export interface PlanReviewTriageRequest {
@@ -1619,12 +1625,13 @@ export class PlanReviewGateService {
     requestedIndexes: readonly number[],
     signal?: AbortSignal
   ): Promise<PlanReviewTriageResult> {
-    if (!this.deps.codex || !this.deps.settings) {
+    if (!this.deps.codex || !this.deps.settings || !this.deps.verifyTarget) {
       throw new AgentRelayError('TOOL_MISSING', 'Automatic finding triage is not configured in this build.');
     }
     // The findings are about the task's branch — what the external reviewer read and what
     // the specification describes — so the analysis reads that tree too, never the
-    // project's own folder, which can be on another commit and carry uncommitted edits.
+    // project's own folder, which can be on another commit and carry uncommitted edits;
+    // and only while it is still the tree the specification was generated against.
     if (task.worktreePath === null) {
       throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to analyze the findings against.');
     }
@@ -1633,6 +1640,7 @@ export class PlanReviewGateService {
       worktreesRoot: this.deps.settings.get().worktreesRoot,
       repositoryPath: project.localPath
     });
+    await this.deps.verifyTarget(task.id);
     const projectPath = task.worktreePath;
     const snapshot = readBoundRuleEvidence(task.id, this.deps.ruleEvidence);
     if (snapshot === null) throw new AgentRelayError('VALIDATION_FAILED', 'No rule evidence is bound.');

@@ -247,49 +247,58 @@ describe('a target that changed after the specification is detected, surfaced an
   });
 });
 
+/** A task specified, its branch prepared, and one external round that raised a finding. */
+async function reviewedOnItsBranch(value: Scenario) {
+  const reviewer = new FakePlanReviewer();
+  const claims = new PlanReviewClaims();
+  const { harness } = value;
+  const gateService = new PlanReviewGateService({
+    subjects: new FakePlanReviewSubjects(),
+    tasks: harness.tasks,
+    projects: harness.projects,
+    ruleEvidence: harness.taskRuleEvidence,
+    gates: harness.planReviewGates,
+    reviewer,
+    codex: harness.codex,
+    settings: harness.settings,
+    clock: harness.clock,
+    ids: harness.ids,
+    claims,
+    operations: harness.operations,
+    verifyTarget: async (taskId: string) => { await harness.orchestrator.verifySpecificationGrounding(taskId); }
+  });
+  const loop = new PlanCorrectionService({
+    tasks: harness.tasks,
+    projects: harness.projects,
+    ruleEvidence: harness.taskRuleEvidence,
+    gates: harness.planReviewGates,
+    corrections: new SqlitePlanCorrectionRepository(harness.db, harness.clock),
+    gateService,
+    codex: harness.codex,
+    settings: harness.settings,
+    claims,
+    operations: harness.operations,
+    clock: harness.clock,
+    ids: harness.ids,
+    verifyTarget: async (taskId: string) => { await harness.orchestrator.verifySpecificationGrounding(taskId); }
+  });
+  const task = createTask(value);
+  gateService.bindRules(task.id, snapshot());
+  await harness.orchestrator.generateSpecification(task.id);
+  await harness.orchestrator.preparePlanReviewWorktree(task.id, { acceptDirtyWorkingTree: true });
+  const worktree = harness.tasks.findById(task.id)!.worktreePath!;
+
+  reviewer.roundQueue = [{ ...reviewer.round, verdict: 'revise', gatingCount: 1, threshold: 1, findings: [finding('Name the tools')] }];
+  reviewer.resolutionQueue = [{ ...reviewer.resolution, stage: 'PlanReview', awaitingResolve: false }];
+  await gateService.review(task.id);
+  return { reviewer, gateService, loop, task, worktree };
+}
+
 describe('plan review, triage and revision read the same target', () => {
   it('names the target in the plan text, and triage and the revision read the task worktree', async () => {
     const value = scenario();
-    const reviewer = new FakePlanReviewer();
-    const claims = new PlanReviewClaims();
     const { harness } = value;
-    const gateService = new PlanReviewGateService({
-      subjects: new FakePlanReviewSubjects(),
-      tasks: harness.tasks,
-      projects: harness.projects,
-      ruleEvidence: harness.taskRuleEvidence,
-      gates: harness.planReviewGates,
-      reviewer,
-      codex: harness.codex,
-      settings: harness.settings,
-      clock: harness.clock,
-      ids: harness.ids,
-      claims,
-      operations: harness.operations
-    });
-    const loop = new PlanCorrectionService({
-      tasks: harness.tasks,
-      projects: harness.projects,
-      ruleEvidence: harness.taskRuleEvidence,
-      gates: harness.planReviewGates,
-      corrections: new SqlitePlanCorrectionRepository(harness.db, harness.clock),
-      gateService,
-      codex: harness.codex,
-      settings: harness.settings,
-      claims,
-      operations: harness.operations,
-      clock: harness.clock,
-      ids: harness.ids
-    });
-    const task = createTask(value);
-    gateService.bindRules(task.id, snapshot());
-    await harness.orchestrator.generateSpecification(task.id);
-    await harness.orchestrator.preparePlanReviewWorktree(task.id, { acceptDirtyWorkingTree: true });
-    const worktree = harness.tasks.findById(task.id)!.worktreePath!;
-
-    reviewer.roundQueue = [{ ...reviewer.round, verdict: 'revise', gatingCount: 1, threshold: 1, findings: [finding('Name the tools')] }];
-    reviewer.resolutionQueue = [{ ...reviewer.resolution, stage: 'PlanReview', awaitingResolve: false }];
-    await gateService.review(task.id);
+    const { reviewer, gateService, loop, task, worktree } = await reviewedOnItsBranch(value);
 
     // Hard-wrapped prose: compared as running text.
     const planText = reviewer.reviewCalls[0]!.planText.replace(/\s+/g, ' ');
@@ -319,5 +328,33 @@ describe('plan review, triage and revision read the same target', () => {
     });
     // The revision keeps the target it was generated against.
     expect(groundingOf(value, task.id)).toMatchObject({ commit: value.base, stale: null });
+  });
+});
+
+describe('a task branch that moves during plan review', () => {
+  it('stops triage and the revision before either reads it, and records why', async () => {
+    const value = scenario();
+    const { harness } = value;
+    const { gateService, loop, task, worktree } = await reviewedOnItsBranch(value);
+    writeFileSync(join(worktree, FILE), crlfText(4, 'committed during plan review'));
+    git(worktree, 'commit', '-am', 'someone edited the task branch during plan review');
+
+    const gate = harness.planReviewGates.findByTask(task.id)!;
+    await expect(gateService.triage(task.id, { gateId: gate.id, expectedRevision: gate.revision })).rejects.toThrow(
+      /changed after the specification was generated: the task branch moved from/
+    );
+    expect(harness.codex.triageCalls).toHaveLength(0);
+    expect(groundingOf(value, task.id)!.stale?.reason).toMatch(/moved from/);
+
+    const settled = harness.planReviewGates.findByTask(task.id)!;
+    await expect(
+      loop.resolveAndRevise(task.id, {
+        gateId: settled.id,
+        expectedRevision: settled.revision,
+        decisions: [{ finding: 0, action: 'accept', reason: 'Yes.' }],
+        autoContinue: false
+      })
+    ).rejects.toThrow(/changed after the specification was generated/);
+    expect(harness.codex.revisionCalls).toHaveLength(0);
   });
 });

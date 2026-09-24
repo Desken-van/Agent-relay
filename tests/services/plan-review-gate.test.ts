@@ -68,7 +68,8 @@ function setup() {
       clock: harness.clock,
       ids: harness.ids,
       claims,
-      operations: harness.operations
+      operations: harness.operations,
+      verifyTarget: async (taskId: string) => { await harness.orchestrator.verifySpecificationGrounding(taskId); }
     });
   const service = build();
   /**
@@ -94,7 +95,8 @@ function setup() {
       claims: new PlanReviewClaims(),
       // Its own registry too: this seam exists to have NO arbitration, so a test using it
       // exercises the durable revision guard alone, not the registry's refusal.
-      operations: new TaskOperationRegistry()
+      operations: new TaskOperationRegistry(),
+      verifyTarget: async (taskId: string) => { await harness.orchestrator.verifySpecificationGrounding(taskId); }
     });
   return { harness, reviewer, codex, service, claims, build, unguarded };
 }

@@ -20,6 +20,7 @@ import {
   specificationGroundingState,
   type SpecificationGrounding
 } from '../../shared/domain/specification-grounding';
+import type { RepositoryInfo } from '../../shared/domain/git';
 import type { Clock, GitAdapter } from '../ports';
 import { assertSafeWorktreePath, isSamePath } from './path-safety';
 
@@ -67,8 +68,7 @@ export class SpecificationGroundingService {
     const capturedAt = this.deps.clock.nowIso();
 
     if (task.worktreePath !== null && task.branchName !== null) {
-      const commit = await this.worktreeCommit(task, project, settings);
-      const info = await git.inspect(task.worktreePath);
+      const { commit, info } = await this.worktreeCommit(task, project, settings);
       // Before any implementation, uncommitted changes here can only be someone's manual
       // edits: content no record could name. Agent Relay never discards them.
       if (!info.isClean && task.currentRound === 0) {
@@ -94,7 +94,7 @@ export class SpecificationGroundingService {
       };
     }
 
-    const commit = await git.resolveCommit(project.localPath, `refs/heads/${baseBranch}`);
+    const commit = await git.resolveCommit(project.localPath, branchRef(baseBranch));
     if (commit === null) {
       throw new AgentRelayError('GIT_FAILED', `The project's base branch "${baseBranch}" does not exist in ${project.localPath}.`, {
         remediation: 'Update the project settings to point at a branch that exists.'
@@ -114,7 +114,14 @@ export class SpecificationGroundingService {
         return error instanceof Error ? error.message : String(error);
       }
     };
-    const info = await git.inspect(path);
+    // Proven to be exactly that commit, clean, before Codex reads it; removed on any failure.
+    let info: RepositoryInfo;
+    try {
+      info = await git.inspect(path);
+    } catch (error) {
+      await close();
+      throw error;
+    }
     if (!info.isRepository || info.headCommit !== commit || !info.isClean) {
       await close();
       throw new AgentRelayError('GIT_FAILED', 'The temporary checkout for the specification is not a clean checkout of the base commit.', {
@@ -152,15 +159,16 @@ export class SpecificationGroundingService {
     const recorded = state.grounding;
 
     if (task.worktreePath !== null && task.branchName !== null) {
-      let commit: string;
+      let observed: { readonly commit: string; readonly info: RepositoryInfo };
       try {
-        commit = await this.worktreeCommit(task, project, settings);
+        observed = await this.worktreeCommit(task, project, settings);
       } catch (error) {
         if (error instanceof AgentRelayError && error.code === 'WORKTREE_INVALID') {
           return { ok: false, kind: 'mismatch', reason: error.message };
         }
         throw error;
       }
+      const { commit, info } = observed;
       if (commit !== recorded.commit) {
         return {
           ok: false,
@@ -168,7 +176,6 @@ export class SpecificationGroundingService {
           reason: `the task branch moved from ${shortCommit(recorded.commit)} to ${shortCommit(commit)}.`
         };
       }
-      const info = await this.deps.git.inspect(task.worktreePath);
       if (recorded.clean && !info.isClean) {
         return { ok: false, kind: 'mismatch', reason: `the task worktree now has uncommitted changes (${files(info.dirtyFiles)}).` };
       }
@@ -178,7 +185,7 @@ export class SpecificationGroundingService {
     if (recorded.checkout === 'task_worktree') {
       return { ok: false, kind: 'mismatch', reason: 'the task worktree it was generated from no longer exists.' };
     }
-    const tip = await this.deps.git.resolveCommit(project.localPath, `refs/heads/${recorded.baseBranch}`);
+    const tip = await this.deps.git.resolveCommit(project.localPath, branchRef(recorded.baseBranch));
     if (tip === null) {
       return { ok: false, kind: 'mismatch', reason: `the base branch "${recorded.baseBranch}" no longer exists.` };
     }
@@ -197,12 +204,16 @@ export class SpecificationGroundingService {
    * the project: inside the worktrees root, on the task branch, and at the commit the
    * project repository's own ref for that branch names.
    */
-  private async worktreeCommit(task: Task, project: Project, settings: Settings): Promise<string> {
+  private async worktreeCommit(
+    task: Task,
+    project: Project,
+    settings: Settings
+  ): Promise<{ readonly commit: string; readonly info: RepositoryInfo }> {
     const worktreePath = task.worktreePath as string;
     const branch = task.branchName as string;
     assertSafeWorktreePath({ worktreePath, worktreesRoot: settings.worktreesRoot, repositoryPath: project.localPath });
     const info = await this.deps.git.inspect(worktreePath);
-    const branchHead = await this.deps.git.resolveCommit(project.localPath, `refs/heads/${branch}`);
+    const branchHead = await this.deps.git.resolveCommit(project.localPath, branchRef(branch));
     if (
       !info.isRepository ||
       info.root === null ||
@@ -212,9 +223,39 @@ export class SpecificationGroundingService {
       branchHead !== info.headCommit
     ) {
       throw new AgentRelayError('WORKTREE_INVALID', 'The task worktree is no longer a checkout of the task branch.', {
-        details: worktreePath
+        details: worktreePath,
+        remediation: `Check the task branch "${branch}" out again in that folder (Agent Relay does not move branches), then retry.`
       });
     }
-    return info.headCommit;
+    return { commit: info.headCommit, info };
   }
+}
+
+/**
+ * Git's own rules for a branch name (`git check-ref-format`): no control characters,
+ * spaces, `~ ^ : ? * [ \`, `..`, `@{`, `//`, a lone `@`, a leading `-` or `/`, a trailing
+ * `/` or `.`, or a `.lock` component. Every revision operator is among them, and nothing
+ * Git accepts as a branch is refused.
+ */
+function isPlainBranchName(name: string): boolean {
+  if (name.length === 0 || name.length > 255 || name === '@') return false;
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x20\x7f~^:?*[\\]/.test(name)) return false;
+  if (name.includes('..') || name.includes('@{') || name.includes('//')) return false;
+  if (name.startsWith('-') || name.startsWith('/') || name.endsWith('/') || name.endsWith('.')) return false;
+  return name.split('/').every((part) => part.length > 0 && !part.startsWith('.') && !part.endsWith('.lock'));
+}
+
+/**
+ * The full ref of one branch. A project's base branch is free text in Settings, and Git
+ * would read `main~1` or `main^` as a revision expression — a different commit — so
+ * anything that is not a plain branch name is refused before it reaches Git.
+ */
+function branchRef(branch: string): string {
+  if (!isPlainBranchName(branch)) {
+    throw new AgentRelayError('VALIDATION_FAILED', `"${branch.slice(0, 80)}" is not a plain branch name.`, {
+      remediation: 'Set the project’s base branch to the name of an existing local branch, such as main.'
+    });
+  }
+  return `refs/heads/${branch}`;
 }
