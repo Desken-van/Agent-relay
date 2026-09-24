@@ -192,6 +192,7 @@ describe('Ornith Electron acceptance', () => {
     // in this suite's scripted Ornith run touches a Node dependency.
     mkdirSync(join(repoDir, 'node_modules'), { recursive: true });
     const originalLog = execFileSync('git', ['log', '--oneline'], { cwd: repoDir }).toString('utf8').trim();
+    const baseCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir }).toString('utf8').trim();
 
     let running: ElectronApplication | null = null;
     try {
@@ -237,9 +238,16 @@ describe('Ornith Electron acceptance', () => {
         const db = new DatabaseSync(join(profile, 'agent-relay.sqlite'));
         try {
           const now = new Date().toISOString();
+          // With the record Agent Relay writes beside a specification it generates: which checkout
+          // it describes. Here, a clean checkout of `main` at the fixture's commit, written for
+          // Ornith — so the first round verifies it and cuts the task branch at exactly that commit.
+          const grounding = {
+            version: 1, checkout: 'base_commit', baseBranch: 'main', branch: null, commit: baseCommit,
+            clean: true, implementationProvider: 'ornith', capturedAt: now, stale: null
+          };
           db.prepare(
-            'UPDATE tasks SET status = ?, specification_json = ?, specification_approved_at = ?, updated_at = ? WHERE id = ?'
-          ).run('READY_FOR_IMPLEMENTATION', JSON.stringify(specification), now, now, task.id);
+            'UPDATE tasks SET status = ?, specification_json = ?, specification_approved_at = ?, specification_grounding_json = ?, updated_at = ? WHERE id = ?'
+          ).run('READY_FOR_IMPLEMENTATION', JSON.stringify(specification), now, JSON.stringify(grounding), now, task.id);
         } finally {
           db.close();
         }
