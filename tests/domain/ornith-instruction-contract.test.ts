@@ -46,6 +46,12 @@ describe('the Ornith instruction contract refuses', () => {
     ['Wait for Agent Relay\'s verification to pass.', 'relay_stage'],
     ['Run Agent Relay\'s verification before finishing.', 'relay_stage'],
     ['Poll the separate verification stage until it completes.', 'relay_stage'],
+    // Bringing it about, or waiting for it, with Agent Relay named as the one acting.
+    ['Ensure Agent Relay runs its own verification before you finish.', 'relay_stage'],
+    ['Make sure Agent Relay has verified the change before finishing.', 'relay_stage'],
+    ['Before you finish, have Agent Relay run its verification.', 'relay_stage'],
+    ["Ensure that Agent Relay's verification has run.", 'relay_stage'],
+    ['Wait until Agent Relay has verified the change.', 'relay_stage'],
     // Commands.
     ['Run `npm run verify` and confirm it passes.', 'command'],
     ['Run the tests.', 'command'],
@@ -86,9 +92,15 @@ describe('the Ornith instruction contract refuses', () => {
     expect(prompt('$ npm test').map((v) => v.category)).toEqual(['command']);
   });
 
-  it('an acceptance criterion that needs an Agent Relay run ID, which only Agent Relay knows', () => {
-    expect(criterion('The handoff names the run ID of Agent Relay\'s verification.').map((v) => v.category)).toEqual(['relay_record']);
-    expect(criterion('docs/manual-test.md cites Agent Relay\'s run ID for the check.').map((v) => v.category)).toEqual(['relay_record']);
+  it.each([
+    "The handoff names the run ID of Agent Relay's verification.",
+    "docs/manual-test.md cites Agent Relay's run ID for the check.",
+    // "Includes" / "contains" / "mentions" say what the implementer must produce, not what a reader is told.
+    "The handoff includes the run ID of Agent Relay's verification.",
+    "The handoff mentions Agent Relay's run ID.",
+    'docs/manual-test.md contains the run ID of the verification run.'
+  ])('an acceptance criterion that needs an Agent Relay run ID, which only Agent Relay knows: %s', (text) => {
+    expect(criterion(text).map((v) => v.category)).toEqual(['relay_record']);
   });
 
   it('operator steps written as instructions instead of file content', () => {
@@ -155,6 +167,11 @@ describe('the Ornith instruction contract allows', () => {
     'You must not invoke Agent Relay\'s UI actions.',
     'Note that Agent Relay\'s verification runs after you stop.',
     'Agent Relay verifies the finished change itself afterwards with `npm run verify`.',
+    // Its verification as an outcome to reach, and Agent Relay acting in the code being changed.
+    "Ensure Agent Relay's verification of the finished change passes.",
+    "Make sure the change passes Agent Relay's verification.",
+    'Ensure the new button makes Agent Relay run its verification when clicked.',
+    'Update the orchestrator so that Agent Relay runs verification after Ornith stops.',
     // Another language as quoted words or file content.
     'Replace the word «штатные» with "standard" in docs/manual-test.md.',
     'Append to docs/manual-test.md:\n```markdown\n## Проверка Ornith\n1. Нажмите «Run verification».\n```'
@@ -167,6 +184,9 @@ describe('the Ornith instruction contract allows', () => {
     '`npm run verify` passes.',
     'npm run verify exits with code 0.',
     'docs/manual-test.md contains a step telling the operator to note the run ID.',
+    "docs/manual-test.md contains a step telling the operator to note the run ID of Agent Relay's verification.",
+    "docs/manual-test.md explains where Agent Relay shows the run ID of its verification.",
+    "The section includes a step for noting Agent Relay's run ID.",
     'The timeline row shows the run ID.',
     'The Run verification action of the finished change succeeds for the operator.',
     // Outcomes Agent Relay records: Ornith need not see the record for them to hold.

@@ -164,10 +164,19 @@ const COORDINATED = /(?:,\s*|\s)(?:and\s+then|and|then|or|before|after\s+that|af
 const REPORTING_CUE =
   /\b(?:tells?|telling|told|instructs?|instructing|instructed|asks?|asking|explains?|explaining|describes?|describing|documents?|documenting|says|saying|states|stating|mentions?|mentioning|reminds?|reminding|guides?|guiding|walks?\s+\S+\s+through|lists|listing|contains?|containing|includes|including)\b|\b(?:the\s+|an?\s+)?(?:operators?|users?|readers?|maintainers?|humans?|reviewers?|testers?|developers?|person|people|someone)\b/gi;
 
-/** The clause up to its first reporting cue: the part that speaks for itself, not for a document or another person. */
-export function beforeReportedContent(clause: string): string {
-  const cue = [...maskQuoted(clause).matchAll(REPORTING_CUE)][0];
-  return cue === undefined ? clause : clause.slice(0, cue.index);
+/**
+ * Narrower than {@link REPORTING_CUE}, for acceptance criteria: where the words start being
+ * addressed to someone else — a step telling the operator, a section explaining how. "Includes",
+ * "contains" or "mentions" do not start it: "the handoff includes the run ID" says what the
+ * implementer must produce, not what a reader is told.
+ */
+const ADDRESSED_CUE =
+  /\b(?:tells?|telling|told|instructs?|instructing|instructed|asks?|asking|reminds?|reminding|guides?|guiding|walks?\s+\S+\s+through)\b|\b(?:explains?|explaining|describes?|describing|documents?|documenting|shows?|showing)\s+(?:how|where|when|what|why|which)\b|\b(?:steps?|sections?|instructions?|paragraphs?|headings?|items?|bullets?)\s+(?:for|about|on|to|explaining|describing|telling|instructing|asking|reminding)\b|\b(?:the\s+|an?\s+)?(?:operators?|users?|readers?|maintainers?|humans?|reviewers?|testers?|developers?)\b/i;
+
+/** A criterion up to where its words are addressed to someone else (see {@link ADDRESSED_CUE}). */
+export function beforeAddressedContent(clause: string): string {
+  const cue = ADDRESSED_CUE.exec(maskQuoted(clause));
+  return cue === null ? clause : clause.slice(0, cue.index);
 }
 
 /** Nouns that start like verbs: "Run IDs are …", "Build output …", "Commit messages …". */

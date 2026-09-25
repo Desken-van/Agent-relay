@@ -56,6 +56,23 @@ describe('a specification Codex writes for Ornith', () => {
     expect(JSON.parse(harness.tasks.findById(task.id)!.specificationJson!)).toEqual(makeSpecification());
   });
 
+  it('logs every violation, one bounded line each — not only the first few', async () => {
+    const harness = setup();
+    const task = harness.createTask(harness.createProject().id, { implementationProvider: 'ornith' });
+    const lines = Array.from({ length: 25 }, (_, index) => `${index + 1}. Capture the run ID of step ${index + 1}.`);
+    harness.codex.specification = makeSpecification({ implementationPrompt: lines.join('\n') });
+
+    await expect(harness.orchestrator.generateSpecification(task.id)).rejects.toThrow(/\(and 22 more\) The specification was not saved\.$/);
+    const run = harness.runs.listByTask(task.id).filter((entry) => entry.runType === 'specification').at(-1)!;
+    const logged = harness.runEvents
+      .listByRun(run.id)
+      .map((event) => (JSON.parse(event.payload) as { text: string }).text)
+      .filter((text) => text.startsWith('Implementation prompt: "Capture the run ID'));
+    expect(logged).toHaveLength(25);
+    expect(logged.at(-1)).toContain('Capture the run ID of step 25.');
+    expect(Math.max(...logged.map((text) => text.length))).toBeLessThan(500);
+  });
+
   it('is held to the contract only when Ornith implements it', async () => {
     const harness = setup();
     const task = harness.createTask(harness.createProject().id, { implementationProvider: 'claude' });

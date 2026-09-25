@@ -641,18 +641,28 @@ verification; use file handles, raw bytes, permissions or links; or reach the ne
   prohibition, not an instruction.
 - **What is guaranteed, lexically.** No directive pairs an operative verb with a forbidden
   object from the tables in the module (or uses an always-forbidden verb such as "commit" or
-  "press"); no clause is a bare command line; no acceptance criterion requires an Agent Relay run
-  ID; every fenced block is closed and tied to a file; and instruction text is in Latin script —
-  the grammar reads English, so text in another script outside quotes is refused rather than
-  passed unread. Outcomes are allowed: "Agent Relay's verification of the finished change
-  passes" and "`npm run verify` passes" state what must hold afterwards.
-- **What is not.** Meaning. A paraphrase outside the tables, text inside a file-content block,
-  and reported content pass. So a subject of the change that happens to be Agent Relay itself
-  ("Update the `workflow:verify` handler", "Add a run ID column") is not mistaken for operating
-  it. The runtime protocol stays the hard boundary: whatever the text says, Ornith cannot run a
-  command or reach Agent Relay.
+  "press") — including bringing about or waiting for Agent Relay's own verification when Agent
+  Relay is named as the one acting ("Ensure Agent Relay runs its own verification", "Wait until
+  Agent Relay has verified it"); no clause is a bare command line; no acceptance criterion
+  requires an Agent Relay run ID, unless its words are addressed to a reader ("a step telling the
+  operator to note …") — "includes", "contains" and "mentions" do not exempt it; every fenced
+  block is closed and tied to a file; and instruction text is in Latin script — the grammar reads
+  English, so text in another script outside quotes is refused rather than passed unread.
+  Outcomes are allowed: "Agent Relay's verification of the finished change passes" (also as
+  "Ensure …") and "`npm run verify` passes" state what must hold afterwards.
+- **What is not.** Meaning. The check matches fixed verb and object lists in fixed sentence
+  positions. An impossible instruction worded outside them passes ("Make sure the change is saved
+  in version control"); so do text inside a file-content block, text after a reporting cue in a
+  directive ("Write a handoff that includes the run ID"), and a negated instruction. A
+  legitimate code instruction can be refused when it uses the same words ("Read the run ID from
+  the row object"); rewording it fixes that. A subject of the change that happens to be Agent
+  Relay itself ("Update the `workflow:verify` handler", "Ensure the new button makes Agent Relay
+  run its verification") is read as an edit, not as operating it. The runtime protocol stays the
+  hard boundary: whatever the text says, Ornith cannot run a command or reach Agent Relay.
 - **Where it is enforced.** Generation, when the target's implementer is Ornith: a violating
-  specification is not stored and its run logs every violation. Revision: a violating revision
+  specification is not stored, and its run logs every violation, one line each, bounded by the
+  160-character excerpt (the run's stored-log budget still applies and says so when it is
+  reached). Revision: a violating revision
   fails the correction and no version is stored. Approval and every implementation round
   (`sendToClaude`, before a lease, worktree or run exists): a stored violating specification —
   one written before the contract, or after a change of implementer — is refused, and before

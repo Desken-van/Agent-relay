@@ -719,12 +719,13 @@ export class Orchestrator {
             { remediation: 'Generate the specification again once nothing is changing the task’s checkout.' }
           );
         }
-        // Written for Ornith: held to its instruction contract before it is stored, and every
-        // violation is kept in the run's log so the operator sees exactly what was refused.
+        // Written for Ornith: held to its instruction contract before it is stored. Every
+        // violation is logged, one line each, bounded by its excerpt (EXCERPT_LIMIT characters)
+        // and the run's own stored-log budget, which says so when it is reached.
         if (target.grounding.implementationProvider === 'ornith') {
           const violations = ornithInstructionViolations(result.specification);
           if (violations.length > 0) {
-            for (const violation of violations.slice(0, 20)) {
+            for (const violation of violations) {
               handle.append({ type: 'log', text: describeOrnithInstructionViolation(violation) });
             }
             throw new AgentRelayError(

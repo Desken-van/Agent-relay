@@ -10,25 +10,31 @@
  * WHAT IT GUARANTEES — lexically, not semantically. For "implementationPrompt" and every
  * "acceptanceCriteria" and "suggestedTests" entry, outside file-content blocks:
  *   1. no directive (as `ornith-instruction-text.ts` defines one) pairs an operative verb with a
- *      forbidden object from the tables below, and no directive uses an always-forbidden verb;
+ *      forbidden object from the tables below, and no directive uses an always-forbidden verb.
+ *      That includes bringing about or waiting for Agent Relay's own verification when Agent
+ *      Relay is named as the one acting ("Ensure Agent Relay runs its own verification", "Wait
+ *      until Agent Relay has verified it");
  *   2. no clause is a bare command line (a command with no outcome stated after it);
  *   3. no acceptance criterion requires an Agent Relay run ID (one tied to Agent Relay or its
- *      verification by the words around it);
+ *      verification by the words around it), unless the words are addressed to a reader ("a step
+ *      telling the operator to note …"); "includes", "contains" and "mentions" do not exempt it;
  *   4. every fenced block is closed and introduced by a line naming its file;
  *   5. instruction text is in Latin script: the grammar reads English, so a clause in another
  *      script is refused rather than passed unread (quoted words and file content are exempt).
- * WHAT IT DOES NOT: understand meaning. An instruction phrased with verbs or objects outside the
- * tables passes; so does text inside a file-content block, text after a reporting cue ("tells
- * the operator to …"), and a negated instruction ("do not run …"). Outcome statements are never
- * refused: "Agent Relay's verification of the finished change passes" and "`npm run verify`
- * passes" state what must be true afterwards, not something Ornith must do. The runtime protocol
- * stays the hard boundary: whatever a specification says, Ornith cannot run a command or reach
- * Agent Relay.
+ * WHAT IT DOES NOT: understand meaning. It matches fixed verb and object lists in fixed sentence
+ * positions, so an impossible instruction worded outside them passes ("Make sure the change is
+ * saved in version control"); so do text inside a file-content block, text after a reporting cue
+ * in a directive ("… a handoff that includes the run ID"), and a negated instruction ("do not run
+ * …"). It can also refuse a legitimate code instruction that uses the same words ("Read the run ID
+ * from the row object"). Outcome statements are never refused: "Agent Relay's verification of the
+ * finished change passes" and "`npm run verify` passes" state what must be true afterwards, not
+ * something Ornith must do. The runtime protocol stays the hard boundary: whatever a
+ * specification says, Ornith cannot run a command or reach Agent Relay.
  */
 
 import type { ImplementationProvider } from './execution-providers';
 import {
-  beforeReportedContent,
+  beforeAddressedContent,
   directivesOf,
   excerpt,
   hasUnreadableLetters,
@@ -161,6 +167,23 @@ const RELAY_STAGE = any(
   /\b(?:the|a)\s+(?:separate|later|subsequent|post-implementation|operator['’]s|operator)\s+verification(?:\s+(?:stage|run|step))?\b/i,
   /\bverification\s+(?:stage|workflow)\b/i
 );
+/** Agent Relay itself acting: "Agent Relay runs its own verification", "Agent Relay to verify". */
+const RELAY_ACTS = new RegExp(
+  String.raw`(?:Agent\s+Relay|\bRelay)\s+(?:(?:has|have|had|will|would|should|must|can|to|actually|first|then|also|itself)\s+)*(?:re-?runs?|ran|running|runs?|starts?|started|starting|performs?|performed|executes?|executed|triggers?|triggered|launch(?:es|ed)?|completes?|completed|finish(?:es|ed)?|verif(?:y|ies|ied)|checks?|checked|validates?|validated)\b`
+);
+/** Agent Relay's verification having happened ("… has run", "… is started"). Its passing is an outcome, never matched here. */
+const RELAY_STAGE_HAPPENED = new RegExp(
+  String.raw`${RELAY}\s+(?:own\s+)?(?:verification|verify)(?:\s+(?:stage|run|step))?\s+(?:has\s+|have\s+|is\s+|was\s+|to\s+)?(?:been\s+)?(?:re-?run|runs?|ran|starts?|started|completes?|completed|finish(?:es|ed)?|executed|triggered|performed|done)\b`
+);
+/**
+ * What a causative verb asks the implementer to bring about, when Agent Relay's own verification
+ * is its immediate object: "Ensure Agent Relay runs its own verification", "Make sure Agent Relay
+ * has verified …", "Have Agent Relay run …". A subject in between ("Ensure the new button makes
+ * Agent Relay run …") describes code, and is not matched.
+ */
+const CAUSED_RELAY_STAGE = new RegExp(
+  String.raw`^\s*(?:sure\s+|certain\s+)?(?:that\s+)?(?:${RELAY_ACTS.source}|${RELAY_STAGE_HAPPENED.source})`
+);
 
 const RUN_ID = String.raw`(?:run\s+IDs?|run\s+ids?|runIds?|run_ids?|run\s+identifiers?)`;
 /** A run ID that is Agent Relay's by what the text says about it: something only Agent Relay knows. */
@@ -202,6 +225,9 @@ const OBSERVE = [
 ];
 /** Also said of code keeping its own data ("store the run ID in the row"), so these need the record tied to Agent Relay. */
 const READ = [...OBSERVE, 'get', 'find', 'locate', 'open', 'save', 'store', 'log'];
+/** Bringing something about: here, Agent Relay's own verification, which only the operator and Agent Relay start. */
+const CAUSE = ['ensure', 'make', 'have', 'get', 'let', 'cause', 'arrange', 'request', 'ask', 'require', 'force'];
+const WAIT = ['wait', 'await', 'poll', 'watch', 'monitor'];
 
 const RULES: readonly Rule[] = [
   { category: 'git', verbs: ['commit', 'stage', 'unstage', 'stash', 'rebase', 'cherry-pick', 'amend', 'squash'] },
@@ -213,6 +239,8 @@ const RULES: readonly Rule[] = [
   { category: 'relay_record', verbs: READ, objects: TIED_RECORD },
   { category: 'relay_record', verbs: OBSERVE, objects: [BARE_RUN_ID] },
   { category: 'relay_stage', verbs: [...RUN, ...INVOKE, ...CHECK, ...READ], objects: RELAY_STAGE },
+  { category: 'relay_stage', verbs: CAUSE, objects: [CAUSED_RELAY_STAGE] },
+  { category: 'relay_stage', verbs: WAIT, objects: [RELAY_ACTS, RELAY_STAGE_HAPPENED] },
   { category: 'relay_ui', verbs: [...RUN, ...INVOKE, 'open'], objects: RELAY_UI },
   { category: 'command', verbs: RUN, objects: RUN_TARGET },
   { category: 'command', verbs: [...INVOKE, ...CHECK], objects: [COMMAND_LINE] },
@@ -329,9 +357,11 @@ function checkField(
           'A command on its own is an instruction to run it, which Ornith cannot do; state the outcome instead, for example that Agent Relay\'s verification of the finished change passes.'
         )
       );
-    } else if (field === 'acceptanceCriteria' && RELAY_RUN_ID.some((pattern) => pattern.test(beforeReportedContent(clause)))) {
+    } else if (field === 'acceptanceCriteria' && RELAY_RUN_ID.some((pattern) => pattern.test(beforeAddressedContent(clause)))) {
       // An outcome Agent Relay records ("its verification record shows passed") is fine: Ornith
-      // need not see it. A run ID it would have to produce is not: only Agent Relay knows it.
+      // need not see it. A run ID it would have to produce is not: only Agent Relay knows it —
+      // "the handoff includes the run ID of Agent Relay's verification". Words addressed to a
+      // reader ("a step telling the operator to note the run ID") are content, and pass.
       found.push(
         violation(
           'relay_record',
