@@ -9,6 +9,7 @@
 
 import type { ImplementationProvider } from '../../../shared/domain/execution-providers';
 import { ORNITH_ACTION_KINDS } from '../../../shared/domain/ornith';
+import { ORNITH_INSTRUCTION_CONTRACT } from '../../../shared/domain/ornith-instruction-contract';
 import { shortCommit, type SpecificationGrounding } from '../../../shared/domain/specification-grounding';
 
 /**
@@ -64,7 +65,8 @@ It has exactly these actions and nothing else: ${ORNITH_ACTION_KINDS.join(', ')}
   open, seek, append through a handle, flush or close a file, or to write raw bytes.
 - Its own "run_verification" action runs the project's verification inside its loop and returns
   the outcome, exit code and a short sanitized summary; it may use it once the work is complete.
-${NO_RELAY_UI}`,
+${NO_RELAY_UI}
+${ORNITH_INSTRUCTION_CONTRACT}`,
   claude: `The implementer is Claude Code, working alone in the task worktree. It can read and edit files
 and run the commands Agent Relay's settings permit, including the configured verification
 commands. It cannot commit, push or touch a remote.

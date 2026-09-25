@@ -7,6 +7,10 @@ import {
 import { implementerCapabilitiesSection, specificationTargetSection } from '../../src/main/adapters/codex/implementer-contract';
 import type { ImplementationProvider } from '../../src/shared/domain/execution-providers';
 import { ORNITH_ACTION_KINDS } from '../../src/shared/domain/ornith';
+import {
+  ORNITH_INSTRUCTION_CONTRACT,
+  ornithInstructionViolations
+} from '../../src/shared/domain/ornith-instruction-contract';
 import type { AcceptedPlanFinding } from '../../src/shared/domain/plan-correction';
 import type { SpecificationGrounding } from '../../src/shared/domain/specification-grounding';
 import { makeGrounding, makeSpecification } from '../helpers/fakes';
@@ -149,9 +153,30 @@ describe('the implementer contract: Ornith is asked only for what its protocol e
 
   it('tells the revision that an accepted finding asking for raw output or the UI stage is met by an acceptance criterion', () => {
     expect(flat(revision('ornith'))).toContain(
-      'a finding that asks for such output, or for the implementer to start or read Agent Relay\'s verification, is addressed by an acceptance criterion on that stage\'s persisted record instead'
+      'a finding that asks for such output, or for the implementer to start or read Agent Relay\'s verification, is addressed by the acceptance criterion that Agent Relay\'s verification of the finished change passes, instead'
     );
     expect(flat(generation())).not.toContain('accepted findings too');
+  });
+
+  it.each([
+    ['generation', generation],
+    ['revision', revision]
+  ] as const)('the %s prompt states the Ornith instruction contract Agent Relay enforces, and only for Ornith', (_name, build) => {
+    const ornith = flat(build('ornith'));
+    expect(ornith).toContain(flat(ORNITH_INSTRUCTION_CONTRACT));
+    expect(ornith).toContain('Agent Relay checks the finished text before approval and before every round');
+    expect(ornith).toContain('goes in a fenced block on the line right after one naming the file');
+    expect(ornith).toContain('Write "implementationPrompt", "acceptanceCriteria" and "suggestedTests" in English');
+    expect(flat(build('claude'))).not.toContain('Agent Relay checks the finished text before approval');
+    expect(flat(implementerCapabilitiesSection('ornith', 'reviewer'))).toContain(flat(ORNITH_INSTRUCTION_CONTRACT));
+  });
+
+  it('the revision prompt asks for exactly the verification criterion the contract allows', () => {
+    const wanted = "Agent Relay's verification of the finished change passes.";
+    expect(flat(revision('ornith'))).toContain(wanted.slice(0, -1));
+    expect(
+      ornithInstructionViolations({ implementationPrompt: 'Edit docs/a.md.', acceptanceCriteria: [wanted], suggestedTests: [] })
+    ).toEqual([]);
   });
 });
 

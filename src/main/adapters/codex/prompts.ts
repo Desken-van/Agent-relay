@@ -192,8 +192,8 @@ Rules for the revision:
 ${transientFactsRule(input.target)}
 ${VERIFICATION_EVIDENCE_RULE}
   This holds for the accepted findings too: a finding that asks for such output, or for the
-  implementer to start or read Agent Relay's verification, is addressed by an acceptance
-  criterion on that stage's persisted record instead.
+  implementer to start or read Agent Relay's verification, is addressed by the acceptance
+  criterion that Agent Relay's verification of the finished change passes, instead.
 
 Return only the JSON object.`;
 }

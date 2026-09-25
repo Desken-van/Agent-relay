@@ -15,6 +15,7 @@ import {
   type VerificationReadiness, type VerificationRerunCause
 } from './verification';
 import { specificationGroundingProblem, specificationGroundingState } from './specification-grounding';
+import { ornithInstructionProblem } from './ornith-instruction-contract';
 
 /**
  * The one workflow transition Run → Actions may offer right now.
@@ -503,11 +504,12 @@ export function runGuidance(
       // A specification that cannot be tied to the task's target — no record of which checkout
       // it was written from, a target that changed since, or an implementer it was not written
       // for — is regenerated before anything else: never reviewed, approved or implemented as it
-      // stands. Only before the first round: later rounds work on files earlier ones changed, by
-      // design, and a continuation inherits an implemented task. The backend refuses the same cases.
+      // stands. So is one that asks Ornith for what its protocol lacks. Only before the first
+      // round: later rounds work on files earlier ones changed, by design, and a continuation
+      // inherits an implemented task. The backend refuses the same cases (Ornith's in every round).
       const groundingProblem =
         task.currentRound === 0 && extra.isContinuation !== true
-          ? specificationGroundingProblem(specificationGroundingState(task))
+          ? (specificationGroundingProblem(specificationGroundingState(task)) ?? ornithInstructionProblem(task))
           : null;
       const regenerate = (problem: string): RunGuidance =>
         acting({

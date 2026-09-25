@@ -131,6 +131,11 @@ import type { ProtectedContinuationAction } from './continuation-service';
 import type { TaskOperationRegistry } from './task-operations';
 import { redactAndTruncate } from '../../shared/util/redact';
 import { ORNITH_LIMITS, ornithRelativePathSchema, redactAbsoluteMachinePaths } from '../../shared/domain/ornith';
+import {
+  describeOrnithInstructionViolation,
+  describeOrnithInstructionViolations,
+  ornithInstructionViolations
+} from '../../shared/domain/ornith-instruction-contract';
 
 
 export interface ContinuationActionGuard {
@@ -189,6 +194,10 @@ export interface OrchestratorDeps {
 /** What the operator does about a specification that cannot be tied to the task's target. */
 const REGENERATE_SPECIFICATION =
   'Choose "Regenerate specification". Codex writes it again from the task’s own checkout; until then nothing is approved or implemented.';
+
+/** What the operator does about a specification that asks Ornith for something its protocol lacks. */
+const REWRITE_FOR_ORNITH =
+  'Choose "Regenerate specification" so Codex writes it for Ornith again, or give the task an implementer that can run commands. Nothing is approved or implemented until then.';
 
 export class Orchestrator {
   /** Live cancellation handles, keyed by task id. Presence == a run in flight. */
@@ -710,6 +719,21 @@ export class Orchestrator {
             { remediation: 'Generate the specification again once nothing is changing the task’s checkout.' }
           );
         }
+        // Written for Ornith: held to its instruction contract before it is stored, and every
+        // violation is kept in the run's log so the operator sees exactly what was refused.
+        if (target.grounding.implementationProvider === 'ornith') {
+          const violations = ornithInstructionViolations(result.specification);
+          if (violations.length > 0) {
+            for (const violation of violations.slice(0, 20)) {
+              handle.append({ type: 'log', text: describeOrnithInstructionViolation(violation) });
+            }
+            throw new AgentRelayError(
+              'VALIDATION_FAILED',
+              `${describeOrnithInstructionViolations(violations)} The specification was not saved.`,
+              { remediation: 'Generate the specification again, or give the task an implementer that can run commands.' }
+            );
+          }
+        }
       } finally {
         const leftover = await target.close();
         if (leftover !== null) {
@@ -768,6 +792,7 @@ export class Orchestrator {
     // Never approve a specification that cannot be tied to the tree it will be implemented in.
     // The Git-level check is `verifySpecificationGrounding`, which the approval IPC runs first.
     this.assertGroundingTrusted(task);
+    this.assertOrnithCanCarryOut(task);
 
     assertPlanReviewAllowsApproval({
       task,
@@ -787,6 +812,21 @@ export class Orchestrator {
   async verifySpecificationGrounding(taskId: string): Promise<Task> {
     const task = this.requireTask(taskId);
     return this.assertGroundingCurrent(task, this.requireProject(task.projectId), this.deps.settings.get());
+  }
+
+  /**
+   * Ornith receives the specification verbatim in every round, so one stored before its
+   * instruction contract existed — or approved for another implementer since — is refused here
+   * rather than handed to it. The text alone decides; nothing is written.
+   */
+  private assertOrnithCanCarryOut(task: Task, specification?: TaskSpecification): void {
+    if (task.implementationProvider !== 'ornith') return;
+    const violations = ornithInstructionViolations(specification ?? readSpecification(task));
+    if (violations.length > 0) {
+      throw new AgentRelayError('VALIDATION_FAILED', describeOrnithInstructionViolations(violations), {
+        remediation: REWRITE_FOR_ORNITH
+      });
+    }
   }
 
   /** The record alone, no Git: refuses a specification that is ungrounded, stale or for another implementer. */
@@ -1007,6 +1047,8 @@ export class Orchestrator {
     });
 
     const specification = readSpecification(task);
+    // Every round hands Ornith this text again, so every round refuses one it cannot carry out.
+    this.assertOrnithCanCarryOut(task, specification);
 
     // Before the worktree, not after: creating a branch and a directory for a
     // round that cannot legally start leaves debris the user has to clean up,

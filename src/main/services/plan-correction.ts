@@ -78,6 +78,10 @@ import {
   specificationGroundingProblem,
   specificationGroundingState
 } from '../../shared/domain/specification-grounding';
+import {
+  describeOrnithInstructionViolations,
+  ornithInstructionViolations
+} from '../../shared/domain/ornith-instruction-contract';
 
 const LOOP_STOPPED = 'The plan-correction loop was stopped. Nothing further was changed.';
 const STOPPED_DURING_REVISION =
@@ -712,6 +716,14 @@ export class PlanCorrectionService {
     });
     if (unaddressed !== null) {
       return fail(`${unaddressed} The revision was not stored, so the accepted findings are still not addressed.`);
+    }
+    // The revision replaces what Ornith will be handed, so it is held to the same contract as
+    // a generated specification: one that asks Ornith for what its protocol lacks is not stored.
+    if (task.implementationProvider === 'ornith') {
+      const violations = ornithInstructionViolations(revised.specification);
+      if (violations.length > 0) {
+        return fail(`${describeOrnithInstructionViolations(violations)} The revision was not stored.`);
+      }
     }
 
     try {

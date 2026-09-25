@@ -622,6 +622,43 @@ with uncommitted edits, and the task branch is cut from the base branch, not fro
   correction. Later rounds and continuations are not re-checked: their files have moved
   on by design.
 
+### Ornith instruction contract: a checked boundary, not an understanding
+
+Ornith is handed the specification verbatim and can act only through its protocol actions.
+`src/shared/domain/ornith-instruction-contract.ts` refuses a specification that tells it to do
+something else: run a command, script, test runner, build or the app; use Git beyond
+`git_status` / `git_diff`; press, click or invoke anything in Agent Relay or call an IPC channel;
+capture or read an Agent Relay run ID or record; start, wait for or read Agent Relay's own
+verification; use file handles, raw bytes, permissions or links; or reach the network.
+
+- **What is read.** `implementationPrompt` and every `acceptanceCriteria` and `suggestedTests`
+  entry. `ornith-instruction-text.ts` splits them with a fixed, shallow grammar: a fenced block on
+  the line after one naming a file is file content and is not inspected; the rest splits into
+  clauses; a *directive* is a clause starting with a verb, a verb after "you" / "Ornith" / "the
+  implementer" (optionally with a modal), a verb after "by", or a verb joined by "and" / "then"
+  to a directive. Quoted text never starts a directive; text after a reporting cue ("tells the
+  operator to …", "describes …") is reported content; a negated directive ("do not run …") is a
+  prohibition, not an instruction.
+- **What is guaranteed, lexically.** No directive pairs an operative verb with a forbidden
+  object from the tables in the module (or uses an always-forbidden verb such as "commit" or
+  "press"); no clause is a bare command line; no acceptance criterion requires an Agent Relay run
+  ID; every fenced block is closed and tied to a file; and instruction text is in Latin script —
+  the grammar reads English, so text in another script outside quotes is refused rather than
+  passed unread. Outcomes are allowed: "Agent Relay's verification of the finished change
+  passes" and "`npm run verify` passes" state what must hold afterwards.
+- **What is not.** Meaning. A paraphrase outside the tables, text inside a file-content block,
+  and reported content pass. So a subject of the change that happens to be Agent Relay itself
+  ("Update the `workflow:verify` handler", "Add a run ID column") is not mistaken for operating
+  it. The runtime protocol stays the hard boundary: whatever the text says, Ornith cannot run a
+  command or reach Agent Relay.
+- **Where it is enforced.** Generation, when the target's implementer is Ornith: a violating
+  specification is not stored and its run logs every violation. Revision: a violating revision
+  fails the correction and no version is stored. Approval and every implementation round
+  (`sendToClaude`, before a lease, worktree or run exists): a stored violating specification —
+  one written before the contract, or after a change of implementer — is refused, and before
+  the first round the Run screen offers **Regenerate specification** with the reason. The same
+  rules are rendered into the specifier, reviser and plan-reviewer prompts from one constant.
+
 ### External plan-review gate
 
 Migration 4 adds two separate records. `task_rule_evidence` owns the immutable
