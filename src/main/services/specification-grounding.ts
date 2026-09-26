@@ -10,7 +10,7 @@
  * no file is copied, nothing in the source checkout is touched, nothing is forced.
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentRelayError } from '../../shared/domain/errors';
 import type { Project, Settings, Task } from '../../shared/domain/models';
@@ -22,7 +22,7 @@ import {
 } from '../../shared/domain/specification-grounding';
 import type { RepositoryInfo } from '../../shared/domain/git';
 import type { Clock, GitAdapter } from '../ports';
-import { assertSafeWorktreePath, isSamePath } from './path-safety';
+import { assertSafeWorktreePath, isInsideDirectory, isSamePath } from './path-safety';
 
 /** Under the worktrees root, beside the task worktrees and never inside a repository. */
 export const SPECIFICATION_CHECKOUT_DIR = '.agent-relay-specification';
@@ -244,10 +244,29 @@ export class SpecificationGroundingService {
     assertSafeWorktreePath({ worktreePath, worktreesRoot: settings.worktreesRoot, repositoryPath: project.localPath });
     const info = await this.deps.git.inspect(worktreePath);
     const branchHead = await this.deps.git.resolveCommit(project.localPath, branchRef(branch));
+    // Git expands Windows 8.3 names (RUNNER~1 -> runneradmin) in --show-toplevel.
+    // Resolve both existing paths before comparing, and keep the physical checkout
+    // within the configured root and outside the source repository.
+    let sameSafeDirectory = false;
+    if (info.root !== null) {
+      try {
+        const actual = realpathSync.native(worktreePath);
+        const reported = realpathSync.native(info.root);
+        const worktreesRoot = realpathSync.native(settings.worktreesRoot);
+        const repositoryRoot = realpathSync.native(project.localPath);
+        sameSafeDirectory =
+          isSamePath(actual, reported) &&
+          isInsideDirectory(worktreesRoot, actual) &&
+          !isSamePath(repositoryRoot, actual) &&
+          !isInsideDirectory(repositoryRoot, actual);
+      } catch {
+        // A missing or unresolvable checkout is not a trusted task worktree.
+      }
+    }
     if (
       !info.isRepository ||
       info.root === null ||
-      !isSamePath(info.root, worktreePath) ||
+      !sameSafeDirectory ||
       info.currentBranch !== branch ||
       info.headCommit === null ||
       branchHead !== info.headCommit

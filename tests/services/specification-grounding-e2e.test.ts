@@ -12,7 +12,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CliGitAdapter } from '../../src/main/adapters/git/git-adapter';
@@ -22,7 +22,7 @@ import type { CodexSpecificationRequest } from '../../src/main/ports';
 import { PlanCorrectionService } from '../../src/main/services/plan-correction';
 import { PlanReviewClaims } from '../../src/main/services/plan-review-claims';
 import { PlanReviewGateService } from '../../src/main/services/plan-review-gate';
-import { isSamePath } from '../../src/main/services/path-safety';
+import { isInsideDirectory, isSamePath } from '../../src/main/services/path-safety';
 import { runGuidance } from '../../src/shared/domain/run-guidance';
 import { parseSpecificationGrounding } from '../../src/shared/domain/specification-grounding';
 import { FakePlanReviewer, finding, snapshot } from '../helpers/fake-plan-reviewer';
@@ -122,13 +122,19 @@ async function assertPreparedBranch(value: Scenario, taskId: string): Promise<vo
   const task = value.harness.tasks.findById(taskId)!;
   const info = await new CliGitAdapter(new ExecaProcessRunner()).inspect(task.worktreePath!);
   const branchHead = git(value.repo, 'rev-parse', `refs/heads/${task.branchName}`);
+  const actual = realpathSync.native(task.worktreePath!);
+  const reported = info.root === null ? null : realpathSync.native(info.root);
+  const worktreesRoot = realpathSync.native(value.harness.worktreesRoot);
   const matches =
-    info.isRepository && info.root !== null && isSamePath(info.root, task.worktreePath!) &&
+    info.isRepository && reported !== null && isSamePath(reported, actual) &&
+    isInsideDirectory(worktreesRoot, actual) &&
     info.currentBranch === task.branchName && info.headCommit === branchHead;
   if (!matches) {
     throw new Error(`Prepared fixture branch mismatch: ${JSON.stringify({
       worktreePath: task.worktreePath,
       observedRoot: info.root,
+      canonicalWorktreePath: actual,
+      canonicalObservedRoot: reported,
       expectedBranch: task.branchName,
       observedBranch: info.currentBranch,
       branchHead,
