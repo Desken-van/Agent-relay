@@ -22,6 +22,7 @@ import type { CodexSpecificationRequest } from '../../src/main/ports';
 import { PlanCorrectionService } from '../../src/main/services/plan-correction';
 import { PlanReviewClaims } from '../../src/main/services/plan-review-claims';
 import { PlanReviewGateService } from '../../src/main/services/plan-review-gate';
+import { isSamePath } from '../../src/main/services/path-safety';
 import { runGuidance } from '../../src/shared/domain/run-guidance';
 import { parseSpecificationGrounding } from '../../src/shared/domain/specification-grounding';
 import { FakePlanReviewer, finding, snapshot } from '../helpers/fake-plan-reviewer';
@@ -116,6 +117,26 @@ function createTask(value: Scenario) {
   return value.harness.createTask(project.id);
 }
 
+/** Check the fixture's branch binding before exercising specification grounding. */
+async function assertPreparedBranch(value: Scenario, taskId: string): Promise<void> {
+  const task = value.harness.tasks.findById(taskId)!;
+  const info = await new CliGitAdapter(new ExecaProcessRunner()).inspect(task.worktreePath!);
+  const branchHead = git(value.repo, 'rev-parse', `refs/heads/${task.branchName}`);
+  const matches =
+    info.isRepository && info.root !== null && isSamePath(info.root, task.worktreePath!) &&
+    info.currentBranch === task.branchName && info.headCommit === branchHead;
+  if (!matches) {
+    throw new Error(`Prepared fixture branch mismatch: ${JSON.stringify({
+      worktreePath: task.worktreePath,
+      observedRoot: info.root,
+      expectedBranch: task.branchName,
+      observedBranch: info.currentBranch,
+      branchHead,
+      observedHead: info.headCommit
+    })}`);
+  }
+}
+
 const groundingOf = (value: Scenario, taskId: string) =>
   parseSpecificationGrounding(value.harness.tasks.findById(taskId)!.specificationGroundingJson);
 
@@ -132,6 +153,7 @@ async function approvedOnItsBranch() {
   const task = createTask(value);
   await value.harness.orchestrator.generateSpecification(task.id);
   await value.harness.orchestrator.preparePlanReviewWorktree(task.id, { acceptDirtyWorkingTree: true });
+  await assertPreparedBranch(value, task.id);
   await value.harness.orchestrator.verifySpecificationGrounding(task.id);
   value.harness.orchestrator.approveSpecification(task.id);
   return { value, task, worktree: value.harness.tasks.findById(task.id)!.worktreePath! };
@@ -165,6 +187,7 @@ describe('a specification is written against the task’s target, never the sour
 
     // The branch is cut from that commit; plan review and implementation read that same tree.
     await value.harness.orchestrator.preparePlanReviewWorktree(task.id, { acceptDirtyWorkingTree: true });
+    await assertPreparedBranch(value, task.id);
     const prepared = value.harness.tasks.findById(task.id)!;
     expect(git(prepared.worktreePath!, 'rev-parse', 'HEAD')).toBe(value.base);
     expect(measure(readFileSync(join(prepared.worktreePath!, FILE)))).toEqual(measure(TARGET));
@@ -388,6 +411,7 @@ async function onItsBranch(value: Scenario) {
   gateService.bindRules(task.id, snapshot());
   await harness.orchestrator.generateSpecification(task.id);
   await harness.orchestrator.preparePlanReviewWorktree(task.id, { acceptDirtyWorkingTree: true });
+  await assertPreparedBranch(value, task.id);
   const worktree = harness.tasks.findById(task.id)!.worktreePath!;
 
   reviewer.roundQueue = [{ ...reviewer.round, verdict: 'revise', gatingCount: 1, threshold: 1, findings: [finding('Name the tools')] }];
