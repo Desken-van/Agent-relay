@@ -14,6 +14,8 @@ import {
   latestVerification, readVerification, verificationFailureKind, verificationRerunPolicy,
   type VerificationReadiness, type VerificationRerunCause
 } from './verification';
+import { specificationGroundingProblem, specificationGroundingState } from './specification-grounding';
+import { ornithInstructionProblem } from './ornith-instruction-contract';
 
 /**
  * The one workflow transition Run → Actions may offer right now.
@@ -92,6 +94,8 @@ export interface RunVerificationDetail {
   readonly durationMs: number | null;
   readonly reason: string | null;
   readonly output: string | null;
+  /** Which local-model profile actually served this attempt. Null for `source: 'relay'`, or when unrecorded. */
+  readonly modelProfileDisplayName: string | null;
 }
 
 export interface RunGuidance {
@@ -221,7 +225,8 @@ function ornithVerificationDetail(evidence: OrnithRunEvidence): RunVerificationD
     exitCode: attempt.exitCode,
     durationMs: attempt.outcome === 'not_run' ? null : attempt.durationMs,
     reason: attempt.reason,
-    output: attempt.summary.length > 0 ? attempt.summary : null
+    output: attempt.summary.length > 0 ? attempt.summary : null,
+    modelProfileDisplayName: evidence.modelProfileDisplayName
   };
 }
 
@@ -251,7 +256,8 @@ function relayVerificationDetail(run: Run): RunVerificationDetail | null {
     exitCode: data.exitCode,
     durationMs: data.durationMs,
     reason: data.reason,
-    output: data.outputSummary !== undefined && data.outputSummary.length > 0 ? data.outputSummary : null
+    output: data.outputSummary !== undefined && data.outputSummary.length > 0 ? data.outputSummary : null,
+    modelProfileDisplayName: null
   };
 }
 
@@ -499,6 +505,25 @@ export function runGuidance(
           tone: 'warning'
         });
       }
+      // A specification that cannot be tied to the task's target — no record of which checkout
+      // it was written from, a target that changed since, or an implementer it was not written
+      // for — is regenerated before anything else: never reviewed, approved or implemented as it
+      // stands. So is one that asks Ornith for what its protocol lacks. Only before the first
+      // round: later rounds work on files earlier ones changed, by design, and a continuation
+      // inherits an implemented task. The backend refuses the same cases (Ornith's in every round).
+      const groundingProblem =
+        task.currentRound === 0 && extra.isContinuation !== true
+          ? (specificationGroundingProblem(specificationGroundingState(task)) ?? ornithInstructionProblem(task))
+          : null;
+      const regenerate = (problem: string): RunGuidance =>
+        acting({
+          happened: problem,
+          stage: 'Step 1 of 5 · Regenerate the specification',
+          result: 'It cannot be reviewed, approved or implemented as it stands. Regenerating writes it again from the task’s own checkout; approval and the external plan review then start again for the new text.',
+          action: action('generate_specification', 'Regenerate specification'),
+          activeStep: 0,
+          tone: 'warning'
+        });
       if (!task.specificationApprovedAt) {
         if (planReviewPreparation === 'loading') {
           return waiting({
@@ -520,6 +545,7 @@ export function runGuidance(
             tone: 'active'
           });
         }
+        if (groundingProblem !== null) return regenerate(groundingProblem);
         if (planReviewPreparation === 'unavailable') {
           return waiting({
             happened: 'The specification exists, but its External plan review cannot continue safely.',
@@ -628,6 +654,7 @@ export function runGuidance(
           tone: 'active'
         });
       }
+      if (groundingProblem !== null) return regenerate(groundingProblem);
       const verification = latestVerification(runs);
       const relayDetail = verification === null ? null : relayVerificationDetail(verification);
       const failureKind = verificationFailureKind(verification);

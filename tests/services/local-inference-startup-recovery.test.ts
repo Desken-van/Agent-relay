@@ -45,20 +45,29 @@ describe('local inference startup recovery', () => {
     };
 
     const first = start();
+    const before = first.settings.get().localInference;
     const custom = {
-      ...first.settings.get().localInference,
+      ...before,
       // Enabled on purpose: the claim under test is that startup never probes,
       // launches or auto-starts *even when the operator has opted in* — a
       // disabled configuration proving the same thing would be a weaker test.
       enabled: true,
-      executable: { kind: 'explicit_path' as const, path: 'C:\\tools\\llama-server.exe' },
-      model: {
-        id: 'restart-model',
-        source: { kind: 'runtime_id' as const, runtimeModelId: 'restart-source' }
-      },
-      fixedArguments: ['--threads', '6'],
-      port: 19222,
-      contextLimitTokens: 16384
+      profiles: before.profiles.map((profile) =>
+        profile.id === before.defaultProfileId
+          ? {
+              ...profile,
+              enabled: true,
+              executable: { kind: 'explicit_path' as const, path: 'C:\\tools\\llama-server.exe' },
+              model: {
+                id: 'restart-model',
+                source: { kind: 'runtime_id' as const, runtimeModelId: 'restart-source' }
+              },
+              fixedArguments: ['--threads', '6'],
+              port: 19222,
+              contextLimitTokens: 16384
+            }
+          : profile
+      )
     };
     first.settings.update({ localInference: custom });
     first.close();
@@ -66,6 +75,18 @@ describe('local inference startup recovery', () => {
 
     const reopened = start();
     expect(reopened.settings.get().localInference).toEqual(custom);
+    // Nothing selects a profile on its own, on startup or otherwise — the volatile "which profile the
+    // retained runtime is bound to" concept starts unselected every time the process starts, exactly like
+    // it never auto-starts. Only once an operator explicitly picks one does state() report anything but
+    // "no profile selected", still without probing, launching or contacting anything.
+    expect(reopened.localInference.state()).toEqual({
+      kind: 'unavailable',
+      reason: 'No local-model profile is selected. Choose one in Settings → Local inference.'
+    });
+    expect(processCalls).toBe(0);
+    expect(providerConstructions).toBe(0);
+
+    reopened.localInference.selectActiveProfile(before.defaultProfileId ?? 'default');
     expect(reopened.localInference.state()).toEqual({ kind: 'stopped' });
     expect(processCalls).toBe(0);
     expect(providerConstructions).toBe(0);

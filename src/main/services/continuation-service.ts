@@ -243,6 +243,10 @@ export class ContinuationService {
     return { task, continuation: link };
   }
 
+  isContinuation(taskId: string): boolean {
+    return this.deps.continuations.findByContinuation(taskId) !== null;
+  }
+
   /** Specification generation is never a continuation's protected first action. */
   assertSpecificationAllowed(taskId: string): void {
     const claim = this.deps.continuations.findClaimByContinuation(taskId);
@@ -493,7 +497,9 @@ export class ContinuationService {
         lastReviewJson: source.lastReviewJson,
         lastError: null,
         codexModel: source.codexModel,
-        claudeModel: source.claudeModel
+        claudeModel: source.claudeModel,
+        ornithModelProfileId: source.ornithModelProfileId,
+        ornithModelProfileFingerprint: source.ornithModelProfileFingerprint
       });
 
       this.cloneRuleEvidenceAndGate(source.id, continuationId);

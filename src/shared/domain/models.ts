@@ -12,7 +12,7 @@
 import { z } from 'zod';
 import { TASK_STATUSES } from './workflow';
 import { implementationProviderSchema, reviewProviderSchema } from './execution-providers';
-import { localInferenceSettingsSchema } from './local-inference';
+import { localInferenceProfilesSettingsSchema } from './local-inference';
 
 /** ISO-8601 instant, e.g. `2026-08-10T09:41:12.004Z`. */
 export const isoDateTime = z.string().min(20).max(32);
@@ -114,6 +114,12 @@ export const taskSchema = z.object({
   specificationJson: z.string().nullable(),
   /** Set when the user explicitly approves the specification. */
   specificationApprovedAt: isoDateTime.nullable(),
+  /**
+   * JSON-serialised `SpecificationGrounding`: the checkout and commit the current
+   * specification was generated against. Null for a specification generated before
+   * this was recorded (read as "not grounded"). Optional so older payloads still parse.
+   */
+  specificationGroundingJson: z.string().nullable().optional(),
   /** JSON-serialised `CodexReviewResult` from the most recent review. */
   lastReviewJson: z.string().nullable(),
   lastError: z.string().nullable(),
@@ -127,6 +133,23 @@ export const taskSchema = z.object({
    */
   codexModel: z.string().min(1).max(MODEL_ID_MAX_LENGTH).nullable(),
   claudeModel: z.string().min(1).max(MODEL_ID_MAX_LENGTH).nullable(),
+  /**
+   * Which local-model profile an `ornith` task is bound to — resolved once, when the task is created (or
+   * when its implementation provider is switched to `ornith`), and never re-resolved. Unlike
+   * `codexModel`/`claudeModel`, there is no "tool default" state to fall back to: a profile IS the whole
+   * runtime a round runs against, so this is always a concrete id once bound. `null` only for a task that
+   * has never used `ornith` as its implementation provider.
+   */
+  ornithModelProfileId: z.string().min(1).max(MODEL_ID_MAX_LENGTH).nullable().default(null),
+  /**
+   * A bounded fingerprint of that profile's runtime configuration, captured in the same moment as
+   * `ornithModelProfileId`. Every later round re-derives the CURRENT profile's fingerprint and refuses to
+   * start unless it still matches — the guarantee that an operator editing the profile's model, executable
+   * or budget after this task was bound can never silently change what an approved task runs against. Never
+   * a path or any other machine-local detail; see `local-inference.ts`'s own "identity is never a machine
+   * path" rule, which this fingerprint follows for the exact same reason.
+   */
+  ornithModelProfileFingerprint: z.string().regex(/^[a-f0-9]{16}$/).nullable().default(null),
   createdAt: isoDateTime,
   updatedAt: isoDateTime
 });
@@ -397,7 +420,7 @@ export function defaultClaudePermissionRules(): {
 
 export const settingsSchema = z.object({
   /** Versioned configuration for the process-local managed inference runtime. */
-  localInference: localInferenceSettingsSchema,
+  localInference: localInferenceProfilesSettingsSchema,
   /** Absolute path to the Claude Code executable, or null to auto-discover. */
   claudeExecutablePath: z.string().nullable(),
   /** Absolute path to the Codex executable, or null to use the bundled/PATH one. */

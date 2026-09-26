@@ -435,6 +435,8 @@ export class CodexSdkAdapter implements CodexAdapter {
     }
     const prompt = buildSpecificationRevisionPrompt({
       projectPath: request.projectPath,
+      target: request.target,
+      implementationProvider: request.implementationProvider,
       taskTitle: request.taskTitle,
       originalRequest: request.originalRequest,
       currentSpecification: request.currentSpecification,
@@ -484,6 +486,8 @@ export class CodexSdkAdapter implements CodexAdapter {
   ): Promise<CodexSpecificationResult> {
     const prompt = buildSpecificationPrompt({
       projectPath: request.projectPath,
+      target: request.target,
+      implementationProvider: request.implementationProvider,
       taskTitle: request.taskTitle,
       originalRequest: request.originalRequest,
       ruleEvidence: request.ruleEvidence

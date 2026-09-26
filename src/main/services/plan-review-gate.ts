@@ -3,7 +3,10 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { AgentRelayError, PlanReviewNotDispatchedError } from '../../shared/domain/errors';
-import type { Task } from '../../shared/domain/models';
+import type { Project, Task } from '../../shared/domain/models';
+import { specificationGroundingState } from '../../shared/domain/specification-grounding';
+import { implementerCapabilitiesSection, specificationTargetSection } from '../adapters/codex/implementer-contract';
+import { assertSafeWorktreePath } from './path-safety';
 import { gateHasAcceptedDecisions, type PlanAutoDecideOutcome } from '../../shared/domain/plan-correction';
 import {
   parsePlanReviewAutoDecisions,
@@ -382,6 +385,13 @@ export interface PlanReviewGateDeps {
    *  so existing tests that never exercise triage need not fake it. */
   readonly codex?: Pick<CodexAdapter, 'triageFindings'>;
   readonly settings?: SettingsRepository;
+  /**
+   * Proves the task's branch and worktree are still the tree the specification was generated
+   * against (the orchestrator's check, which records a definite mismatch). Run before a review
+   * is dispatched, and before and after a triage reads the worktree. Required, not optional: a
+   * service built without it would send a review of a tree the specification does not describe.
+   */
+  readonly verifyTarget: (taskId: string) => Promise<void>;
 }
 
 export interface PlanReviewTriageRequest {
@@ -514,10 +524,26 @@ function stoppedOutcome(stop: PlanReviewTriageRecommendation): PlanAutoDecideOut
   return { kind: 'needs_user', reason: stop.reason, evidenceRef: stop.evidenceRef, confidence: stop.confidence };
 }
 
-function planText(specification: TaskSpecification, snapshot: RuleEvidenceSnapshot): string {
+function planText(
+  specification: TaskSpecification,
+  snapshot: RuleEvidenceSnapshot,
+  task: Pick<Task, 'specificationJson' | 'specificationGroundingJson' | 'implementationProvider'>
+): string {
+  // The reviewer reads the task's branch. It is told which commit the specification was
+  // written against and exactly what the implementer can do, so it judges the plan
+  // against the same tree and the same capabilities the specifier was given.
+  const grounding = specificationGroundingState(task);
   const text = [
     '## Specification under review',
     JSON.stringify(specification),
+    '',
+    '## Target checkout',
+    grounding.kind === 'none' || grounding.kind === 'ungrounded'
+      ? 'Agent Relay has no record of which checkout this specification was written against; its file facts may not describe the task branch.'
+      : specificationTargetSection(grounding.grounding, 'reviewer'),
+    '',
+    '## Implementer',
+    implementerCapabilitiesSection(task.implementationProvider, 'reviewer'),
     '',
     '## Immutable project rule evidence',
     renderRuleEvidence(snapshot)
@@ -802,6 +828,10 @@ export class PlanReviewGateService {
     // start — a row the screen then offers to run. Every refusal that costs
     // nothing belongs in front of the first write.
     subject(task, project.localPath);
+    // The reviewer reads the task branch; the plan text names the commit the specification
+    // was written against. Before anything is written or sent, prove they are still the same
+    // tree — a moved or edited task branch is recorded and refused, never reviewed.
+    await this.deps.verifyTarget(taskId);
     let gate = this.prepare(taskId);
     if (!STARTABLE_STATUSES.includes(gate.status as (typeof STARTABLE_STATUSES)[number])) {
       throw new AgentRelayError(
@@ -822,7 +852,7 @@ export class PlanReviewGateService {
     // Built before anything is dispatched. A refusal here — an oversized plan
     // or credential-shaped rule text — leaves the gate exactly where it was,
     // and provably without any external effect.
-    const text = planText(specification.specification, snapshot);
+    const text = planText(specification.specification, snapshot, task);
     // Before the first write: a stop that already happened must leave the gate
     // exactly as it was, not in an `opening` phase for a call that never went out.
     this.assertStillActive(taskId, signal, false);
@@ -1554,7 +1584,7 @@ export class PlanReviewGateService {
       throw new AgentRelayError('VALIDATION_FAILED', 'One or more requested finding indexes do not exist in the current round.');
     }
 
-    const validated = await this.analyzeFindings(task, project.localPath, findings, requestedIndexes, signal);
+    const validated = await this.analyzeFindings(task, project, findings, requestedIndexes, signal);
     // A result that arrives after a stop is discarded, not stored.
     this.assertStillActive(taskId, signal, false);
 
@@ -1595,7 +1625,7 @@ export class PlanReviewGateService {
    */
   private async analyzeFindings(
     task: Task,
-    projectPath: string,
+    project: Project,
     findings: ReturnType<typeof parsePlanReviewFindings>,
     requestedIndexes: readonly number[],
     signal?: AbortSignal
@@ -1603,6 +1633,20 @@ export class PlanReviewGateService {
     if (!this.deps.codex || !this.deps.settings) {
       throw new AgentRelayError('TOOL_MISSING', 'Automatic finding triage is not configured in this build.');
     }
+    // The findings are about the task's branch — what the external reviewer read and what
+    // the specification describes — so the analysis reads that tree too, never the
+    // project's own folder, which can be on another commit and carry uncommitted edits;
+    // and only while it is still the tree the specification was generated against.
+    if (task.worktreePath === null) {
+      throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to analyze the findings against.');
+    }
+    assertSafeWorktreePath({
+      worktreePath: task.worktreePath,
+      worktreesRoot: this.deps.settings.get().worktreesRoot,
+      repositoryPath: project.localPath
+    });
+    await this.deps.verifyTarget(task.id);
+    const projectPath = task.worktreePath;
     const snapshot = readBoundRuleEvidence(task.id, this.deps.ruleEvidence);
     if (snapshot === null) throw new AgentRelayError('VALIDATION_FAILED', 'No rule evidence is bound.');
     const specification = specificationIdentity(task.specificationJson);
@@ -1643,6 +1687,9 @@ export class PlanReviewGateService {
       context
     );
 
+    // Still the same tree after the read: an analysis of a worktree that moved or was edited
+    // while Codex read it describes neither tree, so it is discarded — nothing is recorded.
+    await this.deps.verifyTarget(task.id);
     return this.validateTriageOutcome(outcome.recommendations, requestedIndexes);
   }
 
@@ -1712,7 +1759,7 @@ export class PlanReviewGateService {
     // A stopped task dispatches nothing, and a result that arrives after a stop is
     // dropped: no automatic decision or stop is recorded for a task that has ended.
     this.assertStillActive(taskId, signal, false);
-    const validated = await this.analyzeFindings(task, project.localPath, findings, [request.findingIndex], signal);
+    const validated = await this.analyzeFindings(task, project, findings, [request.findingIndex], signal);
     this.assertStillActive(taskId, signal, false);
     const recommendation = validated.recommendations[0]!;
 

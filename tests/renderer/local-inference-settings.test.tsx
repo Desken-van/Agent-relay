@@ -54,6 +54,12 @@ afterEach(() => {
   delete (window as unknown as { agentRelay?: unknown }).agentRelay;
 });
 
+/** Opens the editor for the one shipped-default profile, exactly as an operator clicking it would. */
+async function openDefaultProfileEditor(): Promise<void> {
+  fireEvent.click(await screen.findByRole('button', { name: /Local model/ }));
+  await screen.findByText('Editing: Local model');
+}
+
 describe('local inference settings', () => {
   it('submits the complete Settings draft, including an unedited localInference, through settings:update', async () => {
     renderApp(<SettingsView />);
@@ -69,11 +75,13 @@ describe('local inference settings', () => {
     });
   });
 
-  it('edits enabled state, executable/model source variants, arguments, port, context, timeouts and max tokens', async () => {
+  it('edits enabled state, the profile list, and one profile\'s executable/model/arguments/port/context/timeouts/max tokens', async () => {
     renderApp(<SettingsView />);
     await screen.findByLabelText(/^Enable local inference/);
 
     fireEvent.click(screen.getByLabelText(/^Enable local inference/));
+    await openDefaultProfileEditor();
+
     fireEvent.change(screen.getByRole('combobox', { name: /^Executable/ }), {
       target: { value: 'explicit_path' }
     });
@@ -101,16 +109,21 @@ describe('local inference settings', () => {
     expect(bridge.callsTo('settings:update')[0]?.input).toMatchObject({
       localInference: {
         enabled: true,
-        executable: { kind: 'explicit_path', path: 'C:\\tools\\llama-server.exe' },
-        model: { id: 'local-model', source: { kind: 'path', path: 'C:\\models\\model.gguf' } },
-        fixedArguments: ['--threads', '4'],
-        port: 18080,
-        contextLimitTokens: 8192,
-        startupTimeoutMs: 12345,
-        healthTimeoutMs: 2222,
-        inferenceTimeoutMs: 33333,
-        shutdownTimeoutMs: 4444,
-        requestDefaults: { maxOutputTokens: 2048, chatTemplateParameters: {} }
+        profiles: [
+          {
+            id: 'default',
+            executable: { kind: 'explicit_path', path: 'C:\\tools\\llama-server.exe' },
+            model: { id: 'local-model', source: { kind: 'path', path: 'C:\\models\\model.gguf' } },
+            fixedArguments: ['--threads', '4'],
+            port: 18080,
+            contextLimitTokens: 8192,
+            startupTimeoutMs: 12345,
+            healthTimeoutMs: 2222,
+            inferenceTimeoutMs: 33333,
+            shutdownTimeoutMs: 4444,
+            requestDefaults: { maxOutputTokens: 2048, chatTemplateParameters: {} }
+          }
+        ]
       }
     });
   });
@@ -118,6 +131,7 @@ describe('local inference settings', () => {
   it('accepts an Ornith-style chat-template parameter map including false values', async () => {
     renderApp(<SettingsView />);
     await screen.findByLabelText(/^Enable local inference/);
+    await openDefaultProfileEditor();
 
     fireEvent.change(screen.getByLabelText(/^Default chat-template parameters/), {
       target: { value: '{"enable_thinking": false, "preserve_thinking": false}' }
@@ -125,10 +139,13 @@ describe('local inference settings', () => {
     fireEvent.click(screen.getByRole('button', { name: /^Save settings$/ }));
 
     await waitFor(() => expect(bridge.callsTo('settings:update')).toHaveLength(1));
-    expect(
-      (bridge.callsTo('settings:update')[0]?.input as { localInference: { requestDefaults: unknown } })
-        .localInference.requestDefaults
-    ).toEqual({ maxOutputTokens: 4096, chatTemplateParameters: { enable_thinking: false, preserve_thinking: false } });
+    const input = bridge.callsTo('settings:update')[0]?.input as {
+      localInference: { profiles: Array<{ requestDefaults: unknown }> };
+    };
+    expect(input.localInference.profiles[0]?.requestDefaults).toEqual({
+      maxOutputTokens: 4096,
+      chatTemplateParameters: { enable_thinking: false, preserve_thinking: false }
+    });
   });
 
   it('normalizes a blank chat-template parameters textarea to an empty object rather than blocking on invalid JSON', async () => {
@@ -136,14 +153,18 @@ describe('local inference settings', () => {
       ...settings,
       localInference: {
         ...settings.localInference,
-        requestDefaults: {
-          ...settings.localInference.requestDefaults,
-          chatTemplateParameters: { enable_thinking: false }
-        }
+        profiles: settings.localInference.profiles.map((profile) => ({
+          ...profile,
+          requestDefaults: {
+            ...profile.requestDefaults,
+            chatTemplateParameters: { enable_thinking: false }
+          }
+        }))
       }
     };
     renderApp(<SettingsView />);
     await screen.findByLabelText(/^Enable local inference/);
+    await openDefaultProfileEditor();
 
     const field = screen.getByLabelText(/^Default chat-template parameters/);
     fireEvent.change(field, { target: { value: '   ' } });
@@ -152,15 +173,19 @@ describe('local inference settings', () => {
     fireEvent.click(screen.getByRole('button', { name: /^Save settings$/ }));
 
     await waitFor(() => expect(bridge.callsTo('settings:update')).toHaveLength(1));
-    expect(
-      (bridge.callsTo('settings:update')[0]?.input as { localInference: { requestDefaults: unknown } })
-        .localInference.requestDefaults
-    ).toEqual({ maxOutputTokens: 4096, chatTemplateParameters: {} });
+    const input = bridge.callsTo('settings:update')[0]?.input as {
+      localInference: { profiles: Array<{ requestDefaults: unknown }> };
+    };
+    expect(input.localInference.profiles[0]?.requestDefaults).toEqual({
+      maxOutputTokens: 4096,
+      chatTemplateParameters: {}
+    });
   });
 
   it('disables Save and sends no update for invalid raw JSON in chat-template parameters', async () => {
     renderApp(<SettingsView />);
     await screen.findByLabelText(/^Enable local inference/);
+    await openDefaultProfileEditor();
 
     fireEvent.change(screen.getByLabelText(/^Default chat-template parameters/), {
       target: { value: '{not valid json' }
@@ -174,6 +199,7 @@ describe('local inference settings', () => {
   it('disables Save for a reserved fixed-argument override', async () => {
     renderApp(<SettingsView />);
     await screen.findByLabelText(/^Enable local inference/);
+    await openDefaultProfileEditor();
 
     fireEvent.change(screen.getByLabelText(/^Fixed runtime arguments/), {
       target: { value: '--port\n9999' }
@@ -187,6 +213,7 @@ describe('local inference settings', () => {
   it('disables Save when the default output cap exceeds the context size', async () => {
     renderApp(<SettingsView />);
     await screen.findByLabelText(/^Enable local inference/);
+    await openDefaultProfileEditor();
 
     fireEvent.change(screen.getByLabelText('Context size (tokens)'), { target: { value: '100' } });
     fireEvent.change(screen.getByLabelText(/^Default max output tokens/), { target: { value: '200' } });
@@ -199,6 +226,7 @@ describe('local inference settings', () => {
   it('disables Save for an invalid explicit executable path (empty)', async () => {
     renderApp(<SettingsView />);
     await screen.findByLabelText(/^Enable local inference/);
+    await openDefaultProfileEditor();
 
     fireEvent.change(screen.getByRole('combobox', { name: /^Executable/ }), {
       target: { value: 'explicit_path' }
@@ -212,11 +240,70 @@ describe('local inference settings', () => {
   it('disables Save for an out-of-range port', async () => {
     renderApp(<SettingsView />);
     await screen.findByLabelText(/^Enable local inference/);
+    await openDefaultProfileEditor();
 
     fireEvent.change(screen.getByLabelText(/^Port/), { target: { value: '99999' } });
 
     expect(await screen.findByText(/Local inference settings cannot be saved/i)).toBeTruthy();
     expect(screen.getByRole('button', { name: /^Save settings$/ })).toHaveProperty('disabled', true);
     expect(bridge.callsTo('settings:update')).toHaveLength(0);
+  });
+
+  it('adds a second profile, enables it and sets it as default — both persist through Save, the first left untouched', async () => {
+    renderApp(<SettingsView />);
+    await screen.findByLabelText(/^Enable local inference/);
+
+    fireEvent.click(screen.getByRole('button', { name: /^Add profile$/ }));
+    await screen.findByText(/^Editing: Local model 2/);
+
+    const enabledCheckboxes = screen.getAllByLabelText(/^Enable ".*" for new task selection$/);
+    // The newly added profile is the second row; it starts disabled, like the shipped default.
+    fireEvent.click(enabledCheckboxes[1] as HTMLElement);
+    const defaultRadios = screen.getAllByLabelText(/^Set ".*" as the default profile$/);
+    fireEvent.click(defaultRadios[1] as HTMLElement);
+
+    fireEvent.click(screen.getByRole('button', { name: /^Save settings$/ }));
+    await waitFor(() => expect(bridge.callsTo('settings:update')).toHaveLength(1));
+
+    const input = bridge.callsTo('settings:update')[0]?.input as {
+      localInference: {
+        defaultProfileId: string | null;
+        profiles: Array<{ id: string; enabled: boolean }>;
+      };
+    };
+    expect(input.localInference.profiles).toHaveLength(2);
+    const [first, second] = input.localInference.profiles;
+    // Unedited: the shipped default ships disabled.
+    expect(first?.enabled).toBe(false);
+    expect(second?.enabled).toBe(true);
+    expect(input.localInference.defaultProfileId).toBe(second?.id);
+  });
+
+  it('deletes a profile and clears the default when the deleted profile was it', async () => {
+    settings = {
+      ...settings,
+      localInference: {
+        ...settings.localInference,
+        profiles: [
+          ...settings.localInference.profiles,
+          { ...settings.localInference.profiles[0]!, id: 'second', displayName: 'Second profile' }
+        ]
+      }
+    };
+    renderApp(<SettingsView />);
+    await screen.findByLabelText(/^Enable local inference/);
+
+    const deleteButtons = await screen.findAllByRole('button', { name: /^Delete$/ });
+    expect(deleteButtons).toHaveLength(2);
+    fireEvent.click(deleteButtons[0] as HTMLElement);
+
+    fireEvent.click(screen.getByRole('button', { name: /^Save settings$/ }));
+    await waitFor(() => expect(bridge.callsTo('settings:update')).toHaveLength(1));
+
+    const input = bridge.callsTo('settings:update')[0]?.input as {
+      localInference: { defaultProfileId: string | null; profiles: Array<{ id: string }> };
+    };
+    expect(input.localInference.profiles.map((profile) => profile.id)).toEqual(['second']);
+    expect(input.localInference.defaultProfileId).toBeNull();
   });
 });

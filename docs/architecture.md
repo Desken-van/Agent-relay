@@ -557,6 +557,118 @@ validated envelope is passed to Codex specification, Claude implementation and
 corrections, and Codex final review rather than re-reading files at different
 moments.
 
+A source's `revision` and `clean` describe the checkout its rule files were read from
+at capture, and the rendered envelope says so: they are never a statement about the
+task's worktree or the specification's target.
+
+### Specification grounding: one target for every stage
+
+A specification is written about ONE tree, and every later stage uses that tree. The
+project's source checkout is never it: it can be on another branch, at another commit,
+with uncommitted edits, and the task branch is cut from the base branch, not from it.
+
+- **Generation** (`SpecificationGroundingService.open`). When the task already has its
+  worktree, Codex reads that worktree (after the path-safety check, a branch check, and a
+  check that the project's own `refs/heads/<task branch>` names the same commit); in any
+  round, a task worktree with uncommitted changes is refused (`GIT_DIRTY`), because no
+  commit could name what Codex would read and nothing could later prove the worktree still
+  holds it — the changes are left alone. Otherwise Codex reads a temporary, clean, detached
+  checkout of `refs/heads/<base branch>` at `<worktrees root>/.agent-relay-specification/<task id>`,
+  removed afterwards with a non-force `git worktree remove` (a leftover is removed the same
+  way before the next generation; one that cannot be is refused, never forced). After
+  Codex returns, and before anything is stored, `confirmUnchanged` inspects the checkout it
+  read again: a HEAD that moved, or any uncommitted change, refuses the result, so the task
+  keeps the specification and record it had. A regeneration against a different target
+  starts a fresh Codex thread.
+- **The record.** `tasks.specification_grounding_json` (migration 21) holds a
+  `SpecificationGrounding` — checkout kind, base branch, task branch, commit, cleanliness,
+  the implementer it was written for, capture time, and a `stale` mark. It is written in
+  the same row update as `specificationJson`; a plan-correction revision keeps it; a
+  continuation does not copy it.
+- **The task branch.** `ensureWorktree` creates the branch from the recorded commit, not
+  from wherever the base branch is now, and refuses (and marks stale) when the base branch
+  no longer contains that commit. So the external plan review — which reads the task
+  branch — and the implementation start from exactly the tree the specifier read.
+- **Plan review, triage and revision.** The plan text names the target and the
+  implementer's capabilities; Codex triage and the plan-correction revision run in the
+  task worktree, never in `project.localPath`. All three run the same target check as
+  approval (injected as `verifyTarget`, required by both services): a plan round before
+  its gate row is prepared or anything is sent to the reviewer; triage and the revision
+  before Codex reads the worktree and again after it returns. A task branch that moved,
+  or a worktree edited, is recorded and refused; a change during the read discards the
+  triage (nothing is recorded on the gate) or fails the correction (no new version).
+- **Base branch names.** A project's base branch is free text; before it reaches Git it
+  must be a plain branch name by Git's own rules, so `main~1` or `main^` can never
+  resolve to another commit.
+- **Mismatch.** `verifySpecificationGrounding` (run by the approval IPC before the
+  synchronous approval, and by the first implementation round before a branch, lease or
+  round exists) requires the task worktree to be on its branch at the recorded commit and
+  still clean; without a worktree, the recorded commit must still be on the base branch.
+  A definite mismatch is written as `stale` on the record it checked (never on a newer
+  one) and refused; a Git failure is only an error. Approval also refuses, without Git,
+  a missing, stale, unverifiable or wrong-implementer record.
+- **Unverifiable.** A record with `clean: false` — written by an earlier build that let a
+  specification be regenerated after the first round from a worktree with uncommitted
+  changes — is classified `unverifiable`: no commit names what was read, so it is never
+  trusted. It is refused like a missing record (approval, verification, the first round,
+  plan review and revision), with no stale mark added, and regenerated instead.
+- **Implementer.** Claude and Codex can carry out anything a specification written for
+  the other, or for Ornith, asks; Ornith cannot run commands. So only a move to Ornith
+  from another implementer requires regeneration.
+- **Existing tasks.** A specification generated before this existed has no record. It is
+  never rewritten, approved or implemented automatically: before the first round the Run
+  screen's one action is **Regenerate specification**, the backend refuses approval and
+  the first round, and the plan-correction loop refuses to revise it without opening a
+  correction. Later rounds and continuations are not re-checked: their files have moved
+  on by design.
+
+### Ornith instruction contract: a checked boundary, not an understanding
+
+Ornith is handed the specification verbatim and can act only through its protocol actions.
+`src/shared/domain/ornith-instruction-contract.ts` refuses a specification that tells it to do
+something else: run a command, script, test runner, build or the app; use Git beyond
+`git_status` / `git_diff`; press, click or invoke anything in Agent Relay or call an IPC channel;
+capture or read an Agent Relay run ID or record; start, wait for or read Agent Relay's own
+verification; use file handles, raw bytes, permissions or links; or reach the network.
+
+- **What is read.** `implementationPrompt` and every `acceptanceCriteria` and `suggestedTests`
+  entry. `ornith-instruction-text.ts` splits them with a fixed, shallow grammar: a fenced block on
+  the line after one naming a file is file content and is not inspected; the rest splits into
+  clauses; a *directive* is a clause starting with a verb, a verb after "you" / "Ornith" / "the
+  implementer" (optionally with a modal), a verb after "by", or a verb joined by "and" / "then"
+  to a directive. Quoted text never starts a directive; text after a reporting cue ("tells the
+  operator to …", "describes …") is reported content; a negated directive ("do not run …") is a
+  prohibition, not an instruction.
+- **What is guaranteed, lexically.** No directive pairs an operative verb with a forbidden
+  object from the tables in the module (or uses an always-forbidden verb such as "commit" or
+  "press") — including bringing about or waiting for Agent Relay's own verification when Agent
+  Relay is named as the one acting ("Ensure Agent Relay runs its own verification", "Wait until
+  Agent Relay has verified it"); no clause is a bare command line; no acceptance criterion
+  requires an Agent Relay run ID, unless its words are addressed to a reader ("a step telling the
+  operator to note …") — "includes", "contains" and "mentions" do not exempt it; every fenced
+  block is closed and tied to a file; and instruction text is in Latin script — the grammar reads
+  English, so text in another script outside quotes is refused rather than passed unread.
+  Outcomes are allowed: "Agent Relay's verification of the finished change passes" (also as
+  "Ensure …") and "`npm run verify` passes" state what must hold afterwards.
+- **What is not.** Meaning. The check matches fixed verb and object lists in fixed sentence
+  positions. An impossible instruction worded outside them passes ("Make sure the change is saved
+  in version control"); so do text inside a file-content block, text after a reporting cue in a
+  directive ("Write a handoff that includes the run ID"), and a negated instruction. A
+  legitimate code instruction can be refused when it uses the same words ("Read the run ID from
+  the row object"); rewording it fixes that. A subject of the change that happens to be Agent
+  Relay itself ("Update the `workflow:verify` handler", "Ensure the new button makes Agent Relay
+  run its verification") is read as an edit, not as operating it. The runtime protocol stays the
+  hard boundary: whatever the text says, Ornith cannot run a command or reach Agent Relay.
+- **Where it is enforced.** Generation, when the target's implementer is Ornith: a violating
+  specification is not stored, and its run logs every violation, one line each, bounded by the
+  160-character excerpt (the run's stored-log budget still applies and says so when it is
+  reached). Revision: a violating revision
+  fails the correction and no version is stored. Approval and every implementation round
+  (`sendToClaude`, before a lease, worktree or run exists): a stored violating specification —
+  one written before the contract, or after a change of implementer — is refused, and before
+  the first round the Run screen offers **Regenerate specification** with the reason. The same
+  rules are rendered into the specifier, reviser and plan-reviewer prompts from one constant.
+
 ### External plan-review gate
 
 Migration 4 adds two separate records. `task_rule_evidence` owns the immutable

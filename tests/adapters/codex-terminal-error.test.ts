@@ -14,7 +14,7 @@ import {
   splitProcessExit,
   terminalEventMessage
 } from '../../src/main/adapters/codex/terminal-error';
-import { makeSpecification } from '../helpers/fakes';
+import { makeGrounding, makeSpecification } from '../helpers/fakes';
 
 const sdk = vi.hoisted(() => ({ events: [] as unknown[], throwAfter: null as Error | null, delayMs: 0 }));
 vi.mock('@openai/codex-sdk', () => ({
@@ -49,6 +49,8 @@ const runner: ProcessRunner = {
 
 const request: CodexSpecificationRequest = {
   projectPath: process.cwd(),
+  target: makeGrounding(),
+  implementationProvider: 'claude',
   taskTitle: 'Document the manual test',
   originalRequest: 'Update docs/manual-test.md',
   threadId: null,

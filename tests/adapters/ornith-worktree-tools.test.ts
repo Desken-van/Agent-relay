@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ExecaProcessRunner, type ProcessResult, type ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
-import { OrnithWorktreeTools } from '../../src/main/services/ornith-worktree-tools';
+import { OrnithWorktreeTools, type OrnithToolResult } from '../../src/main/services/ornith-worktree-tools';
 import { ORNITH_LIMITS, containsAbsoluteMachinePath } from '../../src/shared/domain/ornith';
 
 const runner = new ExecaProcessRunner();
@@ -55,6 +55,35 @@ function tools(testHooks?: ConstructorParameters<typeof OrnithWorktreeTools>[0][
     gitExecutablePath: gitPath,
     testHooks
   });
+}
+
+/**
+ * A tool call that ran out of the product's own time budget before it could answer says nothing
+ * about the behaviour under test: every process it spawns (git and the fs-guard helper alike —
+ * one create_file here spawns 18-25) was slowed by contention, and a full `npm run verify` drives
+ * this machine's CPU to 100%. Such an attempt is repeated, up to `attempts` times; any other
+ * result is final. Starvation is proved, not guessed: the result must be one the budget produces
+ * (`timeout`, or `checkout_identity_changed` from a native identity probe the budget cut short)
+ * AND the call must have run for the whole budget. `check` runs after EVERY attempt, starved or
+ * not, so no safety assertion is ever skipped.
+ */
+async function answeredWithinBudget(
+  budgetMs: number,
+  attempt: () => Promise<OrnithToolResult>,
+  check: (result: OrnithToolResult) => void,
+  reset: () => void,
+  attempts = 3
+): Promise<OrnithToolResult> {
+  for (let tried = 1; ; tried += 1) {
+    const started = Date.now();
+    const result = await attempt();
+    const elapsedMs = Date.now() - started;
+    check(result);
+    const starved =
+      !result.ok && (result.code === 'timeout' || result.code === 'checkout_identity_changed') && elapsedMs >= budgetMs;
+    if (!starved || tried >= attempts) return result;
+    reset();
+  }
 }
 
 /** Every read-only Git subcommand Ornith is ever allowed to invoke. */
@@ -237,42 +266,56 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       }
     });
 
-    const createResult = await boundary.createFile(
-      { version: 1, action: 'create_file', path: 'nested/new.txt', content: 'must stay inside\n' },
-      undefined,
-      { readBytes: 0, writeBytes: 4096 }
-    );
-    expect(createResult).toMatchObject({ ok: false, code: 'path_symlink' });
-    expect(existsSync(join(outside, 'new.txt'))).toBe(false);
+    const restoreDirectory = (): void => {
+      if (swapped) {
+        unlinkSync(directory);
+        renameSync(displaced, directory);
+      }
+      swapped = false;
+    };
+    const failedClosed = (result: OrnithToolResult): void => {
+      expect(result.ok).toBe(false);
+      expect(existsSync(join(outside, 'new.txt'))).toBe(false);
+      expect(readFileSync(join(outside, 'existing.txt'), 'utf8')).toBe('outside\n');
+    };
+    const guarded = (attempt: () => Promise<OrnithToolResult>): Promise<OrnithToolResult> =>
+      answeredWithinBudget(ORNITH_LIMITS.filesystemTimeoutMs, attempt, failedClosed, restoreDirectory);
 
-    unlinkSync(directory);
-    renameSync(displaced, directory);
-    swapped = false;
-    const replaceResult = await boundary.replaceText(
-      {
-        version: 1,
-        action: 'replace_text',
-        path: 'nested/existing.txt',
-        sha256,
-        replacements: [{ oldText: 'inside', newText: 'changed' }]
-      },
-      undefined,
-      { readBytes: 4096, writeBytes: 4096 }
-    );
-    expect(replaceResult).toMatchObject({ ok: false, code: 'path_symlink' });
-    expect(readFileSync(join(outside, 'existing.txt'), 'utf8')).toBe('outside\n');
+    try {
+      // Keep one-time manifest and root binding work outside the mutation budgets.
+      await boundary.listFiles({ version: 1, action: 'list_files', prefix: '', limit: 20 });
+      const createResult = await guarded(() => boundary.createFile(
+        { version: 1, action: 'create_file', path: 'nested/new.txt', content: 'must stay inside\n' },
+        undefined,
+        { readBytes: 0, writeBytes: 4096 }
+      ));
+      expect(createResult).toMatchObject({ ok: false, code: 'path_symlink' });
+      restoreDirectory();
 
-    unlinkSync(directory);
-    renameSync(displaced, directory);
-    swapped = false;
-    const deleteResult = await boundary.deleteFile(
-      { version: 1, action: 'delete_file', path: 'nested/existing.txt', sha256 },
-      undefined,
-      { readBytes: 4096, writeBytes: 0 }
-    );
-    expect(deleteResult).toMatchObject({ ok: false, code: 'path_symlink' });
-    expect(readFileSync(join(outside, 'existing.txt'), 'utf8')).toBe('outside\n');
-  });
+      const replaceResult = await guarded(() => boundary.replaceText(
+        {
+          version: 1,
+          action: 'replace_text',
+          path: 'nested/existing.txt',
+          sha256,
+          replacements: [{ oldText: 'inside', newText: 'changed' }]
+        },
+        undefined,
+        { readBytes: 4096, writeBytes: 4096 }
+      ));
+      expect(replaceResult).toMatchObject({ ok: false, code: 'path_symlink' });
+      restoreDirectory();
+
+      const deleteResult = await guarded(() => boundary.deleteFile(
+        { version: 1, action: 'delete_file', path: 'nested/existing.txt', sha256 },
+        undefined,
+        { readBytes: 4096, writeBytes: 0 }
+      ));
+      expect(deleteResult).toMatchObject({ ok: false, code: 'path_symlink' });
+    } finally {
+      restoreDirectory();
+    }
+  }, 180_000);
 
   /**
    * The native mutation guard is the only thing here that can prove safety at
@@ -301,10 +344,22 @@ describe('OrnithWorktreeTools containment and budgets', () => {
         symlinkSync(outside, directory, 'junction');
       };
       const restoreDirectory = (): void => {
-        unlinkSync(directory);
+        // `nested` is the junction after a refusal, but can still be the real directory after
+        // an attempt the budget cut short before the swap. Never recurse through the junction.
+        if (lstatSync(directory).isSymbolicLink()) unlinkSync(directory);
+        else rmSync(directory, { recursive: true, force: true });
         mkdirSync(directory);
         writeFileSync(join(directory, 'existing.txt'), 'inside\n', 'utf8');
       };
+      /** After every attempt, decisive or not: refused, and nothing outside the worktree changed. */
+      const failedClosed = (result: OrnithToolResult): void => {
+        expect(result.ok).toBe(false);
+        expect(existsSync(join(outside, 'new.txt'))).toBe(false);
+        expect(existsSync(join(outside, 'deeper'))).toBe(false);
+        expect(readFileSync(join(outside, 'existing.txt'), 'utf8')).toBe('outside\n');
+      };
+      const guarded = (attempt: () => Promise<OrnithToolResult>): Promise<OrnithToolResult> =>
+        answeredWithinBudget(ORNITH_LIMITS.filesystemTimeoutMs, attempt, failedClosed, restoreDirectory);
 
       // `nested` already exists for every case here except the dedicated
       // mkdirp one below, so `mkdirp`'s own no-op success must not be the
@@ -316,35 +371,44 @@ describe('OrnithWorktreeTools containment and budgets', () => {
           if (kind !== 'mkdirp') swapToJunctionOutside();
         }
       });
+      // As in every real Ornith round, the instance has answered a read before its first
+      // mutation: the one-time manifest and root-binding spawns are not inside the timed call.
+      await boundary.listFiles({ version: 1, action: 'list_files', prefix: '', limit: 20 });
 
-      const createResult = await boundary.createFile(
-        { version: 1, action: 'create_file', path: 'nested/new.txt', content: 'must stay inside\n' },
-        undefined,
-        { readBytes: 0, writeBytes: 4096 }
+      const createResult = await guarded(() =>
+        boundary.createFile(
+          { version: 1, action: 'create_file', path: 'nested/new.txt', content: 'must stay inside\n' },
+          undefined,
+          { readBytes: 0, writeBytes: 4096 }
+        )
       );
       expect(createResult).toMatchObject({ ok: false, code: 'path_symlink' });
       expect(existsSync(join(outside, 'new.txt'))).toBe(false);
       restoreDirectory();
 
-      const replaceResult = await boundary.replaceText(
-        {
-          version: 1,
-          action: 'replace_text',
-          path: 'nested/existing.txt',
-          sha256,
-          replacements: [{ oldText: 'inside', newText: 'changed' }]
-        },
-        undefined,
-        { readBytes: 4096, writeBytes: 4096 }
+      const replaceResult = await guarded(() =>
+        boundary.replaceText(
+          {
+            version: 1,
+            action: 'replace_text',
+            path: 'nested/existing.txt',
+            sha256,
+            replacements: [{ oldText: 'inside', newText: 'changed' }]
+          },
+          undefined,
+          { readBytes: 4096, writeBytes: 4096 }
+        )
       );
       expect(replaceResult).toMatchObject({ ok: false, code: 'path_symlink' });
       expect(readFileSync(join(outside, 'existing.txt'), 'utf8')).toBe('outside\n');
       restoreDirectory();
 
-      const deleteResult = await boundary.deleteFile(
-        { version: 1, action: 'delete_file', path: 'nested/existing.txt', sha256 },
-        undefined,
-        { readBytes: 4096, writeBytes: 0 }
+      const deleteResult = await guarded(() =>
+        boundary.deleteFile(
+          { version: 1, action: 'delete_file', path: 'nested/existing.txt', sha256 },
+          undefined,
+          { readBytes: 4096, writeBytes: 0 }
+        )
       );
       expect(deleteResult).toMatchObject({ ok: false, code: 'path_symlink' });
       expect(readFileSync(join(outside, 'existing.txt'), 'utf8')).toBe('outside\n');
@@ -360,14 +424,19 @@ describe('OrnithWorktreeTools containment and budgets', () => {
           if (kind === 'mkdirp') swapToJunctionOutside();
         }
       });
-      const mkdirpResult = await mkdirpBoundary.createFile(
-        { version: 1, action: 'create_file', path: 'nested/deeper/new.txt', content: 'must stay inside\n' },
-        undefined,
-        { readBytes: 0, writeBytes: 4096 }
+      await mkdirpBoundary.listFiles({ version: 1, action: 'list_files', prefix: '', limit: 20 });
+      const mkdirpResult = await guarded(() =>
+        mkdirpBoundary.createFile(
+          { version: 1, action: 'create_file', path: 'nested/deeper/new.txt', content: 'must stay inside\n' },
+          undefined,
+          { readBytes: 0, writeBytes: 4096 }
+        )
       );
       expect(mkdirpResult).toMatchObject({ ok: false, code: 'path_symlink' });
       expect(existsSync(join(outside, 'deeper'))).toBe(false);
-    }
+    },
+    // Up to three attempts of a 10 s budget for each of the four cases.
+    180_000
   );
 
   it.runIf(process.platform === 'win32')(
@@ -564,41 +633,71 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       for (let index = 0; index < 260; index += 1) {
         writeFileSync(join(worktree, `broad-${String(index).padStart(3, '0')}.txt`), 'needle appears once per file\n');
       }
-      const recorded: string[][] = [];
-      const boundary = toolsRecordingGitArgv(recorded);
-
-      const started = Date.now();
-      const result = await boundary.searchText({
-        version: 1,
-        action: 'search_text',
-        query: 'needle',
-        caseSensitive: false,
-        // 261, not 260: hitting exactly `limit` is itself (pre-existingly, and
-        // correctly) treated as possibly-truncated, since there might be more
-        // beyond it — unrelated to what this test exercises.
-        limit: 261
+      // Every process the tools spawn — git or the fs-guard helper — and every identity recheck.
+      let spawned: { file: string; args: readonly string[] }[] = [];
+      let rechecks = 0;
+      const boundary = new OrnithWorktreeTools({
+        worktreePath: worktree,
+        worktreesRoot,
+        repositoryPath: repository,
+        branchName: 'task',
+        runner: {
+          run: (file, args, options) => {
+            spawned.push({ file, args });
+            return runner.run(file, args, options);
+          }
+        },
+        gitExecutablePath: gitPath,
+        testHooks: {
+          beforeIdentityRecheck: () => {
+            rechecks += 1;
+          }
+        }
       });
-      const elapsedMs = Date.now() - started;
+
+      // The cost is counted, not timed: a wall-clock bound (< 10 s, against ~4-6 s idle) failed
+      // under a loaded full suite on unchanged code. Before the fix every candidate re-ran the
+      // identity check — 3 `rev-parse` spawns each, ~780 for 260 files. Now it runs once every
+      // `searchIdentityRecheckFiles` candidates. Manifest build (`ls-files --cached` +
+      // `--others`) is 2 more spawns; nothing else may spawn per candidate, git or not. Checked
+      // after every attempt: one the budget cut short scanned less, so it can only count less,
+      // and a per-candidate regression fails on its first attempt instead of looking starved.
+      const withinCadence = (): void => {
+        expect(rechecks).toBeLessThanOrEqual(Math.ceil(260 / ORNITH_LIMITS.searchIdentityRecheckFiles));
+        expect(spawned.length).toBeLessThan(40);
+        for (const { file, args } of spawned) {
+          expect(file).toBe(gitPath);
+          expect(ALLOWED_GIT_SUBCOMMANDS.has(args[0] ?? '')).toBe(true);
+        }
+      };
+      const result = await answeredWithinBudget(
+        ORNITH_LIMITS.searchTimeoutMs,
+        () =>
+          boundary.searchText({
+            version: 1,
+            action: 'search_text',
+            query: 'needle',
+            caseSensitive: false,
+            // 261, not 260: hitting exactly `limit` is itself (pre-existingly, and
+            // correctly) treated as possibly-truncated, since there might be more
+            // beyond it — unrelated to what this test exercises.
+            limit: 261
+          }),
+        withinCadence,
+        () => {
+          spawned = [];
+          rechecks = 0;
+        }
+      );
 
       expect(result).toMatchObject({ ok: true });
       if (!result.ok) throw new Error('unreachable');
       const forModel = result.forModel as { matches: { path: string; line: number }[]; truncated: boolean };
       expect(forModel.matches.length).toBe(260);
       expect(forModel.truncated).toBe(false);
-      // Generous margin (real machines vary), but this is the assertion that
-      // would have failed outright at 15s/20s before the fix: the old
-      // per-candidate identity re-check made 260 files cost ~780 `git` spawns.
-      expect(elapsedMs).toBeLessThan(10_000);
-
-      // Manifest build (`ls-files --cached` + `ls-files --others`) is 2 calls;
-      // the rest are `assertCheckoutIdentity` invocations (3 `rev-parse` calls
-      // each). 260 candidates at a 25-file recheck interval is at most a
-      // handful of rechecks — nowhere near 260 * 3 = 780.
-      expect(recorded.length).toBeLessThan(40);
-      for (const argv of recorded) {
-        expect(ALLOWED_GIT_SUBCOMMANDS.has(argv[0] ?? '')).toBe(true);
-      }
-    });
+      // Still rechecked mid-scan, so a worktree swapped out underneath the scan is caught.
+      expect(rechecks).toBeGreaterThan(0);
+    }, 120_000);
 
     it('denies the whole call when the worktree root is replaced before it starts', async () => {
       const boundary = tools();

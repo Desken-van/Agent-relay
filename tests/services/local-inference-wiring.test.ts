@@ -70,25 +70,37 @@ describe('composition-root local inference wiring', () => {
         new LlamaCppLocalInference(runner, { ...config, workingDirectory: runtime.path })
     });
     open.push({ app, runtime });
+    const before = app.settings.get().localInference;
     app.settings.update({
       localInference: {
-        ...app.settings.get().localInference,
+        ...before,
         enabled: true,
-        executable: { kind: 'explicit_path', path: FAKE_LOCAL_INFERENCE_RUNTIME },
-        model: { id: 'wired-model', source: { kind: 'runtime_id', runtimeModelId: 'wired-source' } },
-        fixedArguments: ['--threads', '2'],
-        port,
-        contextLimitTokens: 8192,
-        startupTimeoutMs: 20_000,
-        healthTimeoutMs: 5_000,
-        inferenceTimeoutMs: 20_000,
-        shutdownTimeoutMs: 10_000,
-        requestDefaults: {
-          maxOutputTokens: 321,
-          chatTemplateParameters: { enable_thinking: false, custom_flag: 'wired-value' }
-        }
+        profiles: before.profiles.map((profile) =>
+          profile.id === before.defaultProfileId
+            ? {
+                ...profile,
+                enabled: true,
+                executable: { kind: 'explicit_path', path: FAKE_LOCAL_INFERENCE_RUNTIME },
+                model: { id: 'wired-model', source: { kind: 'runtime_id', runtimeModelId: 'wired-source' } },
+                fixedArguments: ['--threads', '2'],
+                port,
+                contextLimitTokens: 8192,
+                startupTimeoutMs: 20_000,
+                healthTimeoutMs: 5_000,
+                inferenceTimeoutMs: 20_000,
+                shutdownTimeoutMs: 10_000,
+                requestDefaults: {
+                  maxOutputTokens: 321,
+                  chatTemplateParameters: { enable_thinking: false, custom_flag: 'wired-value' }
+                }
+              }
+            : profile
+        )
       }
     });
+    // Picking which profile the retained runtime uses is a separate, explicit
+    // step from saving Settings — nothing selects one automatically.
+    app.localInference.selectActiveProfile(before.defaultProfileId ?? 'default');
 
     expect(app.localInference.state()).toEqual({ kind: 'stopped' });
     expect(runtime.ran()).toBe(false);

@@ -132,16 +132,6 @@ beforeEach(() => {
 });
 afterEach(() => h.dispose());
 
-/** Polls until this task's verification run row exists and is `running` — never a fixed sleep. */
-async function waitForRunningVerification(taskId: string): Promise<void> {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    const running = h.runs.listByTask(taskId).find((run) => run.runType === 'verification' && run.status === 'running');
-    if (running) return;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error('The verification run never reached "running".');
-}
-
 async function prepared(): Promise<string> {
   const project = h.createProject({ localPath: repo });
   const task = h.createTask(project.id);
@@ -235,8 +225,15 @@ describe('manual verification never streams, persists or broadcasts raw command 
   });
 
   it('a cancelled command (operator Stop mid-run): classified cancelled, and whatever it had printed is never streamed, persisted or broadcast', async () => {
+    let commandStarted!: () => void;
+    let commandHasStarted = false;
+    const started = new Promise<'started'>((resolve) => {
+      commandStarted = () => resolve('started');
+    });
     script = (options) =>
       new Promise<ProcessResult>((resolve) => {
+        commandHasStarted = true;
+        commandStarted();
         const finish = (): void => resolve(processResult({ exitCode: null, cancelled: true, failed: true, timedOut: false }));
         // The signal may already be aborted by the time this runs (an already-fired 'abort' event never
         // replays to a listener added afterwards) — cover both orderings, not just the common one.
@@ -246,10 +243,21 @@ describe('manual verification never streams, persists or broadcasts raw command 
     const taskId = await prepared();
 
     const pending = h.orchestrator.runVerification(taskId);
-    // Wait for the run to actually be recorded as running — real git subprocesses run inside `identity()`
-    // first, so a fixed tick is not enough to land inside `execute()` rather than the earlier abort check.
-    await waitForRunningVerification(taskId);
-    h.orchestrator.stop(taskId);
+    // Stop only once the command itself has started — an event, not a polling budget. Real git subprocesses
+    // run inside `identity()` first; under a loaded full suite they outlasted the old ~2 s poll budget, the test
+    // gave up and tore the harness down under a verification that then started anyway. Whichever comes first
+    // is taken, so a verification that ends before its command starts fails here at once, never by a timeout.
+    const ended = pending.then(() => 'ended' as const, () => 'ended' as const);
+    try {
+      expect(await Promise.race([started, ended])).toBe('started');
+      expect(h.runs.listByTask(taskId).some((run) => run.runType === 'verification' && run.status === 'running')).toBe(true);
+    } finally {
+      // Whatever an assertion above found: a verification whose command has started is stopped
+      // and drained here, never left running under afterEach's teardown. One that ended first
+      // has nothing to stop, and `ended` never rejects, so the assertion's own failure is reported.
+      if (commandHasStarted) h.orchestrator.stop(taskId);
+      await ended;
+    }
     const after = await pending;
 
     expect(after.status).toBe('READY_FOR_IMPLEMENTATION');

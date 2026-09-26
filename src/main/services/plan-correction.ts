@@ -73,6 +73,15 @@ import {
 import { planReviewRecovery } from '../../shared/domain/plan-review';
 import { renderRuleEvidence } from './rule-evidence';
 import { specificationIdentity } from './specification-identity';
+import { assertSafeWorktreePath } from './path-safety';
+import {
+  specificationGroundingProblem,
+  specificationGroundingState
+} from '../../shared/domain/specification-grounding';
+import {
+  describeOrnithInstructionViolations,
+  ornithInstructionViolations
+} from '../../shared/domain/ornith-instruction-contract';
 
 const LOOP_STOPPED = 'The plan-correction loop was stopped. Nothing further was changed.';
 const STOPPED_DURING_REVISION =
@@ -111,6 +120,12 @@ export interface PlanCorrectionDeps {
   readonly clock: Clock;
   readonly ids: IdGenerator;
   readonly events?: EventPublisher;
+  /**
+   * Proves the task worktree is still the tree the specification was generated against
+   * (the orchestrator's check, which records a definite mismatch) before a revision reads
+   * it. Required: a revision written from a different tree would carry the old record.
+   */
+  readonly verifyTarget: (taskId: string) => Promise<void>;
 }
 
 interface DerivedState {
@@ -575,6 +590,27 @@ export class PlanCorrectionService {
     if (accepted.length === 0) {
       throw new AgentRelayError('VALIDATION_FAILED', 'This round accepted no finding, so there is nothing to revise.');
     }
+    // A revision reads the same tree the specification was generated against — the task's
+    // worktree — and keeps that target. One with no trustworthy record is not revised: it is
+    // regenerated, and nothing (not even a correction row) is opened for it here.
+    const grounding = specificationGroundingState(task);
+    if (grounding.kind !== 'recorded') {
+      throw new AgentRelayError('VALIDATION_FAILED', specificationGroundingProblem(grounding) ?? 'The specification is not grounded.', {
+        remediation: 'Choose "Regenerate specification". Nothing was revised.'
+      });
+    }
+    const settingsForTarget = this.deps.settings.get();
+    if (task.worktreePath === null) {
+      throw new AgentRelayError('WORKTREE_INVALID', 'The task has no worktree to revise the specification against.');
+    }
+    assertSafeWorktreePath({
+      worktreePath: task.worktreePath,
+      worktreesRoot: settingsForTarget.worktreesRoot,
+      repositoryPath: project.localPath
+    });
+    // Still that tree: a commit or an edit in it since the specification was generated
+    // is recorded and refused here, before a correction row or a Codex call exists.
+    await this.deps.verifyTarget(task.id);
 
     const correction = this.deps.corrections.begin({
       id: this.deps.ids.next(),
@@ -608,7 +644,9 @@ export class PlanCorrectionService {
     try {
       const outcome = await this.deps.codex.reviseSpecification(
         {
-          projectPath: project.localPath,
+          projectPath: task.worktreePath,
+          target: grounding.grounding,
+          implementationProvider: task.implementationProvider,
           taskTitle: task.title,
           originalRequest: task.originalRequest,
           currentSpecification: current.specification,
@@ -643,6 +681,18 @@ export class PlanCorrectionService {
       this.deps.corrections.fail(correction.id, STOPPED_DURING_REVISION);
       throw new AgentRelayError('CANCELLED', STOPPED_DURING_REVISION);
     }
+    // Still the same tree after the read: a revision written from a worktree that moved or was
+    // edited while Codex read it would be stored under the old record. Refused (the check records
+    // the mismatch), the correction fails, and no new version exists.
+    try {
+      await this.deps.verifyTarget(task.id);
+    } catch (error) {
+      this.deps.corrections.fail(
+        correction.id,
+        redactAndTruncate(error instanceof Error ? error.message : String(error), 10_000)
+      );
+      throw error;
+    }
 
     if (Buffer.byteLength(revisedJson, 'utf8') > MAX_SPECIFICATION_BYTES) {
       return fail('The revised specification is larger than the external review budget allows.');
@@ -666,6 +716,14 @@ export class PlanCorrectionService {
     });
     if (unaddressed !== null) {
       return fail(`${unaddressed} The revision was not stored, so the accepted findings are still not addressed.`);
+    }
+    // The revision replaces what Ornith will be handed, so it is held to the same contract as
+    // a generated specification: one that asks Ornith for what its protocol lacks is not stored.
+    if (task.implementationProvider === 'ornith') {
+      const violations = ornithInstructionViolations(revised.specification);
+      if (violations.length > 0) {
+        return fail(`${describeOrnithInstructionViolations(violations)} The revision was not stored.`);
+      }
     }
 
     try {

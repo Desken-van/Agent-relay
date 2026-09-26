@@ -68,7 +68,8 @@ function setup() {
       clock: harness.clock,
       ids: harness.ids,
       claims,
-      operations: harness.operations
+      operations: harness.operations,
+      verifyTarget: async (taskId: string) => { await harness.orchestrator.verifySpecificationGrounding(taskId); }
     });
   const service = build();
   /**
@@ -94,7 +95,8 @@ function setup() {
       claims: new PlanReviewClaims(),
       // Its own registry too: this seam exists to have NO arbitration, so a test using it
       // exercises the durable revision guard alone, not the registry's refusal.
-      operations: new TaskOperationRegistry()
+      operations: new TaskOperationRegistry(),
+      verifyTarget: async (taskId: string) => { await harness.orchestrator.verifySpecificationGrounding(taskId); }
     });
   return { harness, reviewer, codex, service, claims, build, unguarded };
 }
@@ -837,8 +839,12 @@ describe('durable external plan review gate', () => {
     const { task } = await ready(value);
     const round = deferred();
     value.reviewer.reviewGate = round.promise;
+    // Waits for the round to be dispatched (an event), not a number of microtasks: the review
+    // first proves the task branch is still the specification's target, which takes Git calls.
+    const dispatched = deferred();
+    value.reviewer.onReview = () => dispatched.resolve(undefined);
     const reviewing = value.service.review(task.id);
-    await Promise.resolve();
+    await dispatched.promise;
     expect(value.harness.planReviewGates.findByTask(task.id)?.status).toBe('reviewing');
 
     // The single-flight claim already forbids this overlap; the point here is
@@ -1808,7 +1814,8 @@ describe('durable external plan review gate', () => {
         clock: value.harness.clock,
         ids: value.harness.ids,
         claims: new PlanReviewClaims(),
-        operations: value.harness.operations
+        operations: value.harness.operations,
+        verifyTarget: async (taskId: string) => { await value.harness.orchestrator.verifySpecificationGrounding(taskId); }
       });
 
       await expect(

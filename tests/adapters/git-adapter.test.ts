@@ -171,6 +171,70 @@ describe('branches and worktrees', () => {
   });
 });
 
+describe('the specification target: one commit, read and branched exactly', () => {
+  const head = (cwd: string): string => execFileSync('git', ['rev-parse', 'HEAD'], { cwd }).toString().trim();
+
+  it('resolves a branch to its commit, and a ref that names nothing to null', async () => {
+    expect(await git.resolveCommit(repo, 'refs/heads/main')).toBe(head(repo));
+    expect(await git.resolveCommit(repo, 'refs/heads/missing')).toBeNull();
+    await expect(git.resolveCommit(repo, '--upload-pack=x')).rejects.toMatchObject({ code: 'VALIDATION_FAILED' });
+  });
+
+  it('throws when Git cannot answer, instead of reporting the ref as missing', async () => {
+    const plain = join(root, 'not-a-repository');
+    mkdirSync(plain);
+    await expect(git.resolveCommit(plain, 'refs/heads/main')).rejects.toMatchObject({ code: 'GIT_FAILED' });
+  });
+
+  it('answers ancestry for commit ids only', async () => {
+    const first = head(repo);
+    commitFile(repo, 'second.txt', 'two\n', 'second');
+    const second = head(repo);
+
+    expect(await git.isAncestor(repo, first, second)).toBe(true);
+    expect(await git.isAncestor(repo, second, first)).toBe(false);
+    expect(await git.isAncestor(repo, second, second)).toBe(true);
+    await expect(git.isAncestor(repo, 'main', second)).rejects.toMatchObject({ code: 'VALIDATION_FAILED' });
+  });
+
+  it('checks out one commit detached, without the source checkout’s uncommitted edits, and removes it cleanly', async () => {
+    const target = head(repo);
+    writeFileSync(join(repo, 'README.md'), '# dirty source edit\n', 'utf8');
+    const checkout = join(worktreesRoot, '.specification', 'task');
+
+    await git.createDetachedCheckout({ repositoryPath: repo, commit: target, checkoutPath: checkout });
+
+    const info = await git.inspect(checkout);
+    expect(info).toMatchObject({ isRepository: true, currentBranch: null, headCommit: target, isClean: true });
+    expect(execFileSync('git', ['show', 'HEAD:README.md'], { cwd: checkout }).toString()).toBe('# demo\n');
+    expect(existsSync(join(checkout, 'README.md'))).toBe(true);
+    expect((await git.inspect(repo)).currentBranch).toBe('main');
+
+    await git.removeWorktree(repo, checkout);
+    expect(existsSync(checkout)).toBe(false);
+    await expect(
+      git.createDetachedCheckout({ repositoryPath: repo, commit: 'main', checkoutPath: checkout })
+    ).rejects.toMatchObject({ code: 'VALIDATION_FAILED' });
+  });
+
+  it('starts a task branch at a recorded commit even after the base branch moved on', async () => {
+    const recorded = head(repo);
+    commitFile(repo, 'later.txt', 'later\n', 'base moved');
+    const wt = join(worktreesRoot, 'task');
+
+    await git.createWorktree({
+      repositoryPath: repo,
+      baseBranch: 'main',
+      branchName: 'agent-relay/task',
+      worktreePath: wt,
+      startPoint: recorded
+    });
+
+    expect(head(wt)).toBe(recorded);
+    expect(existsSync(join(wt, 'later.txt'))).toBe(false);
+  });
+});
+
 describe('collectChanges', () => {
   it('captures modified, added and untracked files without committing them', async () => {
     const worktreePath = join(worktreesRoot, 'task-changes');

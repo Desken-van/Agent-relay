@@ -8,6 +8,7 @@
 
 import type { ToolDiagnostic } from '../../src/shared/domain/diagnostics';
 import type { GitChangeSet, RepositoryInfo, WorktreeInfo } from '../../src/shared/domain/git';
+import type { SpecificationGrounding } from '../../src/shared/domain/specification-grounding';
 import type { PublishConfirmation } from '../../src/shared/ipc';
 import {
   SPECIFICATION_FIELD_NAMES,
@@ -34,6 +35,7 @@ import type {
   CodexTriageOutcome,
   CodexTriageRequest,
   ConfirmationService,
+  CreateDetachedCheckoutRequest,
   CreateWorktreeRequest,
   GitAdapter,
   GitHubAdapter,
@@ -312,6 +314,22 @@ export class FakeClaudeAdapter implements ClaudeAdapter {
 /* Git                                                                         */
 /* -------------------------------------------------------------------------- */
 
+/** A specification's target, as Agent Relay records it: a clean checkout of the base commit by default. */
+export function makeGrounding(overrides: Partial<SpecificationGrounding> = {}): SpecificationGrounding {
+  return {
+    version: 1,
+    checkout: 'base_commit',
+    baseBranch: 'main',
+    branch: null,
+    commit: 'a'.repeat(40),
+    clean: true,
+    implementationProvider: 'claude',
+    capturedAt: '2026-01-01T00:00:00.000Z',
+    stale: null,
+    ...overrides
+  };
+}
+
 export function makeRepositoryInfo(overrides: Partial<RepositoryInfo> = {}): RepositoryInfo {
   return {
     isRepository: true,
@@ -356,20 +374,68 @@ export class FakeGitAdapter implements GitAdapter {
   pushes: { path: string; remote: string; branch: string }[] = [];
   stagedPaths: string[] = [];
   createWorktreeError: Error | null = null;
+  /** What each ref resolves to. The base branch's tip is `repository.headCommit` unless a test says otherwise. */
+  commitsByRef = new Map<string, string>();
+  /** The answer `isAncestor` gives; a test that rewrote the base branch sets it to false. */
+  ancestor = true;
+  detachedCheckouts: CreateDetachedCheckoutRequest[] = [];
+  removedWorktrees: string[] = [];
+  /**
+   * A checkout this fake created, keyed by its path: its own identity (root, branch, HEAD,
+   * cleanliness) over whatever `repository` says about everything else. Tests may edit an entry.
+   */
+  checkouts = new Map<string, Partial<RepositoryInfo>>();
 
-  async inspect(): Promise<RepositoryInfo> {
-    return this.repository;
+  /** `inspect` of one of these paths fails with the error given. */
+  inspectErrors = new Map<string, Error>();
+
+  async inspect(repositoryPath: string): Promise<RepositoryInfo> {
+    const failure = this.inspectErrors.get(repositoryPath);
+    if (failure) throw failure;
+    const checkout = this.checkouts.get(repositoryPath);
+    return checkout === undefined ? this.repository : { ...this.repository, ...checkout };
   }
 
   async branchExists(_repositoryPath: string, branch: string): Promise<boolean> {
     return this.existingBranches.has(branch);
   }
 
+  /** Set to make `resolveCommit` fail the way Git does when it cannot answer at all. */
+  resolveCommitError: Error | null = null;
+
+  async resolveCommit(_repositoryPath: string, ref: string): Promise<string | null> {
+    if (this.resolveCommitError) throw this.resolveCommitError;
+    const known = this.commitsByRef.get(ref);
+    if (known !== undefined) return known;
+    if (/^[0-9a-f]{40}$/.test(ref)) return ref;
+    if (!ref.startsWith('refs/heads/')) return null;
+    const branch = ref.slice('refs/heads/'.length);
+    // A task branch is wherever its worktree's HEAD is, so a test moves both by editing the checkout.
+    const checkout = [...this.checkouts.values()].find((entry) => entry.currentBranch === branch);
+    if (checkout?.headCommit) return checkout.headCommit;
+    return this.existingBranches.has(branch) ? this.repository.headCommit : null;
+  }
+
+  async isAncestor(): Promise<boolean> {
+    return this.ancestor;
+  }
+
+  async createDetachedCheckout(request: CreateDetachedCheckoutRequest): Promise<void> {
+    this.detachedCheckouts.push(request);
+    this.checkouts.set(request.checkoutPath, {
+      root: request.checkoutPath, currentBranch: null, headCommit: request.commit, isClean: true, dirtyFiles: []
+    });
+  }
+
   async createWorktree(request: CreateWorktreeRequest): Promise<WorktreeInfo> {
     if (this.createWorktreeError) throw this.createWorktreeError;
     this.createdWorktrees.push(request);
     this.existingBranches.add(request.branchName);
-    return { path: request.worktreePath, branch: request.branchName, head: 'b'.repeat(40), isLocked: false };
+    const head = request.startPoint ?? this.repository.headCommit ?? 'b'.repeat(40);
+    this.checkouts.set(request.worktreePath, {
+      root: request.worktreePath, currentBranch: request.branchName, headCommit: head, isClean: true, dirtyFiles: []
+    });
+    return { path: request.worktreePath, branch: request.branchName, head, isLocked: false };
   }
 
   async listWorktrees(): Promise<WorktreeInfo[]> {
@@ -381,8 +447,9 @@ export class FakeGitAdapter implements GitAdapter {
     }));
   }
 
-  async removeWorktree(): Promise<void> {
-    // no-op
+  async removeWorktree(_repositoryPath: string, worktreePath: string): Promise<void> {
+    this.removedWorktrees.push(worktreePath);
+    this.checkouts.delete(worktreePath);
   }
 
   async collectChanges(): Promise<GitChangeSet> {

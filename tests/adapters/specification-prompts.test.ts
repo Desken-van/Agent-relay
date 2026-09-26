@@ -1,7 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import { buildSpecificationPrompt, buildSpecificationRevisionPrompt } from '../../src/main/adapters/codex/prompts';
+import {
+  buildSpecificationPrompt,
+  buildSpecificationRevisionPrompt,
+  buildTriagePrompt
+} from '../../src/main/adapters/codex/prompts';
+import { implementerCapabilitiesSection, specificationTargetSection } from '../../src/main/adapters/codex/implementer-contract';
+import type { ImplementationProvider } from '../../src/shared/domain/execution-providers';
+import { ORNITH_ACTION_KINDS } from '../../src/shared/domain/ornith';
+import {
+  ORNITH_INSTRUCTION_CONTRACT,
+  ornithInstructionViolations
+} from '../../src/shared/domain/ornith-instruction-contract';
 import type { AcceptedPlanFinding } from '../../src/shared/domain/plan-correction';
-import { makeSpecification } from '../helpers/fakes';
+import type { SpecificationGrounding } from '../../src/shared/domain/specification-grounding';
+import { makeGrounding, makeSpecification } from '../helpers/fakes';
+
+const TARGET = makeGrounding({ commit: 'b'.repeat(40) });
 
 const accepted: AcceptedPlanFinding = {
   finding: 2,
@@ -15,12 +29,20 @@ const accepted: AcceptedPlanFinding = {
   operatorNote: ''
 };
 
-const generation = (): string =>
-  buildSpecificationPrompt({ projectPath: 'C:\\repo', taskTitle: 'Add a section', originalRequest: 'Add it.' });
+const generation = (provider: ImplementationProvider = 'claude', target: SpecificationGrounding = TARGET): string =>
+  buildSpecificationPrompt({
+    projectPath: 'C:\\worktrees\\.agent-relay-specification\\t1',
+    target,
+    implementationProvider: provider,
+    taskTitle: 'Add a section',
+    originalRequest: 'Add it.'
+  });
 
-const revision = (): string =>
+const revision = (provider: ImplementationProvider = 'claude', target: SpecificationGrounding = TARGET): string =>
   buildSpecificationRevisionPrompt({
-    projectPath: 'C:\\repo',
+    projectPath: 'C:\\worktrees\\t1-add-a-section',
+    target,
+    implementationProvider: provider,
     taskTitle: 'Add a section',
     originalRequest: 'Add it.',
     currentSpecification: makeSpecification(),
@@ -54,29 +76,149 @@ describe('the specification revision prompt: what "addressed" must contain', () 
   });
 });
 
-describe('verification evidence a specification may require', () => {
+describe('the target checkout: one named commit, and facts about it only as observed there', () => {
   it.each([
     ['generation', generation],
     ['revision', revision]
-  ] as const)('the %s prompt requires Relay’s own verification record, never raw output', (_name, build) => {
+  ] as const)('the %s prompt names the commit it reads and says the project folder is not the target', (_name, build) => {
     const prompt = flat(build());
 
-    expect(prompt).toContain('require Agent Relay\'s own verification — its "Run verification" action');
-    expect(prompt).toContain('`npm run verify` in the task worktree');
-    expect(prompt).toContain('its exit code and classified outcome (passed, failed, timed_out or cancelled)');
-    expect(prompt).toContain(
-      'for a failed run, its failure kind and the bounded, sanitized output summary where one is available'
-    );
-    expect(prompt).toContain("never stores a command's raw stdout/stderr or a complete log");
-    expect(prompt).toContain(
-      'may require the actual, full or raw command output to be stored in, attached to, or shown by Agent Relay'
+    expect(prompt).toContain(`You are reading a clean, detached checkout of base branch main at commit ${'b'.repeat(40)}`);
+    expect(prompt).toContain("The project's own folder is NOT the target");
+    // The rule evidence's clean flag describes where the rules were read, never this tree.
+    expect(prompt).toContain('that describes neither this target nor the task\'s worktree');
+    expect(prompt).toContain(`at ${'b'.repeat(12)}, docs/example.md is 1,234 bytes`);
+    expect(prompt).toContain('Never state one you did not observe here');
+    expect(prompt).toContain('tell the implementer to inspect the file when it starts');
+  });
+
+  it('forbids every transient fact when the checkout it reads has uncommitted changes', () => {
+    const dirty = makeGrounding({ checkout: 'task_worktree', branch: 'agent-relay/t1', clean: false });
+    const prompt = flat(revision('claude', dirty));
+
+    expect(prompt).toContain('on branch agent-relay/t1');
+    expect(prompt).toContain('WITH uncommitted changes from earlier implementation rounds');
+    expect(prompt).toContain('This checkout has uncommitted changes, so state none of them.');
+    expect(prompt).not.toContain('docs/example.md is 1,234 bytes');
+  });
+
+  it('tells a reviewer the same facts, addressed to the reviewer', () => {
+    const section = flat(specificationTargetSection(TARGET, 'reviewer'));
+    expect(section).toContain('The specification was written by reading a clean, detached checkout of base branch main');
+    expect(section).toContain('The task branch under review starts from exactly this commit.');
+    expect(section).not.toContain('You are reading');
+  });
+});
+
+describe('the implementer contract: Ornith is asked only for what its protocol exposes', () => {
+  it.each([
+    ['generation', generation],
+    ['revision', revision]
+  ] as const)('the %s prompt lists exactly Ornith’s actions and forbids UI, IPC, run IDs, a shell and file handles', (_name, build) => {
+    const prompt = flat(build('ornith'));
+
+    expect(prompt).toContain(`It has exactly these actions and nothing else: ${ORNITH_ACTION_KINDS.join(', ')}.`);
+    expect(prompt).toContain('It has no shell, terminal or command execution');
+    expect(prompt).toContain('Never instruct it to run a command (npm, node, git, a script) itself.');
+    expect(prompt).toContain('There are no file handles: never instruct it to open, seek, append through a handle, flush or close a file');
+    expect(prompt).toContain('Never instruct it to press or invoke an Agent Relay action (for example "Run verification" / workflow:verify)');
+    expect(prompt).toContain('to capture, poll or wait for an Agent Relay run ID, or to read an Agent Relay record');
+    // Its own tool is not the operator's action, and Relay's check is a later stage of its own.
+    expect(prompt).toContain('Its own "run_verification" action runs the project\'s verification inside its loop');
+    expect(prompt).toContain('After it stops, Agent Relay verifies the result itself, as a separate stage the operator sees.');
+    expect(prompt).toContain('so this implementer can carry it out with exactly these capabilities');
+  });
+
+  it('never tells the specifier to require that the implementer invoke the UI verification or read its record', () => {
+    for (const prompt of [generation('ornith'), revision('ornith'), generation('claude'), revision('codex')]) {
+      const text = flat(prompt);
+      expect(text).not.toContain('require Agent Relay\'s own verification — its "Run verification" action');
+      expect(text).toContain('Agent Relay verifies the finished change itself, as a separate stage after the implementer stops');
+      expect(text).toContain(
+        'The "implementationPrompt" must never ask the implementer to start, wait for, poll or read that stage or its record.'
+      );
+      expect(text).toContain('Acceptance criteria may require that Agent Relay\'s verification of the finished change passes.');
+      expect(text).toContain("never stores a command's raw stdout/stderr or a complete log");
+    }
+  });
+
+  it('describes Claude and Codex accurately, and the reviewer is told to treat an impossible instruction as a defect', () => {
+    expect(flat(generation('claude'))).toContain('The implementer is Claude Code, working alone in the task worktree.');
+    expect(flat(generation('codex'))).toContain('The implementer is Codex, working alone in the task worktree');
+    expect(flat(generation('claude'))).not.toContain('It has exactly these actions and nothing else');
+    expect(flat(implementerCapabilitiesSection('ornith', 'reviewer'))).toContain(
+      'one this implementer cannot carry out is a defect of the plan'
     );
   });
 
-  it('tells the revision that an accepted finding asking for such output is met by the persisted record', () => {
-    expect(flat(revision())).toContain(
-      'a finding that asks for such output is addressed by requiring that persisted record instead'
+  it('tells the revision that an accepted finding asking for raw output or the UI stage is met by an acceptance criterion', () => {
+    expect(flat(revision('ornith'))).toContain(
+      'a finding that asks for such output, or for the implementer to start or read Agent Relay\'s verification, is addressed by the acceptance criterion that Agent Relay\'s verification of the finished change passes, instead'
     );
     expect(flat(generation())).not.toContain('accepted findings too');
+  });
+
+  it.each([
+    ['generation', generation],
+    ['revision', revision]
+  ] as const)('the %s prompt states the Ornith instruction contract Agent Relay enforces, and only for Ornith', (_name, build) => {
+    const ornith = flat(build('ornith'));
+    expect(ornith).toContain(flat(ORNITH_INSTRUCTION_CONTRACT));
+    expect(ornith).toContain('Agent Relay checks the finished text before approval and before every round');
+    expect(ornith).toContain('goes in a fenced block on the line right after one naming the file');
+    expect(ornith).toContain('Write "implementationPrompt", "acceptanceCriteria" and "suggestedTests" in English');
+    expect(flat(build('claude'))).not.toContain('Agent Relay checks the finished text before approval');
+    expect(flat(implementerCapabilitiesSection('ornith', 'reviewer'))).toContain(flat(ORNITH_INSTRUCTION_CONTRACT));
+  });
+
+  it('the revision prompt asks for exactly the verification criterion the contract allows', () => {
+    const wanted = "Agent Relay's verification of the finished change passes.";
+    expect(flat(revision('ornith'))).toContain(wanted.slice(0, -1));
+    expect(
+      ornithInstructionViolations({ implementationPrompt: 'Edit docs/a.md.', acceptanceCriteria: [wanted], suggestedTests: [] })
+    ).toEqual([]);
+  });
+});
+
+describe('triage sees the whole specification', () => {
+  // The regression: a finding about a word that occurs ONLY in the implementation prompt was
+  // rejected by citing a clean constraints field, because triage was never shown the prompt.
+  const specification = makeSpecification({
+    constraints: ['Do not change the existing sections.'],
+    implementationPrompt: 'Добавь раздел и используй штатные средства проверки.',
+    suggestedTests: ['A test for the new section.'],
+    scopedFilePaths: ['docs/manual-test.md']
+  });
+  const prompt = buildTriagePrompt({
+    refKind: 'index',
+    specification,
+    findings: [
+      {
+        ref: 0,
+        severity: 'minor',
+        category: 'clarity',
+        file: 'docs/manual-test.md',
+        line: null,
+        title: 'The word "штатные" is ambiguous',
+        body: 'The instruction says "штатные"; say which tools are meant.',
+        fix: 'Name the tools.'
+      }
+    ],
+    priorDecisions: []
+  });
+
+  it('renders the implementation prompt, suggested tests and scoped paths beside the other fields', () => {
+    expect(prompt).toContain('Implementation prompt (handed verbatim to the implementer):');
+    expect(prompt).toContain('используй штатные средства проверки');
+    expect(prompt).toContain('A test for the new section.');
+    expect(prompt).toContain('  - docs/manual-test.md');
+  });
+
+  it('requires every field to be checked before a rejection, and never one cited from another field', () => {
+    const text = flat(prompt);
+    expect(text).toContain('Judge each finding against the WHOLE specification above.');
+    expect(text).toContain('a wording or content problem is often only in the implementation prompt');
+    expect(text).toContain('check EVERY field above, and never reject a finding by citing a different field that does not contain what the finding is about');
+    expect(text).toContain('name the field(s) you checked');
   });
 });

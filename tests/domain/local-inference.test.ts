@@ -20,19 +20,24 @@ import {
   LOCAL_INFERENCE_HOST,
   LOCAL_INFERENCE_LIMITS,
   LOCAL_INFERENCE_PROTOCOL,
+  LOCAL_INFERENCE_SETTINGS_VERSION,
   LOCAL_INFERENCE_STATE_KINDS,
   LOCAL_INFERENCE_TRANSITIONS,
   localInferenceConfigSchema,
   localInferenceSettingsSchema,
   localInferenceMessageSchema,
   localInferenceOutcomeSchema,
+  localInferenceProfileSchema,
+  localInferenceProfilesSettingsSchema,
   localInferencePromptSchema,
   localInferenceRequestSchema,
   localInferenceResponseSchema,
   localInferenceStateSchema,
   localInferenceTransition,
   modelArgumentFor,
+  summarizeLocalInferenceProfiles,
   upgradeLegacyLocalInferenceSettings,
+  upgradeLocalInferenceProfilesSettings,
   type LocalInferenceEvent,
   type LocalInferenceStateKind
 } from '../../src/shared/domain/local-inference';
@@ -241,41 +246,65 @@ describe('local inference configuration', () => {
   });
 });
 
+/**
+ * The shipped single-runtime default `defaultLocalInferenceSettings()` wraps as its one profile —
+ * reproduced here because the function that used to return this flat shape directly now returns the
+ * profiles shape, and this literal is what `localInferenceSettingsSchema` (the flat, per-profile runtime
+ * config validator) and `upgradeLegacyLocalInferenceSettings` (which still targets that flat shape) are
+ * tested against.
+ */
+const FLAT_DEFAULT = {
+  version: LOCAL_INFERENCE_CONTRACT_VERSION,
+  enabled: false,
+  executable: { kind: 'discovered', command: 'llama-server' },
+  model: {
+    id: 'local-model',
+    source: { kind: 'runtime_id', runtimeModelId: 'local-model' }
+  },
+  fixedArguments: [],
+  port: 8080,
+  contextLimitTokens: 4096,
+  startupTimeoutMs: 600_000,
+  healthTimeoutMs: 60_000,
+  inferenceTimeoutMs: 1_800_000,
+  shutdownTimeoutMs: 60_000,
+  requestDefaults: {
+    maxOutputTokens: 4096,
+    chatTemplateParameters: {}
+  }
+} as const;
+
 describe('persisted local inference settings', () => {
   const persisted = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
-    ...defaultLocalInferenceSettings(),
+    ...FLAT_DEFAULT,
     ...overrides
   });
 
-  it('ships a fresh, harmless version-1 runtime-id default', () => {
+  it('ships a fresh, harmless default with exactly one runtime-id profile', () => {
     const first = defaultLocalInferenceSettings();
     const second = defaultLocalInferenceSettings();
+    const { version: _flatVersion, ...runtimeConfig } = FLAT_DEFAULT;
     expect(first).toEqual({
-      version: 1,
+      version: 2,
       enabled: false,
-      executable: { kind: 'discovered', command: 'llama-server' },
-      model: {
-        id: 'local-model',
-        source: { kind: 'runtime_id', runtimeModelId: 'local-model' }
-      },
-      fixedArguments: [],
-      port: 8080,
-      contextLimitTokens: 4096,
-      startupTimeoutMs: 600_000,
-      healthTimeoutMs: 60_000,
-      inferenceTimeoutMs: 1_800_000,
-      shutdownTimeoutMs: 60_000,
-      requestDefaults: {
-        maxOutputTokens: 4096,
-        chatTemplateParameters: {}
-      }
+      profiles: [
+        {
+          id: 'default',
+          displayName: 'Local model',
+          adapterKind: 'llama_cpp',
+          ...runtimeConfig
+        }
+      ],
+      defaultProfileId: 'default'
     });
     expect(first).not.toBe(second);
-    expect(first.fixedArguments).not.toBe(second.fixedArguments);
-    expect(first.model).not.toBe(second.model);
-    expect(first.requestDefaults).not.toBe(second.requestDefaults);
-    expect(first.requestDefaults.chatTemplateParameters).not.toBe(
-      second.requestDefaults.chatTemplateParameters
+    expect(first.profiles).not.toBe(second.profiles);
+    expect(first.profiles[0]).not.toBe(second.profiles[0]);
+    expect(first.profiles[0]?.fixedArguments).not.toBe(second.profiles[0]?.fixedArguments);
+    expect(first.profiles[0]?.model).not.toBe(second.profiles[0]?.model);
+    expect(first.profiles[0]?.requestDefaults).not.toBe(second.profiles[0]?.requestDefaults);
+    expect(first.profiles[0]?.requestDefaults.chatTemplateParameters).not.toBe(
+      second.profiles[0]?.requestDefaults.chatTemplateParameters
     );
   });
 
@@ -392,9 +421,8 @@ describe('persisted local inference settings', () => {
 });
 
 describe('upgradeLegacyLocalInferenceSettings', () => {
-  it('leaves a row already in the current shape unchanged', () => {
-    const current = defaultLocalInferenceSettings();
-    expect(upgradeLegacyLocalInferenceSettings(current)).toEqual(current);
+  it('leaves a row already in the current (flat, single-runtime) shape unchanged', () => {
+    expect(upgradeLegacyLocalInferenceSettings(FLAT_DEFAULT)).toEqual(FLAT_DEFAULT);
   });
 
   it('upgrades a pre-B2 legacy row, keeping every existing value and adding safe defaults', () => {
@@ -443,8 +471,199 @@ describe('upgradeLegacyLocalInferenceSettings', () => {
 
   it('falls back to the shipped default for malformed or unrecognisable data', () => {
     for (const bad of [undefined, null, 'not an object', { version: 1 }, { surprise: true }]) {
-      expect(upgradeLegacyLocalInferenceSettings(bad)).toEqual(defaultLocalInferenceSettings());
+      expect(upgradeLegacyLocalInferenceSettings(bad)).toEqual(FLAT_DEFAULT);
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Local-model profiles                                                       */
+/* -------------------------------------------------------------------------- */
+
+describe('local-model profiles', () => {
+  const { version: _flatDefaultVersion, ...profileRuntimeConfig } = FLAT_DEFAULT;
+
+  const profile = (overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> => ({
+    ...profileRuntimeConfig,
+    id: 'default',
+    displayName: 'Local model',
+    enabled: true,
+    adapterKind: 'llama_cpp',
+    ...overrides
+  });
+
+  it('accepts a well-formed profile', () => {
+    expect(localInferenceProfileSchema.safeParse(profile()).success).toBe(true);
+  });
+
+  it('bounds the profile id and rejects an unsafe id shape', () => {
+    expect(
+      localInferenceProfileSchema.safeParse(profile({ id: 'a'.repeat(LOCAL_INFERENCE_LIMITS.profileIdMax) }))
+        .success
+    ).toBe(true);
+    expect(
+      localInferenceProfileSchema.safeParse(
+        profile({ id: 'a'.repeat(LOCAL_INFERENCE_LIMITS.profileIdMax + 1) })
+      ).success
+    ).toBe(false);
+    expect(localInferenceProfileSchema.safeParse(profile({ id: '' })).success).toBe(false);
+    expect(localInferenceProfileSchema.safeParse(profile({ id: 'has space' })).success).toBe(false);
+    expect(localInferenceProfileSchema.safeParse(profile({ id: '../etc' })).success).toBe(false);
+  });
+
+  it('bounds the display name and rejects control characters', () => {
+    expect(
+      localInferenceProfileSchema.safeParse(
+        profile({ displayName: 'a'.repeat(LOCAL_INFERENCE_LIMITS.profileDisplayNameMax) })
+      ).success
+    ).toBe(true);
+    expect(
+      localInferenceProfileSchema.safeParse(
+        profile({ displayName: 'a'.repeat(LOCAL_INFERENCE_LIMITS.profileDisplayNameMax + 1) })
+      ).success
+    ).toBe(false);
+    expect(localInferenceProfileSchema.safeParse(profile({ displayName: '' })).success).toBe(false);
+    expect(localInferenceProfileSchema.safeParse(profile({ displayName: 'bad\u0007name' })).success).toBe(
+      false
+    );
+  });
+
+  it('rejects an unknown adapterKind and an unknown property', () => {
+    expect(localInferenceProfileSchema.safeParse(profile({ adapterKind: 'openai_compatible' })).success).toBe(
+      false
+    );
+    expect(localInferenceProfileSchema.safeParse({ ...profile(), path: 'C:\\models\\x.gguf' }).success).toBe(
+      false
+    );
+  });
+
+  it('still cross-validates the default output cap against its own context limit', () => {
+    expect(
+      localInferenceProfileSchema.safeParse(
+        profile({ contextLimitTokens: 512, requestDefaults: { maxOutputTokens: 513, chatTemplateParameters: {} } })
+      ).success
+    ).toBe(false);
+  });
+
+  const profilesSettings = (
+    overrides: Partial<Record<string, unknown>> = {}
+  ): Record<string, unknown> => ({
+    version: LOCAL_INFERENCE_SETTINGS_VERSION,
+    enabled: true,
+    profiles: [profile()],
+    defaultProfileId: 'default',
+    ...overrides
+  });
+
+  it('accepts a well-formed profiles settings object, and a null default with an empty profile list', () => {
+    expect(localInferenceProfilesSettingsSchema.safeParse(profilesSettings()).success).toBe(true);
+    expect(
+      localInferenceProfilesSettingsSchema.safeParse(
+        profilesSettings({ profiles: [], defaultProfileId: null })
+      ).success
+    ).toBe(true);
+  });
+
+  it('rejects duplicate profile ids', () => {
+    expect(
+      localInferenceProfilesSettingsSchema.safeParse(
+        profilesSettings({ profiles: [profile(), profile({ displayName: 'Second' })] })
+      ).success
+    ).toBe(false);
+  });
+
+  it('rejects a defaultProfileId that names no configured profile', () => {
+    expect(
+      localInferenceProfilesSettingsSchema.safeParse(
+        profilesSettings({ defaultProfileId: 'missing' })
+      ).success
+    ).toBe(false);
+  });
+
+  it('bounds the number of configured profiles', () => {
+    const many = Array.from({ length: LOCAL_INFERENCE_LIMITS.profilesMax + 1 }, (_value, index) =>
+      profile({ id: `profile-${index}`, displayName: `Profile ${index}` })
+    );
+    expect(
+      localInferenceProfilesSettingsSchema.safeParse(
+        profilesSettings({ profiles: many, defaultProfileId: 'profile-0' })
+      ).success
+    ).toBe(false);
+    expect(
+      localInferenceProfilesSettingsSchema.safeParse(
+        profilesSettings({ profiles: many.slice(0, LOCAL_INFERENCE_LIMITS.profilesMax), defaultProfileId: 'profile-0' })
+      ).success
+    ).toBe(true);
+  });
+
+  describe('upgradeLocalInferenceProfilesSettings', () => {
+    it('returns an already-current profiles row unchanged', () => {
+      const current = localInferenceProfilesSettingsSchema.parse(profilesSettings());
+      expect(upgradeLocalInferenceProfilesSettings(current)).toEqual(current);
+    });
+
+    it('wraps a legacy flat row as its one profile, naming it after the configured model id', () => {
+      const legacy = { ...FLAT_DEFAULT, model: { id: 'qwen3-coder-30b', source: { kind: 'runtime_id', runtimeModelId: 'qwen' } } };
+      const upgraded = upgradeLocalInferenceProfilesSettings(legacy);
+      expect(upgraded.version).toBe(LOCAL_INFERENCE_SETTINGS_VERSION);
+      expect(upgraded.defaultProfileId).toBe('default');
+      expect(upgraded.profiles).toHaveLength(1);
+      expect(upgraded.profiles[0]?.id).toBe('default');
+      expect(upgraded.profiles[0]?.displayName).toBe('qwen3-coder-30b');
+      expect(upgraded.profiles[0]?.model).toEqual(legacy.model);
+      expect(upgraded.profiles[0]?.executable).toEqual(legacy.executable);
+    });
+
+    it('falls back to the shipped default for malformed or unrecognisable data', () => {
+      // Every runtime-config field matches the shipped default; only the display name differs — this
+      // path derives it from the (fallback) model id rather than the shipped "Local model" label.
+      const shipped = defaultLocalInferenceSettings();
+      const shippedProfile = shipped.profiles[0];
+      for (const bad of [undefined, null, 'not an object', 42, { surprise: true }]) {
+        const upgraded = upgradeLocalInferenceProfilesSettings(bad);
+        expect({ ...upgraded, profiles: [{ ...upgraded.profiles[0], displayName: shippedProfile?.displayName }] }).toEqual(
+          shipped
+        );
+      }
+    });
+  });
+
+  describe('summarizeLocalInferenceProfiles', () => {
+    const settings = localInferenceProfilesSettingsSchema.parse(
+      profilesSettings({
+        profiles: [profile(), profile({ id: 'second', displayName: 'Second profile', enabled: false })],
+        defaultProfileId: 'default'
+      })
+    );
+
+    it('never exposes a path, executable, fingerprint or other machine-local detail', () => {
+      const summaries = summarizeLocalInferenceProfiles(settings, 'default', 'healthy');
+      for (const summary of summaries) {
+        expect(Object.keys(summary).sort()).toEqual(
+          ['activeStateKind', 'activity', 'displayName', 'enabled', 'id', 'isDefault'].sort()
+        );
+      }
+    });
+
+    it('marks exactly the active profile, carrying its live state kind, and the configured default', () => {
+      const summaries = summarizeLocalInferenceProfiles(settings, 'default', 'healthy');
+      expect(summaries).toEqual([
+        { id: 'default', displayName: 'Local model', enabled: true, isDefault: true, activity: 'active', activeStateKind: 'healthy' },
+        { id: 'second', displayName: 'Second profile', enabled: false, isDefault: false, activity: 'inactive', activeStateKind: null }
+      ]);
+    });
+
+    it('marks every profile inactive, with no active state kind, when none is currently selected', () => {
+      const summaries = summarizeLocalInferenceProfiles(settings, null, 'stopped');
+      expect(summaries.every((summary) => summary.activity === 'inactive')).toBe(true);
+      expect(summaries.every((summary) => summary.activeStateKind === null)).toBe(true);
+    });
+
+    it('a disabled profile can still be the active one — enabled and activity are independent', () => {
+      const summaries = summarizeLocalInferenceProfiles(settings, 'second', 'starting');
+      const second = summaries.find((summary) => summary.id === 'second');
+      expect(second).toMatchObject({ enabled: false, activity: 'active', activeStateKind: 'starting' });
+    });
   });
 });
 

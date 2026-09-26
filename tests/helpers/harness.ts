@@ -28,10 +28,11 @@ import { ProjectService } from '../../src/main/services/project-service';
 import { PublishService } from '../../src/main/services/publish-service';
 import { TaskService } from '../../src/main/services/task-service';
 import { defaultSettings } from '../../src/main/container';
-import type { OrnithInferenceLeaseService } from '../../src/main/ports';
+import type { GitAdapter, OrnithInferenceLeaseService } from '../../src/main/ports';
 import type { OrnithImplementationService } from '../../src/main/services/ornith-implementation';
 import type { ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { TaskOperationRegistry } from '../../src/main/services/task-operations';
+import { localInferenceProfileFingerprint } from '../../src/main/services/local-inference-profile-fingerprint';
 import type { Project, Settings, Task } from '../../src/shared/domain/models';
 import {
   FakeClaudeAdapter,
@@ -87,6 +88,11 @@ export function createHarness(
     processRunner?: ProcessRunner;
     /** Findings accepted from an external code review; absent in every test that is not about them. */
     externalCodeRequirements?: OrchestratorDeps['externalCodeRequirements'];
+    /**
+     * A real Git adapter for the orchestrator, for tests that drive a real temporary
+     * repository end to end. `harness.git` stays the fake and is then unused by it.
+     */
+    orchestratorGit?: GitAdapter;
   } = {}
 ): Harness {
   const tempRoot = mkdtempSync(join(tmpdir(), 'agent-relay-test-'));
@@ -155,7 +161,7 @@ export function createHarness(
     settings,
     codex,
     claude,
-    git,
+    git: options.orchestratorGit ?? git,
     clock,
     ids,
     events,
@@ -167,7 +173,8 @@ export function createHarness(
       prepareFirstAction: (...args) => continuationService.prepareFirstAction(...args),
       retargetFirstActionToVerification: (...args) =>
         continuationService.retargetFirstActionToVerification(...args),
-      assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId)
+      assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId),
+      isContinuation: (taskId) => continuationService.isContinuation(taskId)
     },
     ornith: options.ornith,
     ornithLease: options.ornithLease,
@@ -258,6 +265,30 @@ export function createHarness(
     },
 
     createTask(projectId, overrides = {}) {
+      // A caller asking for `implementationProvider: 'ornith'` without naming a profile gets bound to
+      // whichever profile Settings currently marks default — exactly what `configureProviders`/`create()`
+      // would have resolved and snapshotted for a real task, so every existing Ornith-routing test keeps
+      // working without each one having to name a profile explicitly. An override that already sets either
+      // profile field is left untouched.
+      const ornithBinding =
+        overrides.implementationProvider === 'ornith' &&
+        overrides.ornithModelProfileId === undefined &&
+        overrides.ornithModelProfileFingerprint === undefined
+          ? (() => {
+              const localInference = settings.get().localInference;
+              const profile = localInference.profiles.find((p) => p.id === localInference.defaultProfileId);
+              if (profile === undefined) return null;
+              // A real task can only ever have bound to an ENABLED profile — `resolveOrnithModelProfileBinding`
+              // requires it at creation time. Match that here so a later round's lease acquisition (which
+              // re-checks `enabled`, not just the fingerprint) succeeds exactly as it would for a real task,
+              // without each Ornith-routing test having to enable the profile itself first.
+              if (!profile.enabled) settings.update({ localInference: { ...localInference, profiles: localInference.profiles.map((p) => p.id === profile.id ? { ...p, enabled: true } : p) } });
+              return {
+                ornithModelProfileId: profile.id,
+                ornithModelProfileFingerprint: localInferenceProfileFingerprint(profile)
+              };
+            })()
+          : null;
       return tasks.create({
         id: ids.next(),
         projectId,
@@ -277,6 +308,7 @@ export function createHarness(
         specificationApprovedAt: null,
         lastReviewJson: null,
         lastError: null,
+        ...(ornithBinding ?? {}),
         ...overrides
       });
     },

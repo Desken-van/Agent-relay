@@ -51,7 +51,8 @@ export function buildScenario<R extends ExternalPlanReviewer>(reviewer: R, setti
       clock: harness.clock,
       ids: harness.ids,
       claims,
-      operations: harness.operations
+      operations: harness.operations,
+      verifyTarget: async (taskId: string) => { await harness.orchestrator.verifySpecificationGrounding(taskId); }
     });
     const loop = new PlanCorrectionService({
       tasks: harness.tasks,
@@ -65,7 +66,8 @@ export function buildScenario<R extends ExternalPlanReviewer>(reviewer: R, setti
       claims,
       operations: harness.operations,
       clock: harness.clock,
-      ids: harness.ids
+      ids: harness.ids,
+      verifyTarget: async (taskId: string) => { await harness.orchestrator.verifySpecificationGrounding(taskId); }
     });
     return { gateService, loop };
   };

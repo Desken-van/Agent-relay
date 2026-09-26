@@ -17,6 +17,7 @@ import type { GitChangeSet, RepositoryInfo, WorktreeInfo } from '../shared/domai
 import type {
   LocalInferenceCapabilities,
   LocalInferenceOutcome,
+  LocalInferenceProfileSummary,
   LocalInferenceRequest,
   LocalInferenceState
 } from '../shared/domain/local-inference';
@@ -35,6 +36,8 @@ import type {
   ContinuationClaim
 } from '../shared/domain/models';
 import type { TaskStatus } from '../shared/domain/workflow';
+import type { ImplementationProvider } from '../shared/domain/execution-providers';
+import type { SpecificationGrounding } from '../shared/domain/specification-grounding';
 import type {
   OperationEnvironment,
   OperationTarget,
@@ -119,8 +122,8 @@ export interface ProjectRepository {
   delete(id: string): void;
 }
 
-export type NewTask = Omit<Task, 'createdAt' | 'updatedAt' | 'implementationProvider' | 'reviewProvider' | 'providerRevision' | 'implementationThreadId'> &
-  Partial<Pick<Task, 'implementationProvider' | 'reviewProvider' | 'providerRevision' | 'implementationThreadId'>>;
+export type NewTask = Omit<Task, 'createdAt' | 'updatedAt' | 'implementationProvider' | 'reviewProvider' | 'providerRevision' | 'implementationThreadId' | 'ornithModelProfileId' | 'ornithModelProfileFingerprint'> &
+  Partial<Pick<Task, 'implementationProvider' | 'reviewProvider' | 'providerRevision' | 'implementationThreadId' | 'ornithModelProfileId' | 'ornithModelProfileFingerprint'>>;
 export type TaskPatch = Partial<Omit<Task, 'id' | 'projectId' | 'createdAt' | 'updatedAt'>>;
 
 export interface TaskRepository {
@@ -132,10 +135,19 @@ export interface TaskRepository {
    * running, and after a crash the rows saying so are the only trace left.
    */
   listBusy(): Task[];
+  /** Every task not yet in a terminal status, across all projects — used to guard a Settings removal that would orphan one. */
+  listNonTerminal(): Task[];
   findById(id: string): Task | null;
   create(task: NewTask): Task;
   update(id: string, patch: TaskPatch): Task;
-  changeProviders(id: string, expectedRevision: number, implementation: Task['implementationProvider'], review: Task['reviewProvider']): Task;
+  changeProviders(
+    id: string,
+    expectedRevision: number,
+    implementation: Task['implementationProvider'],
+    review: Task['reviewProvider'],
+    ornithModelProfileId: string | null,
+    ornithModelProfileFingerprint: string | null
+  ): Task;
   /** Tasks whose worktree is currently allocated — used to prevent sharing. */
   listActiveWorktreePaths(): { taskId: string; worktreePath: string }[];
   delete(id: string): void;
@@ -254,7 +266,15 @@ export interface AgentRunContext {
 }
 
 export interface CodexSpecificationRequest {
+  /**
+   * The checkout Codex reads, as the read-only sandbox root: the task worktree, or a
+   * clean temporary checkout of the base commit. Never the project's source checkout.
+   */
   readonly projectPath: string;
+  /** Which checkout and commit that is. Stated in the prompt and recorded with the result. */
+  readonly target: SpecificationGrounding;
+  /** Who will implement it; the prompt states exactly what that implementer can do. */
+  readonly implementationProvider: ImplementationProvider;
   readonly taskTitle: string;
   readonly originalRequest: string;
   /** Immutable, validated project/convention evidence bound to this task. */
@@ -367,8 +387,11 @@ export interface CodexTriageOutcome {
  * (or Auto decide) ACCEPTED — and from nothing else.
  */
 export interface CodexRevisionRequest {
-  /** The project checkout, used as the read-only sandbox root. */
+  /** The task worktree — the specification's target — used as the read-only sandbox root. */
   readonly projectPath: string;
+  /** The checkout and commit the specification being revised was generated against. */
+  readonly target: SpecificationGrounding;
+  readonly implementationProvider: ImplementationProvider;
   readonly taskTitle: string;
   /** What the user originally asked for. The revision must stay faithful to it. */
   readonly originalRequest: string;
@@ -1600,6 +1623,22 @@ export interface LocalInferenceLifecycleService {
   health(): Promise<LocalInferenceState>;
   stop(): Promise<LocalInferenceState>;
   runTestInference(prompt: string): Promise<LocalInferenceOutcome>;
+  /**
+   * Which configured profile the retained runtime is, or would next be started as. `null` means none is
+   * selected yet — `start()` then answers `unavailable` regardless of whether local inference is enabled.
+   */
+  activeProfileId(): string | null;
+  /** Read-only, bounded and safe for the renderer: every configured profile's selectability and activity. */
+  listProfiles(): readonly LocalInferenceProfileSummary[];
+  /**
+   * Choose which profile `start()` binds next. Read-only otherwise: never constructs, launches or
+   * contacts anything.
+   *
+   * @throws {AgentRelayError} `NOT_FOUND` when `profileId` names no configured profile; `BUSY` while the
+   * retained runtime is starting, healthy, inferring or stopping — switching profiles requires an
+   * explicit `stop()` first, never an implicit restart of whatever was running.
+   */
+  selectActiveProfile(profileId: string): void;
 }
 
 /**
@@ -1617,6 +1656,9 @@ export interface OrnithHealthyLease {
   readonly runtimeInstanceId: string;
   readonly providerId: string;
   readonly modelId: string;
+  /** The profile this lease was acquired against — the exact identity `acquireOrnithLease` was asked for. */
+  readonly modelProfileId: string;
+  readonly modelProfileDisplayName: string;
   /**
    * The exact context/output limits of the retained runtime configuration.
    * Captured with the provider identity so the Ornith loop can prove every
@@ -1656,12 +1698,23 @@ export interface OrnithInferenceLeaseService {
    * Acquire the one application-wide Ornith execution lease and perform one
    * bounded `health(signal)` check against the already-retained provider.
    *
+   * `expectedProfileId` is the profile the CALLER'S task is bound to (never omitted — there is no
+   * "any profile will do" caller). Acquisition fails unless the retained runtime's active profile is
+   * exactly that one, so a task can never silently run against a different model than the one it was
+   * approved against.
+   *
    * @throws {AgentRelayError} with code `BUSY` when another Ornith run
    * already holds the lease, or `VALIDATION_FAILED` when no provider is
-   * retained, the retained provider is not `healthy`, or the health check
-   * does not confirm it. Never calls `start()`.
+   * retained, the retained provider is not `healthy`, the health check does
+   * not confirm it, the active profile does not match `expectedProfileId`, or that profile's
+   * configuration no longer matches `expectedProfileFingerprint` (an operator edited it after this task
+   * was bound). Never calls `start()`.
    */
-  acquireOrnithLease(signal?: AbortSignal): Promise<OrnithHealthyLease>;
+  acquireOrnithLease(
+    expectedProfileId: string,
+    expectedProfileFingerprint: string,
+    signal?: AbortSignal
+  ): Promise<OrnithHealthyLease>;
   /**
    * Re-confirm the lease is still valid: the same provider/model identity is
    * still configured and the retained provider is still healthy right now.
@@ -1732,11 +1785,32 @@ export interface CreateWorktreeRequest {
   readonly baseBranch: string;
   readonly branchName: string;
   readonly worktreePath: string;
+  /**
+   * The commit the new branch starts at: the one a specification was generated
+   * against. Absent, the branch starts at the base branch's current tip.
+   */
+  readonly startPoint?: string;
+}
+
+export interface CreateDetachedCheckoutRequest {
+  readonly repositoryPath: string;
+  /** A full commit id. The checkout is detached: no branch is created or moved. */
+  readonly commit: string;
+  readonly checkoutPath: string;
 }
 
 export interface GitAdapter {
   inspect(repositoryPath: string): Promise<RepositoryInfo>;
   branchExists(repositoryPath: string, branch: string): Promise<boolean>;
+  /**
+   * The full commit id a ref names, or null when it definitely names no commit. A Git
+   * failure throws — it is never reported as "missing". Read-only.
+   */
+  resolveCommit(repositoryPath: string, ref: string): Promise<string | null>;
+  /** Whether `ancestor` is reachable from `descendant` (a commit is its own ancestor). Read-only. */
+  isAncestor(repositoryPath: string, ancestor: string, descendant: string): Promise<boolean>;
+  /** A detached checkout of exactly one commit, for reading only; removed with `removeWorktree`. */
+  createDetachedCheckout(request: CreateDetachedCheckoutRequest): Promise<void>;
   createWorktree(request: CreateWorktreeRequest): Promise<WorktreeInfo>;
   listWorktrees(repositoryPath: string): Promise<WorktreeInfo[]>;
   /** Non-destructive: refuses when the worktree has uncommitted changes. */

@@ -30,6 +30,8 @@ const lease = (): OrnithHealthyLease => ({
   runtimeInstanceId: 'runtime-1',
   providerId: 'local-llama-cpp',
   modelId: 'test-model',
+  modelProfileId: 'default',
+  modelProfileDisplayName: 'Local model',
   contextLimitTokens: 32_768,
   maxOutputTokens: 1_024,
   release: () => undefined,

@@ -27,6 +27,8 @@ const task = (): Task => ({
   reviewProvider: 'codex',
   providerRevision: 0,
   implementationThreadId: null,
+  ornithModelProfileId: null,
+  ornithModelProfileFingerprint: null,
   worktreePath: null,
   branchName: null,
   baseBranch: null,

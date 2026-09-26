@@ -38,9 +38,16 @@ import {
   preservedOrnithChanges,
   summarizeVerificationOutput
 } from '../../shared/domain/ornith-verification';
+import {
+  describeSpecificationTarget,
+  parseSpecificationGrounding,
+  specificationGroundingProblem,
+  specificationGroundingState
+} from '../../shared/domain/specification-grounding';
 import type { VerificationRecord } from '../../shared/domain/verification';
 import { classifyVerificationFailure } from '../../shared/domain/verification-failure';
 import { verificationConfigurationFingerprint, verificationEvidenceFingerprint } from './verification-fingerprints';
+import { resolveOrnithModelProfileBinding } from './ornith-model-profile-binding';
 import type { WorktreeDependencyStatus } from '../../shared/domain/worktree-dependencies';
 import {
   parsePlanReviewDecisions,
@@ -104,6 +111,7 @@ import {
   readBoundRuleEvidence
 } from './plan-review-gate';
 import { renderRuleEvidence } from './rule-evidence';
+import { SpecificationGroundingService } from './specification-grounding';
 import { join } from 'node:path';
 import {
   canChangeProviders,
@@ -124,6 +132,11 @@ import type { ProtectedContinuationAction } from './continuation-service';
 import type { TaskOperationRegistry } from './task-operations';
 import { redactAndTruncate } from '../../shared/util/redact';
 import { ORNITH_LIMITS, ornithRelativePathSchema, redactAbsoluteMachinePaths } from '../../shared/domain/ornith';
+import {
+  describeOrnithInstructionViolation,
+  describeOrnithInstructionViolations,
+  ornithInstructionViolations
+} from '../../shared/domain/ornith-instruction-contract';
 
 
 export interface ContinuationActionGuard {
@@ -134,6 +147,11 @@ export interface ContinuationActionGuard {
   ): Promise<() => void>;
   retargetFirstActionToVerification(taskId: string, reason: string): Promise<boolean>;
   assertSpecificationAllowed(taskId: string): void;
+  /**
+   * Whether the task continues another one. A continuation inherits its source's approved,
+   * already-implemented specification and worktree, so it has no first round of its own.
+   */
+  isContinuation(taskId: string): boolean;
 }
 
 export interface OrchestratorDeps {
@@ -174,11 +192,23 @@ export interface OrchestratorDeps {
   readonly operations?: TaskOperationRegistry;
 }
 
+/** What the operator does about a specification that cannot be tied to the task's target. */
+const REGENERATE_SPECIFICATION =
+  'Choose "Regenerate specification". Codex writes it again from the task’s own checkout; until then nothing is approved or implemented.';
+
+/** What the operator does about a specification that asks Ornith for something its protocol lacks. */
+const REWRITE_FOR_ORNITH =
+  'Choose "Regenerate specification" so Codex writes it for Ornith again, or give the task an implementer that can run commands. Nothing is approved or implemented until then.';
+
 export class Orchestrator {
   /** Live cancellation handles, keyed by task id. Presence == a run in flight. */
   private readonly inFlight = new Map<string, AbortController>();
+  /** Which checkout a specification is generated from, and whether the task still matches it. */
+  private readonly grounding: SpecificationGroundingService;
 
-  constructor(private readonly deps: OrchestratorDeps) {}
+  constructor(private readonly deps: OrchestratorDeps) {
+    this.grounding = new SpecificationGroundingService({ git: deps.git, clock: deps.clock });
+  }
 
   /* ------------------------------------------------------------------ */
   /* Shared plumbing                                                     */
@@ -579,14 +609,34 @@ export class Orchestrator {
     return record.data;
   }
 
-  configureProviders(input: { taskId: string; expectedRevision: number; implementationProvider: ImplementationProvider; reviewProvider: ReviewProvider }): Task {
+  configureProviders(input: {
+    taskId: string;
+    expectedRevision: number;
+    implementationProvider: ImplementationProvider;
+    reviewProvider: ReviewProvider;
+    /** Omitted while already `ornith` and not asking for a different profile: keeps the current binding untouched. */
+    ornithModelProfileId?: string;
+  }): Task {
     const task = this.requireTask(input.taskId);
     if (this.isRunning(task.id) || !canChangeProviders(task.status) || this.deps.runs.listByTask(task.id).some((r) => r.status === 'running')) {
       throw new AgentRelayError('INVALID_TRANSITION', 'Providers can only change while the task is idle and not approved for publication.');
     }
     const implementation = implementationProviderSchema.parse(input.implementationProvider);
     const review = reviewProviderSchema.parse(input.reviewProvider);
-    const updated = this.deps.tasks.changeProviders(task.id, input.expectedRevision, implementation, review);
+    // No explicit profile requested and the task is already ornith: keep its existing binding exactly as
+    // it is, rather than re-resolving (and possibly re-refusing) it just because providers were reapplied.
+    // Every other case — switching TO ornith, or naming a different profile while already ornith —
+    // resolves and snapshots a fresh binding.
+    const ornithBinding = implementation !== 'ornith'
+      ? null
+      : input.ornithModelProfileId === undefined && task.implementationProvider === 'ornith' &&
+        task.ornithModelProfileId !== null && task.ornithModelProfileFingerprint !== null
+        ? { profileId: task.ornithModelProfileId, profileFingerprint: task.ornithModelProfileFingerprint }
+        : resolveOrnithModelProfileBinding(this.deps.settings.get().localInference, input.ornithModelProfileId);
+    const updated = this.deps.tasks.changeProviders(
+      task.id, input.expectedRevision, implementation, review,
+      ornithBinding?.profileId ?? null, ornithBinding?.profileFingerprint ?? null
+    );
     this.deps.events.publishTask(updated);
     return updated;
   }
@@ -643,22 +693,78 @@ export class Orchestrator {
     try {
       task = this.applyEvent(task, startEvent, { lastError: null });
 
-      const result = await this.deps.codex.createSpecification(
-        {
-          projectPath: project.localPath,
-          taskTitle: task.title,
-          originalRequest: task.originalRequest,
-          ruleEvidence: this.ruleEvidenceText(task.id),
-          threadId: task.codexThreadId,
-          // Snapshotted on the task: a regenerated spec keeps the same model.
-          model: task.codexModel
-        },
-        {
-          signal: controller.signal,
-          timeoutMs: settings.processTimeoutMs,
-          onProgress: (event) => handle.append(event)
+      // Never the project's source checkout: the task worktree when it exists, else a
+      // temporary clean checkout of the base commit the task branch will be cut from.
+      handle.append({
+        type: 'log',
+        text: task.worktreePath === null
+          ? `Preparing a clean checkout of ${task.baseBranch ?? project.defaultBranch} for the specification…`
+          : 'Checking the task worktree the specification will describe…'
+      });
+      const target = await this.grounding.open({ task, project, settings });
+      handle.append({ type: 'log', text: describeSpecificationTarget(target.grounding) });
+      // A thread that read another tree remembers it. Resume only one that read this one.
+      const previous = specificationGroundingState(task);
+      const sameTarget =
+        previous.kind === 'recorded' &&
+        previous.grounding.commit === target.grounding.commit &&
+        previous.grounding.checkout === target.grounding.checkout;
+      let result: Awaited<ReturnType<CodexAdapter['createSpecification']>>;
+      try {
+        result = await this.deps.codex.createSpecification(
+          {
+            projectPath: target.path,
+            target: target.grounding,
+            implementationProvider: task.implementationProvider,
+            taskTitle: task.title,
+            originalRequest: task.originalRequest,
+            ruleEvidence: this.ruleEvidenceText(task.id),
+            threadId: sameTarget ? task.codexThreadId : null,
+            // Snapshotted on the task: a regenerated spec keeps the same model.
+            model: task.codexModel
+          },
+          {
+            signal: controller.signal,
+            timeoutMs: settings.processTimeoutMs,
+            onProgress: (event) => handle.append(event)
+          }
+        );
+        // Still the tree the record names? A commit or an edit made while Codex was reading
+        // would leave the specification describing something else under this commit's name.
+        // Refused before anything is stored: the task keeps what it had.
+        const drift = await this.grounding.confirmUnchanged(target, { task, project, settings });
+        if (drift !== null) {
+          throw new AgentRelayError(
+            'VALIDATION_FAILED',
+            `The checkout changed while Codex was reading it for the specification: ${drift} The specification was not saved.`,
+            { remediation: 'Generate the specification again once nothing is changing the task’s checkout.' }
+          );
         }
-      );
+        // Written for Ornith: held to its instruction contract before it is stored. Every
+        // violation is logged, one line each, bounded by its excerpt (EXCERPT_LIMIT characters)
+        // and the run's own stored-log budget, which says so when it is reached.
+        if (target.grounding.implementationProvider === 'ornith') {
+          const violations = ornithInstructionViolations(result.specification);
+          if (violations.length > 0) {
+            for (const violation of violations) {
+              handle.append({ type: 'log', text: describeOrnithInstructionViolation(violation) });
+            }
+            throw new AgentRelayError(
+              'VALIDATION_FAILED',
+              `${describeOrnithInstructionViolations(violations)} The specification was not saved.`,
+              { remediation: 'Generate the specification again, or give the task an implementer that can run commands.' }
+            );
+          }
+        }
+      } finally {
+        const leftover = await target.close();
+        if (leftover !== null) {
+          handle.append({
+            type: 'log',
+            text: `The temporary checkout could not be removed and will be removed before the next specification: ${leftover}`
+          });
+        }
+      }
 
       handle.finish({
         status: 'succeeded',
@@ -667,8 +773,10 @@ export class Orchestrator {
       });
 
       return this.applyEvent(task, 'specification_completed', {
-        codexThreadId: result.threadId ?? task.codexThreadId,
+        codexThreadId: result.threadId ?? (sameTarget ? task.codexThreadId : null),
         specificationJson: JSON.stringify(result.specification),
+        // Written with the specification, in the same row update: the two never disagree.
+        specificationGroundingJson: JSON.stringify(target.grounding),
         // Regenerating invalidates a previous approval — the user must look again.
         specificationApprovedAt: null,
         title: result.specification.title || task.title,
@@ -703,6 +811,11 @@ export class Orchestrator {
       );
     }
 
+    // Never approve a specification that cannot be tied to the tree it will be implemented in.
+    // The Git-level check is `verifySpecificationGrounding`, which the approval IPC runs first.
+    this.assertGroundingTrusted(task);
+    this.assertOrnithCanCarryOut(task);
+
     assertPlanReviewAllowsApproval({
       task,
       ruleEvidence: this.deps.ruleEvidence,
@@ -710,6 +823,65 @@ export class Orchestrator {
     });
 
     return this.patchTask(taskId, { specificationApprovedAt: this.deps.clock.nowIso() });
+  }
+
+  /**
+   * Whether the task's target is still exactly what its specification was generated
+   * against — the same commit, still clean if it was, for the same implementer.
+   * Read-only, except that a definite mismatch is recorded on the grounding so the
+   * Run screen offers regeneration; the call then refuses.
+   */
+  async verifySpecificationGrounding(taskId: string): Promise<Task> {
+    const task = this.requireTask(taskId);
+    return this.assertGroundingCurrent(task, this.requireProject(task.projectId), this.deps.settings.get());
+  }
+
+  /**
+   * Ornith receives the specification verbatim in every round, so one stored before its
+   * instruction contract existed — or approved for another implementer since — is refused here
+   * rather than handed to it. The text alone decides; nothing is written.
+   */
+  private assertOrnithCanCarryOut(task: Task, specification?: TaskSpecification): void {
+    if (task.implementationProvider !== 'ornith') return;
+    const violations = ornithInstructionViolations(specification ?? readSpecification(task));
+    if (violations.length > 0) {
+      throw new AgentRelayError('VALIDATION_FAILED', describeOrnithInstructionViolations(violations), {
+        remediation: REWRITE_FOR_ORNITH
+      });
+    }
+  }
+
+  /** The record alone, no Git: refuses a specification that is ungrounded, stale or for another implementer. */
+  private assertGroundingTrusted(task: Task): void {
+    const problem = specificationGroundingProblem(specificationGroundingState(task));
+    if (problem !== null) {
+      throw new AgentRelayError('VALIDATION_FAILED', problem, { remediation: REGENERATE_SPECIFICATION });
+    }
+  }
+
+  private async assertGroundingCurrent(task: Task, project: Project, settings: Settings): Promise<Task> {
+    const check = await this.grounding.check({ task, project, settings });
+    if (check.ok) return task;
+    if (check.kind === 'untrusted') {
+      throw new AgentRelayError('VALIDATION_FAILED', check.reason, { remediation: REGENERATE_SPECIFICATION });
+    }
+    // Recorded only onto the record that was checked: a specification regenerated in the
+    // meantime has a record of its own, and a stale mark must never land on it.
+    const current = this.requireTask(task.id);
+    const recorded = parseSpecificationGrounding(current.specificationGroundingJson);
+    if (current.specificationGroundingJson === task.specificationGroundingJson && recorded !== null) {
+      this.patchTask(task.id, {
+        specificationGroundingJson: JSON.stringify({
+          ...recorded,
+          stale: { detectedAt: this.deps.clock.nowIso(), reason: check.reason }
+        })
+      });
+    }
+    throw new AgentRelayError(
+      'VALIDATION_FAILED',
+      `The task’s checkout changed after the specification was generated: ${check.reason}`,
+      { remediation: REGENERATE_SPECIFICATION }
+    );
   }
 
   /** Allocate the unique task branch used as the external review-session key. */
@@ -778,6 +950,17 @@ export class Orchestrator {
       );
     }
 
+    // The branch starts at the commit the specification was generated against, not wherever
+    // the base branch is now — so the plan review and the implementation read that same tree.
+    // Refused (and recorded) when that commit is no longer on the base branch. A specification
+    // with no record keeps the old behaviour here; approval and the first round refuse it.
+    let startPoint: string | undefined;
+    const grounding = specificationGroundingState(task);
+    if (grounding.kind !== 'none' && grounding.kind !== 'ungrounded') {
+      await this.assertGroundingCurrent(task, project, settings);
+      startPoint = grounding.grounding.commit;
+    }
+
     if (!info.isClean && !options.acceptDirtyWorkingTree) {
       throw new AgentRelayError(
         'GIT_DIRTY',
@@ -828,14 +1011,17 @@ export class Orchestrator {
 
       handle.append({
         type: 'log',
-        text: `Creating branch ${branchName} from ${baseBranch} at ${worktreePath}`
+        text: startPoint === undefined
+          ? `Creating branch ${branchName} from ${baseBranch} at ${worktreePath}`
+          : `Creating branch ${branchName} from ${baseBranch} at commit ${startPoint}, the commit the specification was generated against, at ${worktreePath}`
       });
 
       const worktree = await this.deps.git.createWorktree({
         repositoryPath: info.root ?? project.localPath,
         baseBranch,
         branchName,
-        worktreePath
+        worktreePath,
+        ...(startPoint === undefined ? {} : { startPoint })
       });
 
       handle.append({ type: 'log', text: `Worktree ready at ${worktree.path}` });
@@ -883,6 +1069,8 @@ export class Orchestrator {
     });
 
     const specification = readSpecification(task);
+    // Every round hands Ornith this text again, so every round refuses one it cannot carry out.
+    this.assertOrnithCanCarryOut(task, specification);
 
     // Before the worktree, not after: creating a branch and a directory for a
     // round that cannot legally start leaves debris the user has to clean up,
@@ -893,6 +1081,14 @@ export class Orchestrator {
     let completed: Task;
     let ornithLease: OrnithHealthyLease | null = null;
     try {
+      // The first round starts from exactly the tree its specification was generated
+      // against, written for this implementer — checked before a branch, a lease or a
+      // round exists. Later rounds work on the files earlier rounds changed, by design.
+      // A continuation has no first round of its own: it inherits an implemented task.
+      if (task.currentRound === 0 && !(this.deps.continuationGuard?.isContinuation(taskId) ?? false)) {
+        await this.assertGroundingCurrent(task, project, settings);
+      }
+
       // Before worktree creation, the IMPLEMENTING transition, or round
       // consumption: an Ornith round that cannot even start must leave
       // nothing durable behind.
@@ -1192,7 +1388,21 @@ export class Orchestrator {
     if (!this.deps.ornithLease) {
       throw new AgentRelayError('TOOL_MISSING', 'Ornith is not configured in this build.');
     }
-    const lease = await this.deps.ornithLease.acquireOrnithLease(controller.signal);
+    // Bound once, at task creation or at the provider switch that made this task `ornith` — never
+    // resolved here. A task reaching this method without a binding predates that requirement (a data
+    // inconsistency the startup/migration path is responsible for preventing) and fails closed rather
+    // than guessing a profile.
+    if (task.ornithModelProfileId === null || task.ornithModelProfileFingerprint === null) {
+      throw new AgentRelayError(
+        'VALIDATION_FAILED',
+        'This task has no local-model profile bound. Switch its implementation provider to re-bind one.'
+      );
+    }
+    const lease = await this.deps.ornithLease.acquireOrnithLease(
+      task.ornithModelProfileId,
+      task.ornithModelProfileFingerprint,
+      controller.signal
+    );
     // The independently callable `localInference:stop` may stop the runtime
     // this lease is using. When it does, abort this task's own controller so
     // the Ornith loop unwinds through its normal cancellation path — release
@@ -1454,6 +1664,10 @@ export class Orchestrator {
           runtimeProviderId: lease.providerId,
           runtimeInstanceId: lease.runtimeInstanceId,
           modelId: lease.modelId,
+          // Which named profile actually served this run — what a run evidence reader answers "what ran
+          // this" with, distinct from `modelId` (the wire-protocol identity the runtime itself reports).
+          modelProfileId: lease.modelProfileId,
+          modelProfileDisplayName: lease.modelProfileDisplayName,
           counters: result.ornithAudit,
           providerFailure: result.providerFailure ?? null,
           assessment: result.assessment

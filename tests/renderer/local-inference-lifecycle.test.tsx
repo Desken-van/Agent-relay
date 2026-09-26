@@ -18,7 +18,10 @@ afterEach(() => {
 });
 
 function state(value: LocalInferenceState): Bridge {
-  return installBridge({ 'localInference:getState': () => ok<'localInference:getState'>(value) });
+  return installBridge({
+    'localInference:getState': () => ok<'localInference:getState'>(value),
+    'localInference:listProfiles': () => ok<'localInference:listProfiles'>([])
+  });
 }
 
 const CAPABILITIES: LocalInferenceCapabilities = {
@@ -42,7 +45,7 @@ function primaryButton(): HTMLElement {
 }
 
 describe('local inference lifecycle panel', () => {
-  it('shows the four required fact labels and calls only getState on mount', async () => {
+  it('shows the four required fact labels and calls only getState and listProfiles on mount', async () => {
     const bridge = state({ kind: 'stopped' });
     render(<LocalInferenceLifecyclePanel enabled unsaved={false} />);
 
@@ -52,8 +55,10 @@ describe('local inference lifecycle panel', () => {
     expect(screen.getByText('Next action')).toBeTruthy();
 
     await settle();
-    expect(bridge.calls).toHaveLength(1);
-    expect(bridge.calls[0]?.channel).toBe('localInference:getState');
+    expect(bridge.calls).toHaveLength(2);
+    expect(bridge.calls.map((call) => call.channel).sort()).toEqual(
+      ['localInference:getState', 'localInference:listProfiles'].sort()
+    );
   });
 
   it('renders exactly one lifecycle button and one Run test inference button, with no duplicate controls, across every state', async () => {

@@ -282,6 +282,9 @@ function lateBound(factories: ReturnType<typeof adapterFactories>): {
     git: {
       inspect: (path) => factories.git().inspect(path),
       branchExists: (path, branch) => factories.git().branchExists(path, branch),
+      resolveCommit: (path, ref) => factories.git().resolveCommit(path, ref),
+      isAncestor: (path, ancestor, descendant) => factories.git().isAncestor(path, ancestor, descendant),
+      createDetachedCheckout: (request) => factories.git().createDetachedCheckout(request),
       createWorktree: (request) => factories.git().createWorktree(request),
       listWorktrees: (path) => factories.git().listWorktrees(path),
       removeWorktree: (repo, path) => factories.git().removeWorktree(repo, path),
@@ -462,7 +465,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
       prepareFirstAction: (...args) => continuationService.prepareFirstAction(...args),
       retargetFirstActionToVerification: (...args) =>
         continuationService.retargetFirstActionToVerification(...args),
-      assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId)
+      assertSpecificationAllowed: (taskId) => continuationService.assertSpecificationAllowed(taskId),
+      isContinuation: (taskId) => continuationService.isContinuation(taskId)
     },
     // Ornith reuses the same LocalInferenceService instance the Local
     // inference lifecycle IPC handlers use; the Ornith surface it exposes
@@ -563,7 +567,10 @@ export function buildApplication(options: BuildApplicationOptions): Application 
       codex: adapters.codex,
       settings,
       clock,
-      ids
+      ids,
+      verifyTarget: async (taskId) => {
+        await orchestrator.verifySpecificationGrounding(taskId);
+      }
     });
 
   return {
@@ -615,7 +622,10 @@ export function buildApplication(options: BuildApplicationOptions): Application 
         operations: taskOperations,
         clock,
         ids,
-        events: options.events
+        events: options.events,
+        verifyTarget: async (taskId) => {
+          await orchestrator.verifySpecificationGrounding(taskId);
+        }
       }),
     reconciliation,
     close: () => closeDatabase(db)
