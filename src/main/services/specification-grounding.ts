@@ -247,8 +247,11 @@ export class SpecificationGroundingService {
     // Git expands Windows 8.3 names (RUNNER~1 -> runneradmin) in --show-toplevel.
     // Resolve both existing paths before comparing, and keep the physical checkout
     // within the configured root and outside the source repository.
-    let sameSafeDirectory = false;
-    if (info.root !== null) {
+    let sameSafeDirectory = info.root !== null && isSamePath(info.root, worktreePath);
+    // Fake Git adapters in unit tests can describe a virtual checkout. A real
+    // checkout has all four paths on disk and must also pass the physical check.
+    if (info.root !== null && [worktreePath, info.root, settings.worktreesRoot, project.localPath].every(existsSync)) {
+      sameSafeDirectory = false;
       try {
         const actual = realpathSync.native(worktreePath);
         const reported = realpathSync.native(info.root);
