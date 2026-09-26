@@ -91,7 +91,8 @@ describe('after Ornith changed files and could not prove them verified', () => {
       exitCode: 1,
       durationMs: 511_795,
       reason: 'npm run verify exited with code 1 after 8m32s.',
-      output: ' FAIL  tests/adapters/native.test.ts > guard\n Test Files  1 failed | 118 passed (119)'
+      output: ' FAIL  tests/adapters/native.test.ts > guard\n Test Files  1 failed | 118 passed (119)',
+      modelProfileDisplayName: null
     });
     expect(value.tone).toBe('warning');
     expectConsistent(value);
@@ -299,7 +300,8 @@ describe('after Agent Relay’s own verification of the worktree', () => {
       exitCode: 1,
       durationMs: 511_795,
       reason: 'npm run verify failed (exit 1): a test assertion failed. The current files did not pass.',
-      output: ' FAIL  tests/a.test.ts\nAssertionError: expected 1 to be 2\n Test Files  1 failed'
+      output: ' FAIL  tests/a.test.ts\nAssertionError: expected 1 to be 2\n Test Files  1 failed',
+      modelProfileDisplayName: null
     });
   });
 

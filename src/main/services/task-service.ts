@@ -21,6 +21,7 @@ import type {
   TaskContinuationRepository,
   TaskRepository
 } from '../ports';
+import { resolveOrnithModelProfileBinding } from './ornith-model-profile-binding';
 
 export interface CreateTaskInput {
   readonly projectId: string;
@@ -44,6 +45,13 @@ export interface CreateTaskInput {
   readonly claudeModel?: string | null;
   readonly implementationProvider?: ImplementationProvider;
   readonly reviewProvider?: ReviewProvider;
+  /**
+   * Two-state, unlike `codexModel`/`claudeModel`: a local-model profile IS the whole runtime a round
+   * runs against, so there is no "tool default" to fall back to. Omitted means "use Settings' current
+   * default local-model profile" — resolved and snapshotted right here, never re-resolved later. Ignored
+   * unless `implementationProvider` is `'ornith'`.
+   */
+  readonly ornithModelProfileId?: string;
 }
 
 export interface TaskServiceDeps {
@@ -82,6 +90,12 @@ export class TaskService {
     // Settings define the ceiling; a task may ask for fewer rounds but not more.
     const maxRounds = Math.min(Math.max(1, requested), settings.maxReviewRounds);
 
+    const implementationProvider = input.implementationProvider ?? 'claude';
+    // Resolved and snapshotted here, once — never re-resolved against Settings' default on a later round.
+    const ornithBinding = implementationProvider === 'ornith'
+      ? resolveOrnithModelProfileBinding(settings.localInference, input.ornithModelProfileId)
+      : null;
+
     const task = this.deps.tasks.create({
       id: this.deps.ids.next(),
       projectId: project.id,
@@ -101,7 +115,9 @@ export class TaskService {
       lastError: null,
       codexModel,
       claudeModel,
-      implementationProvider: input.implementationProvider ?? 'claude',
+      ornithModelProfileId: ornithBinding?.profileId ?? null,
+      ornithModelProfileFingerprint: ornithBinding?.profileFingerprint ?? null,
+      implementationProvider,
       reviewProvider: input.reviewProvider ?? 'codex'
     });
 

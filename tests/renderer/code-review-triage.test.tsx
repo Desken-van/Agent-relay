@@ -33,6 +33,8 @@ const task = (overrides: Partial<Task> = {}): Task => ({
   reviewProvider: 'codex',
   providerRevision: 0,
   implementationThreadId: null,
+  ornithModelProfileId: null,
+  ornithModelProfileFingerprint: null,
   worktreePath: 'C:\\worktree',
   branchName: 'agent/task-1',
   baseBranch: 'main',

@@ -203,6 +203,11 @@ describe('Local inference Electron acceptance', () => {
       await settingsCard.waitFor();
       const saveButton = page.getByRole('button', { name: 'Save settings' });
 
+      // The shipped default ships as one unopened profile row; open its editor
+      // before touching any of its per-field controls below.
+      await settingsCard.getByRole('button', { name: /Local model/ }).click();
+      await settingsCard.getByText(/^Editing: Local model/).waitFor();
+
       // Invalid edit first: a reserved fixed argument must disable Save and
       // send no update.
       await settingsCard.getByLabel(/^Fixed runtime arguments/).fill('--port\n9999');
@@ -230,6 +235,8 @@ describe('Local inference Electron acceptance', () => {
 
       const lifecycle = card(page, 'Local inference lifecycle');
       await lifecycle.waitFor();
+      // Which profile the runtime acts on is a separate, explicit choice from saving Settings.
+      await lifecycle.getByRole('combobox', { name: /^Active profile/ }).selectOption('default');
       await lifecycle.getByRole('button', { name: 'Check capabilities' }).click();
       await expect.poll(async () => lifecycle.textContent()).toMatch(/Executable available: yes/);
       await lifecycle.getByRole('button', { name: /Start runtime/ }).waitFor();
@@ -343,9 +350,14 @@ describe('Local inference Electron acceptance', () => {
       const persistedFirst = inspectProfile(profile);
       expect(persistedFirst.localInference).toMatchObject({
         enabled: true,
-        executable: { kind: 'explicit_path', path: FAKE_LOCAL_INFERENCE_RUNTIME_PATH },
-        model: { source: { kind: 'runtime_id', runtimeModelId: 'fake-model' } },
-        port
+        profiles: [
+          {
+            id: 'default',
+            executable: { kind: 'explicit_path', path: FAKE_LOCAL_INFERENCE_RUNTIME_PATH },
+            model: { source: { kind: 'runtime_id', runtimeModelId: 'fake-model' } },
+            port
+          }
+        ]
       });
       const persistedLocalInferenceText = JSON.stringify(persistedFirst.localInference);
       for (const sentinel of NON_PERSISTENCE_SENTINELS) {
@@ -392,17 +404,22 @@ describe('Local inference Electron acceptance', () => {
       await second.page.getByRole('button', { name: 'Settings' }).click();
       const reopenedCard = card(second.page, /^Local inference$/);
       await reopenedCard.waitFor();
+      expect(await reopenedCard.getByLabel(/^Enable local inference/).isChecked()).toBe(true);
+      await reopenedCard.getByRole('button', { name: /Local model/ }).click();
+      await reopenedCard.getByText(/^Editing: Local model/).waitFor();
       await expect
         .poll(async () => reopenedCard.getByLabel(/^Port/).inputValue())
         .toBe(String(port));
-      expect(await reopenedCard.getByLabel(/^Enable local inference/).isChecked()).toBe(true);
 
-      // Opening the lifecycle panel performs only getState; it must not have
-      // probed, launched, health-checked, inferred or started anything on its
-      // own, and the prompt/result from the previous session must be gone.
+      // Opening the lifecycle panel performs only getState and listProfiles; it must not have probed,
+      // launched, health-checked, inferred or started anything on its own. Nothing selects a profile on
+      // restart either — "no profile selected" is the strongest possible proof nothing auto-started, and
+      // the prompt/result from the previous session must be gone.
       const reopenedLifecycle = card(second.page, 'Local inference lifecycle');
       await reopenedLifecycle.waitFor();
-      await expect.poll(async () => reopenedLifecycle.textContent()).toMatch(/Stopped/);
+      await expect.poll(async () => reopenedLifecycle.textContent()).toMatch(
+        /No local-model profile is selected/
+      );
       const reopenedText = await reopenedLifecycle.textContent();
       expect(reopenedText).not.toContain('Completion');
       expect(reopenedText).not.toContain(REDACTED_COMPLETION_TEXT);

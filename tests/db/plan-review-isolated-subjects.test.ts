@@ -102,8 +102,8 @@ describe('migration 20 (plan-review-isolated-subjects)', () => {
   it('follows the previous one, and is applied exactly once', () => {
     expect(MIGRATIONS[19]).toMatchObject({ version: 20, name: 'plan-review-isolated-subjects' });
     const db = databaseAt(19);
-    // 20, and 21 (specification grounding) after it.
-    expect(runMigrations(db)).toBe(2);
+    // 20 through 23 remain to run from here.
+    expect(runMigrations(db)).toBe(4);
     expect(runMigrations(db)).toBe(0);
   });
 
@@ -112,7 +112,7 @@ describe('migration 20 (plan-review-isolated-subjects)', () => {
     seedStuckPair(db);
     const before = db.prepare('SELECT * FROM plan_review_gates ORDER BY id').all() as Record<string, unknown>[];
 
-    expect(runMigrations(db)).toBe(2);
+    expect(runMigrations(db)).toBe(4);
 
     const after = db.prepare('SELECT * FROM plan_review_gates ORDER BY id').all() as Record<string, unknown>[];
     expect(after).toHaveLength(2);

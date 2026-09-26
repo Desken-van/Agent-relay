@@ -123,7 +123,13 @@ describe('migrations', () => {
       legacy.exec(`CREATE TABLE schema_migrations (
         version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
       )`);
-      for (const migration of MIGRATIONS.filter((entry) => entry.version < 12)) {
+      // Apply the current repository's columns early so it can create historical fixture rows.
+      // Migration 12 rebuilds tasks, so it must precede migrations 21–23.
+      for (const migration of [
+        ...MIGRATIONS.filter((entry) => entry.version < 12),
+        ...MIGRATIONS.filter((entry) => entry.version === 12),
+        ...MIGRATIONS.filter((entry) => entry.version >= 21)
+      ]) {
         migration.up(legacy);
         legacy.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
           .run(migration.version, migration.name, '2026-09-13T00:00:00.000Z');
@@ -148,11 +154,8 @@ describe('migrations', () => {
         baseBranch: 'main', lastReviewJson: null, lastError: 'Process exited with code 1.'
       });
 
-      // Migrations 12 (Ornith), 13 (this test's review-limit subject),
-      // 14 (review-blocked-status), 15 (compatibility repair), 16
-      // (Coai contract fingerprint), 17 (plan-review triage), 18
-      // (code-review triage), 19, 20 and 21 (specification grounding) are pending.
-      expect(runMigrations(legacy)).toBe(10);
+      // Migrations 13–20 remain pending.
+      expect(runMigrations(legacy)).toBe(8);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_LIMIT_REACHED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');
       expect(() => tasks.create({
@@ -173,7 +176,11 @@ describe('migrations', () => {
       legacy.exec(`CREATE TABLE schema_migrations (
         version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
       )`);
-      for (const migration of MIGRATIONS.filter((entry) => entry.version < 13)) {
+      // Apply migrations 21–23 early so the current task repository can create historical fixtures.
+      for (const migration of [
+        ...MIGRATIONS.filter((entry) => entry.version < 13),
+        ...MIGRATIONS.filter((entry) => entry.version >= 21)
+      ]) {
         migration.up(legacy);
         legacy.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
           .run(migration.version, migration.name, '2026-09-13T00:00:00.000Z');
@@ -213,11 +220,8 @@ describe('migrations', () => {
         baseBranch: 'main', lastReviewJson: null, lastError: 'Process exited with code 1.'
       });
 
-      // Migrations 13 (review-limit-status), 14 (this test's review-blocked
-      // subject), 15 (compatibility repair), 16 (Coai contract
-      // fingerprint), 17 (plan-review triage), 18 (code-review triage),
-      // 19, 20 and 21 (specification grounding) are still pending.
-      expect(runMigrations(legacy)).toBe(9);
+      // Migrations 13–20 remain pending.
+      expect(runMigrations(legacy)).toBe(8);
       expect(tasks.findById(stopped.id)?.status).toBe('REVIEW_BLOCKED');
       expect(tasks.findById(staleEvidence.id)?.status).toBe('FAILED');
       expect(tasks.findById(genuineFailure.id)?.status).toBe('FAILED');

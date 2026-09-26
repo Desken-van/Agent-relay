@@ -6,7 +6,7 @@ import {
   type ReviewProvider
 } from '@shared/domain/execution-providers';
 import { latestClaudeRoundResult } from '@shared/domain/claude-assessment';
-import type { LocalInferenceStateKind } from '@shared/domain/local-inference';
+import type { LocalInferenceProfileSummary, LocalInferenceStateKind } from '@shared/domain/local-inference';
 import type { GitChangeSet } from '@shared/domain/git';
 import { APPROVAL_ACTIONS, type ApprovalAction, type Run, type Task } from '@shared/domain/models';
 import {
@@ -85,6 +85,9 @@ function VerificationDetail({ detail }: { detail: NonNullable<RunGuidance['verif
   return <section className="run-guide__verification" aria-label="Verification attempt">
     <h4>{detail.source === 'ornith' ? 'Ornith verification attempt' : 'Agent Relay verification'}</h4>
     <dl>
+      {detail.modelProfileDisplayName !== null ? (
+        <div><dt>Local-model profile</dt><dd>{detail.modelProfileDisplayName}</dd></div>
+      ) : null}
       <div><dt>Command</dt><dd className="mono">{detail.command}</dd></div>
       <div><dt>Outcome</dt><dd>{VERIFICATION_OUTCOME_LABEL[detail.outcome]}</dd></div>
       {detail.exitCode !== null ? <div><dt>Exit code</dt><dd>{detail.exitCode}</dd></div> : null}
@@ -168,20 +171,77 @@ export function PrimaryActionButton({
 }
 
 export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: boolean; onChanged: (task: Task) => void | Promise<void> }): React.JSX.Element {
+  const { settings } = useStore();
   const [implementation, setImplementation] = useState<ImplementationProvider | null>(null);
   const [review, setReview] = useState<ReviewProvider | null>(null);
+  // `null` = untouched: keep the task's existing binding (if already ornith)
+  // or fall back to Settings' current default (if newly switching to ornith).
+  // Set only when the operator explicitly picks a different profile.
+  const [ornithProfileId, setOrnithProfileId] = useState<string | null>(null);
+  const [profiles, setProfiles] = useState<readonly LocalInferenceProfileSummary[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const claim = useRef(false);
   const implementationValue = implementation ?? task.implementationProvider;
   const reviewValue = review ?? task.reviewProvider;
   const disabled = busy || saving || !canChangeProviders(task.status);
-  const differs = implementationValue !== task.implementationProvider || reviewValue !== task.reviewProvider;
+  const differs =
+    implementationValue !== task.implementationProvider ||
+    reviewValue !== task.reviewProvider ||
+    (implementationValue === 'ornith' && ornithProfileId !== null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const response = await call('localInference:listProfiles', {});
+      if (!cancelled && response.ok) setProfiles(response.data);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Mount-only: this panel is short-lived and Settings is the always-current source.
+  }, []);
+
+  const defaultProfile = profiles.find((profile) => profile.isDefault) ?? null;
+  const boundProfile =
+    task.ornithModelProfileId !== null
+      ? (profiles.find((profile) => profile.id === task.ornithModelProfileId) ?? null)
+      : null;
+
+  // Never silently falls back: Apply stays disabled with a visible, specific reason for every way the
+  // EFFECTIVE choice (what would actually be sent) is unready. Keeping an already-bound task's EXISTING
+  // profile (`ornithProfileId === null` while already ornith) is always fine regardless of current
+  // settings — `configureProviders` reuses that binding unchanged rather than re-resolving it, mirroring
+  // the New-task form's own `resolveOrnithModelProfileBinding` checks for every other case.
+  function ornithUnavailableReason(): string | null {
+    if (implementationValue !== 'ornith') return null;
+    if (task.implementationProvider === 'ornith' && ornithProfileId === null) return null;
+    if (!(settings?.localInference.enabled ?? false)) {
+      return 'Local inference is disabled. Enable it in Settings → Local inference.';
+    }
+    if (profiles.length === 0) {
+      return 'No local-model profile is configured. Add one in Settings → Local inference.';
+    }
+    const effective = ornithProfileId === null ? defaultProfile : profiles.find((profile) => profile.id === ornithProfileId);
+    if (!effective) {
+      return 'Choose a local-model profile, or set a default in Settings → Local inference.';
+    }
+    if (!effective.enabled) {
+      return `The profile "${effective.displayName}" is disabled. Enable it in Settings, or choose another.`;
+    }
+    return null;
+  }
+  const ornithReason = ornithUnavailableReason();
+
   return <details className="provider-controls" aria-label="AI provider settings">
     <summary>
       <span>AI providers</span>
       <span className="provider-controls__summary">
-        {providerLabel(task.implementationProvider)} implements · {providerLabel(task.reviewProvider)} reviews
+        {providerLabel(task.implementationProvider)}
+        {task.implementationProvider === 'ornith'
+          ? ` (${boundProfile?.displayName ?? task.ornithModelProfileId ?? 'no profile bound'})`
+          : ''}{' '}
+        implements · {providerLabel(task.reviewProvider)} reviews
       </span>
     </summary>
     <div className="stack provider-controls__body">
@@ -191,10 +251,47 @@ export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: 
         </select>
       </Field>
       {implementationValue === 'ornith' ? (
-        <p className="hint">
-          Ornith uses the local runtime configured under Settings → Local inference. It must
-          already be started and Healthy — Agent Relay never starts or restarts it.
-        </p>
+        <>
+          <p className="hint">
+            Ornith runs through Agent Relay&apos;s own local coding-agent protocol, against the
+            model profile bound below. That profile&apos;s runtime must already be started and
+            Healthy — Agent Relay never starts or restarts it.
+          </p>
+          {task.implementationProvider === 'ornith' && task.ornithModelProfileId !== null && boundProfile === null ? (
+            <Notice tone="warn">
+              This task&apos;s bound local-model profile ({task.ornithModelProfileId}) is no
+              longer configured. Choose another profile before running implementation again.
+            </Notice>
+          ) : null}
+          <Field
+            label="Local-model profile"
+            hint="Bound at the moment providers are applied. A later Settings edit never silently changes an already-bound task."
+          >
+            <select
+              className="input"
+              aria-label="Local-model profile"
+              value={ornithProfileId ?? ''}
+              disabled={disabled}
+              onChange={(e) => setOrnithProfileId(e.target.value === '' ? null : e.target.value)}
+            >
+              <option value="">
+                {task.implementationProvider === 'ornith' && task.ornithModelProfileId !== null
+                  ? `Keep current (${boundProfile?.displayName ?? task.ornithModelProfileId})`
+                  : defaultProfile
+                    ? `Use default (${defaultProfile.displayName})`
+                    : 'Use default (none configured)'}
+              </option>
+              {profiles.map((profile) => (
+                <option key={profile.id} value={profile.id} disabled={!profile.enabled}>
+                  {profile.displayName}
+                  {profile.isDefault ? ' (default)' : ''}
+                  {profile.enabled ? '' : ' — disabled'}
+                </option>
+              ))}
+            </select>
+          </Field>
+          {ornithReason ? <Notice tone="warn">{ornithReason}</Notice> : null}
+        </>
       ) : null}
       <Field label="Review provider">
         <select className="input" aria-label="Review provider" value={reviewValue} disabled={disabled} onChange={(e) => setReview(e.target.value as ReviewProvider)}>
@@ -205,13 +302,21 @@ export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: 
           persisted providers — there is nothing to apply, so there is no
           control to show. It reappears the moment either selection differs. */}
       {differs || saving ? (
-        <button type="button" className="btn btn--sm" disabled={disabled} onClick={() => {
+        <button type="button" className="btn btn--sm" disabled={disabled || ornithReason !== null} onClick={() => {
           if (claim.current) return;
           claim.current = true; setSaving(true); setError(null);
           void (async () => {
             try {
-              const updated = await expect('workflow:configureProviders', { taskId: task.id, expectedRevision: task.providerRevision, implementationProvider: implementationValue, reviewProvider: reviewValue });
-              await onChanged(updated); setImplementation(null); setReview(null);
+              const updated = await expect('workflow:configureProviders', {
+                taskId: task.id,
+                expectedRevision: task.providerRevision,
+                implementationProvider: implementationValue,
+                reviewProvider: reviewValue,
+                ...(implementationValue === 'ornith' && ornithProfileId !== null
+                  ? { ornithModelProfileId: ornithProfileId }
+                  : {})
+              });
+              await onChanged(updated); setImplementation(null); setReview(null); setOrnithProfileId(null);
             } catch (err) { setError(err instanceof Error ? err.message : 'Could not update providers.'); }
             finally { claim.current = false; setSaving(false); }
           })();

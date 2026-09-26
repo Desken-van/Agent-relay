@@ -89,6 +89,15 @@ describe('ToolDiagnosticsService: Ornith slice stays passive', () => {
       },
       runTestInference: async () => {
         throw new Error('runTestInference() must never be called by diagnostics.');
+      },
+      activeProfileId: () => {
+        throw new Error('activeProfileId() must never be called by diagnostics.');
+      },
+      listProfiles: () => {
+        throw new Error('listProfiles() must never be called by diagnostics.');
+      },
+      selectActiveProfile: () => {
+        throw new Error('selectActiveProfile() must never be called by diagnostics.');
       }
     };
     const events: EventPublisher = { publishDiagnostics: () => undefined } as unknown as EventPublisher;

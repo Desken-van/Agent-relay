@@ -252,6 +252,15 @@ describe('a specification written for an implementer that can run commands, on a
     const project = harness.createProject();
     const task = harness.createTask(project.id);
     await harness.orchestrator.generateSpecification(task.id);
+    const localInference = harness.settings.get().localInference;
+    harness.settings.update({
+      localInference: {
+        ...localInference,
+        profiles: localInference.profiles.map((profile) =>
+          profile.id === localInference.defaultProfileId ? { ...profile, enabled: true } : profile
+        )
+      }
+    });
     const revision = harness.tasks.findById(task.id)!.providerRevision;
     harness.orchestrator.configureProviders({ taskId: task.id, expectedRevision: revision, implementationProvider: 'ornith', reviewProvider: 'codex' });
 

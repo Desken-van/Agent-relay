@@ -7,7 +7,10 @@ import { closeDatabase, openDatabase } from '../../src/main/db/database';
 import { MIGRATIONS, runMigrations } from '../../src/main/db/migrations';
 import { SqliteSettingsRepository } from '../../src/main/db/repositories/settings-repository';
 import { createSqliteDatabase } from '../../src/main/db/sqlite';
-import { defaultLocalInferenceSettings } from '../../src/shared/domain/local-inference';
+import {
+  defaultLocalInferenceSettings,
+  type LocalInferenceProfilesSettings
+} from '../../src/shared/domain/local-inference';
 
 const roots: string[] = [];
 
@@ -23,7 +26,42 @@ function tempDatabase(): { root: string; file: string } {
 
 const defaults = () => defaultSettings({ dataDir: 'C:\\data', documentsDir: 'C:\\docs' });
 
-describe('migrations 9 and 11 through 15', () => {
+/** The shipped default with its one profile's runtime config patched, leaving id/displayName alone. */
+function withDefaultProfile(
+  patch: Partial<LocalInferenceProfilesSettings['profiles'][number]>
+): LocalInferenceProfilesSettings {
+  const base = defaultLocalInferenceSettings();
+  return {
+    ...base,
+    profiles: base.profiles.map((profile) =>
+      profile.id === base.defaultProfileId ? { ...profile, ...patch } : profile
+    )
+  };
+}
+
+describe('migrations 9 and 11 through 23', () => {
+  it('rejects a database where migration 21 came from the other branch', () => {
+    const db = createSqliteDatabase(':memory:');
+    try {
+      db.exec(`CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
+      )`);
+      for (const migration of MIGRATIONS.filter((entry) => entry.version <= 20)) {
+        migration.up(db);
+        db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
+          .run(migration.version, migration.name, '2026-09-26T00:00:00.000Z');
+      }
+      db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
+        .run(21, 'local-inference-profiles', '2026-09-26T00:00:00.000Z');
+
+      expect(() => runMigrations(db)).toThrow(/Migration 21 name mismatch/);
+      expect((db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get() as { count: number }).count)
+        .toBe(21);
+    } finally {
+      db.close();
+    }
+  });
+
   it('are appended after unchanged migrations and preserve the local-inference row', () => {
     expect(MIGRATIONS.map(({ version, name }) => ({ version, name }))).toEqual([
       { version: 1, name: 'initial-schema' },
@@ -46,7 +84,9 @@ describe('migrations 9 and 11 through 15', () => {
       { version: 18, name: 'code-review-triage' },
       { version: 19, name: 'plan-auto-decisions-and-corrections' },
       { version: 20, name: 'plan-review-isolated-subjects' },
-      { version: 21, name: 'specification-grounding' }
+      { version: 21, name: 'specification-grounding' },
+      { version: 22, name: 'local-inference-profiles' },
+      { version: 23, name: 'ornith-model-profile' }
     ]);
 
     const db = createSqliteDatabase(':memory:');
@@ -62,15 +102,14 @@ describe('migrations 9 and 11 through 15', () => {
       );
     }
 
-    // A row already in the current shape (as if migration 9 had already run
-    // under a build that already had request defaults): 9 and 11 both leave
-    // it untouched.
-    const existing = { ...defaultLocalInferenceSettings(), port: 23456 };
+    // A row already in the current (profile) shape: 9, 11 and 22 all leave it untouched — 22's own
+    // upgrade function returns an already-valid row unchanged rather than re-wrapping it.
+    const existing = withDefaultProfile({ port: 23456 });
     db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run(
       'localInference',
       JSON.stringify(existing)
     );
-    expect(runMigrations(db)).toBe(13);
+    expect(runMigrations(db)).toBe(15);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };
@@ -120,20 +159,22 @@ describe('migrations 9 and 11 through 15', () => {
       JSON.stringify('kept-across-migration')
     );
 
-    expect(runMigrations(db)).toBe(11);
+    expect(runMigrations(db)).toBe(13);
 
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };
-    const upgraded = JSON.parse(row.value);
-    expect(upgraded.executable).toEqual(legacy.executable);
-    expect(upgraded.model).toEqual(legacy.model);
-    expect(upgraded.fixedArguments).toEqual(legacy.fixedArguments);
-    expect(upgraded.port).toBe(legacy.port);
-    expect(upgraded.contextLimitTokens).toBe(legacy.contextLimitTokens);
-    expect(upgraded.startupTimeoutMs).toBe(legacy.startupTimeoutMs);
+    const upgraded = JSON.parse(row.value) as LocalInferenceProfilesSettings;
+    const profile = upgraded.profiles.find((candidate) => candidate.id === upgraded.defaultProfileId);
+    expect(profile).toBeDefined();
+    expect(profile?.executable).toEqual(legacy.executable);
+    expect(profile?.model).toEqual(legacy.model);
+    expect(profile?.fixedArguments).toEqual(legacy.fixedArguments);
+    expect(profile?.port).toBe(legacy.port);
+    expect(profile?.contextLimitTokens).toBe(legacy.contextLimitTokens);
+    expect(profile?.startupTimeoutMs).toBe(legacy.startupTimeoutMs);
     expect(upgraded.enabled).toBe(false);
-    expect(upgraded.requestDefaults).toEqual({ maxOutputTokens: 2048, chatTemplateParameters: {} });
+    expect(profile?.requestDefaults).toEqual({ maxOutputTokens: 2048, chatTemplateParameters: {} });
 
     const owner = db.prepare('SELECT value FROM settings WHERE key = ?').get('githubOwner') as {
       value: string;
@@ -157,11 +198,17 @@ describe('migrations 9 and 11 through 15', () => {
     }
     db.prepare('UPDATE settings SET value = ? WHERE key = ?').run('{not valid json', 'localInference');
 
-    expect(runMigrations(db)).toBe(11);
+    expect(runMigrations(db)).toBe(13);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };
-    expect(JSON.parse(row.value)).toEqual(defaultLocalInferenceSettings());
+    const upgraded = JSON.parse(row.value) as LocalInferenceProfilesSettings;
+    const profile = upgraded.profiles.find((candidate) => candidate.id === upgraded.defaultProfileId);
+    expect(profile).toBeDefined();
+    // Every runtime-config field matches the shipped single-config default; only the display name differs
+    // — migration 22's upgrade path derives it from the (fallback) model id rather than the shipped label.
+    const shippedProfile = defaultLocalInferenceSettings().profiles[0];
+    expect({ ...profile, displayName: shippedProfile?.displayName }).toEqual(shippedProfile);
     db.close();
   });
 });
@@ -172,13 +219,13 @@ describe('local-inference Settings persistence', () => {
     const repository = new SqliteSettingsRepository(db, defaults());
     expect(repository.get().localInference).toEqual(defaultLocalInferenceSettings());
 
-    repository.update({ githubOwner: 'kept-owner', localInference: { ...defaultLocalInferenceSettings(), port: 18080 } });
+    repository.update({ githubOwner: 'kept-owner', localInference: withDefaultProfile({ port: 18080 }) });
     db.prepare('UPDATE settings SET value = ? WHERE key = ?').run('{bad json', 'localInference');
     expect(repository.get().localInference).toEqual(defaultLocalInferenceSettings());
     expect(repository.get().githubOwner).toBe('kept-owner');
 
     db.prepare('UPDATE settings SET value = ? WHERE key = ?').run(
-      JSON.stringify({ ...defaultLocalInferenceSettings(), port: 0 }),
+      JSON.stringify(withDefaultProfile({ port: 0 })),
       'localInference'
     );
     expect(repository.get().localInference).toEqual(defaultLocalInferenceSettings());
@@ -192,7 +239,7 @@ describe('local-inference Settings persistence', () => {
     expect(() =>
       repository.update({
         githubOwner: 'must-not-land',
-        localInference: { ...defaultLocalInferenceSettings(), port: 0 }
+        localInference: withDefaultProfile({ port: 0 })
       })
     ).toThrow(/not valid/i);
     expect(repository.get().githubOwner).toBe(defaults().githubOwner);
@@ -203,25 +250,23 @@ describe('local-inference Settings persistence', () => {
   it.each([
     {
       label: 'explicit executable and path model',
-      localInference: {
-        ...defaultLocalInferenceSettings(),
+      localInference: withDefaultProfile({
         executable: { kind: 'explicit_path' as const, path: 'C:\\tools\\llama-server.exe' },
         model: { id: 'path-model', source: { kind: 'path' as const, path: 'C:\\models\\model.gguf' } },
         fixedArguments: ['--threads', '3'],
         port: 19001
-      }
+      })
     },
     {
       label: 'discovered executable and runtime-id model',
-      localInference: {
-        ...defaultLocalInferenceSettings(),
+      localInference: withDefaultProfile({
         model: {
           id: 'runtime-model',
           source: { kind: 'runtime_id' as const, runtimeModelId: 'runtime-model-q4' }
         },
         fixedArguments: ['--threads=4'],
         port: 19002
-      }
+      })
     }
   ])('round-trips $label across SQLite reopen', ({ localInference }) => {
     const { file } = tempDatabase();

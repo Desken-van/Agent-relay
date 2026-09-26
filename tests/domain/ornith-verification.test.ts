@@ -303,7 +303,16 @@ describe('readOrnithRunEvidence', () => {
 
   it('treats a run recorded before these fields existed as having none, not as an error', () => {
     const evidence = readOrnithRunEvidence(run(JSON.stringify({ counters: { changedFiles: 1 }, assessment: { reasonCodes: [] } })));
-    expect(evidence).toEqual({ changedFiles: 1, worktreeChangedFiles: null, attempts: [], reasonCodes: [], deadlineExpired: false });
+    expect(evidence).toEqual({
+      changedFiles: 1,
+      worktreeChangedFiles: null,
+      attempts: [],
+      reasonCodes: [],
+      deadlineExpired: false,
+      modelProfileId: null,
+      modelProfileDisplayName: null,
+      modelId: null
+    });
   });
 
   it('skips a damaged attempt instead of failing the read', () => {

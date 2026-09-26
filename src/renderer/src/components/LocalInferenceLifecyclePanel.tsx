@@ -22,9 +22,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { call } from '../lib/api';
 import {
+  isLocalInferenceActive,
   localInferencePromptSchema,
   type LocalInferenceCapabilities,
   type LocalInferenceFinishReason,
+  type LocalInferenceProfileSummary,
   type LocalInferenceResponse,
   type LocalInferenceState,
   type LocalInferenceStateKind
@@ -37,7 +39,7 @@ const IPC_ERROR_MESSAGE_MAX = 500;
 const IPC_TRANSPORT_FAILURE_REASON =
   'The local inference request failed before a typed response was received.';
 
-type PanelOperation = 'capabilities' | 'start' | 'health' | 'refresh' | 'inference' | 'stop';
+type PanelOperation = 'capabilities' | 'start' | 'health' | 'refresh' | 'inference' | 'stop' | 'selectProfile';
 type PendingOperation = PanelOperation | null;
 
 /** What the primary button currently offers, independent of pending/unsaved overlays. */
@@ -248,6 +250,7 @@ export function LocalInferenceLifecyclePanel({
 }: LocalInferenceLifecyclePanelProps): React.JSX.Element {
   const [state, setState] = useState<LocalInferenceState | null>(null);
   const [capabilities, setCapabilities] = useState<LocalInferenceCapabilities | null>(null);
+  const [profiles, setProfiles] = useState<readonly LocalInferenceProfileSummary[]>([]);
   const [whatHappened, setWhatHappened] = useState<string>('No lifecycle action taken yet.');
   const [result, setResult] = useState<string>('—');
   const [pending, setPending] = useState<PendingOperation>(null);
@@ -270,14 +273,18 @@ export function LocalInferenceLifecyclePanel({
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const response = await call('localInference:getState', {});
+      const [stateResponse, profilesResponse] = await Promise.all([
+        call('localInference:getState', {}),
+        call('localInference:listProfiles', {})
+      ]);
       if (cancelled) return;
-      if (response.ok) setState(response.data);
+      if (stateResponse.ok) setState(stateResponse.data);
+      if (profilesResponse.ok) setProfiles(profilesResponse.data);
     })();
     return () => {
       cancelled = true;
     };
-    // Mount-only: opening the panel reads state once and never again on its own.
+    // Mount-only: opening the panel reads state (and the profile list) once and never again on its own.
   }, []);
 
   const primary = projectPrimaryAction({ enabled, unsaved, state, capabilities, pending });
@@ -285,6 +292,48 @@ export function LocalInferenceLifecyclePanel({
     pending !== null ||
     (state !== null && STOP_APPLICABLE_KINDS.includes(state.kind));
   const stopDisabled = pending !== null;
+
+  const activeProfile = profiles.find((profile) => profile.activity === 'active') ?? null;
+  // Matches `LocalInferenceService.selectActiveProfile`'s own BUSY refusal: a profile switch is
+  // only meaningful while nothing is retained and actively using the runtime.
+  const profileSelectDisabled = pending !== null || (state !== null && isLocalInferenceActive(state.kind));
+
+  async function runSelectProfile(profileId: string): Promise<void> {
+    if (pendingRef.current !== null) return;
+    if (activeProfile?.id === profileId) return;
+    const operation: PanelOperation = 'selectProfile';
+    pendingRef.current = operation;
+    setPending(operation);
+    const epoch = ++stateOperationEpochRef.current;
+    try {
+      const response = await call('localInference:selectProfile', { profileId });
+      if (epoch !== stateOperationEpochRef.current) return;
+      if (response.ok) {
+        // The service discards any retained (stopped-state) provider on a profile switch, so
+        // prior capabilities and the manual test-inference result no longer describe what's
+        // selected now.
+        setCapabilities(null);
+        setTestInference(null);
+        setWhatHappened('Selected local-model profile.');
+        setResult('—');
+        const [stateResponse, profilesResponse] = await Promise.all([
+          call('localInference:getState', {}),
+          call('localInference:listProfiles', {})
+        ]);
+        if (epoch !== stateOperationEpochRef.current) return;
+        if (stateResponse.ok) setState(stateResponse.data);
+        if (profilesResponse.ok) setProfiles(profilesResponse.data);
+      } else {
+        setWhatHappened('Selecting profile failed.');
+        setResult(response.error.message);
+      }
+    } finally {
+      if (pendingRef.current === operation) {
+        pendingRef.current = null;
+        setPending(null);
+      }
+    }
+  }
 
   // The prompt editor's own enabling condition is deliberately independent of
   // prompt *content*: an operator must be able to focus the field and type a
@@ -480,6 +529,34 @@ export function LocalInferenceLifecyclePanel({
   return (
     <Card title="Local inference lifecycle">
       <div className="stack">
+        {profiles.length === 0 ? (
+          <Notice tone="info">
+            No local-model profiles are configured. Add one in Settings → Local inference before
+            starting the runtime.
+          </Notice>
+        ) : (
+          <Field
+            label="Active profile"
+            hint="Which configured model this runtime is (or would next start as). Switching requires the runtime to be stopped first."
+          >
+            <select
+              className="input"
+              value={activeProfile?.id ?? ''}
+              disabled={profileSelectDisabled}
+              onChange={(event) => void runSelectProfile(event.target.value)}
+            >
+              {activeProfile === null ? <option value="">Select a profile…</option> : null}
+              {profiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.displayName}
+                  {profile.isDefault ? ' (default)' : ''}
+                  {profile.enabled ? '' : ' (disabled for new tasks)'}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
+
         <div className="row">
           <strong>What happened</strong>
           <span>{whatHappened}</span>

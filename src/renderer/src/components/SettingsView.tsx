@@ -18,8 +18,9 @@ import {
 } from '@shared/domain/models';
 import {
   chatTemplateParametersSchema,
-  localInferenceSettingsSchema,
-  type LocalInferenceSettings
+  localInferenceProfilesSettingsSchema,
+  type LocalInferenceProfile,
+  type LocalInferenceProfilesSettings
 } from '@shared/domain/local-inference';
 import { containsSecretShape } from '@shared/util/redact';
 import { call, expect } from '../lib/api';
@@ -228,7 +229,75 @@ export function SettingsView(): React.JSX.Element {
     return problems;
   }, [draft]);
 
-  const setLocalInference = (next: LocalInferenceSettings): void => set('localInference', next);
+  const setLocalInference = (next: LocalInferenceProfilesSettings): void => set('localInference', next);
+
+  /** Which profile the form below edits. Defaults to the first configured one, or none if there is none yet. */
+  const [editingProfileId, setEditingProfileId] = useState<string | null>(null);
+  const editingIndex = draft?.localInference.profiles.findIndex((profile) => profile.id === editingProfileId) ?? -1;
+  const editingProfile = editingIndex >= 0 ? draft!.localInference.profiles[editingIndex]! : null;
+
+  /** A fresh profile, distinct id from every one already configured, sensible starting values to edit. */
+  const newProfile = (): LocalInferenceProfile => {
+    const existing = new Set((draft?.localInference.profiles ?? []).map((profile) => profile.id));
+    let n = (draft?.localInference.profiles.length ?? 0) + 1;
+    let id = `profile-${n}`;
+    while (existing.has(id)) { n += 1; id = `profile-${n}`; }
+    return {
+      id,
+      displayName: `Local model ${n}`,
+      enabled: false,
+      adapterKind: 'llama_cpp',
+      executable: { kind: 'discovered', command: 'llama-server' },
+      model: { id: 'local-model', source: { kind: 'runtime_id', runtimeModelId: 'local-model' } },
+      fixedArguments: [],
+      port: 8080,
+      contextLimitTokens: 4096,
+      startupTimeoutMs: 600_000,
+      healthTimeoutMs: 60_000,
+      inferenceTimeoutMs: 1_800_000,
+      shutdownTimeoutMs: 60_000,
+      requestDefaults: { maxOutputTokens: 4096, chatTemplateParameters: {} }
+    };
+  };
+
+  const addProfile = (): void => {
+    if (!draft) return;
+    const profile = newProfile();
+    setLocalInference({
+      ...draft.localInference,
+      profiles: [...draft.localInference.profiles, profile],
+      defaultProfileId: draft.localInference.defaultProfileId ?? profile.id
+    });
+    setEditingProfileId(profile.id);
+    setFixedArgumentsText(null);
+    setChatTemplateParametersText(null);
+    setChatTemplateParametersJsonError(null);
+  };
+
+  const deleteProfile = (id: string): void => {
+    if (!draft) return;
+    const profiles = draft.localInference.profiles.filter((profile) => profile.id !== id);
+    setLocalInference({
+      ...draft.localInference,
+      profiles,
+      // A default that no longer exists is not left dangling — the New-task form must never pre-select a
+      // profile that is gone, and "no default, choose explicitly" is itself a legitimate, visible state.
+      defaultProfileId: draft.localInference.defaultProfileId === id ? null : draft.localInference.defaultProfileId
+    });
+    if (editingProfileId === id) {
+      setEditingProfileId(null);
+      setFixedArgumentsText(null);
+      setChatTemplateParametersText(null);
+      setChatTemplateParametersJsonError(null);
+    }
+  };
+
+  const setEditingProfile = (next: LocalInferenceProfile): void => {
+    if (!draft || editingIndex < 0) return;
+    const profiles = draft.localInference.profiles.slice();
+    profiles[editingIndex] = next;
+    setLocalInference({ ...draft.localInference, profiles });
+  };
 
   /**
    * Local-inference validation, in the user's own words.
@@ -243,7 +312,7 @@ export function SettingsView(): React.JSX.Element {
     const problems: string[] = [];
     if (chatTemplateParametersJsonError) problems.push(chatTemplateParametersJsonError);
 
-    const validated = localInferenceSettingsSchema.safeParse(draft.localInference);
+    const validated = localInferenceProfilesSettingsSchema.safeParse(draft.localInference);
     if (!validated.success) {
       for (const issue of validated.error.issues) {
         const path = issue.path.join('.');
@@ -420,11 +489,12 @@ export function SettingsView(): React.JSX.Element {
             <Card title="Local inference">
               <div className="stack">
                 <Notice tone="info">
-                  Selecting Ornith as a task&apos;s implementation provider reuses this exact
-                  configured runtime — there is no second executable, endpoint or model to set
-                  up. Choosing Ornith never starts it: the runtime must already be started and
-                  Healthy below. Every Ornith implementation rechecks health itself immediately
-                  before it runs, and Stop here remains independent of any running task.
+                  Selecting Ornith as a task&apos;s implementation provider runs it through Agent
+                  Relay&apos;s own local coding-agent protocol against one of the profiles below — never a
+                  second executable or endpoint to set up, only a choice of which model. Choosing Ornith
+                  never starts anything: the profile a task is bound to must already be selected and
+                  started below, and Healthy. Every Ornith implementation rechecks health itself
+                  immediately before it runs, and Stop here remains independent of any running task.
                 </Notice>
                 <label className="row" style={{ alignItems: 'flex-start' }}>
                   <input
@@ -437,273 +507,328 @@ export function SettingsView(): React.JSX.Element {
                   <span>
                     <strong>Enable local inference</strong>
                     <span className="muted" style={{ display: 'block', marginTop: 3 }}>
-                      Off by default. No executable is discovered, launched or contacted while
-                      disabled — the lifecycle panel below stays inert.
+                      Off by default. No executable is discovered, launched or contacted for any profile
+                      while disabled — the lifecycle panel below stays inert.
                     </span>
                   </span>
                 </label>
 
-                <Field label="Executable" hint="Discover llama-server on PATH, or name an absolute path explicitly.">
-                  <select
-                    className="input"
-                    value={draft.localInference.executable.kind}
-                    onChange={(event) =>
-                      setLocalInference({
-                        ...draft.localInference,
-                        executable:
-                          event.target.value === 'discovered'
-                            ? { kind: 'discovered', command: 'llama-server' }
-                            : { kind: 'explicit_path', path: '' }
-                      })
-                    }
-                  >
-                    <option value="discovered">Discover llama-server on PATH</option>
-                    <option value="explicit_path">Explicit executable path</option>
-                  </select>
-                </Field>
-                {draft.localInference.executable.kind === 'explicit_path' ? (
-                  <Field label="Executable path">
-                    <input
-                      className="input input--mono"
-                      value={draft.localInference.executable.path}
-                      onChange={(event) =>
-                        setLocalInference({
-                          ...draft.localInference,
-                          executable: { kind: 'explicit_path', path: event.target.value }
-                        })
-                      }
-                    />
-                  </Field>
-                ) : null}
+                <div className="stack stack--tight" aria-label="Local-model profiles">
+                  <div className="section-title">Model profiles</div>
+                  {draft.localInference.profiles.length === 0 ? (
+                    <p className="hint">No profiles configured yet.</p>
+                  ) : (
+                    draft.localInference.profiles.map((profile) => (
+                      <div className="filerow" key={profile.id}>
+                        <label className="row" style={{ gap: 6 }}>
+                          <input
+                            type="radio"
+                            name="default-local-inference-profile"
+                            checked={draft.localInference.defaultProfileId === profile.id}
+                            onChange={() => setLocalInference({ ...draft.localInference, defaultProfileId: profile.id })}
+                            aria-label={`Set "${profile.displayName}" as the default profile`}
+                          />
+                          <span className="faint" title="Default profile for a new task that names none explicitly">default</span>
+                        </label>
+                        <label className="row" style={{ gap: 6 }}>
+                          <input
+                            type="checkbox"
+                            checked={profile.enabled}
+                            onChange={(event) => {
+                              const profiles = draft.localInference.profiles.map((p) =>
+                                p.id === profile.id ? { ...p, enabled: event.target.checked } : p
+                              );
+                              setLocalInference({ ...draft.localInference, profiles });
+                            }}
+                            aria-label={`Enable "${profile.displayName}" for new task selection`}
+                          />
+                          <span className="faint">enabled</span>
+                        </label>
+                        <button
+                          type="button"
+                          className="filerow__path"
+                          style={{ background: 'none', border: 'none', textAlign: 'left', cursor: 'pointer', color: 'inherit', font: 'inherit', padding: 0 }}
+                          onClick={() => {
+                            setEditingProfileId(profile.id);
+                            setFixedArgumentsText(null);
+                            setChatTemplateParametersText(null);
+                            setChatTemplateParametersJsonError(null);
+                          }}
+                        >
+                          {profile.displayName}{' '}
+                          <span className="mono faint">({profile.id})</span>
+                        </button>
+                        <button type="button" className="btn btn--sm btn--ghost" onClick={() => deleteProfile(profile.id)}>
+                          Delete
+                        </button>
+                      </div>
+                    ))
+                  )}
+                  <button type="button" className="btn btn--sm" onClick={addProfile}>
+                    Add profile
+                  </button>
+                </div>
 
-                <Field label="Model id" hint="The stable identity used in --alias and in every request/response. Never a path.">
-                  <input
-                    className="input input--mono"
-                    value={draft.localInference.model.id}
-                    onChange={(event) =>
-                      setLocalInference({
-                        ...draft.localInference,
-                        model: { ...draft.localInference.model, id: event.target.value }
-                      })
-                    }
-                  />
-                </Field>
-                <Field label="Model source" hint="Where the runtime finds the weights.">
-                  <select
-                    className="input"
-                    value={draft.localInference.model.source.kind}
-                    onChange={(event) =>
-                      setLocalInference({
-                        ...draft.localInference,
-                        model: {
-                          ...draft.localInference.model,
-                          source:
-                            event.target.value === 'path'
-                              ? { kind: 'path', path: '' }
-                              : { kind: 'runtime_id', runtimeModelId: '' }
+                {editingProfile ? (
+                  <div className="stack" aria-label={`Editing profile ${editingProfile.displayName}`}>
+                    <div className="section-title">Editing: {editingProfile.displayName}</div>
+
+                    <Field label="Profile name" hint="Shown wherever this profile is offered, e.g. on the New task screen.">
+                      <input
+                        className="input"
+                        value={editingProfile.displayName}
+                        onChange={(event) => setEditingProfile({ ...editingProfile, displayName: event.target.value })}
+                      />
+                    </Field>
+
+                    <Field label="Executable" hint="Discover llama-server on PATH, or name an absolute path explicitly.">
+                      <select
+                        className="input"
+                        value={editingProfile.executable.kind}
+                        onChange={(event) =>
+                          setEditingProfile({
+                            ...editingProfile,
+                            executable:
+                              event.target.value === 'discovered'
+                                ? { kind: 'discovered', command: 'llama-server' }
+                                : { kind: 'explicit_path', path: '' }
+                          })
                         }
-                      })
-                    }
-                  >
-                    <option value="path">Model file path</option>
-                    <option value="runtime_id">Runtime-resolved identifier</option>
-                  </select>
-                </Field>
-                {draft.localInference.model.source.kind === 'path' ? (
-                  <Field label="Model path">
-                    <input
-                      className="input input--mono"
-                      value={draft.localInference.model.source.path}
-                      onChange={(event) =>
-                        setLocalInference({
-                          ...draft.localInference,
-                          model: {
-                            ...draft.localInference.model,
-                            source: { kind: 'path', path: event.target.value }
+                      >
+                        <option value="discovered">Discover llama-server on PATH</option>
+                        <option value="explicit_path">Explicit executable path</option>
+                      </select>
+                    </Field>
+                    {editingProfile.executable.kind === 'explicit_path' ? (
+                      <Field label="Executable path">
+                        <input
+                          className="input input--mono"
+                          value={editingProfile.executable.path}
+                          onChange={(event) =>
+                            setEditingProfile({
+                              ...editingProfile,
+                              executable: { kind: 'explicit_path', path: event.target.value }
+                            })
                           }
-                        })
+                        />
+                      </Field>
+                    ) : null}
+
+                    <Field label="Model id" hint="The stable identity used in --alias and in every request/response. Never a path.">
+                      <input
+                        className="input input--mono"
+                        value={editingProfile.model.id}
+                        onChange={(event) =>
+                          setEditingProfile({
+                            ...editingProfile,
+                            model: { ...editingProfile.model, id: event.target.value }
+                          })
+                        }
+                      />
+                    </Field>
+                    <Field label="Model source" hint="Where the runtime finds the weights.">
+                      <select
+                        className="input"
+                        value={editingProfile.model.source.kind}
+                        onChange={(event) =>
+                          setEditingProfile({
+                            ...editingProfile,
+                            model: {
+                              ...editingProfile.model,
+                              source:
+                                event.target.value === 'path'
+                                  ? { kind: 'path', path: '' }
+                                  : { kind: 'runtime_id', runtimeModelId: '' }
+                            }
+                          })
+                        }
+                      >
+                        <option value="path">Model file path</option>
+                        <option value="runtime_id">Runtime-resolved identifier</option>
+                      </select>
+                    </Field>
+                    {editingProfile.model.source.kind === 'path' ? (
+                      <Field label="Model path">
+                        <input
+                          className="input input--mono"
+                          value={editingProfile.model.source.path}
+                          onChange={(event) =>
+                            setEditingProfile({
+                              ...editingProfile,
+                              model: {
+                                ...editingProfile.model,
+                                source: { kind: 'path', path: event.target.value }
+                              }
+                            })
+                          }
+                        />
+                      </Field>
+                    ) : (
+                      <Field label="Runtime model identifier">
+                        <input
+                          className="input input--mono"
+                          value={editingProfile.model.source.runtimeModelId}
+                          onChange={(event) =>
+                            setEditingProfile({
+                              ...editingProfile,
+                              model: {
+                                ...editingProfile.model,
+                                source: { kind: 'runtime_id', runtimeModelId: event.target.value }
+                              }
+                            })
+                          }
+                        />
+                      </Field>
+                    )}
+
+                    <Field
+                      label="Fixed runtime arguments"
+                      hint="One argv entry per line. Never shell-parsed. Model, alias, host, port and context flags are owned by Agent Relay and cannot be overridden here."
+                    >
+                      <textarea
+                        className="input input--mono"
+                        rows={3}
+                        spellCheck={false}
+                        value={fixedArgumentsText ?? editingProfile.fixedArguments.join('\n')}
+                        onChange={(event) => {
+                          setFixedArgumentsText(event.target.value);
+                          setEditingProfile({
+                            ...editingProfile,
+                            fixedArguments: event.target.value
+                              .split('\n')
+                              .map((line) => line.trim())
+                              .filter((line) => line.length > 0)
+                          });
+                        }}
+                      />
+                    </Field>
+
+                    <Field label="Port" hint="Loopback only (127.0.0.1); the host is never configurable.">
+                      <input
+                        type="number"
+                        className="input"
+                        value={editingProfile.port}
+                        onChange={(event) => setEditingProfile({ ...editingProfile, port: Number(event.target.value) })}
+                      />
+                    </Field>
+                    <Field label="Context size (tokens)">
+                      <input
+                        type="number"
+                        className="input"
+                        value={editingProfile.contextLimitTokens}
+                        onChange={(event) =>
+                          setEditingProfile({ ...editingProfile, contextLimitTokens: Number(event.target.value) })
+                        }
+                      />
+                    </Field>
+                    <Field label="Default max output tokens" hint="May not exceed the context size.">
+                      <input
+                        type="number"
+                        className="input"
+                        value={editingProfile.requestDefaults.maxOutputTokens}
+                        onChange={(event) =>
+                          setEditingProfile({
+                            ...editingProfile,
+                            requestDefaults: {
+                              ...editingProfile.requestDefaults,
+                              maxOutputTokens: Number(event.target.value)
+                            }
+                          })
+                        }
+                      />
+                    </Field>
+
+                    <Field label="Startup timeout (ms)">
+                      <input
+                        type="number"
+                        className="input"
+                        value={editingProfile.startupTimeoutMs}
+                        onChange={(event) =>
+                          setEditingProfile({ ...editingProfile, startupTimeoutMs: Number(event.target.value) })
+                        }
+                      />
+                    </Field>
+                    <Field label="Health timeout (ms)">
+                      <input
+                        type="number"
+                        className="input"
+                        value={editingProfile.healthTimeoutMs}
+                        onChange={(event) =>
+                          setEditingProfile({ ...editingProfile, healthTimeoutMs: Number(event.target.value) })
+                        }
+                      />
+                    </Field>
+                    <Field label="Inference timeout (ms)">
+                      <input
+                        type="number"
+                        className="input"
+                        value={editingProfile.inferenceTimeoutMs}
+                        onChange={(event) =>
+                          setEditingProfile({ ...editingProfile, inferenceTimeoutMs: Number(event.target.value) })
+                        }
+                      />
+                    </Field>
+                    <Field label="Stop timeout (ms)">
+                      <input
+                        type="number"
+                        className="input"
+                        value={editingProfile.shutdownTimeoutMs}
+                        onChange={(event) =>
+                          setEditingProfile({ ...editingProfile, shutdownTimeoutMs: Number(event.target.value) })
+                        }
+                      />
+                    </Field>
+
+                    <Field
+                      label="Default chat-template parameters"
+                      hint={
+                        'A flat JSON object of strings, numbers or booleans, e.g. Ornith: ' +
+                        '{"enable_thinking": false, "preserve_thinking": false}. Empty {} sends none.'
                       }
-                    />
-                  </Field>
+                    >
+                      <textarea
+                        className="input input--mono"
+                        rows={3}
+                        spellCheck={false}
+                        value={
+                          chatTemplateParametersText ??
+                          JSON.stringify(editingProfile.requestDefaults.chatTemplateParameters)
+                        }
+                        onChange={(event) => {
+                          const raw = event.target.value;
+                          setChatTemplateParametersText(raw);
+                          // A blank or whitespace-only textarea is the empty map,
+                          // not a JSON parse failure — clearing every configured
+                          // parameter must not require typing a literal "{}".
+                          const candidate = raw.trim().length === 0 ? {} : parseJsonOrFailure(raw);
+                          if (candidate === JSON_PARSE_FAILED) {
+                            setChatTemplateParametersJsonError(
+                              'Chat-template parameters must be valid JSON.'
+                            );
+                            return;
+                          }
+                          const validated = chatTemplateParametersSchema.safeParse(candidate);
+                          if (!validated.success) {
+                            setChatTemplateParametersJsonError(
+                              'Chat-template parameters must be a flat object of strings, numbers or booleans.'
+                            );
+                            return;
+                          }
+                          setChatTemplateParametersJsonError(null);
+                          setEditingProfile({
+                            ...editingProfile,
+                            requestDefaults: {
+                              ...editingProfile.requestDefaults,
+                              chatTemplateParameters: validated.data
+                            }
+                          });
+                        }}
+                      />
+                    </Field>
+                  </div>
                 ) : (
-                  <Field label="Runtime model identifier">
-                    <input
-                      className="input input--mono"
-                      value={draft.localInference.model.source.runtimeModelId}
-                      onChange={(event) =>
-                        setLocalInference({
-                          ...draft.localInference,
-                          model: {
-                            ...draft.localInference.model,
-                            source: { kind: 'runtime_id', runtimeModelId: event.target.value }
-                          }
-                        })
-                      }
-                    />
-                  </Field>
+                  <p className="hint">Select a profile above to edit it, or add a new one.</p>
                 )}
-
-                <Field
-                  label="Fixed runtime arguments"
-                  hint="One argv entry per line. Never shell-parsed. Model, alias, host, port and context flags are owned by Agent Relay and cannot be overridden here."
-                >
-                  <textarea
-                    className="input input--mono"
-                    rows={3}
-                    spellCheck={false}
-                    value={fixedArgumentsText ?? draft.localInference.fixedArguments.join('\n')}
-                    onChange={(event) => {
-                      setFixedArgumentsText(event.target.value);
-                      setLocalInference({
-                        ...draft.localInference,
-                        fixedArguments: event.target.value
-                          .split('\n')
-                          .map((line) => line.trim())
-                          .filter((line) => line.length > 0)
-                      });
-                    }}
-                  />
-                </Field>
-
-                <Field label="Port" hint="Loopback only (127.0.0.1); the host is never configurable.">
-                  <input
-                    type="number"
-                    className="input"
-                    value={draft.localInference.port}
-                    onChange={(event) =>
-                      setLocalInference({ ...draft.localInference, port: Number(event.target.value) })
-                    }
-                  />
-                </Field>
-                <Field label="Context size (tokens)">
-                  <input
-                    type="number"
-                    className="input"
-                    value={draft.localInference.contextLimitTokens}
-                    onChange={(event) =>
-                      setLocalInference({
-                        ...draft.localInference,
-                        contextLimitTokens: Number(event.target.value)
-                      })
-                    }
-                  />
-                </Field>
-                <Field label="Default max output tokens" hint="May not exceed the context size.">
-                  <input
-                    type="number"
-                    className="input"
-                    value={draft.localInference.requestDefaults.maxOutputTokens}
-                    onChange={(event) =>
-                      setLocalInference({
-                        ...draft.localInference,
-                        requestDefaults: {
-                          ...draft.localInference.requestDefaults,
-                          maxOutputTokens: Number(event.target.value)
-                        }
-                      })
-                    }
-                  />
-                </Field>
-
-                <Field label="Startup timeout (ms)">
-                  <input
-                    type="number"
-                    className="input"
-                    value={draft.localInference.startupTimeoutMs}
-                    onChange={(event) =>
-                      setLocalInference({
-                        ...draft.localInference,
-                        startupTimeoutMs: Number(event.target.value)
-                      })
-                    }
-                  />
-                </Field>
-                <Field label="Health timeout (ms)">
-                  <input
-                    type="number"
-                    className="input"
-                    value={draft.localInference.healthTimeoutMs}
-                    onChange={(event) =>
-                      setLocalInference({
-                        ...draft.localInference,
-                        healthTimeoutMs: Number(event.target.value)
-                      })
-                    }
-                  />
-                </Field>
-                <Field label="Inference timeout (ms)">
-                  <input
-                    type="number"
-                    className="input"
-                    value={draft.localInference.inferenceTimeoutMs}
-                    onChange={(event) =>
-                      setLocalInference({
-                        ...draft.localInference,
-                        inferenceTimeoutMs: Number(event.target.value)
-                      })
-                    }
-                  />
-                </Field>
-                <Field label="Stop timeout (ms)">
-                  <input
-                    type="number"
-                    className="input"
-                    value={draft.localInference.shutdownTimeoutMs}
-                    onChange={(event) =>
-                      setLocalInference({
-                        ...draft.localInference,
-                        shutdownTimeoutMs: Number(event.target.value)
-                      })
-                    }
-                  />
-                </Field>
-
-                <Field
-                  label="Default chat-template parameters"
-                  hint={
-                    'A flat JSON object of strings, numbers or booleans, e.g. Ornith: ' +
-                    '{"enable_thinking": false, "preserve_thinking": false}. Empty {} sends none.'
-                  }
-                >
-                  <textarea
-                    className="input input--mono"
-                    rows={3}
-                    spellCheck={false}
-                    value={
-                      chatTemplateParametersText ??
-                      JSON.stringify(draft.localInference.requestDefaults.chatTemplateParameters)
-                    }
-                    onChange={(event) => {
-                      const raw = event.target.value;
-                      setChatTemplateParametersText(raw);
-                      // A blank or whitespace-only textarea is the empty map,
-                      // not a JSON parse failure — clearing every configured
-                      // parameter must not require typing a literal "{}".
-                      const candidate = raw.trim().length === 0 ? {} : parseJsonOrFailure(raw);
-                      if (candidate === JSON_PARSE_FAILED) {
-                        setChatTemplateParametersJsonError(
-                          'Chat-template parameters must be valid JSON.'
-                        );
-                        return;
-                      }
-                      const validated = chatTemplateParametersSchema.safeParse(candidate);
-                      if (!validated.success) {
-                        setChatTemplateParametersJsonError(
-                          'Chat-template parameters must be a flat object of strings, numbers or booleans.'
-                        );
-                        return;
-                      }
-                      setChatTemplateParametersJsonError(null);
-                      setLocalInference({
-                        ...draft.localInference,
-                        requestDefaults: {
-                          ...draft.localInference.requestDefaults,
-                          chatTemplateParameters: validated.data
-                        }
-                      });
-                    }}
-                  />
-                </Field>
 
                 {localInferenceProblems.length > 0 ? (
                   <Notice tone="error">

@@ -139,7 +139,14 @@ export const LOCAL_INFERENCE_LIMITS = {
   runtimeResponseIdMax: 128,
   finishReasonMax: 64,
   /** Diagnostics carried on a state or an outcome. Never a body or an argv. */
-  reasonMax: 500
+  reasonMax: 500,
+
+  /** A profile's own identity, distinct from `providerId` (a fixed application constant, never user data). */
+  profileIdMax: 64,
+  /** What the operator calls a profile. Prose, not an argv token. */
+  profileDisplayNameMax: 80,
+  /** Operator-typed configuration, not user-generated content — a handful is the expected count. */
+  profilesMax: 16
 } as const;
 
 /* -------------------------------------------------------------------------- */
@@ -410,61 +417,166 @@ export const localInferenceRequestDefaultsSchema = z
 export type LocalInferenceRequestDefaults = z.infer<typeof localInferenceRequestDefaultsSchema>;
 
 /**
- * The operator-owned, durable part of the local-inference configuration.
+ * The nine fields that describe one runtime's operating conditions — what a
+ * "model profile" is, however many of them Settings goes on to hold. Shared
+ * by {@link localInferenceSettingsSchema} (today's single retained
+ * configuration) and {@link localInferenceProfileSchema} (one entry in a
+ * list of them) so the two can never drift on what a runtime configuration
+ * actually contains; only the wrapper around this shape differs.
+ */
+const localInferenceRuntimeConfigShape = z.object({
+  executable: localInferenceExecutableSchema,
+  model: localInferenceModelSchema,
+  fixedArguments: z
+    .array(fixedArgumentSchema)
+    .max(
+      LOCAL_INFERENCE_LIMITS.fixedArgumentsMax,
+      `At most ${LOCAL_INFERENCE_LIMITS.fixedArgumentsMax} fixed runtime arguments may be supplied.`
+    ),
+  port: z
+    .number()
+    .int('A port must be a whole number.')
+    .min(1, 'A port must be between 1 and 65535.')
+    .max(65535, 'A port must be between 1 and 65535.'),
+  contextLimitTokens: boundedInt(LOCAL_INFERENCE_LIMITS.contextTokensMax, 'The context limit'),
+  startupTimeoutMs: boundedInt(LOCAL_INFERENCE_LIMITS.startupTimeoutMsMax, 'The startup timeout'),
+  healthTimeoutMs: boundedInt(LOCAL_INFERENCE_LIMITS.healthTimeoutMsMax, 'The health timeout'),
+  inferenceTimeoutMs: boundedInt(
+    LOCAL_INFERENCE_LIMITS.inferenceTimeoutMsMax,
+    'The inference timeout'
+  ),
+  shutdownTimeoutMs: boundedInt(LOCAL_INFERENCE_LIMITS.shutdownTimeoutMsMax, 'The shutdown timeout'),
+  requestDefaults: localInferenceRequestDefaultsSchema
+});
+
+/** A request default may only ever LOWER the ceiling a request could ask for, never raise it past the model's own window. */
+function checkOutputCeiling(
+  value: { requestDefaults: { maxOutputTokens: number }; contextLimitTokens: number },
+  ctx: z.RefinementCtx
+): void {
+  if (value.requestDefaults.maxOutputTokens > value.contextLimitTokens) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['requestDefaults', 'maxOutputTokens'],
+      message: 'The default output token cap may not exceed the context limit.'
+    });
+  }
+}
+
+/**
+ * The operator-owned, durable part of ONE runtime's local-inference configuration.
  *
  * Process policy (provider identity, working directory and all output/body
  * ceilings) is intentionally absent. The main process supplies those trusted
  * values when it assembles a complete {@link LocalInferenceConfig}.
+ *
+ * Kept as its own schema, distinct from {@link localInferenceProfileSchema},
+ * because it is also the frozen shape {@link upgradeLegacyLocalInferenceSettings}
+ * upgrades TOWARDS — a shape migration 21 and its successors must be able to
+ * keep naming exactly, regardless of how the profile list around it changes.
  */
-export const localInferenceSettingsSchema = z
-  .object({
+export const localInferenceSettingsSchema = localInferenceRuntimeConfigShape
+  .extend({
     version: z.literal(LOCAL_INFERENCE_CONTRACT_VERSION),
     /** Opt-in. A managed runtime is never discovered, launched or contacted while false. */
+    enabled: z.boolean()
+  })
+  .strict()
+  .superRefine(checkOutputCeiling);
+
+export type LocalInferenceSettings = z.infer<typeof localInferenceSettingsSchema>;
+
+/** A safe display id: letters, digits, dot, underscore, hyphen, starting alphanumeric — see `safeIdSchema`. */
+const profileIdSchema = safeIdSchema(LOCAL_INFERENCE_LIMITS.profileIdMax, 'profile id');
+
+/** What the operator calls a profile. Prose shown in menus, never parsed, never an argv token. */
+const profileDisplayNameSchema = z
+  .string()
+  .min(1, 'A profile name is required.')
+  .max(
+    LOCAL_INFERENCE_LIMITS.profileDisplayNameMax,
+    `A profile name may be at most ${LOCAL_INFERENCE_LIMITS.profileDisplayNameMax} characters.`
+  )
+  .refine((value) => !hasControlCharacter(value), 'A profile name may not contain control characters.');
+
+/**
+ * One named local-model configuration: today always a llama.cpp-compatible runtime, distinguished from a
+ * future kind of local-inference adapter (never built or half-built here) by `adapterKind` — a discriminant
+ * so a later variant (for instance a remote OpenAI-compatible endpoint) can join this same array as a
+ * sibling shape without this field, or the array's element type, having to change again. No such variant
+ * exists yet, and no credential field of any kind is added by this schema or by adding one later here would
+ * still need its own storage decision — plaintext is never the answer, and nothing here assumes it will be.
+ */
+export const localInferenceProfileSchema = localInferenceRuntimeConfigShape
+  .extend({
+    id: profileIdSchema,
+    displayName: profileDisplayNameSchema,
+    /** Selectable for a new task binding. Independent of whether this exact profile is the one currently retained — see `activeProfileId`. */
     enabled: z.boolean(),
-    executable: localInferenceExecutableSchema,
-    model: localInferenceModelSchema,
-    fixedArguments: z
-      .array(fixedArgumentSchema)
-      .max(
-        LOCAL_INFERENCE_LIMITS.fixedArgumentsMax,
-        `At most ${LOCAL_INFERENCE_LIMITS.fixedArgumentsMax} fixed runtime arguments may be supplied.`
-      ),
-    port: z
-      .number()
-      .int('A port must be a whole number.')
-      .min(1, 'A port must be between 1 and 65535.')
-      .max(65535, 'A port must be between 1 and 65535.'),
-    contextLimitTokens: boundedInt(LOCAL_INFERENCE_LIMITS.contextTokensMax, 'The context limit'),
-    startupTimeoutMs: boundedInt(
-      LOCAL_INFERENCE_LIMITS.startupTimeoutMsMax,
-      'The startup timeout'
+    adapterKind: z.literal('llama_cpp')
+  })
+  .strict()
+  .superRefine(checkOutputCeiling);
+
+export type LocalInferenceProfile = z.infer<typeof localInferenceProfileSchema>;
+
+/** The settings-storage shape's own version — independent of {@link LOCAL_INFERENCE_CONTRACT_VERSION}, which versions the wire protocol and is unaffected by how many profiles Settings holds. */
+export const LOCAL_INFERENCE_SETTINGS_VERSION = 2;
+
+/**
+ * The durable, operator-owned local-inference configuration: a bounded list of named profiles, which one
+ * is offered to a new task by default, and whether the feature is available at all.
+ *
+ * There is no per-profile "this one is running" field here — at most one llama.cpp process is ever
+ * retained at a time (see `LOCAL_INFERENCE_TRANSITIONS`'s own comment on why), and which profile that is
+ * lives in {@link LocalInferenceService}'s own runtime state, not in durable settings.
+ */
+export const localInferenceProfilesSettingsSchema = z
+  .object({
+    version: z.literal(LOCAL_INFERENCE_SETTINGS_VERSION),
+    /** The whole feature. A managed runtime is never discovered, launched or contacted while false, whatever the profiles say. */
+    enabled: z.boolean(),
+    profiles: z.array(localInferenceProfileSchema).max(
+      LOCAL_INFERENCE_LIMITS.profilesMax,
+      `At most ${LOCAL_INFERENCE_LIMITS.profilesMax} local-model profiles may be configured.`
     ),
-    healthTimeoutMs: boundedInt(LOCAL_INFERENCE_LIMITS.healthTimeoutMsMax, 'The health timeout'),
-    inferenceTimeoutMs: boundedInt(
-      LOCAL_INFERENCE_LIMITS.inferenceTimeoutMsMax,
-      'The inference timeout'
-    ),
-    shutdownTimeoutMs: boundedInt(
-      LOCAL_INFERENCE_LIMITS.shutdownTimeoutMsMax,
-      'The shutdown timeout'
-    ),
-    requestDefaults: localInferenceRequestDefaultsSchema
+    /**
+     * What a new task inherits when it names no profile explicitly. `null` means no default is
+     * configured — task creation must then name a profile explicitly or be refused, never guess.
+     */
+    defaultProfileId: profileIdSchema.nullable()
   })
   .strict()
   .superRefine((value, ctx) => {
-    if (value.requestDefaults.maxOutputTokens > value.contextLimitTokens) {
+    const seen = new Set<string>();
+    for (const profile of value.profiles) {
+      if (seen.has(profile.id)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['profiles'],
+          message: `Profile id "${profile.id}" is used more than once. Each profile needs a distinct id.`
+        });
+      }
+      seen.add(profile.id);
+    }
+    if (value.defaultProfileId !== null && !value.profiles.some((profile) => profile.id === value.defaultProfileId)) {
       ctx.addIssue({
         code: 'custom',
-        path: ['requestDefaults', 'maxOutputTokens'],
-        message: 'The default output token cap may not exceed the context limit.'
+        path: ['defaultProfileId'],
+        message: 'The default profile must name one of the configured profiles.'
       });
     }
   });
 
-export type LocalInferenceSettings = z.infer<typeof localInferenceSettingsSchema>;
+export type LocalInferenceProfilesSettings = z.infer<typeof localInferenceProfilesSettingsSchema>;
 
-/** A fresh shipped default; callers may safely mutate their own copy. */
-export function defaultLocalInferenceSettings(): LocalInferenceSettings {
+/**
+ * A fresh shipped single-runtime configuration — never exported. This is the exact literal
+ * {@link defaultLocalInferenceSettings} returned before profiles existed, frozen here as the fallback
+ * {@link upgradeLegacyLocalInferenceSettings} still needs (migration 11's own contract), decoupled from
+ * {@link defaultLocalInferenceSettings} now that that name returns the profiles-shaped settings instead.
+ */
+function defaultSingleLocalInferenceSettings(): LocalInferenceSettings {
   return {
     version: LOCAL_INFERENCE_CONTRACT_VERSION,
     enabled: false,
@@ -484,6 +596,37 @@ export function defaultLocalInferenceSettings(): LocalInferenceSettings {
       maxOutputTokens: 4096,
       chatTemplateParameters: {}
     }
+  };
+}
+
+/** `single` widened into a profile — copies every runtime-config field across unchanged, id fixed to `'default'`. */
+function singleAsDefaultProfile(single: LocalInferenceSettings, displayName: string): LocalInferenceProfile {
+  return {
+    id: 'default',
+    displayName,
+    enabled: single.enabled,
+    adapterKind: 'llama_cpp',
+    executable: single.executable,
+    model: single.model,
+    fixedArguments: single.fixedArguments,
+    port: single.port,
+    contextLimitTokens: single.contextLimitTokens,
+    startupTimeoutMs: single.startupTimeoutMs,
+    healthTimeoutMs: single.healthTimeoutMs,
+    inferenceTimeoutMs: single.inferenceTimeoutMs,
+    shutdownTimeoutMs: single.shutdownTimeoutMs,
+    requestDefaults: single.requestDefaults
+  };
+}
+
+/** A fresh shipped default; callers may safely mutate their own copy. */
+export function defaultLocalInferenceSettings(): LocalInferenceProfilesSettings {
+  const single = defaultSingleLocalInferenceSettings();
+  return {
+    version: LOCAL_INFERENCE_SETTINGS_VERSION,
+    enabled: single.enabled,
+    profiles: [singleAsDefaultProfile(single, 'Local model')],
+    defaultProfileId: 'default'
   };
 }
 
@@ -536,7 +679,7 @@ export function upgradeLegacyLocalInferenceSettings(raw: unknown): LocalInferenc
   if (current.success) return current.data;
 
   const legacy = legacyLocalInferenceSettingsV1Schema.safeParse(raw);
-  if (!legacy.success) return defaultLocalInferenceSettings();
+  if (!legacy.success) return defaultSingleLocalInferenceSettings();
 
   const upgraded = {
     ...legacy.data,
@@ -547,6 +690,37 @@ export function upgradeLegacyLocalInferenceSettings(raw: unknown): LocalInferenc
     }
   };
   const parsed = localInferenceSettingsSchema.safeParse(upgraded);
+  return parsed.success ? parsed.data : defaultSingleLocalInferenceSettings();
+}
+
+/**
+ * Upgrade a persisted local-inference settings row to the current profiles shape, for migration 21.
+ *
+ * A row already in the current shape is returned unchanged. Anything single-runtime-shaped — today's
+ * production shape, or anything {@link upgradeLegacyLocalInferenceSettings} already knows how to reach —
+ * is wrapped as exactly one profile (`id: 'default'`), losslessly: every executable/model/argument/port/
+ * context/timeout/request-default value carries across unchanged, `enabled` carries across unchanged, and
+ * that one profile becomes `defaultProfileId`. `displayName` is taken from the configured model id when it
+ * is non-empty (so an operator who already named their model sees that name, not a placeholder), else
+ * `'Local model'`. Anything unparseable at every stage falls back to the shipped default, the same
+ * three-tier shape migration 11's function already uses.
+ */
+export function upgradeLocalInferenceProfilesSettings(raw: unknown): LocalInferenceProfilesSettings {
+  const current = localInferenceProfilesSettingsSchema.safeParse(raw);
+  if (current.success) return current.data;
+
+  const single = upgradeLegacyLocalInferenceSettings(raw);
+  const trimmedModelId = single.model.id.trim();
+  const displayName = trimmedModelId.length > 0
+    ? trimmedModelId.slice(0, LOCAL_INFERENCE_LIMITS.profileDisplayNameMax)
+    : 'Local model';
+  const wrapped = {
+    version: LOCAL_INFERENCE_SETTINGS_VERSION,
+    enabled: single.enabled,
+    profiles: [singleAsDefaultProfile(single, displayName)],
+    defaultProfileId: 'default'
+  };
+  const parsed = localInferenceProfilesSettingsSchema.safeParse(wrapped);
   return parsed.success ? parsed.data : defaultLocalInferenceSettings();
 }
 
@@ -1070,4 +1244,45 @@ export const LOCAL_INFERENCE_ACTIVE_KINDS: readonly LocalInferenceStateKind[] = 
 
 export function isLocalInferenceActive(kind: LocalInferenceStateKind): boolean {
   return LOCAL_INFERENCE_ACTIVE_KINDS.includes(kind);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Profile summaries                                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What a task-creation or provider picker needs to know about one profile — never a path, a fingerprint,
+ * an executable or any other machine-local detail; see rule 2 at the top of this file. `enabled` alone
+ * decides whether a profile is SELECTABLE. `activity` is informational only, never a reason to disable a
+ * choice: an enabled profile that is merely not the one currently retained is still a legitimate choice
+ * for a new task — the operator switches the runtime to it before that task's next round, exactly the
+ * same way "not Healthy yet" has always worked for the single-runtime case.
+ */
+export interface LocalInferenceProfileSummary {
+  readonly id: string;
+  readonly displayName: string;
+  readonly enabled: boolean;
+  readonly isDefault: boolean;
+  /** Whether this is the profile the retained runtime is bound to (or would next start as). */
+  readonly activity: 'active' | 'inactive';
+  /** The retained runtime's own current state, only when `activity === 'active'`. */
+  readonly activeStateKind: LocalInferenceStateKind | null;
+}
+
+export function summarizeLocalInferenceProfiles(
+  settings: LocalInferenceProfilesSettings,
+  activeProfileId: string | null,
+  activeStateKind: LocalInferenceStateKind
+): readonly LocalInferenceProfileSummary[] {
+  return settings.profiles.map((profile) => {
+    const active = profile.id === activeProfileId;
+    return {
+      id: profile.id,
+      displayName: profile.displayName,
+      enabled: profile.enabled,
+      isDefault: profile.id === settings.defaultProfileId,
+      activity: active ? 'active' : 'inactive',
+      activeStateKind: active ? activeStateKind : null
+    };
+  });
 }

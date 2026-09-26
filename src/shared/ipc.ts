@@ -26,6 +26,7 @@ import { localInferencePromptSchema } from './domain/local-inference';
 import type {
   LocalInferenceCapabilities,
   LocalInferenceOutcome,
+  LocalInferenceProfileSummary,
   LocalInferenceState
 } from './domain/local-inference';
 import {
@@ -323,6 +324,13 @@ export const ipcInputSchemas = {
   'localInference:getState': empty,
   'localInference:checkHealth': empty,
   'localInference:stop': empty,
+  /** Read-only: every configured profile's selectability and activity. No identity, path or fingerprint. */
+  'localInference:listProfiles': empty,
+  /**
+   * Choose which profile the retained runtime is or would next be bound to. Never starts, stops or
+   * contacts anything by itself — the existing `start`/`stop`/`checkHealth` channels still do that.
+   */
+  'localInference:selectProfile': z.object({ profileId: z.string().min(1).max(64) }).strict(),
   // Additive to the five lifecycle operations above. Strict on purpose: a
   // prompt and nothing else. No request id, no messages array, no token or
   // template override, no model/provider identity, no path, URL, host, port,
@@ -392,6 +400,8 @@ export const ipcInputSchemas = {
        */
       codexModel: modelIdSchema.optional(),
       claudeModel: modelIdSchema.optional(),
+      /** Ignored unless `implementationProvider` is `'ornith'`. Omitted means "use the current default profile". */
+      ornithModelProfileId: z.string().min(1).max(64).optional(),
       implementationProvider: implementationProviderSchema.optional(),
       reviewProvider: reviewProviderSchema.optional()
     })
@@ -417,7 +427,9 @@ export const ipcInputSchemas = {
 
   'workflow:generateSpecification': byTask,
   'workflow:configureProviders': z.object({ taskId: z.string().min(1), expectedRevision: z.number().int().min(0),
-    implementationProvider: implementationProviderSchema, reviewProvider: reviewProviderSchema }).strict(),
+    implementationProvider: implementationProviderSchema, reviewProvider: reviewProviderSchema,
+    /** Ignored unless `implementationProvider` is `'ornith'`. Omitted while already ornith keeps the current binding. */
+    ornithModelProfileId: z.string().min(1).max(64).optional() }).strict(),
   'workflow:implement': z.object({ taskId: z.string().min(1), acceptDirtyWorkingTree: z.boolean().optional() }).strict(),
   'workflow:review': byTask,
   'workflow:verify': byTask,
@@ -641,6 +653,8 @@ export interface IpcResponseMap {
   'localInference:checkHealth': LocalInferenceState;
   'localInference:stop': LocalInferenceState;
   'localInference:runTestInference': LocalInferenceOutcome;
+  'localInference:listProfiles': readonly LocalInferenceProfileSummary[];
+  'localInference:selectProfile': null;
 
   'diagnostics:run': DiagnosticsReport;
   'coai:checkConnection': CoaiConnectionDiagnostic;

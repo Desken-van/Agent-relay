@@ -246,6 +246,10 @@ export interface OrnithRunEvidence {
   readonly attempts: readonly OrnithVerificationAttempt[];
   readonly reasonCodes: readonly string[];
   readonly deadlineExpired: boolean;
+  /** Which runtime actually served this run. `null` on a run recorded before these fields existed. */
+  readonly modelProfileId: string | null;
+  readonly modelProfileDisplayName: string | null;
+  readonly modelId: string | null;
 }
 
 export function readOrnithRunEvidence(run: Pick<Run, 'agent' | 'structuredResult'>): OrnithRunEvidence | null {
@@ -257,7 +261,14 @@ export function readOrnithRunEvidence(run: Pick<Run, 'agent' | 'structuredResult
     return null;
   }
   if (typeof parsed !== 'object' || parsed === null) return null;
-  const container = parsed as { counters?: unknown; assessment?: unknown };
+  const container = parsed as {
+    counters?: unknown;
+    assessment?: unknown;
+    modelId?: unknown;
+    modelProfileId?: unknown;
+    modelProfileDisplayName?: unknown;
+  };
+  const text = (value: unknown): string | null => typeof value === 'string' && value.length > 0 ? value : null;
   const counters = typeof container.counters === 'object' && container.counters !== null
     ? (container.counters as Record<string, unknown>)
     : null;
@@ -282,7 +293,10 @@ export function readOrnithRunEvidence(run: Pick<Run, 'agent' | 'structuredResult
     worktreeChangedFiles: count(counters?.['worktreeChangedFiles']),
     attempts,
     reasonCodes,
-    deadlineExpired: reasonCodes.includes('limit_deadline_exceeded')
+    deadlineExpired: reasonCodes.includes('limit_deadline_exceeded'),
+    modelId: text(container.modelId),
+    modelProfileId: text(container.modelProfileId),
+    modelProfileDisplayName: text(container.modelProfileDisplayName)
   };
 }
 

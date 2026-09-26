@@ -101,6 +101,13 @@ async function startLocalInference(page: Page, runtimePath: string, port: number
   const saveButton = page.getByRole('button', { name: 'Save settings' });
 
   await settingsCard.getByLabel(/^Enable local inference/).check();
+  // Distinct from the feature-wide toggle above: this profile must also be individually enabled for
+  // `tasks:create` to bind a new Ornith task to it below.
+  await settingsCard.getByLabel(/^Enable "Local model" for new task selection$/).check();
+  // The shipped default ships as one unopened profile row; open its editor before touching any of
+  // its per-field controls below.
+  await settingsCard.getByRole('button', { name: /Local model/ }).click();
+  await settingsCard.getByText(/^Editing: Local model/).waitFor();
   await settingsCard.getByRole('combobox', { name: /^Executable/ }).selectOption('explicit_path');
   await settingsCard.getByRole('textbox', { name: 'Executable path', exact: true }).fill(runtimePath);
   await settingsCard.getByLabel(/^Model id/).fill('fake-model');
@@ -120,6 +127,8 @@ async function startLocalInference(page: Page, runtimePath: string, port: number
 
   const lifecycle = card(page, 'Local inference lifecycle');
   await lifecycle.waitFor();
+  // Which profile the runtime acts on is a separate, explicit choice from saving Settings.
+  await lifecycle.getByRole('combobox', { name: /^Active profile/ }).selectOption('default');
   await lifecycle.getByRole('button', { name: 'Check capabilities' }).click();
   await expect_(async () => lifecycle.textContent(), (text) => (text ?? '').includes('Executable available: yes'));
   await lifecycle.getByRole('button', { name: /Start runtime/ }).waitFor();

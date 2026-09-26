@@ -266,42 +266,56 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       }
     });
 
-    const createResult = await boundary.createFile(
-      { version: 1, action: 'create_file', path: 'nested/new.txt', content: 'must stay inside\n' },
-      undefined,
-      { readBytes: 0, writeBytes: 4096 }
-    );
-    expect(createResult).toMatchObject({ ok: false, code: 'path_symlink' });
-    expect(existsSync(join(outside, 'new.txt'))).toBe(false);
+    const restoreDirectory = (): void => {
+      if (swapped) {
+        unlinkSync(directory);
+        renameSync(displaced, directory);
+      }
+      swapped = false;
+    };
+    const failedClosed = (result: OrnithToolResult): void => {
+      expect(result.ok).toBe(false);
+      expect(existsSync(join(outside, 'new.txt'))).toBe(false);
+      expect(readFileSync(join(outside, 'existing.txt'), 'utf8')).toBe('outside\n');
+    };
+    const guarded = (attempt: () => Promise<OrnithToolResult>): Promise<OrnithToolResult> =>
+      answeredWithinBudget(ORNITH_LIMITS.filesystemTimeoutMs, attempt, failedClosed, restoreDirectory);
 
-    unlinkSync(directory);
-    renameSync(displaced, directory);
-    swapped = false;
-    const replaceResult = await boundary.replaceText(
-      {
-        version: 1,
-        action: 'replace_text',
-        path: 'nested/existing.txt',
-        sha256,
-        replacements: [{ oldText: 'inside', newText: 'changed' }]
-      },
-      undefined,
-      { readBytes: 4096, writeBytes: 4096 }
-    );
-    expect(replaceResult).toMatchObject({ ok: false, code: 'path_symlink' });
-    expect(readFileSync(join(outside, 'existing.txt'), 'utf8')).toBe('outside\n');
+    try {
+      // Keep one-time manifest and root binding work outside the mutation budgets.
+      await boundary.listFiles({ version: 1, action: 'list_files', prefix: '', limit: 20 });
+      const createResult = await guarded(() => boundary.createFile(
+        { version: 1, action: 'create_file', path: 'nested/new.txt', content: 'must stay inside\n' },
+        undefined,
+        { readBytes: 0, writeBytes: 4096 }
+      ));
+      expect(createResult).toMatchObject({ ok: false, code: 'path_symlink' });
+      restoreDirectory();
 
-    unlinkSync(directory);
-    renameSync(displaced, directory);
-    swapped = false;
-    const deleteResult = await boundary.deleteFile(
-      { version: 1, action: 'delete_file', path: 'nested/existing.txt', sha256 },
-      undefined,
-      { readBytes: 4096, writeBytes: 0 }
-    );
-    expect(deleteResult).toMatchObject({ ok: false, code: 'path_symlink' });
-    expect(readFileSync(join(outside, 'existing.txt'), 'utf8')).toBe('outside\n');
-  });
+      const replaceResult = await guarded(() => boundary.replaceText(
+        {
+          version: 1,
+          action: 'replace_text',
+          path: 'nested/existing.txt',
+          sha256,
+          replacements: [{ oldText: 'inside', newText: 'changed' }]
+        },
+        undefined,
+        { readBytes: 4096, writeBytes: 4096 }
+      ));
+      expect(replaceResult).toMatchObject({ ok: false, code: 'path_symlink' });
+      restoreDirectory();
+
+      const deleteResult = await guarded(() => boundary.deleteFile(
+        { version: 1, action: 'delete_file', path: 'nested/existing.txt', sha256 },
+        undefined,
+        { readBytes: 4096, writeBytes: 0 }
+      ));
+      expect(deleteResult).toMatchObject({ ok: false, code: 'path_symlink' });
+    } finally {
+      restoreDirectory();
+    }
+  }, 180_000);
 
   /**
    * The native mutation guard is the only thing here that can prove safety at

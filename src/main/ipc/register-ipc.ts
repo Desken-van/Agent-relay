@@ -30,6 +30,7 @@ import {
 import { IPC_INVOKE_CHANNEL } from '../../shared/ipc-channels';
 import type { Application } from '../container';
 import { assertKnownPath } from '../services/path-safety';
+import { findTaskOrphanedByProfileRemoval } from '../services/local-inference-profile-deletion-guard';
 import {
   parsePlanReviewAutoDecisions,
   parsePlanReviewFindings,
@@ -212,7 +213,23 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
 
   return {
     'settings:get': () => app.settings.get(),
-    'settings:update': (input) => app.settings.update(input),
+    'settings:update': (input) => {
+      // Checked here, at the one IPC layer that already holds both `app.settings` and `app.tasks`,
+      // rather than coupling the two repositories to each other — see the guard's own doc comment.
+      if (input.localInference !== undefined) {
+        const currentIds = new Set(app.settings.get().localInference.profiles.map((profile) => profile.id));
+        const nextIds = new Set(input.localInference.profiles.map((profile) => profile.id));
+        const orphaned = findTaskOrphanedByProfileRemoval(currentIds, nextIds, () => app.tasks.listNonTerminal());
+        if (orphaned) {
+          throw new AgentRelayError(
+            'VALIDATION_FAILED',
+            `Task "${orphaned.title}" is still bound to a local-model profile this change would remove.`,
+            { remediation: 'Keep that profile, or wait until the task completes, then remove it.' }
+          );
+        }
+      }
+      return app.settings.update(input);
+    },
 
     'localInference:getCapabilities': () => app.localInference.capabilities(),
     'localInference:start': () => app.localInference.start(),
@@ -220,6 +237,11 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     'localInference:checkHealth': () => app.localInference.health(),
     'localInference:stop': () => app.localInference.stop(),
     'localInference:runTestInference': (input) => app.localInference.runTestInference(input.prompt),
+    'localInference:listProfiles': () => app.localInference.listProfiles(),
+    'localInference:selectProfile': (input) => {
+      app.localInference.selectActiveProfile(input.profileId);
+      return null;
+    },
 
     'diagnostics:run': (input) => app.diagnostics.run(input.force ?? false),
 
