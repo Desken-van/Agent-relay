@@ -513,6 +513,23 @@ export function SettingsView(): React.JSX.Element {
                   </span>
                 </label>
 
+                <label className="row" style={{ alignItems: 'flex-start' }}>
+                  <input
+                    type="checkbox"
+                    checked={draft.localInferenceReleaseBeforeVerification}
+                    onChange={(event) => set('localInferenceReleaseBeforeVerification', event.target.checked)}
+                  />
+                  <span>
+                    <strong>Release the local runtime while Agent Relay verifies</strong>
+                    <span className="muted" style={{ display: 'block', marginTop: 3 }}>
+                      On by default. Before Agent Relay runs the project&apos;s own verification it stops a
+                      running runtime that no Ornith run is using, so the test suite does not compete with
+                      the model for memory, and starts that same profile back for the next Ornith round.
+                      A runtime you stop yourself is never started by Agent Relay.
+                    </span>
+                  </span>
+                </label>
+
                 <div className="stack stack--tight" aria-label="Local-model profiles">
                   <div className="section-title">Model profiles</div>
                   {draft.localInference.profiles.length === 0 ? (

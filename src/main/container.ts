@@ -116,6 +116,7 @@ export function defaultSettings(paths: ApplicationPaths): Settings {
     ghExecutablePath: process.env.AGENT_RELAY_GH_PATH ?? null,
     externalPlanReviewEnabled: false,
     externalCodeReviewEnabled: false,
+    localInferenceReleaseBeforeVerification: true,
     coaiMcpExecutablePath: null,
     coaiMcpArguments: [],
     coaiMcpWorkingDirectory: null,
@@ -473,6 +474,9 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     // here is a separate, non-IPC interface — see `OrnithInferenceLeaseService`.
     ornith: new OrnithImplementationService(),
     ornithLease: localInference,
+    // The same instance again, through its release surface: stop before Relay's own verification, start
+    // back for the next Ornith round — see `LocalInferenceRuntimeRelease`.
+    localInferenceRuntime: localInference,
     processRunner: runner,
     operations: taskOperations
   });

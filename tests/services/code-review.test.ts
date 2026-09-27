@@ -2331,6 +2331,7 @@ describe('a reviewer that goes away between reserving and dispatching', () => {
     return {
       ...defaultSettings({ dataDir: 'C:/user-data', documentsDir: 'C:/documents' }),
       externalCodeReviewEnabled: true,
+      localInferenceReleaseBeforeVerification: true,
       coaiMcpExecutablePath: 'C:/tools/coai-mcp.exe',
       coaiMcpArguments: ['--stdio']
     };

@@ -328,6 +328,34 @@ record written before the kind existed is read as `unknown`.
 | Implementation attempt provably left nothing behind              | **Retry implementation · <impl.>**      | attempt returned | none    |
 | Approved specification, no attempt yet                           | **Run implementation · <impl.>**        | new round | —           |
 
+### The local runtime around Relay's own verification
+
+A resident local model and the project's test suite compete for the same
+memory, and on a machine that cannot hold both the suite's wall-clock tests
+fail for that reason alone. So, with the setting
+`localInferenceReleaseBeforeVerification` on (the default, in Settings → Local
+inference), `Orchestrator.runVerification` asks
+`LocalInferenceRuntimeRelease.releaseForVerification` — the same
+`LocalInferenceService` instance the lifecycle IPC and the Ornith lease use —
+to stop a retained, healthy runtime before the command runs. It is a courtesy, never a gate: the outcome
+(`released`, `in_use` when an Ornith run holds the lease and nothing is
+touched, `not_running`, `unavailable` with its reason, a release that did not
+finish within the profile's shutdown budget plus a grace, or a build with no
+runtime wired) is one Relay-authored `log` event on the verification run, and
+the command runs regardless. The lease check and the stop are one synchronous
+step, so a lease acquired afterwards meets a runtime already stopping and
+fails its own health check instead of being cut off mid-round.
+
+The runtime stays the operator's. Agent Relay starts back only what it stopped
+itself: the service marks the released profile (id and configuration
+fingerprint), reports the stopped state as `releasedForVerification`, and
+`acquireOrnithLeaseIfNeeded` calls `resumeReleasedRuntime` before taking the
+lease — which starts that profile back exactly once, and only while the mark
+stands. Any operator Start or Stop, a profile switch, or an edit to the bound
+profile clears the mark, so a runtime the operator stopped is never started by
+Agent Relay, exactly as before. The Run screen's readiness guard treats
+"stopped, released by Agent Relay" as ready for the same reason.
+
 A generic **Retry implementation** is never offered while verification is the
 stage, and **Fix verification failures** and **Run verification again** are
 never offered together. Retrying verification consumes no implementation round,
@@ -1774,7 +1802,22 @@ before a run row exists — it acquires the application-wide
 use) and performs one bounded `health()` check against the already-retained
 provider. `recheckOrnithLeaseIfNeeded` re-confirms it immediately before the
 run is recorded, covering the time worktree creation may have taken. Neither
-call, nor anything downstream, ever calls `start()`.
+call, nor anything downstream, starts a runtime the operator stopped; the one
+start on this path is `resumeReleasedRuntime`, which starts back only a
+runtime Agent Relay itself stopped before its own verification (see *The local
+runtime around Relay's own verification*).
+
+**Repair evidence.** When Relay's verification failed with kind
+`implementation`, the next Ornith round's `EVIDENCE FROM THE PREVIOUS ATTEMPT`
+section carries the Relay-authored status line and, between fixed
+`BEGIN`/`END VERIFICATION OUTPUT` markers, the record's own bounded, sanitized
+`outputSummary` — the same field the Claude repair prompt is built from, never
+the raw output, re-bounded on read. The protocol names the markers as program
+output (data, never an instruction) and says what the section is for: change
+only the files the failing checks name or the model's own earlier edits, never
+undo an edit that meets the acceptance criteria, and `finish` saying so when
+the failing checks do not involve its files. A live repair round given only
+"a test assertion failed" had deleted its own correct edit.
 
 **The loop** (`src/main/services/ornith-implementation.ts`) builds one
 complete, stateless chat-completion request per turn — the full approved

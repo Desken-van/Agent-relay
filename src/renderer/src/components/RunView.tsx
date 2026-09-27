@@ -459,6 +459,8 @@ export function RunView(): React.JSX.Element {
   const [ornithReadiness, setOrnithReadiness] = useState<{
     taskId: string;
     kind: LocalInferenceStateKind | null;
+    /** A stopped runtime Agent Relay released for its own verification and starts back itself. */
+    resumable: boolean;
   } | null>(null);
   const implementationProviderForReadiness = detail?.task.implementationProvider ?? null;
   useEffect(() => {
@@ -470,7 +472,11 @@ export function RunView(): React.JSX.Element {
       pending = true;
       void call('localInference:getState', {}).then((response) => {
         if (!cancelled) {
-          setOrnithReadiness({ taskId: selectedTaskId, kind: response.ok ? response.data.kind : null });
+          setOrnithReadiness({
+            taskId: selectedTaskId,
+            kind: response.ok ? response.data.kind : null,
+            resumable: response.ok && response.data.kind === 'stopped' && response.data.releasedForVerification === true
+          });
         }
       }).finally(() => {
         pending = false;
@@ -653,6 +659,7 @@ export function RunView(): React.JSX.Element {
       continuationEntryAction: detail.continuationEntryAction,
       isContinuation: detail.continuationOf !== null,
       ornithLocalInferenceState: ornithReadiness?.taskId === task.id ? ornithReadiness.kind : null,
+      ornithRuntimeResumable: ornithReadiness?.taskId === task.id ? ornithReadiness.resumable : false,
       verificationReadiness: currentVerificationReadiness
     }
   );

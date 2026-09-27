@@ -438,6 +438,15 @@ export const settingsSchema = z.object({
    * Defaults to false: an integration nobody enabled must not reach a provider.
    */
   externalCodeReviewEnabled: z.boolean(),
+  /**
+   * Release the retained local inference runtime before Agent Relay runs its own `npm run verify`.
+   *
+   * The runtime is the operator's (started and stopped in Settings); this only lets Agent Relay stop one
+   * that no Ornith run is using so the project's test suite does not compete with a resident model for
+   * memory, and start that same one back before the next Ornith round. Defaults to true: a machine that
+   * can hold both is not hurt by a stop it did not need.
+   */
+  localInferenceReleaseBeforeVerification: z.boolean(),
   /** Explicit MCP server executable. Authentication remains owned by that server. */
   coaiMcpExecutablePath: z.string().max(32_767).nullable(),
   /** Fixed argv passed to the MCP executable; never interpreted through a shell. */

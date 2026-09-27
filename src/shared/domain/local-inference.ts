@@ -1083,7 +1083,17 @@ export const localInferenceStateSchema = z.discriminatedUnion('kind', [
       ).nullable()
     })
     .strict(),
-  z.object({ kind: z.literal('stopped') }).strict(),
+  z
+    .object({
+      kind: z.literal('stopped'),
+      /**
+       * Present only when Agent Relay itself stopped the runtime to run its own verification and may
+       * start that same profile back for the next Ornith round. A runtime the operator stopped never
+       * carries it.
+       */
+      releasedForVerification: z.literal(true).optional()
+    })
+    .strict(),
   z.object({ kind: z.literal('failed'), reason: lifecycleReasonSchema }).strict(),
   z.object({ kind: z.literal('cancelled'), reason: lifecycleReasonSchema }).strict(),
   z.object({ kind: z.literal('timed_out'), reason: lifecycleReasonSchema }).strict()

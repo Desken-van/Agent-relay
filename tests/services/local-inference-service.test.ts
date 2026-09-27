@@ -849,3 +849,81 @@ describe('LocalInferenceService.runTestInference', () => {
     expect(provider.inferCalls).toHaveLength(1);
   });
 });
+
+describe('releasing the runtime around Relay verification', () => {
+  it('stops a retained healthy runtime nobody is using, reports it as released, and starts the same profile back exactly once', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+
+    await expect(service.releaseForVerification()).resolves.toEqual({ kind: 'released' });
+    expect(provider.stopCalls).toBe(1);
+    expect(service.state()).toEqual({ kind: 'stopped', releasedForVerification: true });
+
+    await expect(service.resumeReleasedRuntime()).resolves.toMatchObject({ kind: 'healthy' });
+    expect(provider.launches).toBe(2);
+    // The mark is spent by the resume: asking again starts nothing more.
+    await expect(service.resumeReleasedRuntime()).resolves.toMatchObject({ kind: 'healthy' });
+    expect(provider.launches).toBe(2);
+  });
+
+  it('never interrupts an Ornith run: reports in_use while the lease is held and stops nothing', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    const lease = await service.acquireOrnithLease('default', settings.defaultFingerprint());
+
+    await expect(service.releaseForVerification()).resolves.toEqual({ kind: 'in_use' });
+    expect(provider.stopCalls).toBe(0);
+    expect(service.state()).toMatchObject({ kind: 'healthy' });
+    lease.release();
+  });
+
+  it('reports not_running when nothing is retained, and unavailable rather than cutting short a startup the operator asked for', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await expect(service.releaseForVerification()).resolves.toEqual({ kind: 'not_running' });
+
+    let releaseStart!: () => void;
+    provider.startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
+    const starting = service.start();
+    await expect(service.releaseForVerification()).resolves.toEqual({ kind: 'unavailable', reason: 'The local runtime is starting.' });
+    expect(provider.stopCalls).toBe(0);
+    releaseStart();
+    await expect(starting).resolves.toMatchObject({ kind: 'healthy' });
+  });
+
+  it('an operator Start or Stop after a release takes the runtime back: the mark is cleared and nothing is resumed', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    await service.releaseForVerification();
+    expect(service.state()).toEqual({ kind: 'stopped', releasedForVerification: true });
+
+    await service.start();
+    expect(service.state()).toMatchObject({ kind: 'healthy' });
+    await service.stop();
+    expect(service.state()).toEqual({ kind: 'stopped' });
+
+    const launchesBefore = provider.launches;
+    await expect(service.resumeReleasedRuntime()).resolves.toEqual({ kind: 'stopped' });
+    expect(provider.launches).toBe(launchesBefore);
+  });
+
+  it('a profile edited after the release is not what was released: the resume starts nothing', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    await service.releaseForVerification();
+    settings.patchDefaultProfile({ port: 19099 });
+
+    await expect(service.resumeReleasedRuntime()).resolves.toEqual({ kind: 'stopped' });
+    expect(provider.launches).toBe(1);
+    expect(service.state()).toEqual({ kind: 'stopped' });
+  });
+});

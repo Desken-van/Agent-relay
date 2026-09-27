@@ -18,6 +18,7 @@ function baseSettings(): Settings {
     ghExecutablePath: null,
     externalPlanReviewEnabled: false,
     externalCodeReviewEnabled: false,
+    localInferenceReleaseBeforeVerification: true,
     coaiMcpExecutablePath: null,
     coaiMcpArguments: [],
     coaiMcpWorkingDirectory: null,
@@ -72,6 +73,20 @@ describe('local inference settings', () => {
     await waitFor(() => expect(bridge.callsTo('settings:update')).toHaveLength(1));
     expect(bridge.callsTo('settings:update')[0]?.input).toMatchObject({
       localInference: defaultLocalInferenceSettings()
+    });
+  });
+
+  it('shows the runtime-release-before-verification switch on, and saves it off when unticked', async () => {
+    renderApp(<SettingsView />);
+    const release = await screen.findByLabelText(/^Release the local runtime while Agent Relay verifies/);
+    expect((release as HTMLInputElement).checked).toBe(true);
+
+    fireEvent.click(release);
+    fireEvent.click(screen.getByRole('button', { name: /^Save settings$/ }));
+
+    await waitFor(() => expect(bridge.callsTo('settings:update')).toHaveLength(1));
+    expect(bridge.callsTo('settings:update')[0]?.input).toMatchObject({
+      localInferenceReleaseBeforeVerification: false
     });
   });
 

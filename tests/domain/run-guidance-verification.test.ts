@@ -117,6 +117,19 @@ describe('after Ornith changed files and could not prove them verified', () => {
     expect(JSON.stringify(value)).not.toContain('run_implementation');
   });
 
+  it('offers the repair enabled when the stopped runtime is one Agent Relay released for its own verification, and disabled when the operator stopped it', () => {
+    const runs = [
+      ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 }),
+      relayRecord({ outcome: 'failed', failureKind: 'implementation', reason: 'npm run verify failed (exit 1): a test assertion failed. The current files did not pass.' })
+    ];
+    const released = runGuidance(task(), runs, true, false, 'not_required', { ornithLocalInferenceState: 'stopped', ornithRuntimeResumable: true });
+    expect(released.action).toMatchObject({ key: 'run_implementation', enabled: true });
+
+    const operatorStopped = runGuidance(task(), runs, true, false, 'not_required', { ornithLocalInferenceState: 'stopped' });
+    expect(operatorStopped.action).toMatchObject({ key: 'run_implementation', enabled: false });
+    expect(operatorStopped.action?.disabledReason).toContain('Start the local runtime');
+  });
+
   it('tells a timed-out verification from a failed one', () => {
     const value = guidance(
       task(),

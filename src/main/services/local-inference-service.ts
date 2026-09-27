@@ -30,6 +30,8 @@ import type {
   IdGenerator,
   LocalInferenceLifecycleService,
   LocalInferenceProvider,
+  LocalInferenceReleaseOutcome,
+  LocalInferenceRuntimeRelease,
   OrnithHealthyLease,
   OrnithInferenceLeaseService,
   SettingsRepository
@@ -88,7 +90,9 @@ export interface LocalInferenceServiceOptions {
   readonly ids: IdGenerator;
 }
 
-export class LocalInferenceService implements LocalInferenceLifecycleService, OrnithInferenceLeaseService {
+export class LocalInferenceService
+  implements LocalInferenceLifecycleService, OrnithInferenceLeaseService, LocalInferenceRuntimeRelease
+{
   private provider: LocalInferenceProvider | null = null;
   private boundProfileFingerprint: string | null = null;
   /** Which profile the retained (or about-to-be-retained) runtime is bound to. Volatile, never persisted. */
@@ -107,6 +111,15 @@ export class LocalInferenceService implements LocalInferenceLifecycleService, Or
   private ornithLeaseProfileFingerprint: string | null = null;
   /** Fired by `stop()` when it stops a runtime an Ornith lease is holding. */
   private readonly ornithStopHandlers = new Set<() => void>();
+  /**
+   * Set only by `releaseForVerification` after it confirmed the stop, cleared by any operator Start or
+   * Stop, a profile switch, or a resume. While set, `state()` reports the stopped runtime as released
+   * and `resumeReleasedRuntime` may start exactly this profile at exactly this configuration back.
+   * Residual: an operator Stop that joins the very same in-flight provider stop is indistinguishable
+   * from ours and the mark is still set — the resume then starts a runtime the operator also meant to
+   * stop; a second Stop clears it.
+   */
+  private releasedForVerification: { readonly profileId: string; readonly fingerprint: string } | null = null;
 
   constructor(private readonly options: LocalInferenceServiceOptions) {}
 
@@ -134,6 +147,7 @@ export class LocalInferenceService implements LocalInferenceLifecycleService, Or
       throw new AgentRelayError('NOT_FOUND', `No local-model profile with id ${profileId}.`);
     }
     this.selectedProfileId = profileId;
+    this.releasedForVerification = null;
     // A terminal provider bound to the PREVIOUS profile has nothing left to preserve; the next bind
     // constructs fresh against whichever profile is now selected. An active provider was already refused
     // above, so this can only ever discard a stopped/failed/cancelled/timed-out one.
@@ -143,9 +157,61 @@ export class LocalInferenceService implements LocalInferenceLifecycleService, Or
 
   /** Cheap and passive: no provider construction, discovery or HTTP. */
   state(): LocalInferenceState {
-    if (this.provider !== null) return this.provider.state();
+    if (this.provider !== null) return this.markReleased(this.provider.state());
     const reason = this.unavailableReason();
-    return reason === null ? { kind: 'stopped' } : { kind: 'unavailable', reason };
+    return reason === null ? this.markReleased({ kind: 'stopped' }) : { kind: 'unavailable', reason };
+  }
+  /** A stopped state carries the release mark only while `releaseForVerification` is what stopped it. */
+  private markReleased(state: LocalInferenceState): LocalInferenceState {
+    if (state.kind !== 'stopped' || this.releasedForVerification === null) return state;
+    return { kind: 'stopped', releasedForVerification: true };
+  }
+  /* ------------------------------------------------------------------ */
+  /* Relay's own verification: release and resume (LocalInferenceRuntimeRelease) */
+  /* ------------------------------------------------------------------ */
+  async releaseForVerification(): Promise<LocalInferenceReleaseOutcome> {
+    if (this.ornithLeaseToken !== null) return { kind: 'in_use' };
+    const reason = this.isDisabledAndUnbound();
+    if (reason !== null) return { kind: 'unavailable', reason };
+    const provider = this.provider;
+    if (provider === null) return { kind: 'not_running' };
+    const state = provider.state();
+    switch (state.kind) {
+      case 'healthy':
+        break;
+      case 'starting':
+      case 'stopping':
+      case 'inferring':
+        // A startup the operator just asked for, a stop already under way, or an inference outside a
+        // lease: none of them is ours to cut short.
+        return { kind: 'unavailable', reason: `The local runtime is ${state.kind}.` };
+      default:
+        return { kind: 'not_running' };
+    }
+    const profileId = this.selectedProfileId;
+    const fingerprint = this.boundProfileFingerprint;
+    // No await between the lease check above and this stop: a lease acquired from here on meets a runtime
+    // already stopping and fails its own health check, instead of being cut off mid-round.
+    const stopped = await this.stop();
+    if (stopped.kind !== 'stopped') {
+      return { kind: 'unavailable', reason: 'reason' in stopped ? stopped.reason : `The local runtime is ${stopped.kind}.` };
+    }
+    if (profileId !== null && fingerprint !== null) this.releasedForVerification = { profileId, fingerprint };
+    return { kind: 'released' };
+  }
+  async resumeReleasedRuntime(signal?: AbortSignal): Promise<LocalInferenceState> {
+    const mark = this.releasedForVerification;
+    if (mark === null) return this.state();
+    // Whatever happens next, the mark is spent: a resume is attempted at most once per release.
+    this.releasedForVerification = null;
+    const profile = this.activeProfile();
+    if (profile === null || profile.id !== mark.profileId || localInferenceProfileFingerprint(profile) !== mark.fingerprint) {
+      return this.state();
+    }
+    if (this.state().kind !== 'stopped') return this.state();
+    const reason = this.isDisabledAndUnbound();
+    if (reason !== null) return { kind: 'unavailable', reason };
+    return this.bindProvider().start(signal);
   }
 
   capabilities(): Promise<LocalInferenceCapabilities> {
@@ -155,6 +221,8 @@ export class LocalInferenceService implements LocalInferenceLifecycleService, Or
   }
 
   start(): Promise<LocalInferenceState> {
+    // An operator Start supersedes a release: what runs from here on is theirs to stop, not ours to resume.
+    this.releasedForVerification = null;
     const reason = this.isDisabledAndUnbound();
     if (reason !== null) return Promise.resolve({ kind: 'unavailable', reason });
     return this.bindProvider().start();
@@ -167,6 +235,9 @@ export class LocalInferenceService implements LocalInferenceLifecycleService, Or
   }
 
   stop(): Promise<LocalInferenceState> {
+    // An operator Stop is theirs: nothing stopped from here on is started back by a resume.
+    // (`releaseForVerification` calls this too and sets its mark only after the stop is confirmed.)
+    this.releasedForVerification = null;
     const provider = this.provider;
 
     // Independently callable, so this may stop a runtime an Ornith run's

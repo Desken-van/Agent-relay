@@ -148,6 +148,12 @@ export interface RunGuidanceExtra {
    */
   readonly ornithLocalInferenceState?: LocalInferenceStateKind | null;
   /**
+   * From the same read: a stopped runtime that Agent Relay itself released before its own verification
+   * and will start back for the next Ornith round (`releasedForVerification` on the stopped state). Such a
+   * runtime is ready for the purpose of offering the action; a runtime the operator stopped is not.
+   */
+  readonly ornithRuntimeResumable?: boolean;
+  /**
    * The renderer's last read of `workflow:verificationReadiness` for the gated verification it is showing:
    * the main process's answer, from the current worktree identity and settings, to whether a verification
    * the re-run policy gated may start now. Consulted only in those two states. `null`/`undefined` means
@@ -175,6 +181,8 @@ function guardOrnithReadiness(
 ): RunPrimaryAction {
   if (task.implementationProvider !== 'ornith' || !candidate.enabled) return candidate;
   if (extra.ornithLocalInferenceState === 'healthy') return candidate;
+  // Stopped by Agent Relay for its own verification: the round starts it back itself before the lease.
+  if (extra.ornithLocalInferenceState === 'stopped' && extra.ornithRuntimeResumable === true) return candidate;
   return { ...candidate, enabled: false, disabledReason: ORNITH_NOT_READY_REASON };
 }
 

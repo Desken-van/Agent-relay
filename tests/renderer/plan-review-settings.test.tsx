@@ -38,6 +38,7 @@ beforeEach(() => {
     ghExecutablePath: null,
     externalPlanReviewEnabled: false,
     externalCodeReviewEnabled: false,
+    localInferenceReleaseBeforeVerification: true,
     coaiMcpExecutablePath: null,
     coaiMcpArguments: [],
     coaiMcpWorkingDirectory: null,

@@ -299,11 +299,17 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
     await lstat(npmCli);
 
     progress({ type: 'log', text: 'Command: npm ci (task worktree only)' });
+    // The install runs with the project's own defaults, as it would in a developer's terminal — not with
+    // the host application's runtime environment. A `NODE_ENV=production` the app process carries (the
+    // production build is started that way) makes npm omit devDependencies, and a live install failed
+    // exactly so: node-gyp was never installed, and the project's own postinstall could not find it
+    // after a green native build. Same rule, same reason as `WorktreeVerification.execute`.
     const result = await this.runner.run(node.path, [npmCli, 'ci'], {
       cwd: target.worktreePath,
       signal,
       timeoutMs,
       maxOutputBytes,
+      omitEnvNames: ['NODE_ENV'],
       onLine: (text) => progress({ type: 'log', text }),
       onStderrLine: (text) => progress({ type: 'log', text })
     });
