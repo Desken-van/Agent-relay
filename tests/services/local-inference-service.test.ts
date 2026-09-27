@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { LocalInferenceProvider, SettingsRepository } from '../../src/main/ports';
 import {
   assembleLocalInferenceConfig,
@@ -851,7 +851,7 @@ describe('LocalInferenceService.runTestInference', () => {
 });
 
 describe('releasing the runtime around Relay verification', () => {
-  it('stops a retained healthy runtime nobody is using, reports it as released, and starts the same profile back exactly once', async () => {
+  it('stops a retained healthy runtime nobody is using, reports it as released, and the next lease for that profile starts it back exactly once', async () => {
     const settings = new MutableSettings();
     const provider = new StubProvider();
     const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
@@ -861,10 +861,12 @@ describe('releasing the runtime around Relay verification', () => {
     expect(provider.stopCalls).toBe(1);
     expect(service.state()).toEqual({ kind: 'stopped', releasedForVerification: true });
 
-    await expect(service.resumeReleasedRuntime()).resolves.toMatchObject({ kind: 'healthy' });
+    const lease = await service.acquireOrnithLease('default', settings.defaultFingerprint());
     expect(provider.launches).toBe(2);
-    // The mark is spent by the resume: asking again starts nothing more.
-    await expect(service.resumeReleasedRuntime()).resolves.toMatchObject({ kind: 'healthy' });
+    expect(service.state()).toMatchObject({ kind: 'healthy', runtimeInstanceId: lease.runtimeInstanceId });
+    lease.release();
+    // The mark was spent by that start: a later lease finds a healthy runtime and starts nothing more.
+    (await service.acquireOrnithLease('default', settings.defaultFingerprint())).release();
     expect(provider.launches).toBe(2);
   });
 
@@ -896,7 +898,27 @@ describe('releasing the runtime around Relay verification', () => {
     await expect(starting).resolves.toMatchObject({ kind: 'healthy' });
   });
 
-  it('an operator Start or Stop after a release takes the runtime back: the mark is cleared and nothing is resumed', async () => {
+  it('an operator Stop that joins the in-flight stop owns the outcome: the runtime is stopped, no mark is left, the next lease starts nothing', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    let finishStop!: () => void;
+    provider.stopGate = new Promise<void>((resolve) => { finishStop = resolve; });
+
+    const releasing = service.releaseForVerification();
+    const operatorStop = service.stop();
+    finishStop();
+
+    await expect(releasing).resolves.toEqual({ kind: 'unavailable', reason: expect.stringContaining('superseded') });
+    await expect(operatorStop).resolves.toEqual({ kind: 'stopped' });
+    expect(provider.stopAttempts).toBe(1);
+    expect(service.state()).toEqual({ kind: 'stopped' });
+    await expect(service.acquireOrnithLease('default', settings.defaultFingerprint())).rejects.toThrow('The local runtime is not Healthy.');
+    expect(provider.launches).toBe(1);
+  });
+
+  it('an operator Start or Stop after a release takes the runtime back: the mark is cleared and the next lease starts nothing', async () => {
     const settings = new MutableSettings();
     const provider = new StubProvider();
     const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
@@ -910,20 +932,65 @@ describe('releasing the runtime around Relay verification', () => {
     expect(service.state()).toEqual({ kind: 'stopped' });
 
     const launchesBefore = provider.launches;
-    await expect(service.resumeReleasedRuntime()).resolves.toEqual({ kind: 'stopped' });
+    await expect(service.acquireOrnithLease('default', settings.defaultFingerprint())).rejects.toThrow('The local runtime is not Healthy.');
     expect(provider.launches).toBe(launchesBefore);
   });
 
-  it('a profile edited after the release is not what was released: the resume starts nothing', async () => {
+  it('a profile edited or disabled after the release is not what was released: the state stops reading as released and the lease starts nothing', async () => {
     const settings = new MutableSettings();
     const provider = new StubProvider();
     const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
     await service.start();
+    const boundFingerprint = settings.defaultFingerprint();
     await service.releaseForVerification();
-    settings.patchDefaultProfile({ port: 19099 });
+    expect(service.state()).toEqual({ kind: 'stopped', releasedForVerification: true });
 
-    await expect(service.resumeReleasedRuntime()).resolves.toEqual({ kind: 'stopped' });
-    expect(provider.launches).toBe(1);
+    settings.patchDefaultProfile({ port: 19099 });
     expect(service.state()).toEqual({ kind: 'stopped' });
+    await expect(service.acquireOrnithLease('default', boundFingerprint)).rejects.toThrow();
+    expect(provider.launches).toBe(1);
+
+    settings.patchDefaultProfile({ port: 8082 });
+    await service.start();
+    await service.releaseForVerification();
+    expect(service.state()).toEqual({ kind: 'stopped', releasedForVerification: true });
+    settings.patchDefaultProfile({ enabled: false });
+    expect(service.state()).toEqual({ kind: 'stopped' });
+    await expect(service.acquireOrnithLease('default', settings.defaultFingerprint())).rejects.toThrow();
+    expect(provider.launches).toBe(2);
+  });
+
+  it('gives up waiting for a stop that never confirms after the active profile’s shutdown budget plus a grace, and leaves no mark', async () => {
+    vi.useFakeTimers();
+    try {
+      const settings = new MutableSettings();
+      const provider = new StubProvider();
+      const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+      await service.start();
+      provider.stopGate = new Promise<void>(() => undefined);
+
+      const releasing = service.releaseForVerification();
+      await vi.advanceTimersByTimeAsync(settings.defaultProfile().shutdownTimeoutMs + 5_001);
+
+      await expect(releasing).resolves.toEqual({ kind: 'unavailable', reason: expect.stringContaining('did not confirm it stopped') });
+      expect(service.state()).not.toMatchObject({ releasedForVerification: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops waiting when the caller’s signal aborts, and leaves no mark', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    provider.stopGate = new Promise<void>(() => undefined);
+    const controller = new AbortController();
+
+    const releasing = service.releaseForVerification(controller.signal);
+    controller.abort();
+
+    await expect(releasing).resolves.toEqual({ kind: 'unavailable', reason: 'The release was cancelled.' });
+    expect(service.state()).not.toMatchObject({ releasedForVerification: true });
   });
 });

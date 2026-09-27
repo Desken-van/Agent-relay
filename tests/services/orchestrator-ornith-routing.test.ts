@@ -12,7 +12,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CLAUDE_ASSESSMENT_VERSION } from '../../src/shared/domain/claude-assessment';
 import { AgentRelayError } from '../../src/shared/domain/errors';
-import type { LocalInferenceRuntimeRelease, OrnithHealthyLease, OrnithInferenceLeaseService } from '../../src/main/ports';
+import type { OrnithHealthyLease, OrnithInferenceLeaseService } from '../../src/main/ports';
 import type {
   OrnithImplementationRequest,
   OrnithImplementationResult,
@@ -174,33 +174,6 @@ describe('Orchestrator: Ornith provider routing', () => {
     expect(completed.status).toBe('READY_FOR_REVIEW');
     // Claude/Codex must never be silently invoked for an Ornith-routed task.
     expect(harness.claude.calls).toHaveLength(0);
-  });
-
-  it('starts back a runtime Agent Relay released for its own verification before taking the lease, and only asks once per round', async () => {
-    const order: string[] = [];
-    const ornith = fakeOrnithService(async () => passingResult());
-    const ornithLease = healthyLeaseService({
-      acquireOrnithLease: async () => {
-        order.push('acquire');
-        return fakeLease();
-      }
-    });
-    const localInferenceRuntime: LocalInferenceRuntimeRelease = {
-      releaseForVerification: async () => ({ kind: 'not_running' }),
-      resumeReleasedRuntime: async () => {
-        order.push('resume');
-        return { kind: 'healthy', runtimeInstanceId: 'runtime-1' };
-      }
-    };
-    harness = createHarness({ ornith, ornithLease, localInferenceRuntime, processRunner: unusedProcessRunner });
-    const project = harness.createProject();
-    const task = harness.createTask(project.id, { implementationProvider: 'ornith' });
-    await harness.orchestrator.generateSpecification(task.id);
-    harness.orchestrator.approveSpecification(task.id);
-
-    await harness.orchestrator.sendToClaude(task.id);
-
-    expect(order).toEqual(['resume', 'acquire']);
   });
 
   it('routes a correction round to Ornith after Codex requests changes', async () => {

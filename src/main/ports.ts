@@ -1708,7 +1708,10 @@ export interface OrnithInferenceLeaseService {
    * retained, the retained provider is not `healthy`, the health check does
    * not confirm it, the active profile does not match `expectedProfileId`, or that profile's
    * configuration no longer matches `expectedProfileFingerprint` (an operator edited it after this task
-   * was bound). Never calls `start()`.
+   * was bound). Starts nothing the operator stopped: the one start on this path is of a runtime that
+   * `LocalInferenceRuntimeRelease.releaseForVerification` stopped itself, and only when its mark names
+   * exactly `expectedProfileId` at exactly `expectedProfileFingerprint` — with the lease token already
+   * claimed, so no release can stop it again in between.
    */
   acquireOrnithLease(
     expectedProfileId: string,
@@ -1746,7 +1749,8 @@ export type LocalInferenceReleaseOutcome =
 /**
  * The narrow surface the orchestrator uses to keep the project's test suite from competing with a
  * resident local model for memory. The runtime stays the operator's: this stops only a retained,
- * healthy runtime that no Ornith run is using, and starts back only a runtime it stopped itself.
+ * healthy runtime that no Ornith run is using, and the runtime it stopped is started back only by
+ * `OrnithInferenceLeaseService.acquireOrnithLease`, for the task bound to that exact profile.
  */
 export interface LocalInferenceRuntimeRelease {
   /**
@@ -1755,14 +1759,13 @@ export interface LocalInferenceRuntimeRelease {
    * feature is disabled, unbound or still starting (`unavailable`, with the reason). The lease check and
    * the stop happen in one synchronous step, so an acquisition that begins afterwards finds the runtime
    * already stopping and fails its own health check instead of being cut off mid-round.
+   *
+   * Every wait has a ceiling: the stop is awaited for at most the active profile's shutdown budget plus
+   * a grace, or until `signal` aborts; an expired or aborted wait is `unavailable` and never leaves a
+   * release mark behind, however the stop later ends. An operator Start, Stop or profile switch during
+   * the stop supersedes the release: the runtime stays stopped but is not marked for starting back.
    */
-  releaseForVerification(): Promise<LocalInferenceReleaseOutcome>;
-  /**
-   * Start back the profile `releaseForVerification` stopped, and only that: an operator Stop or Start
-   * since, a profile switch, or an edit to the bound profile clears the mark, and this then returns the
-   * current state without starting anything. Resolves with the state the start ended in.
-   */
-  resumeReleasedRuntime(signal?: AbortSignal): Promise<LocalInferenceState>;
+  releaseForVerification(signal?: AbortSignal): Promise<LocalInferenceReleaseOutcome>;
 }
 
 /* -------------------------------------------------------------------------- */

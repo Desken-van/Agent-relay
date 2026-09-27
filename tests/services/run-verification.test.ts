@@ -27,8 +27,7 @@ async function prepared() {
 describe('local runtime release before Relay verification', () => {
   function runtimeStub(outcome: LocalInferenceReleaseOutcome, calls: string[]): LocalInferenceRuntimeRelease {
     return {
-      releaseForVerification: async () => { calls.push('release'); return outcome; },
-      resumeReleasedRuntime: async () => { calls.push('resume'); return { kind: 'stopped' }; }
+      releaseForVerification: async (signal) => { calls.push(signal instanceof AbortSignal ? 'release' : 'release-without-signal'); return outcome; }
     };
   }
   async function verifiedWith(runtime: LocalInferenceRuntimeRelease | undefined, calls: string[], on = true) {
@@ -50,7 +49,9 @@ describe('local runtime release before Relay verification', () => {
     const { verified, texts } = await verifiedWith(runtimeStub({ kind: 'released' }, calls), calls);
     expect(calls).toEqual(['release', 'execute']);
     expect(verified.status).toBe('READY_FOR_REVIEW');
-    expect(texts).toContain('Local runtime released before verification; it is started back for the next Ornith round.');
+    expect(texts.indexOf('Releasing the local runtime before verification…')).toBeGreaterThanOrEqual(0);
+    expect(texts.indexOf('Local runtime released before verification; it is started back for the next Ornith round.'))
+      .toBeGreaterThan(texts.indexOf('Releasing the local runtime before verification…'));
   });
 
   it('leaves the runtime alone when the setting is off', async () => {
