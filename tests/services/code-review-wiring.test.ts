@@ -61,6 +61,7 @@ function settings(overrides: Partial<Settings> = {}): Settings {
   return {
     ...defaultSettings({ dataDir: 'C:/user-data', documentsDir: 'C:/documents' }),
     externalCodeReviewEnabled: true,
+    localInferenceReleaseBeforeVerification: true,
     coaiMcpExecutablePath: 'C:\\tools\\coai-mcp.exe',
     coaiMcpArguments: ['--stdio'],
     ...overrides
@@ -316,6 +317,7 @@ describe('the two gates describe one server', () => {
     const value = settings({
       externalPlanReviewEnabled: true,
       externalCodeReviewEnabled: true,
+      localInferenceReleaseBeforeVerification: true,
       coaiMcpWorkingDirectory: 'C:/work',
       processTimeoutMs: 90 * 60_000
     });

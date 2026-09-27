@@ -41,7 +41,7 @@ function settings(): Settings {
   return {
     localInference: defaultLocalInferenceSettings(),
     claudeExecutablePath: null, codexExecutablePath: null, ghExecutablePath: null,
-    externalPlanReviewEnabled: true, externalCodeReviewEnabled: false,
+    externalPlanReviewEnabled: true, externalCodeReviewEnabled: false, localInferenceReleaseBeforeVerification: true,
     coaiMcpExecutablePath: null, coaiMcpArguments: [], coaiMcpWorkingDirectory: null,
     coaiLastKnownContractFingerprint: null, coaiLastKnownContractCheckedAt: null,
     conventionsRepositoryPath: null, conventionsExpectedRevision: null, conventionsRulePaths: [],

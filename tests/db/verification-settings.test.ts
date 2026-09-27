@@ -39,6 +39,14 @@ const repository = () => new SqliteSettingsRepository(db, defaults);
 /* -------------------------------------------------------------------------- */
 
 describe('defaults', () => {
+  it('releases the local runtime before Relay verification by default, and honours a stored false', () => {
+    expect(defaults.localInferenceReleaseBeforeVerification).toBe(true);
+    // A database written before the key existed has no row for it: the default applies.
+    expect(repository().get().localInferenceReleaseBeforeVerification).toBe(true);
+    repository().update({ localInferenceReleaseBeforeVerification: false });
+    expect(repository().get().localInferenceReleaseBeforeVerification).toBe(false);
+  });
+
   it('ships the two shell rules', () => {
     expect(defaults.claudeVerificationTools).toEqual([
       'Bash(npm test *)',
@@ -368,6 +376,7 @@ describe('external review settings that no round could satisfy', () => {
       store.update({
         externalPlanReviewEnabled: true,
         externalCodeReviewEnabled: true,
+        localInferenceReleaseBeforeVerification: true,
         coaiMcpExecutablePath: null
       })
     ).toThrow(/absolute MCP executable path/i);
@@ -381,6 +390,7 @@ describe('external review settings that no round could satisfy', () => {
 
     const saved = store.update({
       externalCodeReviewEnabled: true,
+      localInferenceReleaseBeforeVerification: true,
       coaiMcpExecutablePath: 'C:\\tools\\coai-mcp.exe'
     });
 

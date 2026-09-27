@@ -33,14 +33,19 @@ function settings(overrides: Partial<Settings> = {}): Settings {
 /** An in-memory stand-in for the durable settings table, so `check()`'s recorded "last known" fingerprint survives across calls exactly as the real repository would. */
 class FakeSettingsRepository implements SettingsRepository {
   private current: Settings;
+  private localInferenceWriteRevision = 0;
   constructor(initial: Settings) {
     this.current = initial;
   }
   get(): Settings {
     return this.current;
   }
+  localInferenceRevision(): number {
+    return this.localInferenceWriteRevision;
+  }
   update(patch: Partial<Settings>): Settings {
     this.current = { ...this.current, ...patch };
+    if (patch.localInference !== undefined) this.localInferenceWriteRevision += 1;
     return this.current;
   }
 }

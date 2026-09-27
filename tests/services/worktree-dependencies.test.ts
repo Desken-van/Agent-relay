@@ -272,6 +272,39 @@ describe('installDependencies', () => {
     expect(['package_manager_failed', 'manifest_drift']).toContain(outcome.kind);
   });
 
+  it('installs devDependencies whatever NODE_ENV the host application carries: npm ci never inherits it', async () => {
+    // The live failure this guards against: Agent Relay started with `npm start` (electron-vite preview)
+    // carries NODE_ENV=production; an `npm ci` that inherits it omits devDependencies, so node-gyp is
+    // missing when the project's own postinstall needs it and the install fails after a green native build.
+    // The fixture observes the effect — the devDependency is installed — not the flag.
+    const localDev = join(root, 'local-dev');
+    mkdirSync(localDev);
+    writeFileSync(join(localDev, 'package.json'), JSON.stringify({ name: 'local-dev', version: '1.0.0' }));
+    writeFileSync(join(worktreePath, 'package.json'), JSON.stringify({
+      name: 'probe', version: '1.0.0', devDependencies: { 'local-dev': 'file:../local-dev' }
+    }));
+    rmSync(join(worktreePath, 'package-lock.json'), { force: true });
+    // The lockfile is generated before NODE_ENV is set, so it lists the devDependency; the install under
+    // test is the only step that runs with the host's production marker.
+    await npmInstall(worktreePath);
+    rmSync(join(worktreePath, 'node_modules'), { recursive: true, force: true });
+    const previous = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const outcome = await prepare.installDependencies(
+        { repositoryPath, worktreePath },
+        new AbortController().signal,
+        60_000,
+        1_000_000,
+        () => undefined
+      );
+      expect(outcome.kind).toBe('succeeded');
+      expect(statSync(join(worktreePath, 'node_modules', 'local-dev')).isDirectory()).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previous;
+    }
+  });
+
   it('is cancellable', async () => {
     const localPkg = join(root, 'local-pkg');
     mkdirSync(localPkg);

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createHarness, type Harness } from '../helpers/harness';
 import type { VerificationExecutor } from '../../src/main/services/worktree-verification';
+import type { LocalInferenceReleaseOutcome, LocalInferenceRuntimeRelease } from '../../src/main/ports';
 import type { ProcessResult } from '../../src/main/adapters/process/process-runner';
 import { planReconciliation } from '../../src/main/services/startup-reconciliation';
 import { ipcInputSchemas } from '../../src/shared/ipc';
@@ -23,6 +24,60 @@ async function prepared() {
   // Model the saved worktree after an unsuccessful implementation, not a new agent run.
   return h.tasks.update(task.id, {worktreePath: `${h.worktreesRoot}/task`, branchName: 'agent/task', baseBranch: 'main', currentRound: 1});
 }
+describe('local runtime release before Relay verification', () => {
+  function runtimeStub(outcome: LocalInferenceReleaseOutcome, calls: string[]): LocalInferenceRuntimeRelease {
+    return {
+      releaseForVerification: async (signal) => { calls.push(signal instanceof AbortSignal ? 'release' : 'release-without-signal'); return outcome; }
+    };
+  }
+  async function verifiedWith(runtime: LocalInferenceRuntimeRelease | undefined, calls: string[], on = true) {
+    h.dispose();
+    h = createHarness({
+      ...(runtime ? { localInferenceRuntime: runtime } : {}),
+      verification: { identity: async () => identity, execute: async (...args) => { calls.push('execute'); return execute(...args); } }
+    });
+    h.settings.update({ localInferenceReleaseBeforeVerification: on });
+    const task = await prepared();
+    const verified = await h.orchestrator.runVerification(task.id);
+    const run = h.runs.listByTask(task.id).find(r => r.runType === 'verification')!;
+    const texts = h.runEvents.listByRun(run.id).map(e => (JSON.parse(e.payload) as { text?: string }).text ?? '');
+    return { verified, texts };
+  }
+
+  it('stops a retained runtime nobody is using before the command runs, and says so in the run log', async () => {
+    const calls: string[] = [];
+    const { verified, texts } = await verifiedWith(runtimeStub({ kind: 'released' }, calls), calls);
+    expect(calls).toEqual(['release', 'execute']);
+    expect(verified.status).toBe('READY_FOR_REVIEW');
+    expect(texts.indexOf('Releasing the local runtime before verification…')).toBeGreaterThanOrEqual(0);
+    expect(texts.indexOf('Local runtime released before verification; a later Ornith round can start it back if the bound profile is unchanged.'))
+      .toBeGreaterThan(texts.indexOf('Releasing the local runtime before verification…'));
+  });
+
+  it('leaves the runtime alone when the setting is off', async () => {
+    const calls: string[] = [];
+    const { texts } = await verifiedWith(runtimeStub({ kind: 'released' }, calls), calls, false);
+    expect(calls).toEqual(['execute']);
+    expect(texts.some(text => text.includes('Local runtime'))).toBe(false);
+  });
+
+  it('still verifies when an Ornith run holds the runtime, and records that it was left running', async () => {
+    const calls: string[] = [];
+    const { verified, texts } = await verifiedWith(runtimeStub({ kind: 'in_use' }, calls), calls);
+    expect(calls).toEqual(['release', 'execute']);
+    expect(verified.status).toBe('READY_FOR_REVIEW');
+    expect(texts).toContain('Local runtime left running: an Ornith run is using it.');
+  });
+
+  it('records that no local runtime is wired when the setting is on in a build without one, and verifies anyway', async () => {
+    const calls: string[] = [];
+    const { verified, texts } = await verifiedWith(undefined, calls);
+    expect(calls).toEqual(['execute']);
+    expect(verified.status).toBe('READY_FOR_REVIEW');
+    expect(texts.some(text => text.includes('no local runtime is wired in this build'))).toBe(true);
+  });
+});
+
 describe('verification-only workflow', () => {
   it('records system evidence and opens review without launching implementation or consuming a round', async () => {
     const task = await prepared();

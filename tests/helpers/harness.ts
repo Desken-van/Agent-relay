@@ -28,7 +28,7 @@ import { ProjectService } from '../../src/main/services/project-service';
 import { PublishService } from '../../src/main/services/publish-service';
 import { TaskService } from '../../src/main/services/task-service';
 import { defaultSettings } from '../../src/main/container';
-import type { GitAdapter, OrnithInferenceLeaseService } from '../../src/main/ports';
+import type { GitAdapter, LocalInferenceRuntimeRelease, OrnithInferenceLeaseService } from '../../src/main/ports';
 import type { OrnithImplementationService } from '../../src/main/services/ornith-implementation';
 import type { ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { TaskOperationRegistry } from '../../src/main/services/task-operations';
@@ -85,6 +85,8 @@ export function createHarness(
     /** Present only in tests that exercise Ornith routing; absent everywhere else, matching production's optional wiring. */
     ornith?: OrnithImplementationService;
     ornithLease?: OrnithInferenceLeaseService;
+    /** Present only in tests about releasing the local runtime around Relay's own verification. */
+    localInferenceRuntime?: LocalInferenceRuntimeRelease;
     processRunner?: ProcessRunner;
     /** Findings accepted from an external code review; absent in every test that is not about them. */
     externalCodeRequirements?: OrchestratorDeps['externalCodeRequirements'];
@@ -178,6 +180,7 @@ export function createHarness(
     },
     ornith: options.ornith,
     ornithLease: options.ornithLease,
+    localInferenceRuntime: options.localInferenceRuntime,
     processRunner: options.processRunner,
     operations
   });

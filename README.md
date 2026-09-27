@@ -513,6 +513,19 @@ Being precise about what was actually exercised, rather than merely written:
 | **External plan-review gate** | ✅ **Durable contract and real-provider journey verified.** Settings hold only a fixed executable, argv and explicit convention selection; task IPC accepts identifiers and decisions, never process configuration or rule bytes. The live synthetic journey bound project rules plus four pinned convention files, generated a real specification, proved premature approval was refused, prepared an isolated branch, completed one Coai/Codex review, resolved all five findings, persisted `proceeded`, and read it back after restart. |
 | **Local inference lifecycle** | 🧪 **Backend, renderer, and one manual smoke-test inference verified with Agent Relay's fake runtime; real lifecycle and inference acceptance recorded 2026-09-14.** A strict version-1 Settings object persists an opt-in `enabled` flag, executable/model source, fixed arguments, port, context, timeouts, and request defaults (max output tokens, Ornith-compatible chat-template parameters). The Settings screen exposes every field, and a lifecycle panel drives six IPC operations: the five empty-input lifecycle calls — capabilities, explicit start, passive state, explicit health and stop — plus one additive `runTestInference` that accepts only `{prompt}`. The prompt field and its button are enabled only while the runtime is Healthy, the configuration is saved, and no other panel action is in progress; one click sends exactly one bounded, non-streaming, single-choice completion request using the saved model id and saved output-token/chat-template defaults, and renders the redacted completion, a typed finish reason, duration and provider/model identity, or an explicit failure reason. One synchronous panel-wide claim prevents capabilities, Start, health, passive refresh, Stop, and test inference from overlapping in the renderer; the provider's defensive backend stop/cancellation synchronization remains unchanged. The prompt and its result are volatile React state only — never SQLite, task history, logs, or browser storage — and disappear on unmount or restart. Disabled settings construct no provider. There is still no workflow/RAG/patch integration, retry/fallback, or streaming. On 2026-09-14, on Windows, a real llama.cpp/Ornith lifecycle and one real test inference completed successfully using runtime `llama.cpp 0.4.0-dev`, build `10850`, commit `f114f91f9`, with model `Ornith-1.5-9B-Q6_K`; capabilities were available and the runtime reached `Healthy`. The separate full Ornith implementation-provider end-to-end acceptance remains pending as of 2026-09-15 until the current Agent Relay run, `15a01938-record-real-ornith-inference-acceptance`, completes. After completion, the Agent Relay operator must update that status with the run outcome; see `docs/manual-test.md` §15. |
 
+### Memory-constrained machines
+
+Agent Relay runs the project's `npm run verify` with the project's own
+defaults, and vitest's default is one worker per CPU. On a machine where the
+test suite and a resident local model compete for memory — a 32 GB laptop with
+a 35B model loaded, for instance — that is what makes the suite's wall-clock
+tests fail. Two levers: the Settings switch *Release the local runtime while
+Agent Relay verifies* (on by default) stops a runtime no Ornith run is using
+before Relay's own verification and starts it back for the next round; and
+setting `VITEST_MAX_WORKERS` (for example `8`) in the environment Agent Relay
+is launched from caps the suite's parallelism — a machine-local setting the
+app passes through to `npm run verify` unchanged, not an app behaviour.
+
 ### Verify saved implementation without an AI round
 
 In **Run → Actions → Writes local files**, choose **Run verification**. This

@@ -19,10 +19,16 @@ import { assertExternalPlanReviewSettings } from '../../services/plan-review-con
  * executables are.
  */
 export class SqliteSettingsRepository implements SettingsRepository {
+  private localInferenceWriteRevision = 0;
+
   constructor(
     private readonly db: Db,
     private readonly defaults: Settings
   ) {}
+
+  localInferenceRevision(): number {
+    return this.localInferenceWriteRevision;
+  }
 
   get(): Settings {
     const rows = this.db.prepare('SELECT key, value FROM settings').all() as {
@@ -102,6 +108,7 @@ export class SqliteSettingsRepository implements SettingsRepository {
       }
     });
     write(next.data);
+    if (patch.localInference !== undefined) this.localInferenceWriteRevision += 1;
 
     return next.data;
   }
