@@ -237,6 +237,8 @@ export interface ApprovalRepository {
 export interface SettingsRepository {
   get(): Settings;
   update(patch: Partial<Settings>): Settings;
+  /** Increases after every successful local-inference settings write, including edits later reverted. */
+  localInferenceRevision(): number;
 }
 
 /* -------------------------------------------------------------------------- */

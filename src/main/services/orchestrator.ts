@@ -215,7 +215,7 @@ const ORNITH_VERIFICATION_MARKER_NEUTRALIZED = '[a line that looked like a verif
  * the protocol calls data must end exactly where Agent Relay ends it, whatever a test printed.
  */
 function verificationSummaryForOrnith(summary: string): string {
-  return summarizeVerificationOutput(summary, ORNITH_LIMITS.maxVerificationSummaryChars)
+  const neutralized = summarizeVerificationOutput(summary, ORNITH_LIMITS.maxVerificationSummaryChars)
     .split('\n')
     .map((line) => {
       const trimmed = line.trim();
@@ -224,6 +224,7 @@ function verificationSummaryForOrnith(summary: string): string {
         : line;
     })
     .join('\n');
+  return summarizeVerificationOutput(neutralized, ORNITH_LIMITS.maxVerificationSummaryChars);
 }
 
 export class Orchestrator {
@@ -1472,7 +1473,7 @@ export class Orchestrator {
     try {
       const outcome = await runtime.releaseForVerification(signal);
       switch (outcome.kind) {
-        case 'released': return 'Local runtime released before verification; it is started back for the next Ornith round.';
+        case 'released': return 'Local runtime released before verification; a later Ornith round can start it back if the bound profile is unchanged.';
         case 'in_use': return 'Local runtime left running: an Ornith run is using it.';
         case 'not_running': return 'Local runtime was not running.';
         case 'unavailable': return `Local runtime not released: ${outcome.reason}`;

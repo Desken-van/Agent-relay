@@ -46,7 +46,7 @@ const NO_ACTIVE_PROFILE_REASON = 'No local-model profile is selected. Choose one
 /** Beyond the active profile's own shutdown budget: how much longer `releaseForVerification` waits for the stop to confirm. */
 const LOCAL_RUNTIME_RELEASE_GRACE_MS = 5_000;
 
-type Settled<T> = { readonly kind: 'settled'; readonly value: T } | { readonly kind: 'expired' } | { readonly kind: 'aborted' };
+type Settled<T> = { readonly kind: 'settled'; readonly value: T } | { readonly kind: 'expired' } | { readonly kind: 'aborted' } | { readonly kind: 'failed' };
 
 /**
  * Await `work` for at most `ceilingMs`, or until `signal` aborts. The work itself is not cancelled — a
@@ -69,7 +69,7 @@ function settleWithin<T>(work: Promise<T>, ceilingMs: number, signal?: AbortSign
     signal?.addEventListener('abort', onAbort, { once: true });
     work.then(
       (value) => finish({ kind: 'settled', value }),
-      () => finish({ kind: 'expired' })
+      () => finish({ kind: 'failed' })
     );
   });
 }
@@ -147,7 +147,7 @@ export class LocalInferenceService
    * the runtime back. While set (and while the active profile still is that profile, enabled and
    * unedited — checked on every read), `state()` reports the stopped runtime as released.
    */
-  private releasedForVerification: { readonly profileId: string; readonly fingerprint: string } | null = null;
+  private releasedForVerification: { readonly profileId: string; readonly fingerprint: string; readonly profileRevision: number } | null = null;
   /**
    * Bumped by every operator lifecycle action (Start, Stop, profile switch). `releaseForVerification`
    * reads it before its stop and sets its mark only if it is unchanged after: an operator Stop that
@@ -210,11 +210,12 @@ export class LocalInferenceService
     }
     return { kind: 'stopped', releasedForVerification: true };
   }
-  private markMatchesActiveProfile(mark: { readonly profileId: string; readonly fingerprint: string }): boolean {
+  private markMatchesActiveProfile(mark: { readonly profileId: string; readonly fingerprint: string; readonly profileRevision: number }): boolean {
     const profile = this.activeProfile();
     // `enabled` is deliberately outside the fingerprint (see `localInferenceProfileFingerprint`), so a
     // disabled profile has to be refused here by name: the lease would refuse it, so the mark must too.
-    return profile !== null && profile.id === mark.profileId && profile.enabled &&
+    return this.options.settings.localInferenceRevision() === mark.profileRevision &&
+      profile !== null && profile.id === mark.profileId && profile.enabled &&
       localInferenceProfileFingerprint(profile) === mark.fingerprint;
   }
   /* ------------------------------------------------------------------ */
@@ -247,6 +248,7 @@ export class LocalInferenceService
       return { kind: 'unavailable', reason: 'The retained local runtime’s profile is no longer configured.' };
     }
     const generation = this.lifecycleGeneration;
+    const profileRevision = this.options.settings.localInferenceRevision();
     // No await between the lease check above and this stop: a lease acquired from here on meets a runtime
     // already stopping and fails its own health check, instead of being cut off mid-round. The stop is the
     // provider's own (already bounded by the profile's shutdown budget inside the adapter); this wait adds
@@ -263,16 +265,17 @@ export class LocalInferenceService
       };
     }
     if (settled.kind === 'aborted') return { kind: 'unavailable', reason: 'The release was cancelled.' };
+    if (settled.kind === 'failed') return { kind: 'unavailable', reason: 'The local runtime stop failed; verification can proceed without a confirmed release.' };
     const stopped = settled.value;
     if (stopped.kind !== 'stopped') {
       return { kind: 'unavailable', reason: 'reason' in stopped ? stopped.reason : `The local runtime is ${stopped.kind}.` };
     }
     // An operator Start, Stop or profile switch that landed while the stop was in flight owns the
     // outcome: the runtime is stopped either way, but it is theirs, and nothing starts it back.
-    if (this.lifecycleGeneration !== generation) {
-      return { kind: 'unavailable', reason: 'An operator action superseded the release; Agent Relay will not start the runtime back.' };
+    if (this.lifecycleGeneration !== generation || this.options.settings.localInferenceRevision() !== profileRevision) {
+      return { kind: 'unavailable', reason: 'An operator action or profile edit superseded the release; Agent Relay will not start the runtime back.' };
     }
-    this.releasedForVerification = { profileId, fingerprint };
+    this.releasedForVerification = { profileId, fingerprint, profileRevision };
     return { kind: 'released' };
   }
   /**

@@ -46,6 +46,11 @@ class MutableSettings implements SettingsRepository {
   // inference is enabled; these tests are about provider ownership and
   // delegation, not the disabled short-circuit, so they opt in up front.
   value = enabledDefaults();
+  private localInferenceWriteRevision = 0;
+
+  localInferenceRevision(): number {
+    return this.localInferenceWriteRevision;
+  }
 
   get(): Settings {
     return this.value;
@@ -53,6 +58,7 @@ class MutableSettings implements SettingsRepository {
 
   update(patch: Partial<Settings>): Settings {
     this.value = { ...this.value, ...patch };
+    if (patch.localInference !== undefined) this.localInferenceWriteRevision += 1;
     return this.value;
   }
 
@@ -916,6 +922,68 @@ describe('releasing the runtime around Relay verification', () => {
     expect(service.state()).toEqual({ kind: 'stopped' });
     await expect(service.acquireOrnithLease('default', settings.defaultFingerprint())).rejects.toThrow('The local runtime is not Healthy.');
     expect(provider.launches).toBe(1);
+  });
+
+  it('does not start back a profile edited and reverted while the release stop was in flight', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    const fingerprint = settings.defaultFingerprint();
+    let finishStop!: () => void;
+    provider.stopGate = new Promise<void>((resolve) => { finishStop = resolve; });
+
+    const releasing = service.releaseForVerification();
+    settings.patchDefaultProfile({ port: 19099 });
+    settings.patchDefaultProfile({ port: 8080 });
+    expect(settings.defaultFingerprint()).toBe(fingerprint);
+    finishStop();
+
+    await expect(releasing).resolves.toEqual({ kind: 'unavailable', reason: expect.stringContaining('superseded') });
+    expect(service.state()).toEqual({ kind: 'stopped' });
+    await expect(service.acquireOrnithLease('default', fingerprint)).rejects.toThrow('The local runtime is not Healthy.');
+    expect(provider.launches).toBe(1);
+  });
+
+  it('clears a release mark after a profile edit is reverted before the next round', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    const fingerprint = settings.defaultFingerprint();
+    await service.releaseForVerification();
+
+    settings.patchDefaultProfile({ port: 19099 });
+    settings.patchDefaultProfile({ port: 8080 });
+    expect(settings.defaultFingerprint()).toBe(fingerprint);
+    expect(service.state()).toEqual({ kind: 'stopped' });
+    await expect(service.acquireOrnithLease('default', fingerprint)).rejects.toThrow('The local runtime is not Healthy.');
+    expect(provider.launches).toBe(1);
+  });
+
+  it('releases the lease token if starting the released runtime back fails', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    await service.releaseForVerification();
+    vi.spyOn(provider, 'start').mockRejectedValueOnce(new Error('start failed'));
+
+    await expect(service.acquireOrnithLease('default', settings.defaultFingerprint())).rejects.toThrow('start failed');
+    await expect(service.acquireOrnithLease('default', settings.defaultFingerprint())).rejects.toThrow('The local runtime is not Healthy.');
+  });
+
+  it('reports a rejected provider stop as failure, not a timeout', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    vi.spyOn(provider, 'stop').mockRejectedValueOnce(new Error('private adapter detail'));
+
+    await expect(service.releaseForVerification()).resolves.toEqual({
+      kind: 'unavailable', reason: 'The local runtime stop failed; verification can proceed without a confirmed release.'
+    });
+    expect(service.state()).not.toMatchObject({ releasedForVerification: true });
   });
 
   it('an operator Start or Stop after a release takes the runtime back: the mark is cleared and the next lease starts nothing', async () => {

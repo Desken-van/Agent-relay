@@ -50,7 +50,7 @@ describe('local runtime release before Relay verification', () => {
     expect(calls).toEqual(['release', 'execute']);
     expect(verified.status).toBe('READY_FOR_REVIEW');
     expect(texts.indexOf('Releasing the local runtime before verification…')).toBeGreaterThanOrEqual(0);
-    expect(texts.indexOf('Local runtime released before verification; it is started back for the next Ornith round.'))
+    expect(texts.indexOf('Local runtime released before verification; a later Ornith round can start it back if the bound profile is unchanged.'))
       .toBeGreaterThan(texts.indexOf('Releasing the local runtime before verification…'));
   });
 

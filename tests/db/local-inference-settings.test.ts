@@ -214,6 +214,24 @@ describe('migrations 9 and 11 through 23', () => {
 });
 
 describe('local-inference Settings persistence', () => {
+  it('advances the profile-write revision for each successful edit, including one later reverted', () => {
+    const db = openDatabase({ file: ':memory:' });
+    try {
+      const repository = new SqliteSettingsRepository(db, defaults());
+      expect(repository.localInferenceRevision()).toBe(0);
+      repository.update({ githubOwner: 'unrelated' });
+      expect(repository.localInferenceRevision()).toBe(0);
+      repository.update({ localInference: withDefaultProfile({ port: 19099 }) });
+      repository.update({ localInference: withDefaultProfile({ port: 8080 }) });
+      expect(repository.localInferenceRevision()).toBe(2);
+      expect(repository.get().localInference).toEqual(defaultLocalInferenceSettings());
+      expect(() => repository.update({ localInference: withDefaultProfile({ port: 0 }) })).toThrow();
+      expect(repository.localInferenceRevision()).toBe(2);
+    } finally {
+      closeDatabase(db);
+    }
+  });
+
   it('returns shipped defaults and falls back only the malformed local field', () => {
     const db = openDatabase({ file: ':memory:' });
     const repository = new SqliteSettingsRepository(db, defaults());
