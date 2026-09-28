@@ -857,3 +857,6 @@ never touched.
 > ```powershell
 > $env:AGENT_RELAY_DATA_DIR = 'H:\some-throwaway-dir'; npm run dev
 > ```
+
+## Ornith UI smoke test
+This section verifies that Ornith can edit a repository file through Agent Relay.
