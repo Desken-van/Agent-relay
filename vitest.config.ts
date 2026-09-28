@@ -1,5 +1,6 @@
 import { resolve } from 'node:path';
 import { defineConfig } from 'vitest/config';
+import { VERIFICATION_VITEST_MAX_WORKERS } from './src/shared/domain/verification-execution-policy';
 
 const root = import.meta.dirname;
 
@@ -22,6 +23,8 @@ export default defineConfig({
     testTimeout: 60_000,
     hookTimeout: 60_000,
     pool: 'forks',
+    // Real Git/native-process suites overload high-core machines at Vitest's CPU-count default.
+    maxWorkers: VERIFICATION_VITEST_MAX_WORKERS,
     reporters: ['default']
   }
 });

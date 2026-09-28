@@ -738,11 +738,14 @@ of the locally held output and records one of `implementation`,
 record. Its reason is always a fixed, Relay-authored sentence plus at most an
 exit code, a duration or the configured limit — never a line the command
 printed. Only an `implementation` kind (an explicit assertion, `error TS…`,
-ESLint or build failure in the output) ever supplies repair evidence to a
+ESLint or build failure without a known worker failure beside it) supplies repair evidence to a
 provider, and that evidence is the record's sanitized `outputSummary`, never a
 run event and never the raw buffer; a test-runner failure (vitest's own pool
 messages), a cancellation and anything unclassifiable produce no prompt at all
-and are simply re-verified. So an unexplained failure can never be turned into
+and follow the verification recovery policy. Mixed check and worker failures are
+`unknown`, allowing one diagnostic re-run before an identical result blocks another
+unchanged attempt. Concrete error messages take priority over test titles and stack
+tails in the bounded summary. So an unexplained failure can never be turned into
 a model's correction round on evidence nobody has read.
 
 **An output that overflowed the stored log budget is never read as a
@@ -772,7 +775,11 @@ changes nothing for other callers). A live run had inherited
 `NODE_ENV=production` from the app process, which made Vite resolve React's
 production build for the test run and fail 528 renderer tests
 (`React.act is not a function`) with no change to the files under test. As in
-a developer's terminal, the project's tooling now picks its own defaults.
+a developer's terminal, the project's tooling picks its own NODE_ENV default.
+Relay additionally supplies `VITEST_MAX_WORKERS=2` to verification processes,
+including older task checkouts. Explicit project configuration or CLI options
+can override this Vitest default; other test runners ignore it. The worker policy
+is included in the verification configuration fingerprint.
 
 **Two read-only Git questions, fixed and internal.** After a run the loop asks
 `git status --porcelain=v1 --untracked-files=all` (a changed-file *count*, stderr

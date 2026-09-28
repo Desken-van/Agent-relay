@@ -105,7 +105,8 @@ describe('summarizeVerificationOutput', () => {
     ].join('\n');
     const summary = summarizeVerificationOutput(raw);
     const lines = summary.split('\n');
-    expect(lines[0]).toContain('FAIL  tests/adapters/ornith-worktree-tools.test.ts');
+    expect(lines[0]).toContain('AssertionError: expected timeout to be stale_hash');
+    expect(summary).toContain('FAIL  tests/adapters/ornith-worktree-tools.test.ts');
     expect(summary).toContain('AssertionError: expected timeout to be stale_hash');
     expect(lines).toContain('…');
     expect(lines.at(-1)).toContain('Test Files  1 failed | 118 passed (119)');
@@ -392,4 +393,18 @@ describe('describeUnverifiedOrnithOutcome', () => {
     expect(text).not.toContain('SECRET-OUTPUT');
     expect(text).not.toContain('someone');
   });
+});
+
+
+it('retains the assertion and worker cause after six long failed-test titles, ahead of a long stack tail', () => {
+  const titles = Array.from({ length: 6 }, (_, i) => `× test ${i} ${'long title '.repeat(25)}`);
+  const raw = [...titles, 'AssertionError: expected timeout to be stale_hash',
+    'Error: [vitest-pool]: Failed to start forks worker',
+    ...Array.from({ length: 20 }, () => ` at ${'worker-frame '.repeat(20)}`),
+    'Caused by: Error: [vitest-pool-runner]: Timeout waiting for worker to respond'].join('\n');
+  const summary = summarizeVerificationOutput(raw);
+  expect(summary).toContain('AssertionError: expected timeout to be stale_hash');
+  expect(summary).toContain('[vitest-pool]: Failed to start forks worker');
+  expect(summary).toContain('Timeout waiting for worker to respond');
+  expect(summary.length).toBeLessThanOrEqual(1_500);
 });

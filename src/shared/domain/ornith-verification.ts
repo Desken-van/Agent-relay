@@ -121,6 +121,7 @@ export function classifyVerificationExecution(
 const ESCAPE = String.fromCharCode(27);
 const ANSI_SEQUENCE = new RegExp(`${ESCAPE}\\[[0-9;?]*[ -/]*[@-~]`, 'g');
 const FAILING_LINE = /^\s*(FAIL\b|×|✗|✖)|AssertionError|\bError:|\bnpm error\b|^\s*(Test Files|Tests)\s/;
+const DIAGNOSTIC_LINE = /AssertionError|\berror TS\d{4,5}\b|✖ \d+ problems?|\bError:|\bTypeError:|\bRollupError|error during build|\[vitest-pool/;
 const SUMMARY_LINE_MAX = 200;
 const SUMMARY_TAIL_LINES = 8;
 const SUMMARY_FAILING_LINES = 6;
@@ -180,22 +181,22 @@ export function summarizeVerificationOutput(
     .filter((line) => line.trim().length > 0);
   if (lines.length === 0) return '';
 
-  const tail = lines.slice(-SUMMARY_TAIL_LINES);
-  const failing: string[] = [];
-  for (const line of lines) {
-    if (failing.length >= SUMMARY_FAILING_LINES) break;
-    if (FAILING_LINE.test(line) && !tail.includes(line) && !failing.includes(line)) failing.push(line);
-  }
+  const limit = Math.max(0, Math.floor(maxChars));
+  if (lines.length <= SUMMARY_TAIL_LINES && lines.join('\n').length <= limit) return lines.join('\n');
 
-  const compose = (head: readonly string[]): string =>
-    [...head, ...(head.length > 0 ? ['…'] : []), ...tail].join('\n');
-  let head = failing;
-  let text = compose(head);
-  while (text.length > maxChars && head.length > 0) {
-    head = head.slice(0, -1);
-    text = compose(head);
+  // Reserve space for actual error messages before failing-test titles and stack tails.
+  // Otherwise six early test titles can consume every slot and erase the later assertion.
+  const diagnostic = [...new Set(lines.filter(line => DIAGNOSTIC_LINE.test(line)))].slice(0, SUMMARY_FAILING_LINES);
+  const tailLines = lines.slice(-SUMMARY_TAIL_LINES);
+  const failing = [...new Set(lines.filter(line => FAILING_LINE.test(line) && !diagnostic.includes(line) && !tailLines.includes(line)))].slice(0, SUMMARY_FAILING_LINES);
+  const tail = tailLines.filter(line => !diagnostic.includes(line));
+  const parts = [...diagnostic, ...failing, ...(tail.length > 0 && (diagnostic.length + failing.length) > 0 ? ['…'] : []), ...tail];
+  let text = parts.join('\n');
+  if (text.length > limit) {
+    text = limit === 0 ? '' : diagnostic.length > 0
+      ? `${text.slice(0, limit - 1)}…`
+      : `…${text.slice(text.length - (limit - 1))}`;
   }
-  if (text.length > maxChars) text = `…${text.slice(text.length - (maxChars - 1))}`;
   return text;
 }
 

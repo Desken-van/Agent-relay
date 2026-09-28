@@ -589,3 +589,13 @@ describe('exactly one action, from a fixed set, in every recovery combination', 
     }
   });
 });
+
+
+it('offers diagnosis for a legacy mixed failure, and verification after a later failed Ornith attempt preserved changes', () => {
+  const original = ornithRun({ changedFiles: 1, worktreeChangedFiles: 1 });
+  const legacy = relayRecord({ outcome: 'failed', failureKind: 'implementation',
+    outputSummary: 'Error: [vitest-pool]: Failed to start forks worker', reason: 'A test assertion failed.' });
+  expect(guidance(task(), [original, legacy]).action).toMatchObject({ key: 'run_verification', label: 'Run verification to diagnose' });
+  const retry = ornithRun({ changedFiles: 0, worktreeChangedFiles: 1, reasonCodes: ['stale_hash'], id: 'retry' });
+  expect(guidance(task(), [original, legacy, retry]).action).toMatchObject({ key: 'run_verification', label: 'Run verification' });
+});
