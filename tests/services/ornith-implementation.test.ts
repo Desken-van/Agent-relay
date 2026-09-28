@@ -1721,6 +1721,63 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(replaceTextCalls).toHaveBeenCalledTimes(1);
     });
 
+    it('refuses bare LF in a CRLF replacement, then accepts one corrected retry', async () => {
+      const { result, denials, promptOf } = await run([
+        readAction,
+        replace(rightOldText, 'Kept this line\nTail'),
+        replace(rightOldText, 'Kept this line\r\nTail'),
+        finishAction
+      ]);
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(result.ornithAudit.outcomes).toEqual([
+        { sequence: 1, action: 'read_file', ok: true },
+        { sequence: 2, action: 'replace_text', ok: false, code: 'line_ending_change_refused' },
+        { sequence: 3, action: 'replace_text', ok: true }
+      ]);
+      expect(denials).toHaveLength(1);
+      expect(denials[0]!.data).toMatchObject({ code: 'line_ending_change_refused', recoverable: true });
+      expect(promptOf(2)).toContain('"code":"line_ending_change_refused"');
+      expect(promptOf(2)).toContain('git_diff display cannot prove line endings');
+      expect(onDisk()).toBe('Title\r\nKept this line\r\nTail\r\n');
+      expect(replaceTextCalls).toHaveBeenCalledTimes(2);
+    });
+
+    it('preserves a correct CRLF edit when a later replacement would regress it to bare LF', async () => {
+      const corrected = 'Title\r\nKept this line\r\nTail\r\n';
+      const correctedHash = createHash('sha256').update(corrected, 'utf8').digest('hex');
+      const regression = JSON.stringify({
+        version: 1, action: 'replace_text', path: 'crlf.md', sha256: correctedHash,
+        replacements: [{ oldText: 'Kept this line\r\nTail', newText: 'Kept this line\nTail' }]
+      });
+      const { result, denials, promptOf } = await run([
+        readAction,
+        replace(rightOldText, 'Kept this line\r\nTail'),
+        regression,
+        finishAction
+      ]);
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(result.ornithAudit.changedFiles).toBe(1);
+      expect(denials).toHaveLength(1);
+      expect(denials[0]!.data).toMatchObject({ code: 'line_ending_change_refused', recoverable: true });
+      expect(promptOf(3)).toContain('If the file already meets the task requirement');
+      expect(onDisk()).toBe(corrected);
+      expect(replaceTextCalls).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not dispatch an identical line-ending retry and stops with the original bytes intact', async () => {
+      const wrong = replace(rightOldText, 'Kept this line\nTail');
+      const { result, requests, denials } = await run([readAction, wrong, wrong]);
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.reasonCodes).toEqual(['line_ending_change_refused']);
+      expect(replaceTextCalls).toHaveBeenCalledTimes(1);
+      expect(requests).toHaveLength(3);
+      expect(denials.map((event) => (event.data as { recoverable: boolean }).recoverable)).toEqual([true, false]);
+      expect(onDisk()).toBe(original);
+    });
+
     it('refuses a doubled-backslash oldText with the exact diagnosis, writes nothing, and lets the model fix the escaping once', async () => {
       const { result, denials, promptOf } = await run([
         readAction,

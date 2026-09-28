@@ -1679,6 +1679,49 @@ describe('OrnithWorktreeTools containment and budgets', () => {
 
       expect(result).toMatchObject({ ok: true });
       expect(bytes.toString('utf8')).toBe('title\r\nkept\r\ntail\r\n');
+      if (!result.ok) throw new Error('expected successful replacement');
+      expect(result.forModel).toMatchObject({ lineEnding: 'crlf' });
+    });
+
+    it.each([
+      ['crlf', 'Title\r\nTail\r\n', 'Tail\r\n', 'Tail\n'],
+      ['lf', 'Title\nTail\n', 'Tail\n', 'Tail\r\n']
+    ])('refuses an accidental line-ending change in a uniform %s file before writing', async (style, content, oldText, newText) => {
+      const { result, boundary, bytes } = await replaceIn('uniform.txt', content, oldText, newText);
+      expect(result).toMatchObject({ ok: false, code: 'line_ending_change_refused' });
+      if (result.ok) throw new Error('expected a refusal');
+      expect(result.reason).toContain(style.toUpperCase());
+      expect(result.reason).not.toContain('Title');
+      expect(result.reason.length).toBeLessThanOrEqual(ORNITH_LIMITS.maxErrorChars);
+      expect(bytes.toString('utf8')).toBe(content);
+      expect(boundary.changedFileCount()).toBe(0);
+    });
+
+    it('allows an explicit requested conversion and reports the resulting style', async () => {
+      const original = 'Title\r\nTail\r\n';
+      writeFileSync(join(worktree, 'convert.txt'), original);
+      const result = await tools().replaceText({
+        version: 1, action: 'replace_text', path: 'convert.txt', sha256: sha(original),
+        replacements: [{ oldText: 'Tail\r\n', newText: 'Tail\n' }], allowLineEndingChange: true
+      }, undefined, budget);
+      expect(result).toMatchObject({ ok: true, forModel: { lineEnding: 'mixed' } });
+      expect(readFileSync(join(worktree, 'convert.txt'), 'utf8')).toBe('Title\r\nTail\n');
+    });
+
+    it('rejects a late wrong-ending replacement without applying earlier replacements in the same action', async () => {
+      const original = 'Title\r\nTail\r\n';
+      writeFileSync(join(worktree, 'multi-ending.txt'), original);
+      const boundary = tools();
+      const result = await boundary.replaceText({
+        version: 1, action: 'replace_text', path: 'multi-ending.txt', sha256: sha(original),
+        replacements: [
+          { oldText: 'Title', newText: 'Heading' },
+          { oldText: 'Tail\r\n', newText: 'Tail\n' }
+        ]
+      }, undefined, budget);
+      expect(result).toMatchObject({ ok: false, code: 'line_ending_change_refused' });
+      expect(readFileSync(join(worktree, 'multi-ending.txt'), 'utf8')).toBe(original);
+      expect(boundary.changedFileCount()).toBe(0);
     });
 
     it.each([

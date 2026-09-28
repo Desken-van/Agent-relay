@@ -336,6 +336,15 @@ describe('ornithActionSchema: strict per-action acceptance', () => {
     expect(missingHash.success).toBe(false);
   });
 
+  it('replace_text: permits an explicit line-ending conversion flag, but not a string in its place', () => {
+    const action = envelope({
+      action: 'replace_text', path: 'a.ts', sha256: HASH,
+      replacements: [{ oldText: 'a', newText: 'b' }], allowLineEndingChange: true
+    });
+    expect(ornithActionSchema.safeParse(action).success).toBe(true);
+    expect(ornithActionSchema.safeParse({ ...action, allowLineEndingChange: 'true' }).success).toBe(false);
+  });
+
   it('delete_file: requires a sha256', () => {
     expect(
       ornithActionSchema.safeParse(envelope({ action: 'delete_file', path: 'a.ts', sha256: HASH })).success
@@ -558,6 +567,8 @@ describe('line-ending classification and literal escape detection', () => {
   it('gives the escape diagnosis its own denial code and exactly one retry', () => {
     expect(ORNITH_DENIAL_CODES).toContain('replacement_escape_suspected');
     expect(ORNITH_LIMITS.maxReplacementEscapeRecoveryAttempts).toBe(1);
+    expect(ORNITH_DENIAL_CODES).toContain('line_ending_change_refused');
+    expect(ORNITH_LIMITS.maxLineEndingRecoveryAttempts).toBe(1);
   });
 });
 
