@@ -1501,6 +1501,7 @@ export class OrnithWorktreeTools {
         return denied('path_not_regular_file', 'The file is not valid UTF-8 text.');
       }
 
+      const originalLineEnding = classifyLineEnding(raw);
       let next = text;
       for (const replacement of action.replacements) {
         const occurrences = countOccurrences(next, replacement.oldText);
@@ -1534,6 +1535,18 @@ export class OrnithWorktreeTools {
       }
       if (nextBytes > budget.writeBytes) {
         return denied('limit_write_bytes_exceeded', 'Replacing the file would exceed the remaining repository write budget.');
+      }
+      const nextLineEnding = classifyLineEnding(Buffer.from(next, 'utf8'));
+      if (!action.allowLineEndingChange &&
+          (originalLineEnding === 'crlf' || originalLineEnding === 'lf') &&
+          nextLineEnding !== originalLineEnding && nextLineEnding !== 'none') {
+        return denied(
+          'line_ending_change_refused',
+          `The file uses ${originalLineEnding.toUpperCase()} line endings, but this replacement would make it ` +
+            `${nextLineEnding.toUpperCase()}. No write was made. Use real line breaks matching the file's ` +
+            'lineEnding in newText. Set allowLineEndingChange to true only when the task explicitly requires ' +
+            'changing the file’s line-ending style.'
+        );
       }
       if (containsSecretShape(next)) {
         return denied('disallowed_action', 'The resulting file content looks credential-shaped.');
@@ -1576,7 +1589,7 @@ export class OrnithWorktreeTools {
 
       return {
         ok: true,
-        forModel: { path: action.path, sha256: newSha256, bytesWritten: nextBytes },
+        forModel: { path: action.path, sha256: newSha256, bytesWritten: nextBytes, lineEnding: nextLineEnding },
         // Two internal reads of the target (first read, final re-read), on whichever pool paid for them.
         readBytes: onValidationBudget ? 0 : raw.byteLength * 2,
         validationReadBytes: onValidationBudget ? raw.byteLength * 2 : 0,

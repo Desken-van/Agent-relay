@@ -134,6 +134,8 @@ export const ORNITH_LIMITS = {
    *  gets exactly one DIFFERENT retry, and an identical repeat is never
    *  dispatched. */
   maxReplacementEscapeRecoveryAttempts: 1,
+  /** One no-write retry when replace_text would change a uniform file's line-ending style. */
+  maxLineEndingRecoveryAttempts: 1,
 
   /** Discovery-scope hint: how many of a specification's declared
    *  `scopedFilePaths` entries are honored after syntax sanitization. Matches
@@ -191,6 +193,7 @@ export const ORNITH_DENIAL_CODES = [
   'stale_hash',
   'replacement_mismatch',
   'replacement_escape_suspected',
+  'line_ending_change_refused',
   'file_exists',
   'file_not_found',
   'limit_turns_exceeded',
@@ -463,7 +466,8 @@ export const ornithReplaceTextActionSchema = z
     action: z.literal('replace_text'),
     path: ornithRelativePathSchema,
     sha256: ornithSha256Schema,
-    replacements: z.array(ornithReplacementSchema).min(1).max(ORNITH_LIMITS.maxReplacements)
+    replacements: z.array(ornithReplacementSchema).min(1).max(ORNITH_LIMITS.maxReplacements),
+    allowLineEndingChange: z.boolean().optional()
   })
   .strict();
 
@@ -596,6 +600,7 @@ export const ORNITH_ACTION_JSON_SCHEMA = {
         action: { const: 'replace_text' },
         path: { type: 'string' },
         sha256: { type: 'string' },
+        allowLineEndingChange: { type: 'boolean' },
         replacements: {
           type: 'array',
           minItems: 1,
