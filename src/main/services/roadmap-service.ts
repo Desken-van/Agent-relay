@@ -531,4 +531,3 @@ function describeCycle(edges: readonly WaitEdge[]): string {
     .filter((item, index, all) => all.indexOf(item) === index)
     .join(', ');
 }
-
