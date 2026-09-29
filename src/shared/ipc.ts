@@ -81,6 +81,20 @@ import type {
   RuleEvidenceOmission,
   RuleEvidenceSource
 } from './domain/rule-evidence';
+import {
+  roadmapAddDependencyInputSchema,
+  roadmapCreateNodeInputSchema,
+  roadmapGetInputSchema,
+  roadmapMoveNodeInputSchema,
+  roadmapPlaceTaskInputSchema,
+  roadmapRemoveDependencyInputSchema,
+  roadmapRemoveNodeInputSchema,
+  roadmapTransitionNodeInputSchema,
+  roadmapUnassignTaskInputSchema,
+  roadmapUpdateNodeInputSchema,
+  type ContinuationPlacement,
+  type RoadmapView
+} from './domain/roadmap-operations';
 
 /* -------------------------------------------------------------------------- */
 /* Envelope                                                                    */
@@ -305,7 +319,9 @@ export type AppEvent =
   | { readonly kind: 'run-started'; readonly run: Run }
   | { readonly kind: 'run-updated'; readonly run: Run }
   | { readonly kind: 'run-event'; readonly taskId: string; readonly event: RunEvent }
-  | { readonly kind: 'diagnostics'; readonly report: DiagnosticsReport };
+  | { readonly kind: 'diagnostics'; readonly report: DiagnosticsReport }
+  /** Sent after the change committed; the renderer re-reads the roadmap at or after `revision`. */
+  | { readonly kind: 'roadmap-updated'; readonly projectId: string; readonly revision: number };
 
 /* -------------------------------------------------------------------------- */
 /* Input schemas                                                               */
@@ -635,7 +651,25 @@ export const ipcInputSchemas = {
       probeId: diagnosticProbeIdSchema,
       options: diagnosticOptionsSchema.optional()
     })
-    .strict()
+    .strict(),
+
+  /* ---------------------------------------------------------------------- */
+  /* Roadmap                                                                 */
+  /* ---------------------------------------------------------------------- */
+  //
+  // Every write names its project and the revision the caller last read; a stale one is refused with
+  // nothing written. Text is normalised here and again by the service. No channel creates, changes or
+  // runs a task: tasks are only placed, moved and unassigned.
+  'roadmap:get': roadmapGetInputSchema,
+  'roadmap:createNode': roadmapCreateNodeInputSchema,
+  'roadmap:updateNode': roadmapUpdateNodeInputSchema,
+  'roadmap:moveNode': roadmapMoveNodeInputSchema,
+  'roadmap:removeNode': roadmapRemoveNodeInputSchema,
+  'roadmap:transitionNode': roadmapTransitionNodeInputSchema,
+  'roadmap:placeTask': roadmapPlaceTaskInputSchema,
+  'roadmap:unassignTask': roadmapUnassignTaskInputSchema,
+  'roadmap:addDependency': roadmapAddDependencyInputSchema,
+  'roadmap:removeDependency': roadmapRemoveDependencyInputSchema
 } as const;
 
 export type IpcChannel = keyof typeof ipcInputSchemas;
@@ -695,9 +729,11 @@ export interface IpcResponseMap {
   'workflow:approveForPublishing': Task;
   /**
    * The full continuation `TaskDetail`, so the renderer can select and
-   * display it without an immediate second `tasks:get` round trip.
+   * display it without an immediate second `tasks:get` round trip, plus what
+   * happened to its roadmap placement — a refusal is reported as one, never as
+   * a placement (null when none was attempted).
    */
-  'workflow:continue': TaskDetail;
+  'workflow:continue': TaskDetail & { readonly roadmapPlacement: ContinuationPlacement | null };
 
   'planReview:get': PlanReviewDetail;
   'planReview:bindRules': PlanReviewDetail;
@@ -744,6 +780,17 @@ export interface IpcResponseMap {
   'operations:deleteTarget': { removed: true };
   'operations:listDiagnostics': OperationDiagnosticRun[];
   'operations:runDiagnostic': OperationDiagnosticRun;
+
+  'roadmap:get': RoadmapView;
+  'roadmap:createNode': RoadmapView;
+  'roadmap:updateNode': RoadmapView;
+  'roadmap:moveNode': RoadmapView;
+  'roadmap:removeNode': RoadmapView;
+  'roadmap:transitionNode': RoadmapView;
+  'roadmap:placeTask': RoadmapView;
+  'roadmap:unassignTask': RoadmapView;
+  'roadmap:addDependency': RoadmapView;
+  'roadmap:removeDependency': RoadmapView;
 }
 
 export const IPC_CHANNELS = Object.keys(ipcInputSchemas) as IpcChannel[];

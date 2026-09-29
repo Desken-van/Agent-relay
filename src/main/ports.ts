@@ -104,6 +104,12 @@ export interface Clock {
  */
 export interface TransactionRunner {
   run(work: () => void): void;
+  /**
+   * Run `callback` after the outermost transaction commits (at once outside any), and never if the work
+   * that registered it rolls back. Returning from a nested `run` proves nothing: it only released a
+   * savepoint. This is how a notification is kept from describing work that could still be undone.
+   */
+  afterCommit(callback: () => void): void;
 }
 
 export interface IdGenerator {
@@ -1926,6 +1932,8 @@ export interface EventPublisher {
   publishRun(run: Run, kind: 'run-started' | 'run-updated'): void;
   publishRunEvent(taskId: string, event: RunEvent): void;
   publishDiagnostics(report: DiagnosticsReport): void;
+  /** A project's roadmap reached `revision`. Published only after the change is durable. */
+  publishRoadmap(projectId: string, revision: number): void;
 }
 
 /* -------------------------------------------------------------------------- */

@@ -15,4 +15,8 @@ export class SqliteTransactionRunner implements TransactionRunner {
   run(work: () => void): void {
     this.db.transaction(work)();
   }
+
+  afterCommit(callback: () => void): void {
+    this.db.afterCommit(callback);
+  }
 }

@@ -164,9 +164,10 @@ projects ──┬─< tasks ──┬─< runs ──< run_events
 
 The durable Roadmap (Goal → Phase → Epic → Task) is specified in [roadmap.md](roadmap.md). Its domain
 model lives in [`src/shared/domain/roadmap.ts`](../src/shared/domain/roadmap.ts) and
-[`roadmap-structure.ts`](../src/shared/domain/roadmap-structure.ts); its tables are designed there and
-arrive with migration 24 in Milestone 13B. It attaches existing tasks to epics and never owns, transitions or
-copies a task's workflow status, and the workflow never reads it.
+[`roadmap-structure.ts`](../src/shared/domain/roadmap-structure.ts); its tables are migration 24 (13B), and
+`RoadmapService` with the `roadmap:*` IPC channels (13C) is its only writer. It attaches existing tasks to epics
+and never owns, transitions or copies a task's workflow status, and the workflow never reads it. Its change
+event is published through `TransactionRunner.afterCommit`, after the outermost commit.
 
 Migration 9 seeds the strict version-1 `localInference` Settings object only
 when absent; migration 11 is forward-only and upgrades a pre-existing row to

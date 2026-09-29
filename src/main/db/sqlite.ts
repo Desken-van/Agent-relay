@@ -50,6 +50,16 @@ export interface SqliteDatabase {
    */
   pragma(statement: string, options?: { simple?: boolean }): unknown;
   transaction<A extends readonly unknown[]>(fn: (...args: A) => void): (...args: A) => void;
+  /**
+   * Run `callback` once the work it belongs to is durable.
+   *
+   * Outside a transaction that is now. Inside one it is after the OUTERMOST
+   * commit — a nested `transaction()` is only a savepoint, and releasing it
+   * proves nothing — and never if the savepoint or transaction that registered
+   * it rolls back. For notifications such as events: something another party
+   * may act on must not describe work that could still be undone.
+   */
+  afterCommit(callback: () => void): void;
   close(): void;
 }
 
@@ -127,6 +137,9 @@ class NodeSqliteDatabase implements SqliteDatabase {
   /** Nesting depth, so an inner transaction uses a SAVEPOINT rather than BEGIN. */
   private depth = 0;
 
+  /** Post-commit callbacks, each with the depth that registered it; see {@link afterCommit}. */
+  private pending: { readonly depth: number; readonly callback: () => void }[] = [];
+
   constructor(private readonly db: DatabaseSync) {}
 
   prepare(sql: string): PreparedStatement {
@@ -159,11 +172,17 @@ class NodeSqliteDatabase implements SqliteDatabase {
 
       this.db.exec(nested ? `SAVEPOINT ${savepoint}` : 'BEGIN');
       this.depth += 1;
+      const level = this.depth;
+      let committed = false;
 
       try {
         fn(...args);
         this.db.exec(nested ? `RELEASE ${savepoint}` : 'COMMIT');
+        committed = !nested;
       } catch (error) {
+        // Everything registered at this level or deeper is undone with it. A deeper savepoint that was
+        // released still belongs to this level, which is exactly why a release alone runs nothing.
+        this.pending = this.pending.filter((entry) => entry.depth < level);
         try {
           this.db.exec(nested ? `ROLLBACK TO ${savepoint}` : 'ROLLBACK');
           if (nested) this.db.exec(`RELEASE ${savepoint}`);
@@ -174,7 +193,35 @@ class NodeSqliteDatabase implements SqliteDatabase {
       } finally {
         this.depth -= 1;
       }
+      if (committed) this.runPending();
     };
+  }
+
+  afterCommit(callback: () => void): void {
+    if (this.depth === 0) {
+      callback();
+      return;
+    }
+    this.pending.push({ depth: this.depth, callback });
+  }
+
+  /**
+   * Runs once the outermost transaction has committed. Every callback runs even if an earlier one throws;
+   * the first error is then re-thrown, so a failed notification is reported rather than lost — after the
+   * commit, which it cannot and does not undo.
+   */
+  private runPending(): void {
+    const callbacks = this.pending;
+    this.pending = [];
+    let failure: { readonly error: unknown } | null = null;
+    for (const { callback } of callbacks) {
+      try {
+        callback();
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+    if (failure !== null) throw failure.error;
   }
 
   close(): void {

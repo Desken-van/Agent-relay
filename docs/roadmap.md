@@ -1,13 +1,16 @@
 # Roadmap
 
 The durable project Roadmap: **Goal → Phase → Epic → Task**. Milestone 13A defines the domain model, its
-invariants and the storage contract below; 13B implements storage (migration 24 and `SqliteRoadmapRepository`),
-13C the services (authoring, moves,
-dependency validation, cycle rejection, readiness and roll-up), 13D the screens, 13E the acceptance.
+invariants and the storage contract below; 13B implements storage (migration 24 and `SqliteRoadmapRepository`);
+13C the services (authoring, moves, dependency validation, cycle rejection, readiness, roll-up, the continuation
+hook and typed IPC — §8); 13D the screens; 13E the acceptance.
 
-Code: [`src/shared/domain/roadmap.ts`](../src/shared/domain/roadmap.ts) (vocabulary and per-record schemas) and
+Code: [`src/shared/domain/roadmap.ts`](../src/shared/domain/roadmap.ts) (vocabulary and per-record schemas),
 [`src/shared/domain/roadmap-structure.ts`](../src/shared/domain/roadmap-structure.ts) (cross-record invariants
-and the snapshot boundary).
+and the snapshot boundary), [`roadmap-graph.ts`](../src/shared/domain/roadmap-graph.ts) (continuation resolution
+and the cycle graph), [`roadmap-progress.ts`](../src/shared/domain/roadmap-progress.ts) (readiness and roll-up),
+[`roadmap-operations.ts`](../src/shared/domain/roadmap-operations.ts) (operation inputs and the read model) and
+[`roadmap-service.ts`](../src/main/services/roadmap-service.ts) (the service).
 
 ## 1. One execution system
 
@@ -75,14 +78,21 @@ Preconditions the services enforce (13C):
 
 - Every change must leave the snapshot valid, so `accept` and `cancel` need no open child node and no
   non-terminal task beneath (I7).
-- `accept` over a subtree holding a `stopped` task needs the operator's explicit acknowledgement in the request;
-  without it the accept is refused and names those tasks. A stopped task is not always recoverable — the
-  continuation service admits a source only with review evidence, so a task that failed during specification
-  or publishing can never be continued — and the only other way out would be moving it away from the epic's
-  history. The stopped-work flag stays visible on the accepted node.
+- `accept` over a subtree holding a `stopped` task needs the operator's explicit acknowledgement in the request
+  (`acknowledgeStoppedWork: true`); without it the accept is refused with `APPROVAL_REQUIRED`, naming those
+  tasks. "The subtree" is what the node's progress counts, so stopped work under a cancelled child does not ask,
+  and accepting a phase asks again about stopped work its accepted epics already acknowledged — the phase's
+  acceptance accepts it too. A stopped task is not always recoverable — the continuation service admits a
+  source only with review evidence, so a task that failed during specification or publishing can never be
+  continued — and the only other way out would be moving it away from the epic's history. The stopped-work flag
+  stays visible on the accepted node.
 - **A closed node's contents are frozen.** Placing a task into, or moving one out of, an accepted or cancelled
-  epic is refused, as is adding a child under a closed node; reopen it first. Otherwise work could be slipped
-  under an acceptance that never saw it.
+  epic is refused, as is adding a child under a closed node, moving a node into or out of one, and adding a
+  dependency whose dependent is, or sits inside, a closed node; reopen it first. Otherwise work could be slipped
+  under an acceptance that never saw it. The closed node itself is read-only too — its title, description and
+  acceptance criteria are what was accepted. Removing a dependency is always allowed (§4).
+- A node can be **removed** only while it is open, empty (no children, no tasks), under an open parent, and named
+  by no dependency. Cancelling is how finished or abandoned work is kept.
 - An **empty** node may be accepted: its acceptance evidence may lie outside Agent Relay.
 
 ### Task progress — derived, never stored
@@ -207,9 +217,14 @@ cycle, so today's continuations do not trigger the read-time case. The read-time
 roadmap must not depend on how another service happens to pick its successor, and a later service that
 continues into an existing task would otherwise turn an accepted edge into an unseen deadlock.
 
-The design contract [`tests/domain/roadmap-cycle-design.test.ts`](../tests/domain/roadmap-cycle-design.test.ts)
-executes these rules on a small model and the examples above. It is a model of the text, not the 13C engine: the
-application derives no readiness and detects no cycles until 13C.
+[`roadmap-graph.ts`](../src/shared/domain/roadmap-graph.ts) implements `R` (bounded: a chain that revisits a
+task ends as `continuation_loop`, one that names a missing task as `continuation_missing`), the graph, strongly
+connected components (iterative Tarjan, so a long chain never meets the stack limit) and the write-time rule as
+"a cyclic edge that did not exist before the change". Edges are identified by their cause — the dependency, the
+parent link or the placement — so a reopened node's reactivated edges count as new. A task placed into an epic
+whose own wait is cyclic is not itself on the cycle: nothing on it reaches the task's start; the task inherits the
+cyclic wait and is blocked with `dependency_cycle`. [`tests/domain/roadmap-graph.test.ts`](../tests/domain/roadmap-graph.test.ts)
+runs every example above against this engine.
 
 ## 5. Invariants
 
@@ -237,9 +252,9 @@ that is a graph search over resolved references and belongs to 13C (§4).
 
 - **Every existing task starts Unassigned**, with no row written: it keeps its status, runs, worktree, Run screen
   and every workflow action unchanged, and it is in no goal's progress.
-- **New tasks**, continuations included, are created exactly as today and start Unassigned. When 13C adds the
-  continuation hook it places a continuation immediately after its source, in the source's epic, if that epic is
-  open; otherwise the continuation stays Unassigned.
+- **New tasks** are created exactly as today and start Unassigned. A **continuation** is placed by the
+  continuation hook (§8) immediately after its source, in the source's epic, if that epic is open; otherwise it
+  stays Unassigned. The hook never stops a continuation from being created.
 - **Cancelled tasks** stay where they are placed, as history. They count in no total, never satisfy a
   dependency, and — being terminal — never stop their epic from closing.
 - **Stopped tasks** count as work still owed until a continuation supersedes them. One that can never be
@@ -432,7 +447,8 @@ The repository is available as `container.roadmap`; no workflow or renderer path
    including position shifts, deletions and the head bump. Return the validated snapshot after commit.
 7. Publishing roadmap change events belongs to the 13C service, after the **outermost** transaction commits.
    The 13B repository emits no events. If called inside a transaction it uses a savepoint; its return does
-   not imply that the enclosing transaction has committed.
+   not imply that the enclosing transaction has committed — which is why the service publishes through
+   `TransactionRunner.afterCommit` (§8), never on `apply`'s return.
 
 Task creation and task status changes do **not** touch the head: they are not roadmap state. Progress is
 derived at read time, so a task finishing needs no roadmap write.
@@ -459,11 +475,58 @@ writers on separate file connections, and exact snapshots after close/reopen.
   even when the domain check is bypassed.
 - Forgetting a project removes its roadmap and leaves another project's untouched.
 
-## 8. Delivery boundaries
+## 8. Services, IPC and events (13C)
+
+`RoadmapService` ([`roadmap-service.ts`](../src/main/services/roadmap-service.ts)) is the only writer above the
+repository. Each write:
+
+1. parses its input through the strict schema IPC uses (text trimmed, line endings normalised, then checked by
+   the 13A persisted schemas), so a caller that bypasses IPC is normalised and refused the same way;
+2. runs in one transaction: read the snapshot, refuse a stale `expectedRevision` (`VALIDATION_FAILED`, "Roadmap
+   changed. Refresh.", no automatic retry), build the complete next state under the policies of §3, validate it
+   whole (`parseRoadmapSnapshot`), refuse a new cycle (`RoadmapCycleError`, naming the edges), and hand the
+   difference to `apply` — every row of every destination group whose order changed, as §7 requires;
+3. writes nothing when the next state equals the current one: no `apply`, no revision, no event;
+4. registers `roadmap-updated { projectId, revision }` with `afterCommit`.
+
+`afterCommit` ([`sqlite.ts`](../src/main/db/sqlite.ts)) runs a callback after the OUTERMOST commit — at once
+outside a transaction — and drops it if the savepoint or transaction that registered it rolls back, including a
+released savepoint whose outer transaction later rolls back. Every callback runs even if one throws; the first
+error is then re-thrown, after the commit it cannot undo.
+
+The read, `view`, returns the snapshot with `unassignedTaskIds` (Tasks-list order), per-node progress, per-item
+readiness, the dependencies on a cycle right now and those `R` could not resolve — one consistent transaction.
+A damaged roadmap fails the read as an integrity error; `tasks:list` does not read the roadmap and keeps working.
+
+IPC channels, each strictly validated before its handler runs: `roadmap:get`, `roadmap:createNode`,
+`roadmap:updateNode`, `roadmap:moveNode`, `roadmap:removeNode`, `roadmap:transitionNode`, `roadmap:placeTask`,
+`roadmap:unassignTask`, `roadmap:addDependency`, `roadmap:removeDependency`. Every write returns the new
+`RoadmapView`. No channel creates, changes or runs a task. The renderer receives `roadmap-updated` on the
+existing event channel; screens are 13D.
+
+### The continuation hook
+
+`ContinuationService` calls `RoadmapService.placeContinuation` inside the continuation's own creation
+transaction, after the task, link and claim rows are written. The hook runs in its own savepoint, so a refused
+placement leaves no row behind, and its event waits for the creation commit. It never throws — the continuation
+service also fences it — and `workflow:continue` returns its outcome as `roadmapPlacement`:
+
+| Outcome | Reason | Meaning |
+|---|---|---|
+| `placed` | — | Right after the source in the source's epic; `revision` is the new roadmap revision. |
+| `unassigned` | `source_unassigned`, `epic_closed` | Policy: there is nowhere to place it. |
+| `failed` | `roadmap_invalid` | The stored roadmap is damaged; nothing written. |
+| `failed` | `roadmap_changed` | Stale revision; nothing written, no retry. |
+| `failed` | `dependency_cycle` | Placing it would re-form a deadlock its source's continuation had broken. |
+| `failed` | `refused` | Any other refusal, with its message. |
+
+`null` means no placement was attempted (an existing continuation was returned). A failure is never reported
+as a placement, and the continuation exists in every case.
+
+## 9. Delivery boundaries
 
 - Storage is implemented in 13B: migration 24, the repository and its file-backed tests.
-- Authoring, move and reorder services, dependency cycle rejection, readiness and blocker derivation, roll-up
-  computation, the continuation placement hook, IPC channels and change events (13C).
+- Services, cycle rejection, readiness and roll-up, the continuation hook, IPC and events are implemented in 13C.
 - The Roadmap and Kanban screens (13D); Electron acceptance (13E); automatic decomposition and Ornith (15A–15B).
 
 Known limitations of the model as defined: acceptance records no note or evidence link, only the state and

@@ -313,8 +313,8 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
     'workflow:stop': (input) => app.orchestrator.stop(input.taskId),
     'workflow:approveForPublishing': (input) => app.orchestrator.approveForPublishing(input.taskId),
     'workflow:continue': async (input) => {
-      const { task } = await app.continuationService.create(input.taskId);
-      return app.taskService.detail(task.id);
+      const { task, roadmapPlacement } = await app.continuationService.create(input.taskId);
+      return { ...app.taskService.detail(task.id), roadmapPlacement };
     },
 
     'planReview:get': (input) => planReviewDetail(input.taskId),
@@ -483,6 +483,17 @@ function buildHandlers({ app, getWindow }: IpcContext): Handlers {
         probeId: input.probeId,
         ...(input.options ? { options: input.options } : {})
       }),
+
+    'roadmap:get': (input) => app.roadmapService.view(input),
+    'roadmap:createNode': (input) => app.roadmapService.createNode(input),
+    'roadmap:updateNode': (input) => app.roadmapService.updateNode(input),
+    'roadmap:moveNode': (input) => app.roadmapService.moveNode(input),
+    'roadmap:removeNode': (input) => app.roadmapService.removeNode(input),
+    'roadmap:transitionNode': (input) => app.roadmapService.transitionNode(input),
+    'roadmap:placeTask': (input) => app.roadmapService.placeTask(input),
+    'roadmap:unassignTask': (input) => app.roadmapService.unassignTask(input),
+    'roadmap:addDependency': (input) => app.roadmapService.addDependency(input),
+    'roadmap:removeDependency': (input) => app.roadmapService.removeDependency(input),
 
     'shell:openExternal': async (input) => {
       let url: URL;

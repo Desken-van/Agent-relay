@@ -13,6 +13,7 @@
 
 import { SqliteRoadmapRepository } from './db/repositories/roadmap-repository';
 import type { RoadmapRepository } from './ports';
+import { RoadmapService } from './services/roadmap-service';
 
 
 import { join } from 'node:path';
@@ -160,6 +161,8 @@ export interface Application {
   /** Specification history and the plan-correction lifecycle. */
   readonly planCorrections: PlanCorrectionRepository;
   readonly roadmap: RoadmapRepository;
+  /** Roadmap authoring, readiness and progress; publishes after the outermost commit. */
+  readonly roadmapService: RoadmapService;
   /**
    * The process-wide plan-review claims. Exposed so the detail read can report a
    * running correction loop; only the services built here may take a claim.
@@ -333,6 +336,13 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     ids
   });
   const roadmap = new SqliteRoadmapRepository(db, clock);
+  const roadmapService = new RoadmapService({
+    roadmap,
+    transactions: new SqliteTransactionRunner(db),
+    clock,
+    ids,
+    events: options.events
+  });
   const projects = new SqliteProjectRepository(db, clock);
   const tasks = new SqliteTaskRepository(db, clock);
   const runs = new SqliteRunRepository(db);
@@ -436,7 +446,8 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     clock,
     ids,
     events: options.events,
-    isSourceBusy: (taskId) => runtime.orchestrator?.isRunning(taskId) ?? false
+    isSourceBusy: (taskId) => runtime.orchestrator?.isRunning(taskId) ?? false,
+    placeContinuation: (input) => roadmapService.placeContinuation(input)
   });
 
   const worktreeDependencyPreparer = new LocalWorktreeDependencyPreparer(runner);
@@ -596,6 +607,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     planReviewGates,
     planCorrections,
     roadmap,
+    roadmapService,
     planReviewClaims,
     codeReviewClaims,
     taskOperations,
