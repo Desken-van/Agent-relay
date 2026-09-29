@@ -57,7 +57,8 @@ export interface SqliteDatabase {
    * commit — a nested `transaction()` is only a savepoint, and releasing it
    * proves nothing — and never if the savepoint or transaction that registered
    * it rolls back. For notifications such as events: something another party
-   * may act on must not describe work that could still be undone.
+   * may act on must not describe work that could still be undone. A callback
+   * that throws is logged, never re-thrown into the committing caller.
    */
   afterCommit(callback: () => void): void;
   close(): void;
@@ -137,8 +138,8 @@ class NodeSqliteDatabase implements SqliteDatabase {
   /** Nesting depth, so an inner transaction uses a SAVEPOINT rather than BEGIN. */
   private depth = 0;
 
-  /** Post-commit callbacks, each with the depth that registered it; see {@link afterCommit}. */
-  private pending: { readonly depth: number; readonly callback: () => void }[] = [];
+  /** Post-commit callbacks in registration order; see {@link afterCommit}. */
+  private pending: (() => void)[] = [];
 
   constructor(private readonly db: DatabaseSync) {}
 
@@ -172,7 +173,10 @@ class NodeSqliteDatabase implements SqliteDatabase {
 
       this.db.exec(nested ? `SAVEPOINT ${savepoint}` : 'BEGIN');
       this.depth += 1;
-      const level = this.depth;
+      // Everything registered from here on belongs to this transaction or savepoint — including what a
+      // deeper savepoint registered and released — and nothing registered before it does, an earlier
+      // sibling savepoint's released work included.
+      const mark = this.pending.length;
       let committed = false;
 
       try {
@@ -180,9 +184,7 @@ class NodeSqliteDatabase implements SqliteDatabase {
         this.db.exec(nested ? `RELEASE ${savepoint}` : 'COMMIT');
         committed = !nested;
       } catch (error) {
-        // Everything registered at this level or deeper is undone with it. A deeper savepoint that was
-        // released still belongs to this level, which is exactly why a release alone runs nothing.
-        this.pending = this.pending.filter((entry) => entry.depth < level);
+        this.pending = this.pending.slice(0, mark);
         try {
           this.db.exec(nested ? `ROLLBACK TO ${savepoint}` : 'ROLLBACK');
           if (nested) this.db.exec(`RELEASE ${savepoint}`);
@@ -199,33 +201,35 @@ class NodeSqliteDatabase implements SqliteDatabase {
 
   afterCommit(callback: () => void): void {
     if (this.depth === 0) {
-      callback();
+      runNotification(callback);
       return;
     }
-    this.pending.push({ depth: this.depth, callback });
+    this.pending.push(callback);
   }
 
-  /**
-   * Runs once the outermost transaction has committed. Every callback runs even if an earlier one throws;
-   * the first error is then re-thrown, so a failed notification is reported rather than lost — after the
-   * commit, which it cannot and does not undo.
-   */
+  /** Runs once the outermost transaction has committed, in registration order. */
   private runPending(): void {
     const callbacks = this.pending;
     this.pending = [];
-    let failure: { readonly error: unknown } | null = null;
-    for (const { callback } of callbacks) {
-      try {
-        callback();
-      } catch (error) {
-        failure ??= { error };
-      }
-    }
-    if (failure !== null) throw failure.error;
+    for (const callback of callbacks) runNotification(callback);
   }
 
   close(): void {
     this.db.close();
+  }
+}
+
+/**
+ * A post-commit callback is a notification about work that is already durable. If it throws, the error is
+ * logged and the remaining callbacks still run; it is never re-thrown into the committing caller, which would
+ * then report committed work as failed — and could, as a continuation's creation would, release state that
+ * belongs to the committed work.
+ */
+function runNotification(callback: () => void): void {
+  try {
+    callback();
+  } catch (error) {
+    console.error('A post-commit notification failed; the committed work is unaffected.', error);
   }
 }
 

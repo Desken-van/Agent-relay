@@ -109,15 +109,10 @@ export function renumber<T extends { readonly position: number; readonly updated
   return rows.map((row, position) => (row.position === position ? row : { ...row, position, updatedAt: now }));
 }
 
-/** `rows` with every row of `replacements` swapped in by key, and rows in `dropped` left out. */
-export function replaceRows<T>(
-  rows: readonly T[],
-  replacements: readonly T[],
-  key: (row: T) => string,
-  dropped: ReadonlySet<string> = new Set()
-): T[] {
+/** `rows` with every row of `replacements` swapped in by key; a replacement with a new key is appended. */
+export function replaceRows<T>(rows: readonly T[], replacements: readonly T[], key: (row: T) => string): T[] {
   const byKey = new Map(replacements.map((row) => [key(row), row]));
-  const kept = rows.filter((row) => !dropped.has(key(row))).map((row) => byKey.get(key(row)) ?? row);
+  const kept = rows.map((row) => byKey.get(key(row)) ?? row);
   const present = new Set(kept.map(key));
   return [...kept, ...replacements.filter((row) => !present.has(key(row)))];
 }

@@ -221,10 +221,14 @@ continues into an existing task would otherwise turn an accepted edge into an un
 task ends as `continuation_loop`, one that names a missing task as `continuation_missing`), the graph, strongly
 connected components (iterative Tarjan, so a long chain never meets the stack limit) and the write-time rule as
 "a cyclic edge that did not exist before the change". Edges are identified by their cause — the dependency, the
-parent link or the placement — so a reopened node's reactivated edges count as new. A task placed into an epic
-whose own wait is cyclic is not itself on the cycle: nothing on it reaches the task's start; the task inherits the
-cyclic wait and is blocked with `dependency_cycle`. [`tests/domain/roadmap-graph.test.ts`](../tests/domain/roadmap-graph.test.ts)
-runs every example above against this engine.
+parent link or the placement — so a reopened node's reactivated edges count as new. Whether placing a task into
+an epic E with a cyclic wait is itself refused depends on where the cycle runs. When only `start(E)` is on it
+(E waits, through a prerequisite, on its own successor-resolved source), nothing on the cycle reaches the task's
+start: the placement is allowed and the task inherits the cyclic wait, blocked with `dependency_cycle`. When
+`done(E)` is on it too (two epics waiting on each other), the new placement edges
+`done(E) → done(t) → start(t) → start(E)` join the cycle and the placement is refused.
+[`tests/domain/roadmap-graph.test.ts`](../tests/domain/roadmap-graph.test.ts) runs every example above against
+this engine.
 
 ## 5. Invariants
 

@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { openDatabase, type Db } from '../../src/main/db/database';
 import { SqliteTransactionRunner } from '../../src/main/db/transaction-runner';
 
@@ -94,6 +94,27 @@ describe('afterCommit', () => {
     expect(committed()).toEqual(['outer']);
   });
 
+  it('keeps an earlier sibling savepoint’s released callback when a later sibling rolls back', () => {
+    const seen: string[] = [];
+    db.transaction(() => {
+      db.transaction(() => {
+        mark('A');
+        db.afterCommit(() => seen.push('A'));
+      })();
+      try {
+        db.transaction(() => {
+          mark('B');
+          db.afterCommit(() => seen.push('B'));
+          throw new Error('B rolls back');
+        })();
+      } catch {
+        // the caller continues
+      }
+    })();
+    expect(committed()).toEqual(['A']);
+    expect(seen).toEqual(['A']);
+  });
+
   it('forgets everything registered before a rolled-back outer transaction', () => {
     const seen: string[] = [];
     expect(() => db.transaction(() => {
@@ -104,20 +125,27 @@ describe('afterCommit', () => {
     expect(seen).toEqual(['fresh']);
   });
 
-  it('runs every callback in order, then reports the first failure without undoing the commit', () => {
+  it('logs a failing callback instead of re-throwing it: the caller’s committed work is not reported as failed', () => {
     const seen: string[] = [];
-    expect(() =>
-      db.transaction(() => {
-        mark('kept');
-        db.afterCommit(() => seen.push('first'));
-        db.afterCommit(() => {
-          throw new Error('listener failed');
-        });
-        db.afterCommit(() => seen.push('third'));
-      })()
-    ).toThrow('listener failed');
-    expect(seen).toEqual(['first', 'third']);
-    expect(committed()).toEqual(['kept']);
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(() =>
+        db.transaction(() => {
+          mark('kept');
+          db.afterCommit(() => seen.push('first'));
+          db.afterCommit(() => {
+            throw new Error('listener failed');
+          });
+          db.afterCommit(() => seen.push('third'));
+        })()
+      ).not.toThrow();
+      expect(seen).toEqual(['first', 'third']);
+      expect(committed()).toEqual(['kept']);
+      expect(logged).toHaveBeenCalledTimes(1);
+      expect(String(logged.mock.calls[0]?.[1])).toContain('listener failed');
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   it('is what the transaction runner port exposes', () => {

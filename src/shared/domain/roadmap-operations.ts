@@ -8,6 +8,7 @@
  */
 
 import { z } from 'zod';
+import { AgentRelayError } from './errors';
 import { idSchema } from './models';
 import {
   ROADMAP_LIMITS,
@@ -18,12 +19,19 @@ import {
   roadmapItemRefSchema,
   roadmapTitleSchema,
   type RoadmapDependency,
+  type RoadmapItemRef,
   type RoadmapNode,
   type RoadmapTaskFact,
   type RoadmapTaskPlacement
 } from './roadmap';
 import { buildWaitGraph, type UnresolvedDependency } from './roadmap-graph';
-import { deriveReadiness, rollUpProgress, type ItemReadiness, type NodeProgress } from './roadmap-progress';
+import {
+  deriveReadiness,
+  rollUpProgress,
+  type ItemReadiness,
+  type JudgedDependency,
+  type NodeProgress
+} from './roadmap-progress';
 import type { RoadmapSnapshot } from './roadmap-structure';
 
 /* -------------------------------------------------------------------------- */
@@ -140,13 +148,17 @@ export interface RoadmapView {
   /** Tasks with no placement, in the Tasks-list order (`created_at DESC, id ASC`). */
   readonly unassignedTaskIds: readonly string[];
   readonly progress: Readonly<Record<string, NodeProgress>>;
-  readonly readiness: {
-    readonly nodes: Readonly<Record<string, ItemReadiness>>;
-    readonly tasks: Readonly<Record<string, ItemReadiness>>;
-  };
+  /** Linear in size: each dependency judged once; items list ids only. See {@link effectiveWaits}. */
+  readonly readiness: RoadmapViewReadiness;
   /** Stored dependencies whose resolved edge lies on a cycle right now. */
   readonly cyclicDependencyIds: readonly string[];
   readonly unresolvedDependencies: readonly UnresolvedDependency[];
+}
+
+export interface RoadmapViewReadiness {
+  readonly dependencies: Readonly<Record<string, JudgedDependency>>;
+  readonly nodes: Readonly<Record<string, ItemReadiness>>;
+  readonly tasks: Readonly<Record<string, ItemReadiness>>;
 }
 
 export function roadmapView(snapshot: RoadmapSnapshot, unassignedTaskIds: readonly string[]): RoadmapView {
@@ -161,10 +173,53 @@ export function roadmapView(snapshot: RoadmapSnapshot, unassignedTaskIds: readon
     tasks: snapshot.tasks,
     unassignedTaskIds,
     progress: Object.fromEntries(rollUpProgress(snapshot)),
-    readiness: { nodes: Object.fromEntries(readiness.nodes), tasks: Object.fromEntries(readiness.tasks) },
+    readiness: {
+      dependencies: Object.fromEntries(readiness.dependencies),
+      nodes: Object.fromEntries(readiness.nodes),
+      tasks: Object.fromEntries(readiness.tasks)
+    },
     cyclicDependencyIds: [...graph.cyclicDependencyIds].sort(),
     unresolvedDependencies: graph.unresolved
   };
+}
+
+/** One wait of an item, own or inherited, as a screen shows it. */
+export interface EffectiveWait extends JudgedDependency {
+  /** Null for the item's own edge; otherwise the ancestor node whose edge it inherits. */
+  readonly inheritedFrom: string | null;
+}
+
+/**
+ * Every wait an item has, expanded on demand from the linear readiness: its own dependencies first, then each
+ * ancestor's, nearest first. Nothing here is stored or sent; a screen asks for the item it is showing.
+ */
+export function effectiveWaits(readiness: RoadmapViewReadiness, ref: RoadmapItemRef): EffectiveWait[] {
+  const item = ref.kind === 'node' ? readiness.nodes[ref.nodeId] : readiness.tasks[ref.taskId];
+  if (item === undefined) return [];
+  const expand = (ids: readonly string[], inheritedFrom: string | null) =>
+    ids.flatMap((id) => {
+      const judged = readiness.dependencies[id];
+      return judged === undefined ? [] : [{ ...judged, inheritedFrom }];
+    });
+  return [
+    ...expand(item.dependencyIds, null),
+    ...item.inheritsFrom.flatMap((ancestor) => expand(readiness.nodes[ancestor]?.dependencyIds ?? [], ancestor))
+  ];
+}
+
+/* -------------------------------------------------------------------------- */
+/* Revision conflict                                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The roadmap moved on since the caller read it. Recognised by type, never by its words; its code stays
+ * `VALIDATION_FAILED` so a caller that does not care keeps the behaviour it always had. Never retried.
+ */
+export class RoadmapRevisionConflictError extends AgentRelayError {
+  constructor(details?: string) {
+    super('VALIDATION_FAILED', 'Roadmap changed. Refresh.', details === undefined ? undefined : { details });
+    this.name = 'RoadmapRevisionConflictError';
+  }
 }
 
 /* -------------------------------------------------------------------------- */

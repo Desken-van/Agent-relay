@@ -36,6 +36,7 @@ import {
   roadmapUnassignTaskInputSchema,
   roadmapUpdateNodeInputSchema,
   roadmapView,
+  RoadmapRevisionConflictError,
   type ContinuationPlacement,
   type RoadmapAddDependencyInput,
   type RoadmapCreateNodeInput,
@@ -62,8 +63,6 @@ export interface RoadmapServiceDeps {
   readonly events: EventPublisher;
 }
 
-/** The repository's own words for a stale revision; the service uses the same ones. */
-const STALE_MESSAGE = 'Roadmap changed. Refresh.';
 
 /** A write refused because it would close a dependency cycle. */
 export class RoadmapCycleError extends AgentRelayError {
@@ -168,8 +167,8 @@ export class RoadmapService {
     return this.write(input.projectId, input.expectedRevision, (before) => {
       const nodes = byId(before.nodes);
       const node = requireNode(nodes, input.nodeId);
+      // Only an open node; by I7 an open node's parent is open too, so no closed parent can lose a child here.
       refuseIfFrozen(node, 'remove');
-      if (node.parentId !== null) refuseIfFrozen(requireNode(nodes, node.parentId), 'remove a child of');
       if (before.nodes.some((row) => row.parentId === node.id)) invalid('Only a node without children can be removed.');
       if (before.placements.some((row) => row.epicId === node.id)) invalid('Only an epic without tasks can be removed.');
       const edges = before.dependencies.filter((row) =>
@@ -347,7 +346,7 @@ export class RoadmapService {
       return {
         outcome: 'failed',
         reason: error instanceof RoadmapCycleError ? 'dependency_cycle'
-          : messageOf(error) === STALE_MESSAGE ? 'roadmap_changed' : 'refused',
+          : error instanceof RoadmapRevisionConflictError ? 'roadmap_changed' : 'refused',
         message: messageOf(error)
       };
     }
@@ -367,9 +366,7 @@ export class RoadmapService {
     this.deps.transactions.run(() => {
       const before = this.deps.roadmap.read(projectId);
       if (before.revision !== expectedRevision) {
-        throw new AgentRelayError('VALIDATION_FAILED', STALE_MESSAGE, {
-          details: `expected revision ${expectedRevision}, current ${before.revision}`
-        });
+        throw new RoadmapRevisionConflictError(`expected revision ${expectedRevision}, current ${before.revision}`);
       }
       const after = this.applyDraft(before, build(before, this.deps.clock.nowIso()));
       view = this.viewOf(after ?? before);

@@ -11,7 +11,8 @@ import { FixedClock, SequentialIdGenerator } from '../../src/main/infra/clock';
 import { InMemoryEventPublisher } from '../../src/main/services/event-bus';
 import { RoadmapCycleError, RoadmapService } from '../../src/main/services/roadmap-service';
 import { AgentRelayError } from '../../src/shared/domain/errors';
-import type { RoadmapView } from '../../src/shared/domain/roadmap-operations';
+import type { RoadmapItemRef } from '../../src/shared/domain/roadmap';
+import { effectiveWaits, type RoadmapView } from '../../src/shared/domain/roadmap-operations';
 
 const P = 'project-1';
 const Q = 'project-2';
@@ -63,6 +64,11 @@ function contents() {
 }
 const roadmapEvents = () => events.events.filter((event) => event.kind === 'roadmap-updated');
 const idOf = (view: RoadmapView, title: string) => view.nodes.find((node) => node.title === title)!.id;
+/** An item's readiness with its waits expanded the way a screen expands them. */
+const readinessOf = (view: RoadmapView, ref: RoadmapItemRef) => ({
+  ...(ref.kind === 'node' ? view.readiness.nodes[ref.nodeId] : view.readiness.tasks[ref.taskId]),
+  waits: effectiveWaits(view.readiness, ref)
+});
 
 /** The refusal happens, with this code, and changes nothing anywhere — rows or events. */
 function refused(action: () => unknown, code: string, message?: RegExp): AgentRelayError {
@@ -245,6 +251,21 @@ describe('closed nodes, acceptance and reopen', () => {
     expect(view.placements.map((row) => row.taskId)).toEqual(['t3', 't5']);
   });
 
+  it('freezes a closed phase too: no child created under it, and no node moved into or out of it', () => {
+    let view = hierarchy();
+    view = service.transitionNode({ projectId: P, expectedRevision: view.revision, nodeId: idOf(view, 'Epic A1'), event: 'accept' });
+    view = service.transitionNode({ projectId: P, expectedRevision: view.revision, nodeId: idOf(view, 'Epic A2'), event: 'cancel' });
+    view = service.transitionNode({ projectId: P, expectedRevision: view.revision, nodeId: idOf(view, 'Phase A'), event: 'accept' });
+    const r = view.revision;
+    const phaseA = idOf(view, 'Phase A');
+    refused(() => service.createNode({ projectId: P, expectedRevision: r, kind: 'epic', parentId: phaseA, title: 'Late' }),
+      'VALIDATION_FAILED', /add a child under a phase that is accepted/);
+    refused(() => service.moveNode({ projectId: P, expectedRevision: r, nodeId: idOf(view, 'Epic B1'), parentId: phaseA, position: 0 }),
+      'VALIDATION_FAILED', /move a node into a phase that is accepted/);
+    refused(() => service.moveNode({ projectId: P, expectedRevision: r, nodeId: idOf(view, 'Epic A1'), parentId: idOf(view, 'Phase B'), position: 0 }),
+      'VALIDATION_FAILED', /move a node out of a phase that is accepted/);
+  });
+
   it('reopens without cascading, and refuses reopening a child under a closed parent', () => {
     let view = hierarchy();
     for (const title of ['Epic A1', 'Epic A2', 'Phase A']) {
@@ -323,13 +344,14 @@ describe('dependencies and cycles', () => {
 
   it('reports a cycle a continuation created at read time, lets unrelated writes through, and lets the edge be removed', () => {
     let view = service.addDependency({ projectId: P, expectedRevision: 0, dependent: { kind: 'task', taskId: 't1' }, prerequisite: { kind: 'task', taskId: 't4' } });
-    expect(view.readiness.tasks['t1']).toMatchObject({ status: 'blocked', waits: [{ reason: 'task_stopped' }] });
+    expect(readinessOf(view, { kind: 'task', taskId: 't1' })).toMatchObject({ status: 'blocked', waits: [{ reason: 'task_stopped' }] });
     const edge = view.dependencies[0]!.id;
     // A workflow event, not a roadmap write: t4 is now continued by t1.
     db.prepare(`INSERT INTO task_continuations(id,source_task_id,continuation_task_id,entry_action,created_at) VALUES ('c1','t4','t1','verification',?)`).run(AT);
     view = service.view({ projectId: P });
     expect(view.cyclicDependencyIds).toEqual([edge]);
-    expect(view.readiness.tasks['t1']).toMatchObject({ status: 'blocked', waits: [{ dependencyId: edge, reason: 'dependency_cycle' }] });
+    expect(readinessOf(view, { kind: 'task', taskId: 't1' }))
+      .toMatchObject({ status: 'blocked', waits: [{ dependencyId: edge, reason: 'dependency_cycle' }] });
     view = service.createNode({ projectId: P, expectedRevision: view.revision, kind: 'goal', parentId: null, title: 'Unrelated' });
     view = service.addDependency({ projectId: P, expectedRevision: view.revision, dependent: { kind: 'task', taskId: 't2' }, prerequisite: { kind: 'task', taskId: 't3' } });
     view = service.removeDependency({ projectId: P, expectedRevision: view.revision, dependencyId: edge });
@@ -351,8 +373,12 @@ describe('readiness and progress in the view', () => {
     });
     expect(view.progress[idOf(view, 'Epic A2')]?.display).toBe('awaiting_acceptance');
     expect(view.progress[idOf(view, 'Epic B1')]?.display).toBe('empty');
-    expect(view.readiness.nodes[idOf(view, 'Epic B1')]).toMatchObject({
+    expect(readinessOf(view, { kind: 'node', nodeId: idOf(view, 'Epic B1') })).toMatchObject({
       status: 'pending', waits: [{ inheritedFrom: idOf(view, 'Phase B'), reason: 'node_open' }]
+    });
+    // Linear, not copied: the epic lists no edge of its own, only where it inherits from.
+    expect(view.readiness.nodes[idOf(view, 'Epic B1')]).toMatchObject({
+      dependencyIds: [], inheritsFrom: [idOf(view, 'Phase B'), idOf(view, 'Goal')]
     });
     expect(view.unassignedTaskIds).toEqual(['t4']);
   });

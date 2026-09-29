@@ -13,7 +13,7 @@ import { ContinuationService } from '../../src/main/services/continuation-servic
 import { RoadmapService } from '../../src/main/services/roadmap-service';
 import type { VerificationExecutor } from '../../src/main/services/worktree-verification';
 import { AgentRelayError } from '../../src/shared/domain/errors';
-import type { RoadmapView } from '../../src/shared/domain/roadmap-operations';
+import { RoadmapRevisionConflictError, type RoadmapView } from '../../src/shared/domain/roadmap-operations';
 import { createHarness, runToFailedRoundExhaustion, type Harness } from '../helpers/harness';
 
 const passed: ProcessResult = {
@@ -146,13 +146,15 @@ describe('continuation placement', () => {
     expect(() => roadmap.view({ projectId: project.id })).toThrow(AgentRelayError);
   });
 
-  it('reports a revision conflict as a failed placement, with nothing placed and the continuation created', async () => {
+  // Defensive: the real hook reads and applies inside one transaction, so a conflict cannot happen there; a
+  // stand-in repository forces one to prove the outcome is still an explicit failure.
+  it('reports a (forced) revision conflict as a failed placement, with nothing placed and the continuation created', async () => {
     const real = new SqliteRoadmapRepository(harness.db, harness.clock);
     const conflicting: RoadmapRepository = {
       read: (projectId) => real.read(projectId),
       listUnassigned: (projectId) => real.listUnassigned(projectId),
       apply: () => {
-        throw new AgentRelayError('VALIDATION_FAILED', 'Roadmap changed. Refresh.');
+        throw new RoadmapRevisionConflictError();
       }
     };
     const setup = roadmapService(real);

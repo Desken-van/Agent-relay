@@ -4,6 +4,10 @@
  * Both are derived on every read from the snapshot and the workflow's own task facts; nothing here is
  * stored, and nothing here changes a task. Readiness is advisory: the workflow never reads it, so a person
  * can still start any task by hand.
+ *
+ * Sizes stay linear in the roadmap: each dependency is judged once, and an item lists only the ids of its own
+ * dependencies and the ancestors whose waits it inherits — never a copy of every inherited wait, which at the
+ * documented limits would multiply thousands of tasks by thousands of edges.
  */
 
 import { roadmapItemKey, taskProgressKind, type RoadmapItemRef, type RoadmapNode, type RoadmapTaskFact } from './roadmap';
@@ -101,16 +105,16 @@ export function rollUpProgress(input: Pick<RoadmapGraphInput, 'nodes' | 'placeme
     const known = result.get(node.id);
     if (known !== undefined) return known;
     let counts = ZERO;
-    let stoppedTaskIds: string[] = [];
+    const stoppedTaskIds: string[] = [];
     for (const fact of placed.get(node.id) ?? []) {
       counts = add(counts, countTask(fact));
-      if (taskProgressKind(fact) === 'stopped') stoppedTaskIds = [...stoppedTaskIds, fact.id];
+      if (taskProgressKind(fact) === 'stopped') stoppedTaskIds.push(fact.id);
     }
     for (const child of children.get(node.id) ?? []) {
       const childProgress = visit(child);
       if (child.state === 'cancelled') continue;
       counts = add(counts, childProgress.counts);
-      stoppedTaskIds = [...stoppedTaskIds, ...childProgress.stoppedTaskIds];
+      stoppedTaskIds.push(...childProgress.stoppedTaskIds);
     }
     const progress = { counts, display: displayState(node, counts), hasStoppedWork: counts.stopped > 0, stoppedTaskIds };
     result.set(node.id, progress);
@@ -142,14 +146,15 @@ export const WAIT_REASONS = [
 ] as const;
 export type WaitReason = (typeof WAIT_REASONS)[number];
 
-export interface EffectiveWait {
+/** One stored dependency, judged once. */
+export interface JudgedDependency {
   readonly dependencyId: string;
-  /** Null for the item's own edge; otherwise the ancestor node whose edge it inherits. */
-  readonly inheritedFrom: string | null;
-  /** As stored — the item a person pointed at. */
-  readonly prerequisite: RoadmapItemRef;
+  /** `R(dependent)`: the item this edge binds. Null when the chain could not be resolved. */
+  readonly resolvedDependent: RoadmapItemRef | null;
   /** `R(prerequisite)`: what is actually judged. Null when the chain could not be resolved. */
   readonly resolvedPrerequisite: RoadmapItemRef | null;
+  /** The resolved dependent will never start (a cancelled node or a `CANCELLED` task): the edge binds nothing. */
+  readonly inert: boolean;
   readonly state: PrerequisiteState;
   readonly reason: WaitReason;
 }
@@ -159,7 +164,10 @@ export type ReadinessStatus = 'ready' | 'pending' | 'blocked' | 'not_applicable'
 export interface ItemReadiness {
   /** blocked: some wait is unsatisfiable; pending: some wait is not yet satisfied; ready: none of those. */
   readonly status: ReadinessStatus;
-  readonly waits: readonly EffectiveWait[];
+  /** Dependencies that bind this item itself, after resolution — stored on it or on a task it supersedes. */
+  readonly dependencyIds: readonly string[];
+  /** Ancestors, nearest first, whose own `dependencyIds` this item also waits on. */
+  readonly inheritsFrom: readonly string[];
   /** Why readiness does not apply, when it does not: the item will never start itself. */
   readonly notApplicable: 'superseded' | 'cancelled' | null;
   /** For a superseded task: `R(task)`, which carries its work (null when the chain is malformed). */
@@ -167,8 +175,22 @@ export interface ItemReadiness {
 }
 
 export interface RoadmapReadiness {
+  readonly dependencies: ReadonlyMap<string, JudgedDependency>;
   readonly nodes: ReadonlyMap<string, ItemReadiness>;
   readonly tasks: ReadonlyMap<string, ItemReadiness>;
+}
+
+const SEVERITY: Record<Exclude<ReadinessStatus, 'not_applicable'>, number> = { ready: 0, pending: 1, blocked: 2 };
+
+function worst(
+  a: Exclude<ReadinessStatus, 'not_applicable'>,
+  b: Exclude<ReadinessStatus, 'not_applicable'>
+): Exclude<ReadinessStatus, 'not_applicable'> {
+  return SEVERITY[a] >= SEVERITY[b] ? a : b;
+}
+
+function statusOf(state: PrerequisiteState): Exclude<ReadinessStatus, 'not_applicable'> {
+  return state === 'unsatisfiable' ? 'blocked' : state === 'pending' ? 'pending' : 'ready';
 }
 
 /**
@@ -182,58 +204,75 @@ export function deriveReadiness(input: RoadmapGraphInput, graph: WaitGraph = bui
   const nodes = new Map(input.nodes.map((node) => [node.id, node]));
   const epicOfTask = new Map(input.placements.map((placement) => [placement.taskId, placement.epicId]));
 
-  /** Waits keyed by the resolved dependent they bind; inert edges bind nothing. */
-  const byDependent = groupBy(input.dependencies.flatMap((dependency) => {
-    const dependent = resolve(dependency.dependent);
-    if (!dependent.ok || isInert(dependent.ref, nodes, facts)) return [];
-    return [[roadmapItemKey(dependent.ref), { dependencyId: dependency.id, prerequisite: dependency.prerequisite }] as const];
-  }));
-
-  const judge = (dependencyId: string, prerequisite: RoadmapItemRef, inheritedFrom: string | null): EffectiveWait => {
+  const judge = (dependencyId: string, prerequisite: RoadmapItemRef): Pick<JudgedDependency, 'resolvedPrerequisite' | 'state' | 'reason'> => {
     const resolved = resolve(prerequisite);
-    const base = { dependencyId, inheritedFrom, prerequisite, resolvedPrerequisite: resolved.ok ? resolved.ref : null };
-    if (graph.cyclicDependencyIds.has(dependencyId)) return { ...base, state: 'unsatisfiable', reason: 'dependency_cycle' };
-    if (!resolved.ok) return { ...base, state: 'unsatisfiable', reason: 'continuation_unresolvable' };
+    const resolvedPrerequisite = resolved.ok ? resolved.ref : null;
+    if (graph.cyclicDependencyIds.has(dependencyId)) return { resolvedPrerequisite, state: 'unsatisfiable', reason: 'dependency_cycle' };
+    if (!resolved.ok) return { resolvedPrerequisite, state: 'unsatisfiable', reason: 'continuation_unresolvable' };
     if (resolved.ref.kind === 'node') {
       const state = nodes.get(resolved.ref.nodeId)?.state;
-      if (state === 'accepted') return { ...base, state: 'satisfied', reason: 'accepted' };
-      if (state === 'cancelled') return { ...base, state: 'unsatisfiable', reason: 'node_cancelled' };
-      return { ...base, state: 'pending', reason: 'node_open' };
+      if (state === 'accepted') return { resolvedPrerequisite, state: 'satisfied', reason: 'accepted' };
+      if (state === 'cancelled') return { resolvedPrerequisite, state: 'unsatisfiable', reason: 'node_cancelled' };
+      return { resolvedPrerequisite, state: 'pending', reason: 'node_open' };
     }
     const fact = facts.get(resolved.ref.taskId);
     const kind = fact === undefined ? null : taskProgressKind(fact);
-    if (kind === 'done') return { ...base, state: 'satisfied', reason: 'completed' };
-    if (kind === 'cancelled') return { ...base, state: 'unsatisfiable', reason: 'task_cancelled' };
-    if (kind === 'stopped') return { ...base, state: 'unsatisfiable', reason: 'task_stopped' };
-    if (kind === null) return { ...base, state: 'unsatisfiable', reason: 'continuation_unresolvable' };
-    return { ...base, state: 'pending', reason: 'task_not_done' };
+    if (kind === 'done') return { resolvedPrerequisite, state: 'satisfied', reason: 'completed' };
+    if (kind === 'cancelled') return { resolvedPrerequisite, state: 'unsatisfiable', reason: 'task_cancelled' };
+    if (kind === 'stopped') return { resolvedPrerequisite, state: 'unsatisfiable', reason: 'task_stopped' };
+    if (kind === null) return { resolvedPrerequisite, state: 'unsatisfiable', reason: 'continuation_unresolvable' };
+    return { resolvedPrerequisite, state: 'pending', reason: 'task_not_done' };
   };
 
-  const ancestorsOfNode = (nodeId: string | null): string[] => {
-    const chain: string[] = [];
-    for (let current = nodeId; current !== null && !chain.includes(current); current = nodes.get(current)?.parentId ?? null) {
-      chain.push(current);
+  const dependencies = new Map<string, JudgedDependency>();
+  const bound = new Map<string, string[]>();
+  for (const dependency of input.dependencies) {
+    const dependent = resolve(dependency.dependent);
+    const resolvedDependent = dependent.ok ? dependent.ref : null;
+    const inert = resolvedDependent !== null && isInert(resolvedDependent, nodes, facts);
+    dependencies.set(dependency.id, { dependencyId: dependency.id, resolvedDependent, inert, ...judge(dependency.id, dependency.prerequisite) });
+    if (resolvedDependent === null || inert) continue;
+    const key = roadmapItemKey(resolvedDependent);
+    const list = bound.get(key);
+    if (list === undefined) bound.set(key, [dependency.id]);
+    else list.push(dependency.id);
+  }
+
+  const ownStatus = (key: string): Exclude<ReadinessStatus, 'not_applicable'> =>
+    (bound.get(key) ?? []).reduce<Exclude<ReadinessStatus, 'not_applicable'>>(
+      (status, id) => worst(status, statusOf(dependencies.get(id)!.state)), 'ready');
+
+  /** A node's status with every ancestor's waits folded in; memoised, so each chain is walked once. */
+  const chain = new Map<string, Exclude<ReadinessStatus, 'not_applicable'>>();
+  const chainStatus = (nodeId: string | null, seen: ReadonlySet<string> = new Set()): Exclude<ReadinessStatus, 'not_applicable'> => {
+    if (nodeId === null || seen.has(nodeId)) return 'ready';
+    const known = chain.get(nodeId);
+    if (known !== undefined) return known;
+    const own = ownStatus(roadmapItemKey({ kind: 'node', nodeId }));
+    const status = worst(own, chainStatus(nodes.get(nodeId)?.parentId ?? null, new Set([...seen, nodeId])));
+    chain.set(nodeId, status);
+    return status;
+  };
+  const ancestors = (nodeId: string | null): string[] => {
+    const list: string[] = [];
+    for (let current = nodeId; current !== null && !list.includes(current); current = nodes.get(current)?.parentId ?? null) {
+      list.push(current);
     }
-    return chain;
-  };
-
-  const readinessOf = (self: RoadmapItemRef, ancestors: readonly string[]): ItemReadiness => {
-    const waits = [
-      ...(byDependent.get(roadmapItemKey(self)) ?? []).map((wait) => judge(wait.dependencyId, wait.prerequisite, null)),
-      ...ancestors.flatMap((ancestor) =>
-        (byDependent.get(roadmapItemKey({ kind: 'node', nodeId: ancestor })) ?? [])
-          .map((wait) => judge(wait.dependencyId, wait.prerequisite, ancestor)))
-    ];
-    const status: ReadinessStatus = waits.some((wait) => wait.state === 'unsatisfiable') ? 'blocked'
-      : waits.some((wait) => wait.state === 'pending') ? 'pending' : 'ready';
-    return { status, waits, notApplicable: null, successorTaskId: null };
+    return list;
   };
 
   const nodeReadiness = new Map<string, ItemReadiness>();
   for (const node of input.nodes) {
+    const key = roadmapItemKey({ kind: 'node', nodeId: node.id });
     nodeReadiness.set(node.id, node.state === 'cancelled'
       ? notApplicable('cancelled', null)
-      : readinessOf({ kind: 'node', nodeId: node.id }, ancestorsOfNode(node.parentId)));
+      : {
+          status: chainStatus(node.id),
+          dependencyIds: bound.get(key) ?? [],
+          inheritsFrom: ancestors(node.parentId),
+          notApplicable: null,
+          successorTaskId: null
+        });
   }
   const taskReadiness = new Map<string, ItemReadiness>();
   for (const fact of input.tasks) {
@@ -241,17 +280,27 @@ export function deriveReadiness(input: RoadmapGraphInput, graph: WaitGraph = bui
     if (kind === 'superseded') {
       const successor = resolve({ kind: 'task', taskId: fact.id });
       taskReadiness.set(fact.id, notApplicable('superseded', successor.ok && successor.ref.kind === 'task' ? successor.ref.taskId : null));
-    } else if (kind === 'cancelled') {
-      taskReadiness.set(fact.id, notApplicable('cancelled', null));
-    } else {
-      taskReadiness.set(fact.id, readinessOf({ kind: 'task', taskId: fact.id }, ancestorsOfNode(epicOfTask.get(fact.id) ?? null)));
+      continue;
     }
+    if (kind === 'cancelled') {
+      taskReadiness.set(fact.id, notApplicable('cancelled', null));
+      continue;
+    }
+    const key = roadmapItemKey({ kind: 'task', taskId: fact.id });
+    const epic = epicOfTask.get(fact.id) ?? null;
+    taskReadiness.set(fact.id, {
+      status: worst(ownStatus(key), chainStatus(epic)),
+      dependencyIds: bound.get(key) ?? [],
+      inheritsFrom: ancestors(epic),
+      notApplicable: null,
+      successorTaskId: null
+    });
   }
-  return { nodes: nodeReadiness, tasks: taskReadiness };
+  return { dependencies, nodes: nodeReadiness, tasks: taskReadiness };
 }
 
 function notApplicable(reason: 'superseded' | 'cancelled', successorTaskId: string | null): ItemReadiness {
-  return { status: 'not_applicable', waits: [], notApplicable: reason, successorTaskId };
+  return { status: 'not_applicable', dependencyIds: [], inheritsFrom: [], notApplicable: reason, successorTaskId };
 }
 
 /** Groups pairs by key in one pass; each group keeps the input order. */

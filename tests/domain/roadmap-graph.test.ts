@@ -15,6 +15,7 @@ import {
   continuationResolver,
   introducedCycleEdges
 } from '../../src/shared/domain/roadmap-graph';
+import { effectiveWaits, roadmapView } from '../../src/shared/domain/roadmap-operations';
 import { deriveReadiness } from '../../src/shared/domain/roadmap-progress';
 import { parseRoadmapSnapshot } from '../../src/shared/domain/roadmap-structure';
 import { dependency, nodeRef, placement, PROJECT, roadmapNode, taskFact, taskRef } from '../helpers/roadmap-fixtures';
@@ -43,8 +44,11 @@ function roadmap(parts: {
 }
 
 const cyclic = (snapshot: ReturnType<typeof roadmap>) => [...buildWaitGraph(snapshot).cyclicDependencyIds].sort();
-const waitOf = (snapshot: ReturnType<typeof roadmap>, taskId: string) =>
-  deriveReadiness(snapshot).tasks.get(taskId)!;
+/** A task's readiness with its waits expanded the way a screen expands them. */
+const waitOf = (snapshot: ReturnType<typeof roadmap>, taskId: string) => {
+  const view = roadmapView(snapshot, []);
+  return { ...view.readiness.tasks[taskId]!, waits: effectiveWaits(view.readiness, taskRef(taskId)) };
+};
 
 describe('continuation resolution R', () => {
   it('ends at the last task of the chain, ignores a continuation on a task that is not stopped, and never loops', () => {
@@ -195,6 +199,17 @@ describe('the write-time rule', () => {
     });
   });
 
+  it('refuses a placement into an epic whose completion is on a cycle: the task would join it', () => {
+    const before = roadmap({
+      tasks: [taskFact('t9', 'DRAFT')],
+      dependencies: [dependency('d1', nodeRef('e1'), nodeRef('e2')), dependency('d2', nodeRef('e2'), nodeRef('e1'))]
+    });
+    expect(cyclic(before)).toEqual(['d1', 'd2']);
+    const after = { ...before, placements: [placement('t9', 'e1', 0)] };
+    const introduced = introducedCycleEdges(buildWaitGraph(before), buildWaitGraph(after));
+    expect(introduced.some((edge) => edge.link.kind === 'placement' && edge.link.taskId === 't9')).toBe(true);
+  });
+
   it('counts a reopened node’s reactivated edges as new', () => {
     const cancelledE1 = BASE_NODES.map((node) => (node.id === 'e1' ? { ...node, state: 'cancelled' as const } : node));
     const before = roadmap({
@@ -261,6 +276,6 @@ describe('readiness', () => {
     expect(readiness.tasks.get('A')).toMatchObject({ status: 'not_applicable', notApplicable: 'superseded', successorTaskId: 'B' });
     expect(readiness.tasks.get('X')).toMatchObject({ status: 'not_applicable', notApplicable: 'cancelled' });
     expect(readiness.nodes.get('e2')).toMatchObject({ status: 'not_applicable', notApplicable: 'cancelled' });
-    expect(readiness.tasks.get('B')).toMatchObject({ status: 'ready', waits: [] });
+    expect(readiness.tasks.get('B')).toMatchObject({ status: 'ready', dependencyIds: [], inheritsFrom: [] });
   });
 });

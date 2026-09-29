@@ -107,7 +107,8 @@ export interface TransactionRunner {
   /**
    * Run `callback` after the outermost transaction commits (at once outside any), and never if the work
    * that registered it rolls back. Returning from a nested `run` proves nothing: it only released a
-   * savepoint. This is how a notification is kept from describing work that could still be undone.
+   * savepoint. This is how a notification is kept from describing work that could still be undone. A
+   * callback that throws is logged and never re-thrown into the committing caller.
    */
   afterCommit(callback: () => void): void;
 }
