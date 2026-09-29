@@ -215,7 +215,7 @@ describe('progress inputs', () => {
     expect(having('not_started')).toEqual(['DRAFT']);
     expect(having('done')).toEqual(['COMPLETED']);
     expect(having('cancelled')).toEqual(['CANCELLED']);
-    // Exactly the statuses a continuation may start from (continuation-service).
+    // The statuses continuation-service accepts as a source, before its own evidence checks.
     expect(having('stopped').sort()).toEqual(['FAILED', 'REVIEW_BLOCKED', 'REVIEW_LIMIT_REACHED']);
   });
 

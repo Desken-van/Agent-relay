@@ -246,6 +246,21 @@ describe('closed nodes', () => {
     expect(only(underCancelled)).toEqual({ code: 'closed_node_open_child', path: ['nodes', 8, 'state'] });
   });
 
+  it('allows closed children under a closed parent', () => {
+    const snapshot = withSnapshot((base) => ({
+      nodes: base.nodes.map((node) =>
+        node.id === 'p1' ? { ...node, state: 'accepted' as const }
+          : node.id === 'e1' ? { ...node, state: 'cancelled' as const }
+            : node
+      ),
+      tasks: base.tasks.map((task) =>
+        task.id === 't1' || task.id === 't2' ? { ...task, status: 'CANCELLED' as const } : task
+      )
+    }));
+    // p1 accepted over the accepted e2 and the cancelled e1, whose tasks are all terminal.
+    expect(roadmapStructureViolations(snapshot)).toEqual([]);
+  });
+
   it('allows an open parent with closed children: a reopened parent keeps them as they are', () => {
     const snapshot = validSnapshot();
     // g1 is open over the cancelled p2, and p1 is open over the accepted e2.
@@ -322,20 +337,50 @@ describe('the snapshot boundary', () => {
     expect(details).toContain('…and 2 more.');
   });
 
-  it('refuses records that fail their own schema, unknown keys, and more nodes than the limit', () => {
+  it('reports a rule the record already checks once, while the function alone still reports it', () => {
+    const snapshot = withSnapshot((base) => ({
+      nodes: base.nodes.map((node) => (node.id === 'g2' ? { ...node, parentId: 'g1', position: 9 } : node)),
+      dependencies: [
+        ...base.dependencies.filter((row) => row.id !== 'd4'),
+        dependency('d9', taskRef('t2'), taskRef('t2'))
+      ]
+    }));
+    expect(codesOf(snapshot)).toEqual(['parent_kind_mismatch', 'self_dependency']);
+    const issues = roadmapSnapshotSchema.safeParse(snapshot).error?.issues ?? [];
+    expect(issues.map((issue) => issue.path.join('.'))).toEqual(['nodes.1.parentId', 'dependencies.3.prerequisite']);
+  });
+
+  it('refuses records that fail their own schema and unknown keys', () => {
     expect(roadmapSnapshotSchema.safeParse({ ...validSnapshot(), revision: -1 }).success).toBe(false);
     expect(roadmapSnapshotSchema.safeParse({ ...validSnapshot(), unassigned: [] }).success).toBe(false);
     const badTitle = withSnapshot((base) => ({
       nodes: base.nodes.map((node) => (node.id === 'g1' ? { ...node, title: '' } : node))
     }));
     expect(roadmapSnapshotSchema.safeParse(badTitle).success).toBe(false);
-    const tooMany = withSnapshot(() => ({
+  });
+
+  it('refuses more nodes or dependencies than a project may hold, on the limit itself', () => {
+    const tooManyNodes = withSnapshot(() => ({
       nodes: Array.from({ length: ROADMAP_LIMITS.nodesPerProject + 1 }, (_, index) =>
         roadmapNode({ id: `g${index}`, kind: 'goal', position: index })
       ),
       placements: [],
       dependencies: []
     }));
-    expect(roadmapSnapshotSchema.safeParse(tooMany).success).toBe(false);
+    expect(roadmapSnapshotSchema.safeParse(tooManyNodes).error?.issues).toEqual([
+      expect.objectContaining({ code: 'too_big', path: ['nodes'] })
+    ]);
+    // Edges to nodes that do not exist: each is also unknown_node, so look for the size issue itself.
+    const sizeIssues = (count: number) => {
+      const edges = Array.from({ length: count }, (_, index) =>
+        dependency(`d${index}`, taskRef('t5'), nodeRef(`n${index}`))
+      );
+      const issues = roadmapSnapshotSchema.safeParse(withSnapshot(() => ({ dependencies: edges }))).error?.issues ?? [];
+      return issues.filter((issue) => issue.code === 'too_big');
+    };
+    expect(sizeIssues(ROADMAP_LIMITS.dependenciesPerProject)).toEqual([]);
+    expect(sizeIssues(ROADMAP_LIMITS.dependenciesPerProject + 1)).toEqual([
+      expect.objectContaining({ code: 'too_big', path: ['dependencies'] })
+    ]);
   });
 });

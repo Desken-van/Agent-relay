@@ -14,9 +14,11 @@ Existing `tasks` rows remain the **only** executable workflow objects. The roadm
 
 - never creates, transitions, cancels or deletes a task, and never stores a copy of its status;
 - attaches a task to an epic with a *placement* and reads the task's own status when it needs progress;
-- is never read by the workflow, so a roadmap problem cannot block, alter or retry task execution.
+- is never read by the workflow, so a roadmap problem cannot block, alter or retry task execution, and a
+  person can run any task by hand whatever the roadmap says about it (§4).
 
-Nothing in `tasks`, `workflow.ts`, `models.ts` or any existing service changes for the roadmap.
+No column or row of `tasks`, and nothing in `workflow.ts`, `models.ts` or any existing service, changes for the
+roadmap. Migration 24 adds one index to `tasks` (§7).
 
 ## 2. Model
 
@@ -32,8 +34,9 @@ Nothing in `tasks`, `workflow.ts`, `models.ts` or any existing service changes f
 - **Tasks are not nodes.** A task sits under an epic through a placement, never under a phase or a goal.
 - **Unassigned is the absence of a placement.** There is no placement with a null epic and no synthetic
   "Unassigned" node: one fact, one representation. Unassigned is a per-project bucket, not an item — it has no
-  id, no criteria, no state, and cannot be a dependency endpoint. It is ordered like today's Tasks list,
-  `created_at DESC, id ASC`, and is not manually reorderable; ordering work is what an epic is for.
+  id, no criteria, no state, and cannot be a dependency endpoint. It keeps today's Tasks-list order,
+  `created_at DESC`, with `id ASC` added as a tiebreak, and is not manually reorderable; ordering work is what
+  an epic is for.
 - **Stable identity.** Ids are minted once by the `IdGenerator` and never reused or changed. A move changes
   `parentId` or `epicId`, never `id`; a node's `projectId` and `kind` never change either. A task's project is
   the task row's own `project_id`, which no code path updates.
@@ -67,10 +70,19 @@ Transitions (`ROADMAP_NODE_TRANSITIONS`): `open —accept→ accepted`, `open �
 open node with closed children is normal, it is how acceptance proceeds bottom-up. A child cannot be reopened
 under a closed parent (invariant I7), so reopening runs top-down, one explicit decision per node.
 
-Preconditions the services enforce (13C): the change must leave the snapshot valid (so `accept` and `cancel`
-need no open child node and no non-terminal task beneath, see I7), and `accept` is additionally refused while
-the subtree holds a `stopped` task — work that is still owed. The operator continues that task, or moves it out,
-first. An **empty** node may be accepted: its acceptance evidence may lie outside Agent Relay.
+Preconditions the services enforce (13C):
+
+- Every change must leave the snapshot valid, so `accept` and `cancel` need no open child node and no
+  non-terminal task beneath (I7).
+- `accept` over a subtree holding a `stopped` task needs the operator's explicit acknowledgement in the request;
+  without it the accept is refused and names those tasks. A stopped task is not always recoverable — the
+  continuation service admits a source only with review evidence, so a task that failed during specification
+  or publishing can never be continued — and the only other way out would be moving it away from the epic's
+  history. The stopped-work flag stays visible on the accepted node.
+- **A closed node's contents are frozen.** Placing a task into, or moving one out of, an accepted or cancelled
+  epic is refused, as is adding a child under a closed node; reopen it first. Otherwise work could be slipped
+  under an acceptance that never saw it.
+- An **empty** node may be accepted: its acceptance evidence may lie outside Agent Relay.
 
 ### Task progress — derived, never stored
 
@@ -82,7 +94,7 @@ decides its meaning here); `taskProgressKind` adds `superseded`.
 | `not_started` | `DRAFT` | yes |
 | `in_progress` | every other non-terminal status | yes |
 | `done` | `COMPLETED` | yes |
-| `stopped` | `FAILED`, `REVIEW_LIMIT_REACHED`, `REVIEW_BLOCKED` — exactly the statuses a continuation may start from | yes, as not done |
+| `stopped` | `FAILED`, `REVIEW_LIMIT_REACHED`, `REVIEW_BLOCKED` — the statuses the continuation service admits as a source, before its own evidence checks | yes, as not done |
 | `superseded` | a `stopped` task that has a continuation | no — its successor carries the work |
 | `cancelled` | `CANCELLED` | no — abandoned on purpose |
 
@@ -97,19 +109,26 @@ decides its meaning here); `taskProgressKind` adds `superseded`.
 - Display state, first match wins: `cancelled` / `accepted` (the authored state), `empty` (`total = 0`),
   `awaiting_acceptance` (`done = total`), `not_started` (`notStarted = total`), otherwise `in_progress`; plus a
   stopped-work flag when `stopped > 0`.
-- **Empty is not done.** An empty node satisfies no dependency, never reads as complete, and adds nothing to
-  its parent; a parent with only empty or cancelled children is itself empty.
+- **Empty is not done.** An *open* empty node satisfies no dependency, never reads as complete, and adds nothing
+  to its parent; a parent with only empty or cancelled children is itself empty. The authored state wins: once
+  a person accepts an empty node it is accepted, and satisfies dependencies like any accepted node (§4).
 
 ## 4. Dependencies
 
-`dependent` may not start until `prerequisite` is satisfied. Either end is a node of any level or a task, in the
-same project.
+`dependent` is **ready** only when every effective `prerequisite` is satisfied, and **blocked** otherwise.
+Either end is a node of any level or a task, in the same project.
 
-- **Satisfied**: a node prerequisite only when it is `accepted`; a task prerequisite when the **last task of its
-  continuation chain** is `COMPLETED` (`task_continuations` is one-to-one on both sides, so the chain is linear).
+Readiness is derived and advisory. 13C computes it and 13D shows it; the automatic dependency scheduler
+(15B) will consult it before it starts anything on its own. The task workflow does not read it: a person can
+still start or continue a blocked task by hand, exactly as today, so no task's lifecycle depends on the
+roadmap (§1).
+
+- **Satisfied**: a node prerequisite only when it is `accepted` (an accepted empty node included); a task
+  prerequisite when the **last task of its continuation chain** is `COMPLETED` (`task_continuations` is
+  one-to-one on both sides, so the chain is linear).
 - **Unsatisfiable, fail closed**: a cancelled node, or a chain ending in `CANCELLED` or in a `stopped` task. The
-  dependent stays blocked with that reason until a person removes or retargets the edge. Nothing is ever
-  treated as satisfied by default.
+  dependent stays blocked with that reason until the chain is continued to a completed task, or a person
+  removes or retargets the edge. Nothing is ever treated as satisfied by default.
 - **Inherited downwards**: an item's effective prerequisites are its own plus every ancestor's. A task in epic E
   waits for E's, its phase's and its goal's prerequisites. An Unassigned task has only its own.
 - **Structural refusals (13A)**: an item depending on itself, the same edge twice, and any edge between an item
@@ -119,13 +138,17 @@ same project.
   `start(x) → done(p)` for each dependency, `start(child) → start(parent)` (inheritance),
   `done(parent) → done(child)` (a node is done only when its subtree is) and `done(x) → start(x)`, a change is
   refused if it creates a cycle. This catches deadlocks that no single edge shows: epic A on epic B, and a task
-  of B on a task of A.
+  of B on a task of A. Items that will never run are left out, because they cannot deadlock anything: no
+  containment edge leads to a cancelled node or to a cancelled or superseded task (a parent's completion does
+  not wait for them), and a dependency whose dependent is cancelled or superseded adds no edge. A dependency
+  *on* such an item is not a cycle; it is the unsatisfiable case above.
 
 ## 5. Invariants
 
-`roadmapStructureViolations(snapshot)` returns every violation, section by section in snapshot order;
-`roadmapSnapshotSchema` reports them as schema issues carrying `params.roadmapViolation`, and
-`parseRoadmapSnapshot` throws `VALIDATION_FAILED` quoting the first ten.
+`roadmapStructureViolations(snapshot)` returns every violation, section by section in snapshot order.
+`roadmapSnapshotSchema` reports them as schema issues carrying `params.roadmapViolation` — except at a path
+where a record's own schema already reported one (a goal's parent, a self-dependency), so a problem is never
+listed twice. `parseRoadmapSnapshot` throws `VALIDATION_FAILED` quoting the first ten issues.
 
 | # | Rule | Code |
 |---|---|---|
@@ -150,8 +173,10 @@ transitions. General cycles are **not** checked here; that is a graph search and
   open; otherwise the continuation stays Unassigned.
 - **Cancelled tasks** stay where they are placed, as history. They count in no total, never satisfy a
   dependency, and — being terminal — never stop their epic from closing.
-- **Stopped tasks** count as work still owed until a continuation supersedes them.
-- **Moving** a task only changes its placement. Placing a non-terminal task under a closed epic is refused (I7).
+- **Stopped tasks** count as work still owed until a continuation supersedes them. One that can never be
+  continued stays in its epic's history, and the epic is accepted over it only with the acknowledgement in §3.
+- **Moving** a task only changes its placement. Nothing moves into or out of a closed epic (§3), and a
+  non-terminal task can never sit under one (I7).
 
 ## 7. Storage design (13B)
 
@@ -273,8 +298,12 @@ What the database guarantees on its own, independently of the domain check:
   Every other roadmap foreign key is `NO ACTION`, checked at the end of the statement: the project cascade
   passes because every referencing row goes in the same statement, while deleting an epic that holds tasks, a
   node that has children or edges, or a task named by a placement or dependency is refused. `CASCADE` there
-  would silently unassign tasks or drop edges — and a dropped edge silently unblocks its dependent.
+  would silently unassign tasks or drop edges — and a dropped edge silently unblocks its dependent. So
+  `TaskRepository.delete`, which today only one repository test calls, is refused for a placed or depended-on
+  task: removing it would rewrite its epic's history. No product path deletes a single task.
 - A dependency edge is inserted or deleted, never edited; retargeting is delete + insert in one change.
+- The title CHECK is a backstop, not the rule: SQLite's `length` counts code points and the schema counts UTF-16
+  units, so the database is never stricter than the domain.
 
 A future migration that rebuilds `tasks` must recreate `ux_tasks_id_project` and run `foreign_key_check`
 before committing, as the migration runner already requires of rebuilds.
@@ -289,8 +318,11 @@ before committing, as the migration runner already requires of rebuilds.
 - **Unassigned**: the project's tasks with no placement, `ORDER BY created_at DESC, id ASC`.
 - **Revision**: `roadmap_heads.revision`; no row means revision 0 (the row is created by the first write).
 - The assembled snapshot goes through `parseRoadmapSnapshot`. A failure is an integrity error shown on the
-  Roadmap screen, and roadmap writes for that project are refused until it is repaired. It is never repaired
-  silently, and the workflow is unaffected.
+  Roadmap screen, naming the offending paths, and roadmap writes for that project are refused: every write is
+  validated whole (step 6), so none could pass. It is never repaired silently, and the workflow is unaffected.
+- A rule is only ever tightened together with a migration that brings the existing rows into line in the same
+  release — the forward-only convention `migrations.ts` already follows for settings. A stored roadmap that
+  fails validation is therefore damage from outside the application, and 13B offers no in-app repair for it.
 
 ### Writes: one change, one transaction, in this order
 
@@ -345,5 +377,6 @@ derived at read time, so a task finishing needs no roadmap write.
 - The Roadmap and Kanban screens (13D); Electron acceptance (13E); automatic decomposition and Ornith (15A–15B).
 
 Known limitations of the model as defined: acceptance records no note or evidence link, only the state and
-`updated_at`; there is no audit trail of roadmap changes beyond the revision counter; Unassigned cannot be
-ordered by hand.
+`updated_at` (an acknowledged stopped task included); there is no audit trail of roadmap changes beyond the
+revision counter; Unassigned cannot be ordered by hand; a roadmap damaged outside the application is
+reported but cannot be repaired from inside it; readiness is advisory until the 15B scheduler consults it.

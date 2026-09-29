@@ -357,8 +357,10 @@ export type TaskProgressKind = (typeof TASK_PROGRESS_KINDS)[number];
  * Every workflow status and what it means for progress.
  *
  * A total record on purpose: adding a status to the workflow does not compile
- * until someone decides what it means here. The stopped statuses are exactly
- * the ones a continuation may start from.
+ * until someone decides what it means here. The stopped statuses are the ones
+ * the continuation service accepts as a source — subject to its own evidence
+ * checks, so a task that failed before any review can never be continued and
+ * stays stopped.
  */
 export const TASK_STATUS_PROGRESS: {
   readonly [S in TaskStatus]: Exclude<TaskProgressKind, 'superseded'>;

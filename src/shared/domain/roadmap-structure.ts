@@ -321,7 +321,12 @@ export const roadmapSnapshotSchema = z
   })
   .strict()
   .superRefine((snapshot, context) => {
+    // A few structural rules restate a record's own (a goal's parent, a self-dependency) for callers
+    // that use the function directly. Through the schema that record's issue already stands at the same
+    // path, so it is not repeated — a duplicate would also crowd real issues out of the quoted ten.
+    const reported = new Set(context.issues.map((issue) => JSON.stringify(issue.path)));
     for (const found of roadmapStructureViolations(snapshot)) {
+      if (reported.has(JSON.stringify(found.path))) continue;
       context.addIssue({
         code: 'custom',
         path: [...found.path],
