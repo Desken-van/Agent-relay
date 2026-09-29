@@ -123,25 +123,92 @@ Readiness is derived and advisory. 13C computes it and 13D shows it; the automat
 still start or continue a blocked task by hand, exactly as today, so no task's lifecycle depends on the
 roadmap (§1).
 
+### Continuation resolution — one rule for readiness and for cycles
+
+A stored edge names the task a person pointed at, and stays as written: the workflow never rewrites roadmap
+rows. What the edge *means* follows the work. `R(ref)` resolves a reference:
+
+- a node resolves to itself;
+- a task resolves to itself unless it is `superseded` (per `taskProgressKind`: stopped **and** continued), in
+  which case it resolves to `R(its continuation)`. So `R` ends at the last task of the continuation chain, and a
+  continuation recorded against a task that is not stopped is ignored here exactly as it is for progress.
+  `task_continuations` is one-to-one on both sides, so the chain is linear; a chain that revisits a task is
+  malformed, cannot be resolved, and blocks every dependent that relies on it.
+
+Readiness and the cycle check both evaluate every stored edge as **`R(dependent)` waits for
+`R(prerequisite)`** — both ends, always, and nowhere the raw reference. After resolution a superseded task is
+never an endpoint: as a prerequisite it is judged by its successor, and as a dependent its waits pass to its
+successor, which carries its work. Resolution is computed at read time from `task_continuations`, so a new
+continuation changes what the edges mean without any roadmap write.
+
+### Readiness
+
 - **Satisfied**: a node prerequisite only when it is `accepted` (an accepted empty node included); a task
-  prerequisite when the **last task of its continuation chain** is `COMPLETED` (`task_continuations` is
-  one-to-one on both sides, so the chain is linear).
-- **Unsatisfiable, fail closed**: a cancelled node, or a chain ending in `CANCELLED` or in a `stopped` task. The
-  dependent stays blocked with that reason until the chain is continued to a completed task, or a person
-  removes or retargets the edge. Nothing is ever treated as satisfied by default.
-- **Inherited downwards**: an item's effective prerequisites are its own plus every ancestor's. A task in epic E
-  waits for E's, its phase's and its goal's prerequisites. An Unassigned task has only its own.
-- **Structural refusals (13A)**: an item depending on itself, the same edge twice, and any edge between an item
-  and its own ancestor or descendant — including a task and its epic's ancestors. Containment already relates
-  them, and under inheritance either direction is a guaranteed deadlock.
-- **Cycles (13C)**: over two vertices per item, `start(x)` and `done(x)`, with edges
-  `start(x) → done(p)` for each dependency, `start(child) → start(parent)` (inheritance),
-  `done(parent) → done(child)` (a node is done only when its subtree is) and `done(x) → start(x)`, a change is
-  refused if it creates a cycle. This catches deadlocks that no single edge shows: epic A on epic B, and a task
-  of B on a task of A. Items that will never run are left out, because they cannot deadlock anything: no
-  containment edge leads to a cancelled node or to a cancelled or superseded task (a parent's completion does
-  not wait for them), and a dependency whose dependent is cancelled or superseded adds no edge. A dependency
-  *on* such an item is not a cycle; it is the unsatisfiable case above.
+  prerequisite when `R(prerequisite)` is `COMPLETED`. A dependency on a superseded task is therefore exactly as
+  satisfiable as its successor — never unsatisfiable merely because the task it names was superseded.
+- **Unsatisfiable, fail closed**: a cancelled node, or `R(prerequisite)` `CANCELLED` or `stopped` (a stopped
+  chain end is one nobody continued). The dependent stays blocked with that reason until the chain is continued
+  to a completed task, or a person removes or retargets the edge. Nothing is ever treated as satisfied by default.
+- **Inert**: an edge whose `R(dependent)` is a cancelled node or a `CANCELLED` task constrains nothing — that
+  item will never start — so it counts for neither readiness nor cycles.
+- **Inherited downwards**: an item's effective prerequisites are its own plus every ancestor's, through its own
+  placement. A task in epic E waits for E's, its phase's and its goal's prerequisites; an Unassigned task has only
+  its own. A successor inherits through **its** placement, not its source's.
+- **A cycle blocks.** A dependent whose resolved wait lies on a cycle (below) is blocked with
+  `dependency_cycle`, naming the stored edges involved, whatever each edge's own satisfaction says — so readiness
+  and the cycle check can never disagree.
+- Readiness matters for work that has not started; for anything else it is information.
+
+### Structural refusals (13A)
+
+An item depending on itself, the same edge twice, and any edge between an item and its own ancestor or
+descendant — including a task and its epic's ancestors. Containment already relates them, and under inheritance
+either direction is a guaranteed deadlock. These are invariants (I6) about **stored** references only. The same
+shapes after resolution are cycles, handled below, and deliberately not invariants: a continuation can create
+one without any roadmap write, and an invariant a workflow event can break would lock the project's roadmap.
+
+### Cycles (13C)
+
+Two vertices per resolved item — every node, and every task that is not superseded: `start(x)` and `done(x)`.
+Edges:
+
+- `start(R(d)) → done(R(p))` for each stored dependency that is not inert;
+- `start(child) → start(parent)` for each node with a parent and each placed task that is a vertex
+  (inheritance);
+- `done(parent) → done(child)` for each child node that is not cancelled and each placed task that is not
+  `CANCELLED` (a node is done only when its live subtree is; superseded tasks are not vertices, and their
+  successors bring their own placement);
+- `done(x) → start(x)`.
+
+A cycle is a deadlock. This catches what no single edge shows — epic A on epic B and a task of B on a task of A —
+and what only resolution shows: stopped task A continued by B, and B depends on A. Resolved, that edge is
+B waits for B: `start(B) → done(B) → start(B)`, a cycle of length one. A graph built on the raw references A and
+B misses it. The reverse edge (A depends on B) resolves to the same loop, and so does an edge from the
+successor's own epic to its superseded source ("E2 depends on A" with B placed in E2).
+
+It is checked at two moments, with the same graph and the same `R`:
+
+1. **Write time.** A roadmap change is refused if, after it, a cycle passes through a link the change adds — a
+   dependency, a placement or a parent link, the 13C continuation-placement hook included. A cycle that already
+   existed does not block unrelated writes, and a change that only removes links is never refused, so a cycle
+   can always be undone.
+2. **Read time.** Every readiness derivation runs the same search on the current resolved graph. A continuation
+   is a workflow event that never writes the roadmap, so the write check never sees it; an edge that was
+   acyclic when it was accepted can become cyclic once a continuation re-points one of its ends. Its dependents
+   are then blocked with `dependency_cycle`. It is not an integrity error: the stored snapshot stays valid and
+   writable, and the operator removes or retargets an edge.
+
+Today's continuation service creates the successor as a brand-new task in the same transaction as the link
+(`continuation-service.ts`), so the successor has no edges of its own, and the resolved graph after a
+continuation is the previous one with the source replaced by its successor, minus the source's containment
+links if the successor is not placed where the source was. Renaming a vertex and removing links cannot close a
+cycle, so today's continuations do not trigger the read-time case. The read-time check is required anyway: the
+roadmap must not depend on how another service happens to pick its successor, and a later service that
+continues into an existing task would otherwise turn an accepted edge into an unseen deadlock.
+
+The design contract [`tests/domain/roadmap-cycle-design.test.ts`](../tests/domain/roadmap-cycle-design.test.ts)
+executes these rules on a small model and the examples above. It is a model of the text, not the 13C engine: the
+application derives no readiness and detects no cycles until 13C.
 
 ## 5. Invariants
 
@@ -162,7 +229,8 @@ listed twice. `parseRoadmapSnapshot` throws `VALIDATION_FAILED` quoting the firs
 
 I7 holds for the whole subtree by induction, and no workflow event can break it: a task under a closed epic was
 terminal when the epic closed (or when it was placed there), and terminal statuses have no outgoing
-transitions. General cycles are **not** checked here; that is a graph search and belongs to 13C.
+transitions. General cycles — including those only continuation resolution reveals — are **not** checked here;
+that is a graph search over resolved references and belongs to 13C (§4).
 
 ## 6. Existing tasks
 
@@ -182,9 +250,11 @@ transitions. General cycles are **not** checked here; that is a graph search and
 
 ### Migration 24 `roadmap-hierarchy`
 
-New tables and indexes only: no table rebuild, no change to any existing row, no backfill rows. Every statement
-below was run against the real migrated schema (migrations 1–23, in-memory) by a throwaway probe during 13A,
-including every refusal described in the comments of this section.
+New tables and indexes only: no table rebuild, no change to any existing row, no backfill rows. This is still a
+design, not a migration the application runs: the design-contract test
+[`tests/db/roadmap-ddl-design.test.ts`](../tests/db/roadmap-ddl-design.test.ts) reads the block below from this
+file, executes it against a real in-memory database migrated through 1–23, and checks each refusal listed in
+this section. 13B replaces that test with tests of the real migration.
 
 ```sql
 -- Parent key for the composite foreign keys below: lets every roadmap row prove
@@ -193,13 +263,13 @@ including every refusal described in the comments of this section.
 CREATE UNIQUE INDEX ux_tasks_id_project ON tasks(id, project_id);
 
 CREATE TABLE roadmap_heads (
-  project_id  TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  project_id  TEXT NOT NULL PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
   revision    INTEGER NOT NULL CHECK (revision >= 0),
   updated_at  TEXT NOT NULL
 );
 
 CREATE TABLE roadmap_nodes (
-  id                        TEXT PRIMARY KEY,
+  id                        TEXT NOT NULL PRIMARY KEY,
   project_id                TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   kind                      TEXT NOT NULL CHECK (kind IN ('goal','phase','epic')),
   parent_id                 TEXT,
@@ -213,10 +283,12 @@ CREATE TABLE roadmap_nodes (
   updated_at                TEXT NOT NULL,
   UNIQUE (id, project_id),
   UNIQUE (id, project_id, kind),
+  -- `parent_kind IS NOT NULL` is not redundant: `NULL = 'goal'` is NULL, a CHECK that is NULL passes, and a
+  -- foreign key with a NULL column is not checked at all — a phase could otherwise name any parent.
   CHECK (
     (kind = 'goal'  AND parent_id IS NULL     AND parent_kind IS NULL) OR
-    (kind = 'phase' AND parent_id IS NOT NULL AND parent_kind = 'goal') OR
-    (kind = 'epic'  AND parent_id IS NOT NULL AND parent_kind = 'phase')
+    (kind = 'phase' AND parent_id IS NOT NULL AND parent_kind IS NOT NULL AND parent_kind = 'goal') OR
+    (kind = 'epic'  AND parent_id IS NOT NULL AND parent_kind IS NOT NULL AND parent_kind = 'phase')
   ),
   FOREIGN KEY (parent_id, project_id, parent_kind) REFERENCES roadmap_nodes(id, project_id, kind)
 );
@@ -233,7 +305,7 @@ BEGIN
 END;
 
 CREATE TABLE roadmap_task_placements (
-  task_id     TEXT PRIMARY KEY,
+  task_id     TEXT NOT NULL PRIMARY KEY,
   project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   epic_id     TEXT NOT NULL,
   epic_kind   TEXT NOT NULL DEFAULT 'epic' CHECK (epic_kind = 'epic'),
@@ -247,7 +319,7 @@ CREATE TABLE roadmap_task_placements (
 CREATE INDEX idx_roadmap_task_placements_project ON roadmap_task_placements(project_id);
 
 CREATE TABLE roadmap_dependencies (
-  id                    TEXT PRIMARY KEY,
+  id                    TEXT NOT NULL PRIMARY KEY,
   project_id            TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   dependent_node_id     TEXT,
   dependent_task_id     TEXT,
@@ -287,6 +359,12 @@ END;
 
 What the database guarantees on its own, independently of the domain check:
 
+- **No NULL way round a rule.** SQLite accepts NULL in a `TEXT PRIMARY KEY` unless it is declared `NOT NULL`,
+  passes a CHECK whose result is NULL, and does not check a foreign key when any of its columns is NULL. So
+  every key column is `NOT NULL` — without it, a placement with a NULL `task_id` would skip both of its foreign
+  keys — and the phase and epic branches of the parent CHECK require `parent_kind IS NOT NULL` explicitly.
+  Without that clause a phase with a NULL `parent_kind` was accepted under a missing parent, a parent of the
+  wrong kind, another project's goal and itself, and `PRAGMA foreign_key_check` reported nothing.
 - **Same project everywhere.** Composite foreign keys through `(id, project_id)` refuse a cross-project parent,
   placement or dependency endpoint.
 - **Kinds.** `parent_kind` must match both the node's own kind (CHECK) and the parent row's kind (foreign key),
@@ -339,9 +417,9 @@ placement upserts and removals (a removal unassigns a task) and dependency inser
 3. Shift: a change that writes any position in a sibling group — a reorder, or a row moving in — carries that
    group's **complete** final order. Move every row still in each such group to `position + offset`, with
    `offset = 1 + max(every existing and every new position in those groups)`. SQLite checks UNIQUE row by row,
-   so a one-statement swap fails (the probe observed `UNIQUE constraint failed`); after the shift every row
-   sits above every final position, so no write in the next step can collide. A group that only loses a row
-   keeps a gap, which is allowed.
+   so a one-statement swap fails (the design-contract test observes `UNIQUE constraint failed`); after the
+   shift every row sits above every final position, so no write in the next step can collide. A group that
+   only loses a row keeps a gap, which is allowed.
 4. Upserts, nodes parents-first and then placements, each with its final parent or epic and its final dense
    position `0 … n−1` in its group. Rewriting whole groups also keeps positions bounded by the group's size.
 5. Dependency inserts.
@@ -366,7 +444,8 @@ derived at read time, so a task finishing needs no roadmap write.
   pinned migration-list tests name version 24.
 - A real file-backed database: write, close, reopen, and read the identical snapshot and revision.
 - A stale revision writes nothing; a change failing the snapshot check rolls back every row and the head.
-- The database refuses a cross-project or wrong-kind row even when the domain check is bypassed.
+- The database refuses a cross-project or wrong-kind row, a NULL key and a phase or epic with a NULL parent kind,
+  even when the domain check is bypassed.
 - Forgetting a project removes its roadmap and leaves another project's untouched.
 
 ## 8. Not in 13A
