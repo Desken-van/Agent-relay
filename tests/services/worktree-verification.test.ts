@@ -72,3 +72,17 @@ it('runs the project’s verification with the project’s own defaults: a NODE_
     if (previous === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previous;
   }
 }, 30_000);
+
+it('bounds Vitest workers even in an older task tree and overrides an inherited high worker count', async () => {
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ scripts: { verify: "node -e \"console.log('workers=' + process.env.VITEST_MAX_WORKERS)\"" } }));
+  const previous = process.env.VITEST_MAX_WORKERS;
+  process.env.VITEST_MAX_WORKERS = '23';
+  try {
+    const result = await verifier.execute(target, new AbortController().signal, () => {});
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('workers=2');
+    expect(process.env.VITEST_MAX_WORKERS).toBe('23');
+  } finally {
+    if (previous === undefined) delete process.env.VITEST_MAX_WORKERS; else process.env.VITEST_MAX_WORKERS = previous;
+  }
+}, 30_000);

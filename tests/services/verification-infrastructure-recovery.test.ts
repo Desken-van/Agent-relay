@@ -35,6 +35,7 @@ import {
   PLANTED_PATH,
   PLANTED_SECRET,
   VITEST_ASSERTION_FAILURE_OUTPUT,
+  VITEST_MIXED_FAILURE_OUTPUT,
   VITEST_WORKER_TIMEOUT_OUTPUT
 } from '../helpers/verification-output-fixtures';
 
@@ -325,3 +326,30 @@ describe('the production sequence: implementation → lease released → verific
     expect(s.requests[1]!.correctionFindings).toBeNull();
   }, 60_000);
 });
+
+it('diagnoses mixed assertion and worker failures without spending another Ornith round or changing the finished document', async () => {
+  scenario = await approvedOrnithTask();
+  const s = scenario;
+  s.scripts.push({ ...assertionFailureRun(), stdout: VITEST_MIXED_FAILURE_OUTPUT });
+  await s.h.orchestrator.sendToClaude(s.taskId);
+  const hash = sha256(s.target);
+  expect(guidanceOf(s).action).toMatchObject({ key: 'run_verification', label: 'Run verification to diagnose' });
+  s.scripts.push(passingRun());
+  expect((await s.h.orchestrator.runVerification(s.taskId)).status).toBe('READY_FOR_REVIEW');
+  expect(s.requests).toHaveLength(1);
+  expect(sha256(s.target)).toBe(hash);
+}, 60_000);
+
+it('blocks repeated identical mixed failures after one diagnostic attempt and never invents a pass', async () => {
+  scenario = await approvedOrnithTask();
+  const s = scenario;
+  const mixed = { ...assertionFailureRun(), stdout: VITEST_MIXED_FAILURE_OUTPUT };
+  s.scripts.push(mixed);
+  await s.h.orchestrator.sendToClaude(s.taskId);
+  const hash = sha256(s.target);
+  s.scripts.push(mixed);
+  expect((await s.h.orchestrator.runVerification(s.taskId)).status).toBe('READY_FOR_IMPLEMENTATION');
+  await expect(s.h.orchestrator.runVerification(s.taskId)).rejects.toThrow(/last two runs/);
+  expect(s.requests).toHaveLength(1);
+  expect(sha256(s.target)).toBe(hash);
+}, 60_000);

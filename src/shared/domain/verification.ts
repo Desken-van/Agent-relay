@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { Run, Settings } from './models';
-import { VERIFICATION_FAILURE_KINDS, type VerificationFailureKind } from './verification-failure';
+import { hasVerificationInfrastructureFailure, VERIFICATION_FAILURE_KINDS, type VerificationFailureKind } from './verification-failure';
 
 export const verificationRecordSchema = z.object({
   version: z.literal(1), command: z.literal('npm run verify'),
@@ -54,6 +54,9 @@ export function verificationFailureKind(run: Run | null): VerificationFailureKin
   const record = readVerification(run);
   if (!record.success) return run.status === 'cancelled' ? 'cancelled' : 'unknown';
   if (record.data.passed) return null;
+  // Older classifiers preferred assertions even beside worker failures, and their summaries
+  // could discard the assertion itself. Preserve the stored evidence; only the recovery route changes.
+  if (record.data.failureKind === 'implementation' && hasVerificationInfrastructureFailure(record.data.outputSummary ?? '')) return 'unknown';
   if (record.data.failureKind !== undefined) return record.data.failureKind;
   return record.data.outcome === 'cancelled' || run.status === 'cancelled' ? 'cancelled' : 'unknown';
 }

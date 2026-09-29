@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { VERIFICATION_VITEST_MAX_WORKERS } from '../../shared/domain/verification-execution-policy';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { Project, Settings, Task } from '../../shared/domain/models';
@@ -100,7 +101,9 @@ export class WorktreeVerification implements VerificationExecutor {
     // from a production build) with no change to the files under test.
     return this.runner.run(node.path, [npmCli, 'run', 'verify'], {
       cwd: root, signal, timeoutMs: settings.processTimeoutMs, maxOutputBytes: settings.maxStoredLogBytes,
-      omitEnvNames: ['NODE_ENV']
+      omitEnvNames: ['NODE_ENV'],
+      // Applies even to existing task trees whose config predates the worker bound.
+      env: { VITEST_MAX_WORKERS: String(VERIFICATION_VITEST_MAX_WORKERS) }
     });
   }
 }

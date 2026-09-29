@@ -8,6 +8,8 @@ import type { ExecutedVerificationOutcome } from '../../shared/domain/ornith-ver
 import type { VerificationFailureKind } from '../../shared/domain/verification-failure-kind';
 import { verificationConfigurationFields } from '../../shared/domain/verification';
 
+import { VERIFICATION_VITEST_MAX_WORKERS } from '../../shared/domain/verification-execution-policy';
+
 const FINGERPRINT_HEX_CHARS = 16;
 
 function digest(parts: readonly string[]): string {
@@ -19,7 +21,7 @@ function digest(parts: readonly string[]): string {
  * `verificationConfigurationFields` (shared) is the one place that names which Settings fields those are.
  */
 export function verificationConfigurationFingerprint(settings: Pick<Settings, 'processTimeoutMs' | 'maxStoredLogBytes'>): string {
-  return digest(['npm run verify', ...verificationConfigurationFields(settings).map(String)]);
+  return digest(['npm run verify', `VITEST_MAX_WORKERS=${VERIFICATION_VITEST_MAX_WORKERS}`, ...verificationConfigurationFields(settings).map(String)]);
 }
 
 /**

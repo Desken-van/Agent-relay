@@ -39,7 +39,7 @@ missing or malformed verification cannot fall back to an older success. Historic
 results remain visible with command, exit code, duration and snapshot digest.
 They are not displayed as proof that the current files still match.
 
-A failed verification is also actionable evidence. The next primary action becomes
+A verification classified as an implementation failure supplies repair evidence. The next primary action becomes
 **Fix verification failures · &lt;provider&gt;**. That resumes the selected implementation
 provider in the existing worktree and passes it the bounded, redacted output stored
 for the failed verification. This repair does not consume another review round. A
@@ -52,7 +52,30 @@ Run → Actions → Writes local files → **Run verification**. While the reque
 pending the button is disabled; repeated clicks do not submit another request.
 The main-process exclusion is authoritative. Result and output are under
 Relay Timeline → **Verification · npm run verify**. After a pass use **Run review**.
-After a failure use **Fix verification failures · &lt;provider&gt;**, then verify the
-changed files again.
+After a confirmed implementation failure use **Fix verification failures · &lt;provider&gt;**,
+then verify the changed files again. Worker failures offer verification again;
+ambiguous or mixed failures offer bounded diagnosis as described below.
 No additional Claude permission or Coai setting is required for this fixed
 command. This path does not grant publication approval or run Coai.
+
+## Worker limits and ambiguous failures
+
+Relay supplies `VITEST_MAX_WORKERS=2` to its verification child process. This also
+applies to existing task worktrees with older Vitest configuration; an explicit
+project config or command-line option can override that default. Other test
+runners ignore this Vitest-specific environment variable. Agent Relay's own
+Vitest config defaults to two workers for terminal runs as well. The host policy
+is part of the verification configuration fingerprint. No task files are rewritten.
+
+Only an implementation failure without a known worker failure is sent to the
+implementation provider. Mixed assertion and worker failures remain failed and
+use the existing `unknown` diagnostic policy: one manual diagnostic re-run; two
+materially identical failures on the same snapshot and configuration block another
+unchanged re-run. A pure assertion failure after diagnosis still requires repair.
+Older stored implementation failures with worker evidence in their summaries use
+this same recovery route without rewriting their history. Publication still
+requires a passing verification and review of the exact current snapshot.
+
+Bounded, redacted summaries prioritize concrete error messages over test titles
+and stack tails. They are evidence excerpts, not full logs. A historical summary
+cannot recover assertion details that were already discarded.

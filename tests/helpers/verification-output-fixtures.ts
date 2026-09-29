@@ -94,7 +94,7 @@ export const VITEST_ASSERTION_FAILURE_OUTPUT = [
   '      Tests  1 failed | 2284 passed (2285)'
 ].join('\n');
 
-/** The same runner failure AND a real assertion failure in one run: the files' failure stands. */
+/** The same runner failure AND an assertion failure: diagnose before repair; success is not established. */
 export const VITEST_MIXED_FAILURE_OUTPUT = [
   RUN_HEADER,
   ' ❯ tests/domain/example.test.ts (4 tests | 1 failed) 52ms',

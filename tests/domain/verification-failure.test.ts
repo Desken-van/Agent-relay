@@ -67,11 +67,11 @@ describe('classifyVerificationFailure', () => {
     expect(classified.reason).toBe(`npm run verify failed (exit 1): ${expected}. The current files did not pass.`);
   });
 
-  it('lets a real assertion failure stand even when a runner failure happened beside it', () => {
+  it('preserves a mixed failure as unconfirmed and offers bounded diagnosis before repair', () => {
     const classified = classifyVerificationFailure(failed(VITEST_MIXED_FAILURE_OUTPUT));
 
-    expect(classified.kind).toBe('implementation');
-    expect(classified.reason).toContain('a test assertion failed');
+    expect(classified.kind).toBe('unknown');
+    expect(classified.reason).toContain('checks failed and the test runner also failed');
   });
 
   it('fails closed on a TypeError thrown inside node_modules with no assertion, lint, type or build error to name (the React production-build failure)', () => {
@@ -162,7 +162,17 @@ describe('what a stored verification run is read back as', () => {
     }
   });
 
-  it('fails closed on a record written before classification existed: unknown, never a repair', () => {
+  it('routes old implementation records containing worker failures to diagnosis without modifying stored evidence', () => {
+    for (const summary of [VITEST_WORKER_TIMEOUT_OUTPUT.slice(-1_500), 'AssertionError: mismatch\nError: [vitest-pool]: Failed to start forks worker']) {
+      const run = verificationRun(record({ failureKind: 'implementation', outputSummary: summary }));
+      const original = run.structuredResult;
+      expect(verificationFailureKind(run)).toBe('unknown');
+      expect(verificationNeedsImplementationRepair(run)).toBe(false);
+      expect(run.structuredResult).toBe(original);
+    }
+  });
+
+  it('fails closed on a record written before classification existed: unknown, never a repair' , () => {
     const legacy = verificationRun(record({}));
     expect(verificationFailureKind(legacy)).toBe('unknown');
     expect(verificationNeedsImplementationRepair(legacy)).toBe(false);
