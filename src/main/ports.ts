@@ -7,6 +7,10 @@
  * loop testable without touching a network or a real repository.
  */
 
+import type { RoadmapNode, RoadmapTaskPlacement, RoadmapDependency, RoadmapTaskFact } from '../shared/domain/roadmap';
+import type { RoadmapSnapshot } from '../shared/domain/roadmap-structure';
+
+
 import type {
   CodexModelCatalogResult,
   CodexModelOption
@@ -2024,3 +2028,20 @@ export type OperationProbeOutcome =
       readonly kind: DiagnosticFailureKind;
       readonly message: string;
     };
+
+/** Storage change prepared by the authoring service. Changed destination groups carry complete dense orders. */
+export interface RoadmapChange {
+  readonly nodeUpserts?: readonly RoadmapNode[];
+  readonly nodeRemovals?: readonly string[];
+  readonly placementUpserts?: readonly RoadmapTaskPlacement[];
+  readonly placementRemovals?: readonly string[];
+  readonly dependencyInserts?: readonly RoadmapDependency[];
+  readonly dependencyRemovals?: readonly string[];
+}
+
+export interface RoadmapRepository {
+  read(projectId: string): RoadmapSnapshot;
+  listUnassigned(projectId: string): RoadmapTaskFact[];
+  /** Returns after commit (or release of a caller's enclosing transaction's savepoint). Never publishes events. */
+  apply(projectId: string, expectedRevision: number, change: RoadmapChange): RoadmapSnapshot;
+}

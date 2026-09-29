@@ -39,7 +39,7 @@ function withDefaultProfile(
   };
 }
 
-describe('migrations 9 and 11 through 23', () => {
+describe('migrations 9 and 11 through 24', () => {
   it('rejects a database where migration 21 came from the other branch', () => {
     const db = createSqliteDatabase(':memory:');
     try {
@@ -86,7 +86,8 @@ describe('migrations 9 and 11 through 23', () => {
       { version: 20, name: 'plan-review-isolated-subjects' },
       { version: 21, name: 'specification-grounding' },
       { version: 22, name: 'local-inference-profiles' },
-      { version: 23, name: 'ornith-model-profile' }
+      { version: 23, name: 'ornith-model-profile' },
+      { version: 24, name: 'roadmap-hierarchy' }
     ]);
 
     const db = createSqliteDatabase(':memory:');
@@ -109,7 +110,7 @@ describe('migrations 9 and 11 through 23', () => {
       'localInference',
       JSON.stringify(existing)
     );
-    expect(runMigrations(db)).toBe(15);
+    expect(runMigrations(db)).toBe(16);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };
@@ -159,7 +160,7 @@ describe('migrations 9 and 11 through 23', () => {
       JSON.stringify('kept-across-migration')
     );
 
-    expect(runMigrations(db)).toBe(13);
+    expect(runMigrations(db)).toBe(14);
 
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
@@ -198,7 +199,7 @@ describe('migrations 9 and 11 through 23', () => {
     }
     db.prepare('UPDATE settings SET value = ? WHERE key = ?').run('{not valid json', 'localInference');
 
-    expect(runMigrations(db)).toBe(13);
+    expect(runMigrations(db)).toBe(14);
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('localInference') as {
       value: string;
     };

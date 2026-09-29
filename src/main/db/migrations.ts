@@ -1286,6 +1286,113 @@ export const MIGRATIONS: readonly Migration[] = [
           WHERE implementation_provider = 'ornith' AND ornith_model_profile_id IS NULL`
       ).run(defaultProfile.id, fingerprint);
     }
+  },
+  {
+    version: 24,
+    name: 'roadmap-hierarchy',
+    up(db) {
+      // Additive only: existing task rows and workflow history remain untouched.
+      db.exec(`
+        -- Parent key for the composite foreign keys below: lets every roadmap row prove
+        -- "same project as the task" in the database itself. \`id\` is already the
+        -- primary key, so this index can never reject an existing row.
+        CREATE UNIQUE INDEX ux_tasks_id_project ON tasks(id, project_id);
+
+        CREATE TABLE roadmap_heads (
+          project_id  TEXT NOT NULL PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+          revision    INTEGER NOT NULL CHECK (revision >= 0),
+          updated_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE roadmap_nodes (
+          id                        TEXT NOT NULL PRIMARY KEY,
+          project_id                TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          kind                      TEXT NOT NULL CHECK (kind IN ('goal','phase','epic')),
+          parent_id                 TEXT,
+          parent_kind               TEXT,
+          title                     TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 200),
+          description               TEXT NOT NULL DEFAULT '',
+          acceptance_criteria_json  TEXT NOT NULL DEFAULT '[]',
+          position                  INTEGER NOT NULL CHECK (position >= 0),
+          state                     TEXT NOT NULL CHECK (state IN ('open','accepted','cancelled')),
+          created_at                TEXT NOT NULL,
+          updated_at                TEXT NOT NULL,
+          UNIQUE (id, project_id),
+          UNIQUE (id, project_id, kind),
+          -- \`parent_kind IS NOT NULL\` is not redundant: \`NULL = 'goal'\` is NULL, a CHECK that is NULL passes, and a
+          -- foreign key with a NULL column is not checked at all — a phase could otherwise name any parent.
+          CHECK (
+            (kind = 'goal'  AND parent_id IS NULL     AND parent_kind IS NULL) OR
+            (kind = 'phase' AND parent_id IS NOT NULL AND parent_kind IS NOT NULL AND parent_kind = 'goal') OR
+            (kind = 'epic'  AND parent_id IS NOT NULL AND parent_kind IS NOT NULL AND parent_kind = 'phase')
+          ),
+          FOREIGN KEY (parent_id, project_id, parent_kind) REFERENCES roadmap_nodes(id, project_id, kind)
+        );
+        CREATE UNIQUE INDEX ux_roadmap_nodes_child_position
+          ON roadmap_nodes(parent_id, position) WHERE parent_id IS NOT NULL;
+        CREATE UNIQUE INDEX ux_roadmap_nodes_goal_position
+          ON roadmap_nodes(project_id, position) WHERE parent_id IS NULL;
+
+        CREATE TRIGGER roadmap_nodes_identity_immutable
+        BEFORE UPDATE OF id, project_id, kind ON roadmap_nodes
+        WHEN OLD.id IS NOT NEW.id OR OLD.project_id IS NOT NEW.project_id OR OLD.kind IS NOT NEW.kind
+        BEGIN
+          SELECT RAISE(ABORT, 'A roadmap node keeps its id, project and kind.');
+        END;
+
+        CREATE TABLE roadmap_task_placements (
+          task_id     TEXT NOT NULL PRIMARY KEY,
+          project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          epic_id     TEXT NOT NULL,
+          epic_kind   TEXT NOT NULL DEFAULT 'epic' CHECK (epic_kind = 'epic'),
+          position    INTEGER NOT NULL CHECK (position >= 0),
+          created_at  TEXT NOT NULL,
+          updated_at  TEXT NOT NULL,
+          UNIQUE (epic_id, position),
+          FOREIGN KEY (task_id, project_id) REFERENCES tasks(id, project_id),
+          FOREIGN KEY (epic_id, project_id, epic_kind) REFERENCES roadmap_nodes(id, project_id, kind)
+        );
+        CREATE INDEX idx_roadmap_task_placements_project ON roadmap_task_placements(project_id);
+
+        CREATE TABLE roadmap_dependencies (
+          id                    TEXT NOT NULL PRIMARY KEY,
+          project_id            TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          dependent_node_id     TEXT,
+          dependent_task_id     TEXT,
+          prerequisite_node_id  TEXT,
+          prerequisite_task_id  TEXT,
+          created_at            TEXT NOT NULL,
+          CHECK ((dependent_node_id IS NULL) <> (dependent_task_id IS NULL)),
+          CHECK ((prerequisite_node_id IS NULL) <> (prerequisite_task_id IS NULL)),
+          CHECK (dependent_node_id IS NULL OR prerequisite_node_id IS NULL
+                 OR dependent_node_id <> prerequisite_node_id),
+          CHECK (dependent_task_id IS NULL OR prerequisite_task_id IS NULL
+                 OR dependent_task_id <> prerequisite_task_id),
+          FOREIGN KEY (dependent_node_id, project_id)    REFERENCES roadmap_nodes(id, project_id),
+          FOREIGN KEY (dependent_task_id, project_id)    REFERENCES tasks(id, project_id),
+          FOREIGN KEY (prerequisite_node_id, project_id) REFERENCES roadmap_nodes(id, project_id),
+          FOREIGN KEY (prerequisite_task_id, project_id) REFERENCES tasks(id, project_id)
+        );
+        CREATE UNIQUE INDEX ux_roadmap_dependencies_edge ON roadmap_dependencies(
+          COALESCE(dependent_node_id, ''), COALESCE(dependent_task_id, ''),
+          COALESCE(prerequisite_node_id, ''), COALESCE(prerequisite_task_id, ''));
+        CREATE INDEX idx_roadmap_dependencies_project ON roadmap_dependencies(project_id);
+        CREATE INDEX idx_roadmap_dependencies_dependent_node
+          ON roadmap_dependencies(dependent_node_id) WHERE dependent_node_id IS NOT NULL;
+        CREATE INDEX idx_roadmap_dependencies_dependent_task
+          ON roadmap_dependencies(dependent_task_id) WHERE dependent_task_id IS NOT NULL;
+        CREATE INDEX idx_roadmap_dependencies_prerequisite_node
+          ON roadmap_dependencies(prerequisite_node_id) WHERE prerequisite_node_id IS NOT NULL;
+        CREATE INDEX idx_roadmap_dependencies_prerequisite_task
+          ON roadmap_dependencies(prerequisite_task_id) WHERE prerequisite_task_id IS NOT NULL;
+
+        CREATE TRIGGER roadmap_dependencies_immutable
+        BEFORE UPDATE ON roadmap_dependencies
+        BEGIN
+          SELECT RAISE(ABORT, 'A roadmap dependency is replaced, never edited.');
+        END;
+      `);
+    }
   }
 ];
 

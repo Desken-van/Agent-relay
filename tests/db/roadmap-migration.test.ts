@@ -1,25 +1,12 @@
-/**
- * Design contract for Milestone 13B — NOT a migration, and not code the application runs.
- *
- * Executes the SQL block of docs/roadmap.md §7 ("Migration 24") against a real in-memory database migrated
- * through 1–23, so every refusal the document promises is observed rather than trusted. 13B turns that SQL into
- * the real migration 24 and replaces this file with tests of it; once the migration exists this file stops
- * applying cleanly (the tables already exist), which is intended.
- */
-
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { MIGRATIONS, runMigrations } from '../../src/main/db/migrations';
+import { createSqliteDatabase } from '../../src/main/db/sqlite';
+import { TASK_STATUSES } from '../../src/shared/domain/workflow';
+import { FixedClock } from '../../src/main/infra/clock';
+import { SqliteRoadmapRepository } from '../../src/main/db/repositories/roadmap-repository';
 import { openDatabase } from '../../src/main/db/database';
 
 const AT = '2026-09-29T10:00:00.000Z';
-
-function designDdl(): string {
-  const document = readFileSync(resolve(import.meta.dirname, '..', '..', 'docs', 'roadmap.md'), 'utf8');
-  const block = /### Migration 24[^\n]*\r?\n[\s\S]*?```sql\r?\n([\s\S]*?)```/.exec(document)?.[1];
-  if (block === undefined) throw new Error('docs/roadmap.md has no SQL block under "### Migration 24".');
-  return block;
-}
 
 function setup() {
   const db = openDatabase({ file: ':memory:' });
@@ -44,7 +31,7 @@ function setup() {
   ).run(AT);
   const tasksBefore = db.prepare('SELECT * FROM tasks ORDER BY id').all();
 
-  db.exec(designDdl());
+  // openDatabase applies the real migration 24.
 
   const node = db.prepare(
     `INSERT INTO roadmap_nodes (id, project_id, kind, parent_id, parent_kind, title, position, state,
@@ -68,7 +55,7 @@ function setup() {
   return { db, node, place, dep, count, tasksBefore };
 }
 
-describe('docs/roadmap.md migration 24 design', () => {
+describe('roadmap migration 24 database constraints', () => {
   it('accepts goal → phase → epic, leaves every task row as it was and every task unassigned', () => {
     const { db, count, tasksBefore } = setup();
     expect(count('roadmap_nodes')).toBe(4);
@@ -250,5 +237,44 @@ describe('docs/roadmap.md migration 24 design', () => {
       expect(detail).not.toMatch(/TEMP B-TREE/);
     }
     db.close();
+  });
+});
+
+
+describe('upgrade from migration 23', () => {
+  it('preserves every workflow status and continuation byte-for-byte, with no roadmap backfill, then is idempotent', () => {
+    const db = createSqliteDatabase(':memory:');
+    try {
+      db.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)');
+      for (const migration of MIGRATIONS.filter((entry) => entry.version <= 23)) {
+        db.transaction(() => {
+          migration.up(db);
+          db.prepare('INSERT INTO schema_migrations VALUES (?,?,?)').run(migration.version, migration.name, AT);
+        })();
+      }
+      db.pragma('foreign_keys = ON');
+      db.prepare(`INSERT INTO projects(id,name,local_path,project_type,default_branch,github_visibility,created_at,updated_at)
+        VALUES ('p','P','C:/p','existing','main','private',?,?)`).run(AT, AT);
+      const insert = db.prepare(`INSERT INTO tasks(id,project_id,title,original_request,status,last_error,created_at,updated_at)
+        VALUES (?,'p','Task','Original request',?,'Preserve history',?,?)`);
+      for (const status of TASK_STATUSES) insert.run(status, status, AT, AT);
+      db.prepare(`INSERT INTO task_continuations(id,source_task_id,continuation_task_id,entry_action,created_at)
+        VALUES ('c','REVIEW_LIMIT_REACHED','DRAFT','verification',?)`).run(AT);
+      const before = db.prepare('SELECT * FROM tasks ORDER BY id').all();
+      const continuations = db.prepare('SELECT * FROM task_continuations').all();
+      expect(runMigrations(db)).toBe(1);
+      expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
+      expect(db.prepare('SELECT * FROM tasks ORDER BY id').all()).toEqual(before);
+      expect(db.prepare('SELECT * FROM task_continuations').all()).toEqual(continuations);
+      for (const table of ['roadmap_nodes', 'roadmap_heads', 'roadmap_task_placements', 'roadmap_dependencies']) {
+        expect(db.prepare('SELECT * FROM ' + table).all()).toEqual([]);
+      }
+      const repo = new SqliteRoadmapRepository(db, new FixedClock());
+      expect(repo.listUnassigned('p').map((fact) => fact.id)).toEqual([...TASK_STATUSES].sort());
+      expect(repo.read('p').tasks.find((fact) => fact.id === 'REVIEW_LIMIT_REACHED')?.continuedByTaskId).toBe('DRAFT');
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      expect(runMigrations(db)).toBe(0);
+      expect(db.prepare('SELECT name FROM schema_migrations WHERE version = 24').get()).toEqual({ name: 'roadmap-hierarchy' });
+    } finally { db.close(); }
   });
 });

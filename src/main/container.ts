@@ -11,6 +11,10 @@
  * operation without restarting the app.
  */
 
+import { SqliteRoadmapRepository } from './db/repositories/roadmap-repository';
+import type { RoadmapRepository } from './ports';
+
+
 import { join } from 'node:path';
 import {
   DEFAULT_CLAUDE_ALLOWED_TOOLS,
@@ -155,6 +159,7 @@ export interface Application {
   readonly planReviewGates: PlanReviewGateRepository;
   /** Specification history and the plan-correction lifecycle. */
   readonly planCorrections: PlanCorrectionRepository;
+  readonly roadmap: RoadmapRepository;
   /**
    * The process-wide plan-review claims. Exposed so the detail read can report a
    * running correction loop; only the services built here may take a claim.
@@ -327,6 +332,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     createProvider: createLocalInferenceProvider,
     ids
   });
+  const roadmap = new SqliteRoadmapRepository(db, clock);
   const projects = new SqliteProjectRepository(db, clock);
   const tasks = new SqliteTaskRepository(db, clock);
   const runs = new SqliteRunRepository(db);
@@ -589,6 +595,7 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     taskRuleEvidence,
     planReviewGates,
     planCorrections,
+    roadmap,
     planReviewClaims,
     codeReviewClaims,
     taskOperations,
