@@ -860,3 +860,5 @@ never touched.
 
 ## Ornith UI smoke test
 This section verifies that Ornith can edit a repository file through Agent Relay.
+
+Record the Ornith model, Coai plan review, verification, and Coai code review outcomes for each live smoke run.
