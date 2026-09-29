@@ -162,6 +162,12 @@ projects ──┬─< tasks ──┬─< runs ──< run_events
 | `approvals` | Audit trail for `commit` / `push` / `create_repository` / `create_pull_request` |
 | `settings` | Key/value; never holds a credential |
 
+The durable Roadmap (Goal → Phase → Epic → Task) is specified in [roadmap.md](roadmap.md). Its domain
+model lives in [`src/shared/domain/roadmap.ts`](../src/shared/domain/roadmap.ts) and
+[`roadmap-structure.ts`](../src/shared/domain/roadmap-structure.ts); its tables are designed there and
+arrive with migration 24 in Milestone 13B. It attaches existing tasks to epics and never owns, transitions or
+copies a task's workflow status, and the workflow never reads it.
+
 Migration 9 seeds the strict version-1 `localInference` Settings object only
 when absent; migration 11 is forward-only and upgrades a pre-existing row to
 add the opt-in `enabled` flag and `requestDefaults` (default output token cap,
