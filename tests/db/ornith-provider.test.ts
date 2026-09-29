@@ -230,7 +230,7 @@ describe('migration 12 (ornith-provider)', () => {
       continuations: (db.prepare('SELECT COUNT(*) AS n FROM task_continuations').get() as { n: number }).n
     };
 
-    expect(runMigrations(db)).toBe(9);
+    expect(runMigrations(db)).toBe(10);
     db.pragma('foreign_keys = ON');
 
     expect((db.prepare('SELECT COUNT(*) AS n FROM tasks').get() as { n: number }).n).toBe(before.tasks);
@@ -272,7 +272,8 @@ describe('migration 12 (ornith-provider)', () => {
       { version: 20, name: 'plan-review-isolated-subjects' },
       { version: 21, name: 'specification-grounding' },
       { version: 22, name: 'local-inference-profiles' },
-      { version: 23, name: 'ornith-model-profile' }
+      { version: 23, name: 'ornith-model-profile' },
+      { version: 24, name: 'roadmap-hierarchy' }
     ]);
   });
 

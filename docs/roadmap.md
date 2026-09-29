@@ -1,7 +1,8 @@
 # Roadmap
 
 The durable project Roadmap: **Goal → Phase → Epic → Task**. Milestone 13A defines the domain model, its
-invariants and the storage design below; 13B implements storage, 13C the services (authoring, moves,
+invariants and the storage contract below; 13B implements storage (migration 24 and `SqliteRoadmapRepository`),
+13C the services (authoring, moves,
 dependency validation, cycle rejection, readiness and roll-up), 13D the screens, 13E the acceptance.
 
 Code: [`src/shared/domain/roadmap.ts`](../src/shared/domain/roadmap.ts) (vocabulary and per-record schemas) and
@@ -250,11 +251,11 @@ that is a graph search over resolved references and belongs to 13C (§4).
 
 ### Migration 24 `roadmap-hierarchy`
 
-New tables and indexes only: no table rebuild, no change to any existing row, no backfill rows. This is still a
-design, not a migration the application runs: the design-contract test
-[`tests/db/roadmap-ddl-design.test.ts`](../tests/db/roadmap-ddl-design.test.ts) reads the block below from this
-file, executes it against a real in-memory database migrated through 1–23, and checks each refusal listed in
-this section. 13B replaces that test with tests of the real migration.
+New tables and indexes only: no table rebuild, no change to any existing row, no backfill rows. Migration 24
+in [`migrations.ts`](../src/main/db/migrations.ts) implements this SQL. The migration and upgrade tests in
+[`tests/db/roadmap-migration.test.ts`](../tests/db/roadmap-migration.test.ts) exercise the actual migration,
+including a database at version 23 holding every task status and a continuation. The SQL below documents the
+storage contract; the application runs the migration, never reads this document.
 
 ```sql
 -- Parent key for the composite foreign keys below: lets every roadmap row prove
@@ -404,31 +405,41 @@ before committing, as the migration runner already requires of rebuilds.
 
 ### Writes: one change, one transaction, in this order
 
-The repository takes `(projectId, expectedRevision, change)`, where a change lists node upserts and removals,
+`SqliteRoadmapRepository.apply(projectId, expectedRevision, change)` takes node upserts and removals,
 placement upserts and removals (a removal unassigns a task) and dependency inserts and removals. The service
-(13C) builds it from a typed operation.
+(13C) builds it from a typed operation. `read(projectId)` returns a validated, consistently ordered snapshot;
+`listUnassigned(projectId)` returns task facts in the Tasks-list order. Both read within a SQLite transaction.
+The repository is available as `container.roadmap`; no workflow or renderer path calls it in 13B.
 
 1. `INSERT OR IGNORE` the head at revision 0, then
    `UPDATE roadmap_heads SET revision = revision + 1, updated_at = ? WHERE project_id = ? AND revision = ?`.
    Zero rows changed means the roadmap moved on: throw `VALIDATION_FAILED` ("Roadmap changed. Refresh.") with
    nothing written. The caller shows the new state; nothing is retried automatically.
-2. Removals: dependencies, then placements, then nodes, deepest first. Foreign keys are checked at the end of
-   each statement, so this order is what lets a removal the change also cleans up after succeed.
-3. Shift: a change that writes any position in a sibling group — a reorder, or a row moving in — carries that
-   group's **complete** final order. Move every row still in each such group to `position + offset`, with
-   `offset = 1 + max(every existing and every new position in those groups)`. SQLite checks UNIQUE row by row,
-   so a one-statement swap fails (the design-contract test observes `UNIQUE constraint failed`); after the
-   shift every row sits above every final position, so no write in the next step can collide. A group that
-   only loses a row keeps a gap, which is allowed.
-4. Upserts, nodes parents-first and then placements, each with its final parent or epic and its final dense
-   position `0 … n−1` in its group. Rewriting whole groups also keeps positions bounded by the group's size.
-5. Dependency inserts.
-6. Re-read the project snapshot inside the same transaction and parse it with `parseRoadmapSnapshot`. Any
-   violation throws, and the whole transaction — the head bump included — rolls back.
-7. After the commit, publish the roadmap change event with the project id and the new revision. Never before.
+2. Read and validate the existing snapshot. Corrupt stored data cannot be silently repaired by an upsert.
+   Reject duplicate change ids, ids listed for both removal and writing, foreign-project rows, changes to
+   creation timestamps, and removals that name no row of this project.
+3. Remove dependencies and placements. Keep nodes scheduled for removal until surviving children and tasks
+   have moved out of them: deleting their parent first would fail an immediate foreign key even when the
+   complete change is valid.
+4. Shift: each **destination** group receiving a new row, a moved row or a changed position must carry its
+   complete final order at positions `0 … n−1`. Shift its existing rows, including nodes awaiting deletion,
+   above all existing and incoming positions. Then write final positions, without UNIQUE collisions.
+   An unchanged-position metadata edit needs no sibling rewrite. A source group that only loses a row may
+   keep a gap. Reject unsafe integer offsets instead of losing position precision.
+5. Upsert nodes parents-first, then placements. Delete removed nodes deepest-first, now that surviving rows
+   have moved. Insert dependencies. Foreign keys stay enabled throughout; no constraint is deferred.
+6. Re-read and validate the complete snapshot inside the transaction. Any violation rolls everything back,
+   including position shifts, deletions and the head bump. Return the validated snapshot after commit.
+7. Publishing roadmap change events belongs to the 13C service, after the **outermost** transaction commits.
+   The 13B repository emits no events. If called inside a transaction it uses a savepoint; its return does
+   not imply that the enclosing transaction has committed.
 
 Task creation and task status changes do **not** touch the head: they are not roadmap state. Progress is
 derived at read time, so a task finishing needs no roadmap write.
+
+Repository tests: [`tests/db/roadmap-repository.test.ts`](../tests/db/roadmap-repository.test.ts) cover
+reorders and cross-group moves, move-and-delete changes, corruption refusal, transaction rollback, stale
+writers on separate file connections, and exact snapshots after close/reopen.
 
 ### Backfill and restart
 
@@ -437,7 +448,7 @@ derived at read time, so a task finishing needs no roadmap write.
 - **Restart**: a roadmap change is one synchronous transaction; there is no in-flight roadmap state to recover
   and nothing to reconcile at startup. Reads validate, as above.
 
-### Tests 13B must add
+### Storage checks implemented in 13B
 
 - Migration 24 on a database holding tasks in every workflow status, continuations included: every `tasks` row
   reads back identical (`SELECT *` before and after), every task is Unassigned, no roadmap row exists, and the
@@ -448,9 +459,9 @@ derived at read time, so a task finishing needs no roadmap write.
   even when the domain check is bypassed.
 - Forgetting a project removes its roadmap and leaves another project's untouched.
 
-## 8. Not in 13A
+## 8. Delivery boundaries
 
-- Migrations, repositories and file-backed tests (13B).
+- Storage is implemented in 13B: migration 24, the repository and its file-backed tests.
 - Authoring, move and reorder services, dependency cycle rejection, readiness and blocker derivation, roll-up
   computation, the continuation placement hook, IPC channels and change events (13C).
 - The Roadmap and Kanban screens (13D); Electron acceptance (13E); automatic decomposition and Ornith (15A–15B).
