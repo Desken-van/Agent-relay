@@ -55,6 +55,7 @@ import type {
   TaskRuleEvidenceRepository,
   TransactionRunner
 } from '../ports';
+import type { ContinuationPlacement } from '../../shared/domain/roadmap-operations';
 import { assertPlanReviewAllowsApproval, readBoundRuleEvidence } from './plan-review-gate';
 import type { VerificationExecutor } from './worktree-verification';
 
@@ -73,10 +74,21 @@ export interface ContinuationServiceDeps {
   readonly events: EventPublisher;
   /** True while the orchestrator still has a live operation for this task. */
   readonly isSourceBusy: (taskId: string) => boolean;
+  /**
+   * Roadmap placement for the new continuation, run inside the creation transaction (its own savepoint).
+   * Must not throw; an absent hook leaves every continuation Unassigned, as before the roadmap existed.
+   */
+  readonly placeContinuation?: (input: {
+    readonly projectId: string;
+    readonly sourceTaskId: string;
+    readonly continuationTaskId: string;
+  }) => ContinuationPlacement;
 }
 export interface ContinuationResult {
   readonly task: Task;
   readonly continuation: TaskContinuation;
+  /** Null when no placement was attempted: no roadmap hook, or the continuation already existed. */
+  readonly roadmapPlacement: ContinuationPlacement | null;
 }
 
 /**
@@ -240,7 +252,25 @@ export class ContinuationService {
         'A continuation link exists but its task cannot be found.'
       );
     }
-    return { task, continuation: link };
+    return { task, continuation: link, roadmapPlacement: null };
+  }
+
+  /**
+   * The roadmap hook, fenced: whatever it does or throws, the continuation is created. Its own savepoint has
+   * already undone any partial write by the time an error could reach here.
+   */
+  private placeInRoadmap(source: Task, continuationTaskId: string): ContinuationPlacement | null {
+    const place = this.deps.placeContinuation;
+    if (place === undefined) return null;
+    try {
+      return place({ projectId: source.projectId, sourceTaskId: source.id, continuationTaskId });
+    } catch (error) {
+      return {
+        outcome: 'failed',
+        reason: 'refused',
+        message: error instanceof Error ? error.message : String(error)
+      };
+    }
   }
 
   isContinuation(taskId: string): boolean {
@@ -522,7 +552,7 @@ export class ContinuationService {
         effectiveEntryAction: entry.entryAction
       });
 
-      result = { task: continuationTask, continuation };
+      result = { task: continuationTask, continuation, roadmapPlacement: this.placeInRoadmap(source, continuationId) };
     });
 
     const created = result as ContinuationResult | null;

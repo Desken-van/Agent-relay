@@ -31,6 +31,7 @@ describe('the Ornith instruction contract refuses', () => {
     ['Press "Run verification" when the edit is done.', 'relay_ui'],
     ['Click the Run verification button.', 'relay_ui'],
     ['Invoke workflow:verify to check the change.', 'relay_ui'],
+    ['Call roadmap:placeTask to put the task in its epic.', 'relay_ui'],
     ['Call window.agentRelay.invoke with the task id.', 'relay_ui'],
     ['Open the Run screen and confirm the status.', 'relay_ui'],
     ['Use the Run verification action once more.', 'relay_ui'],

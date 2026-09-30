@@ -11,6 +11,7 @@ import {
   type RoadmapTaskFact,
   type RoadmapTaskPlacement
 } from '../../../shared/domain/roadmap';
+import { RoadmapRevisionConflictError } from '../../../shared/domain/roadmap-operations';
 import { parseRoadmapSnapshot, type RoadmapSnapshot } from '../../../shared/domain/roadmap-structure';
 import type { Clock, RoadmapChange, RoadmapRepository } from '../../ports';
 import type { Db } from '../database';
@@ -111,7 +112,7 @@ export class SqliteRoadmapRepository implements RoadmapRepository {
           .run(projectId, now);
         const bumped = this.db.prepare(`UPDATE roadmap_heads SET revision = revision + 1, updated_at = ?
           WHERE project_id = ? AND revision = ?`).run(now, projectId, expectedRevision);
-        if (Number(bumped.changes) !== 1) invalid('Roadmap changed. Refresh.');
+        if (Number(bumped.changes) !== 1) throw new RoadmapRevisionConflictError();
 
         // Validate the stored state before any edit, including an edit that would otherwise hide corruption.
         const before = this.readSnapshot(projectId);

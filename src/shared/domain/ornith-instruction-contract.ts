@@ -94,7 +94,7 @@ const REASONS: Readonly<Record<OrnithInstructionCategory, string>> = {
 /** Every IPC namespace in `src/shared/ipc.ts` (a test keeps the two in step); a channel is `<namespace>:<name>`. */
 export const IPC_NAMESPACES = [
   'settings', 'localInference', 'diagnostics', 'coai', 'codex', 'dialog', 'projects', 'tasks', 'runs',
-  'dependencies', 'workflow', 'planReview', 'codeReview', 'git', 'publish', 'shell', 'operations'
+  'dependencies', 'workflow', 'planReview', 'codeReview', 'git', 'publish', 'shell', 'operations', 'roadmap'
 ] as const;
 
 /** The Run screen's action labels (a test keeps them in step with run guidance). */

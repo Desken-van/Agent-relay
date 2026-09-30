@@ -49,6 +49,10 @@ export class WindowEventPublisher implements EventPublisher {
   publishDiagnostics(report: DiagnosticsReport): void {
     this.send({ kind: 'diagnostics', report });
   }
+
+  publishRoadmap(projectId: string, revision: number): void {
+    this.send({ kind: 'roadmap-updated', projectId, revision });
+  }
 }
 
 /** Collects events in memory. Used by tests and by headless startup. */
@@ -73,5 +77,9 @@ export class InMemoryEventPublisher implements EventPublisher {
 
   publishDiagnostics(report: DiagnosticsReport): void {
     this.events.push({ kind: 'diagnostics', report });
+  }
+
+  publishRoadmap(projectId: string, revision: number): void {
+    this.events.push({ kind: 'roadmap-updated', projectId, revision });
   }
 }
