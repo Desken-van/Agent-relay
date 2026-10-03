@@ -1,6 +1,7 @@
 import { AppRail } from './components/AppRail';
 import { OperationsView } from './components/OperationsView';
 import { ProjectsView } from './components/ProjectsView';
+import { RoadmapScreen } from './components/RoadmapScreen';
 import { Rounds, StatusBadge } from './components/primitives';
 import { RunView } from './components/RunView';
 import { SettingsView } from './components/SettingsView';
@@ -10,6 +11,7 @@ import { useStore } from './state/store';
 
 const TITLES: Record<string, string> = {
   projects: 'Projects',
+  roadmap: 'Roadmap',
   tasks: 'Tasks',
   run: 'Run',
   operations: 'Operations',
@@ -66,6 +68,8 @@ export function App(): React.JSX.Element {
             <div className="empty">Loading…</div>
           ) : section === 'projects' ? (
             <ProjectsView />
+          ) : section === 'roadmap' ? (
+            <RoadmapScreen />
           ) : section === 'tasks' ? (
             <TasksView />
           ) : section === 'run' ? (
