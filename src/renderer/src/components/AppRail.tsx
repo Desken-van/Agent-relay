@@ -4,6 +4,7 @@ import { ToolDot } from './primitives';
 
 const SECTIONS: ReadonlyArray<{ id: Section; label: string; glyph: string }> = [
   { id: 'projects', label: 'Projects', glyph: '▤' },
+  { id: 'roadmap', label: 'Roadmap', glyph: '◇' },
   { id: 'tasks', label: 'Tasks', glyph: '◈' },
   { id: 'run', label: 'Run', glyph: '⟳' },
   { id: 'operations', label: 'Operations', glyph: '◎' },
@@ -38,7 +39,8 @@ export function AppRail(): React.JSX.Element {
       <div className="rail__nav">
         {SECTIONS.map((item) => {
           const disabled =
-            (item.id === 'tasks' && !selectedProjectId) || (item.id === 'run' && !selectedTaskId);
+            ((item.id === 'tasks' || item.id === 'roadmap') && !selectedProjectId) ||
+            (item.id === 'run' && !selectedTaskId);
 
           return (
             <button
@@ -50,7 +52,7 @@ export function AppRail(): React.JSX.Element {
               onClick={() => setSection(item.id)}
               title={
                 disabled
-                  ? item.id === 'tasks'
+                  ? item.id === 'tasks' || item.id === 'roadmap'
                     ? 'Select a project first'
                     : 'Select a task first'
                   : undefined

@@ -797,6 +797,12 @@ export function RunView(): React.JSX.Element {
           try {
             const continuationDetail = await expect('workflow:continue', { taskId: task.id });
             notify({ tone: 'success', title: 'Continuation created', body: continuationDetail.task.title });
+            const placement = continuationDetail.roadmapPlacement;
+            if (placement?.outcome === 'failed') {
+              notify({ tone: 'error', title: 'Roadmap placement failed', body: placement.message });
+            } else if (placement?.outcome === 'unassigned') {
+              notify({ tone: 'info', title: 'Continuation is Unassigned', body: placement.message });
+            }
             // The response already carries the full detail the renderer
             // needs; opening it directly avoids a second `tasks:get`.
             openTaskDetail(continuationDetail);

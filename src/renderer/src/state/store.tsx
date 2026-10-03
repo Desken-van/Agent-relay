@@ -37,7 +37,7 @@ import { call, describeError, expect } from '../lib/api';
  * repository to be selected first would imply a relationship that does not
  * exist. Its state lives in its own provider, not in this store.
  */
-export type Section = 'projects' | 'tasks' | 'run' | 'operations' | 'settings';
+export type Section = 'projects' | 'roadmap' | 'tasks' | 'run' | 'operations' | 'settings';
 /** A Settings control another screen can send the operator to; the Settings screen scrolls to and focuses it once. */
 export type SettingsFocus = 'maxStoredLogBytes';
 
