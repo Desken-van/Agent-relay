@@ -432,7 +432,7 @@ The repository is available as `container.roadmap`; no workflow or renderer path
 
 1. `INSERT OR IGNORE` the head at revision 0, then
    `UPDATE roadmap_heads SET revision = revision + 1, updated_at = ? WHERE project_id = ? AND revision = ?`.
-   Zero rows changed means the roadmap moved on: throw `VALIDATION_FAILED` ("Roadmap changed. Refresh.") with
+   Zero rows changed means the roadmap moved on: throw `ROADMAP_CHANGED` ("Roadmap changed. Refresh.") with
    nothing written. The caller shows the new state; nothing is retried automatically.
 2. Read and validate the existing snapshot. Corrupt stored data cannot be silently repaired by an upsert.
    Reject duplicate change ids, ids listed for both removal and writing, foreign-project rows, changes to

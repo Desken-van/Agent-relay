@@ -7,7 +7,7 @@ import { call } from '../lib/api';
 import { useStore } from '../state/store';
 import { Card, Empty, Field, Notice, Spinner } from './primitives';
 
-type Write = (request: (revision: number) => Promise<IpcResult<RoadmapView>>) => Promise<boolean>;
+type Write = (request: (revision: number) => Promise<IpcResult<RoadmapView>>, action: string) => Promise<boolean>;
 type Tab = 'tree' | 'board' | 'dependencies';
 interface CriterionDraft { key: string; id?: string; text: string }
 interface NodeDraft {
@@ -64,7 +64,8 @@ function RoadmapProject({ projectId, tasks, openTask }: {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [conflict, setConflict] = useState(false);
-  const [busy, setBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const busy = busyAction !== null;
   const [tab, setTab] = useState<Tab>('tree');
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<Record<string, NodeDraft>>({});
@@ -114,16 +115,16 @@ function RoadmapProject({ projectId, tasks, openTask }: {
     });
   }, [projectId, reload]);
 
-  const write: Write = useCallback(async (request) => {
+  const write: Write = useCallback(async (request, action) => {
     if (writing.current || view === null || conflict) return false;
     writing.current = true;
-    setBusy(true);
+    setBusyAction(action);
     try {
       const result = await request(view.revision);
       if (!alive.current) return false;
       if (!result.ok) {
         setError(result.error.message);
-        if (result.error.message === 'Roadmap changed. Refresh.') setConflict(true);
+        if (result.error.code === 'ROADMAP_CHANGED') setConflict(true);
         return false;
       }
       setView((current) => current && current.revision > result.data.revision ? current : result.data);
@@ -134,7 +135,7 @@ function RoadmapProject({ projectId, tasks, openTask }: {
       return false;
     } finally {
       writing.current = false;
-      if (alive.current) setBusy(false);
+      if (alive.current) setBusyAction(null);
     }
   }, [view, conflict]);
 
@@ -150,6 +151,7 @@ function RoadmapProject({ projectId, tasks, openTask }: {
       </div>
       <div className="roadmap__header-actions">
         {view ? <span className="roadmap__revision">Revision {view.revision}</span> : null}
+        {busyAction ? <span role="status" className="roadmap__revision"><Spinner /> {busyAction}</span> : null}
         <button type="button" className="btn btn--sm" onClick={() => void reload(true)} disabled={loading || busy}>
           {loading ? <Spinner /> : null} Refresh
         </button>
@@ -215,7 +217,11 @@ function RoadmapTree({ view, selectedNodeId, onSelect, write, canWrite }: {
   const [addingGoal, setAddingGoal] = useState(false);
   const children = useMemo(() => {
     const groups = new Map<string | null, RoadmapNode[]>();
-    for (const node of view.nodes) groups.set(node.parentId, [...(groups.get(node.parentId) ?? []), node]);
+    for (const node of view.nodes) {
+      const siblings = groups.get(node.parentId);
+      if (siblings) siblings.push(node);
+      else groups.set(node.parentId, [node]);
+    }
     for (const [parent, rows] of groups) groups.set(parent, byPosition(rows));
     return groups;
   }, [view.nodes]);
@@ -256,7 +262,7 @@ function CreateNodeForm({ kind, parentId, projectId, write, canWrite, onDone }: 
   const [description, setDescription] = useState('');
   return <form className="stack" onSubmit={(event) => {
     event.preventDefault();
-    void write((expectedRevision) => call('roadmap:createNode', { projectId, expectedRevision, kind, parentId, title, description }))
+    void write((expectedRevision) => call('roadmap:createNode', { projectId, expectedRevision, kind, parentId, title, description }), `Creating ${kind}…`)
       .then((saved) => { if (saved) onDone(); });
   }}>
     <Field label={`New ${kind} title`}><input className="input" required maxLength={200} value={title} onChange={(event) => setTitle(event.target.value)} /></Field>
@@ -300,12 +306,12 @@ function NodeInspector({ node, view, tasks, write, canWrite, draft, onDraftChang
     JSON.stringify(criteria.map(({ id, text }) => [id ?? null, text])) !==
       JSON.stringify(node.acceptanceCriteria.map(({ id, text }) => [id, text]));
   const move = (parentId: string | null, position: number) =>
-    void write((expectedRevision) => call('roadmap:moveNode', { projectId: view.projectId, expectedRevision, nodeId: node.id, parentId, position }));
+    void write((expectedRevision) => call('roadmap:moveNode', { projectId: view.projectId, expectedRevision, nodeId: node.id, parentId, position }), `Moving ${node.kind}…`);
   const transition = (event: 'accept' | 'cancel' | 'reopen') =>
     void write((expectedRevision) => call('roadmap:transitionNode', {
       projectId: view.projectId, expectedRevision, nodeId: node.id, event,
       ...(event === 'accept' && acknowledge ? { acknowledgeStoppedWork: true } : {})
-    }));
+    }), `${event === 'accept' ? 'Accepting' : event === 'cancel' ? 'Cancelling' : 'Reopening'} ${node.kind}…`);
 
   return <div className="stack">
     <Card title={`${node.kind[0]!.toUpperCase() + node.kind.slice(1)} details`} actions={<span className={`roadmap__state roadmap__state--${node.state}`}>{node.state}</span>}>
@@ -336,7 +342,7 @@ function NodeInspector({ node, view, tasks, write, canWrite, draft, onDraftChang
           void write((expectedRevision) => call('roadmap:updateNode', {
             projectId: view.projectId, expectedRevision, nodeId: node.id, title, description,
             acceptanceCriteria: criteria.map(({ id, text }) => ({ ...(id ? { id } : {}), text }))
-          })).then((saved) => { if (saved) onDraftDiscard(); });
+          }), 'Saving details…').then((saved) => { if (saved) onDraftDiscard(); });
         }}>
           <Field label="Title"><input className="input" required maxLength={200} value={title} disabled={!open} onChange={(event) => updateDraft({ title: event.target.value })} /></Field>
           <Field label="Description"><textarea className="textarea" rows={4} value={description} disabled={!open} onChange={(event) => updateDraft({ description: event.target.value })} /></Field>
@@ -394,7 +400,7 @@ function NodeInspector({ node, view, tasks, write, canWrite, draft, onDraftChang
             }}>Cancel {node.kind}</button>
             <button type="button" className="btn btn--sm btn--danger" disabled={!canWrite} onClick={() => {
               if (window.confirm(`Remove empty ${node.kind} ${node.title}?`)) {
-                void write((expectedRevision) => call('roadmap:removeNode', { projectId: view.projectId, expectedRevision, nodeId: node.id }));
+                void write((expectedRevision) => call('roadmap:removeNode', { projectId: view.projectId, expectedRevision, nodeId: node.id }), `Removing ${node.kind}…`);
               }
             }}>Remove empty {node.kind}</button>
           </> : <button type="button" className="btn btn--sm" disabled={!canWrite} onClick={() => transition('reopen')}>Reopen {node.kind}</button>}
@@ -477,8 +483,8 @@ function KanbanBoard({ view, tasks, write, canWrite, openTask }: {
             <select className="input" aria-label={`Place ${task?.title ?? taskId}`} value={placement?.epicId ?? ''} disabled={!canWrite || frozen}
               onChange={(event) => {
                 const epicId = event.target.value;
-                if (!epicId) void write((expectedRevision) => call('roadmap:unassignTask', { projectId: view.projectId, expectedRevision, taskId }));
-                else void write((expectedRevision) => call('roadmap:placeTask', { projectId: view.projectId, expectedRevision, taskId, epicId }));
+                if (!epicId) void write((expectedRevision) => call('roadmap:unassignTask', { projectId: view.projectId, expectedRevision, taskId }), 'Unassigning task…');
+                else void write((expectedRevision) => call('roadmap:placeTask', { projectId: view.projectId, expectedRevision, taskId, epicId }), 'Placing task…');
               }}>
               <option value="">Unassigned</option>
               {destinations.map((epic) => <option key={epic.id} value={epic.id}>{epic.title}</option>)}
@@ -486,9 +492,9 @@ function KanbanBoard({ view, tasks, write, canWrite, openTask }: {
             </select>
             {placement && !frozen ? <div className="roadmap__task-order">
               <button className="btn btn--sm btn--ghost" type="button" disabled={!canWrite || index === 0} onClick={() =>
-                void write((expectedRevision) => call('roadmap:placeTask', { projectId: view.projectId, expectedRevision, taskId, epicId: placement.epicId, position: index - 1 }))}>Up</button>
+                void write((expectedRevision) => call('roadmap:placeTask', { projectId: view.projectId, expectedRevision, taskId, epicId: placement.epicId, position: index - 1 }), 'Moving task…')}>Up</button>
               <button className="btn btn--sm btn--ghost" type="button" disabled={!canWrite || index === column.taskIds.length - 1} onClick={() =>
-                void write((expectedRevision) => call('roadmap:placeTask', { projectId: view.projectId, expectedRevision, taskId, epicId: placement.epicId, position: index + 1 }))}>Down</button>
+                void write((expectedRevision) => call('roadmap:placeTask', { projectId: view.projectId, expectedRevision, taskId, epicId: placement.epicId, position: index + 1 }), 'Moving task…')}>Down</button>
             </div> : null}
             {frozen ? <span className="faint">Reopen the epic to move this task.</span> : null}
             {waits.length > 0 ? <details className="roadmap__task-waits"><summary>{waits.length} {waits.length === 1 ? 'wait' : 'waits'}</summary><WaitList waits={waits} view={view} tasks={tasks} /></details> : null}
@@ -524,7 +530,7 @@ function DependenciesPanel({ view, tasks, write, canWrite }: {
         if (!dependent || !prerequisite) return;
         void write((expectedRevision) => call('roadmap:addDependency', {
           projectId: view.projectId, expectedRevision, dependent: itemFromKey(dependent), prerequisite: itemFromKey(prerequisite)
-        })).then((saved) => { if (saved) { setDependent(''); setPrerequisite(''); } });
+        }), 'Adding dependency…').then((saved) => { if (saved) { setDependent(''); setPrerequisite(''); } });
       }}>
         <Field label="Dependent"><select className="input" required value={dependent} onChange={(event) => setDependent(event.target.value)}>
           <option value="">Choose an item</option>{options.map(({ ref, label }) => <option value={itemKey(ref)} key={itemKey(ref)}>{label}</option>)}
@@ -545,7 +551,7 @@ function DependenciesPanel({ view, tasks, write, canWrite }: {
             <div className="faint">{cyclic ? 'dependency cycle' : judged?.reason.replaceAll('_', ' ') ?? 'unknown'} · {judged?.state ?? 'unknown'}</div>
           </div>
           <button className="btn btn--sm btn--ghost" type="button" disabled={!canWrite}
-            onClick={() => void write((expectedRevision) => call('roadmap:removeDependency', { projectId: view.projectId, expectedRevision, dependencyId: dependency.id }))}>Remove</button>
+            onClick={() => void write((expectedRevision) => call('roadmap:removeDependency', { projectId: view.projectId, expectedRevision, dependencyId: dependency.id }), 'Removing dependency…')}>Remove</button>
         </div>;
       })}</div>
     </Card>

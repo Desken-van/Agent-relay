@@ -55,13 +55,39 @@ describe('Roadmap authoring through the renderer', () => {
     }]);
   });
 
+  it('shows the pending action and blocks another write until it completes', async () => {
+    let finish!: () => void;
+    const bridge = installBridge({
+      'projects:list': () => ok<'projects:list'>([project]),
+      'tasks:list': () => ok<'tasks:list'>([]),
+      'roadmap:get': () => ok<'roadmap:get'>(view(4)),
+      'roadmap:createNode': async () => {
+        await new Promise<void>((resolve) => { finish = resolve; });
+        return ok<'roadmap:createNode'>(view(5, [goal]));
+      }
+    });
+    renderApp(<App />);
+    await openRoadmap();
+    await screen.findByText('No goals yet');
+    fireEvent.click(screen.getByRole('button', { name: '+ Goal' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'New goal title' }), { target: { value: goal.title } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create goal' }));
+
+    expect(screen.getByRole('status').textContent).toContain('Creating goal');
+    expect((screen.getByRole('button', { name: 'Create goal' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(bridge.callsTo('roadmap:createNode')).toHaveLength(1);
+    await act(async () => { finish(); });
+    await screen.findByText('Revision 5');
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
   it('does not replay a stale write and enables a new edit only after refresh', async () => {
     let current = view(3);
     const bridge = installBridge({
       'projects:list': () => ok<'projects:list'>([project]),
       'tasks:list': () => ok<'tasks:list'>([]),
       'roadmap:get': () => ok<'roadmap:get'>(current),
-      'roadmap:createNode': () => fail('Roadmap changed. Refresh.')
+      'roadmap:createNode': () => fail('The revision changed.', 'ROADMAP_CHANGED')
     });
     renderApp(<App />);
     await openRoadmap();
@@ -102,7 +128,7 @@ describe('Roadmap authoring through the renderer', () => {
       'roadmap:get': () => ok<'roadmap:get'>(current),
       'roadmap:updateNode': () => {
         writes += 1;
-        return writes === 1 ? fail('Roadmap changed. Refresh.') : ok<'roadmap:updateNode'>(view(7, [saved]));
+        return writes === 1 ? fail('The revision changed.', 'ROADMAP_CHANGED') : ok<'roadmap:updateNode'>(view(7, [saved]));
       }
     });
     renderApp(<App />);
