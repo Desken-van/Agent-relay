@@ -536,7 +536,10 @@ as a placement, and the continuation exists in every case.
   refresh after a roadmap event, retain unsaved node drafts for explicit reapply or discard, and require a fresh
   revision after a conflict. A damaged roadmap does not hide
   the project's task list. Continuation creation reports a placement failure separately from task creation.
-- Electron acceptance is 13E; automatic decomposition and Ornith are 15A–15B.
+- 13E runs the built Electron application against a disposable profile and Git fixture. It covers hierarchy and
+  criterion authoring, Kanban placement without changing task workflow state, dependency creation, event refresh
+  with an unsaved draft, persistence across restart, and task access when stored roadmap data is damaged.
+  Automatic decomposition and Ornith are 15A–15B.
 
 Known limitations of the model as defined: acceptance records no note or evidence link, only the state and
 `updated_at` (an acknowledged stopped task included); there is no audit trail of roadmap changes beyond the
