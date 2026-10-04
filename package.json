@@ -15,6 +15,7 @@
     "dev": "node scripts/launch.mjs dev",
     "start": "node scripts/launch.mjs preview",
     "build": "electron-vite build",
+    "package:win": "npm run build && node scripts/package-windows.mjs",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
@@ -22,6 +23,7 @@
     "lint:fix": "eslint . --fix",
     "test": "vitest run",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:e2e:packaged": "npm run package:win && node scripts/test-packaged.mjs",
     "test:e2e:live-plan-review": "vitest run --config vitest.live.config.ts",
     "test:watch": "vitest",
     "verify": "npm run lint && npm run typecheck && npm run test && npm run build && npm run test:e2e"
@@ -34,6 +36,7 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@electron/packager": "^20.0.4",
     "@eslint/js": "^9.39.1",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^22.15.0",
