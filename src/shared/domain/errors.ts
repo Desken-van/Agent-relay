@@ -11,6 +11,7 @@ export type AgentRelayErrorCode =
   | 'INVALID_TRANSITION'
   | 'NOT_FOUND'
   | 'VALIDATION_FAILED'
+  | 'ROADMAP_CHANGED'
   | 'TOOL_MISSING'
   | 'TOOL_UNAUTHENTICATED'
   | 'TOOL_FAILED'

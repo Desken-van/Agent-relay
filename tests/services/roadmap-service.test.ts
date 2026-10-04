@@ -148,7 +148,7 @@ describe('nodes', () => {
       'VALIDATION_FAILED', /must be a phase, not a goal/);
     refused(() => service.createNode({ projectId: Q, expectedRevision: 0, kind: 'epic', parentId: phase, title: 'x' }), 'NOT_FOUND');
     refused(() => service.createNode({ projectId: P, expectedRevision: view.revision - 1, kind: 'goal', parentId: null, title: 'x' }),
-      'VALIDATION_FAILED', /Roadmap changed/);
+      'ROADMAP_CHANGED', /Roadmap changed/);
     refused(() => service.createNode({ projectId: 'missing', expectedRevision: 0, kind: 'goal', parentId: null, title: 'x' }), 'NOT_FOUND');
     refused(() => service.createNode({ projectId: P, expectedRevision: view.revision, kind: 'goal', parentId: null, title: '   ' }),
       'VALIDATION_FAILED', /invalid/);
@@ -410,6 +410,6 @@ describe('events and transactions', () => {
     const first = service.view({ projectId: P });
     service.createNode({ projectId: P, expectedRevision: first.revision, kind: 'goal', parentId: null, title: 'One' });
     refused(() => service.createNode({ projectId: P, expectedRevision: first.revision, kind: 'goal', parentId: null, title: 'Two' }),
-      'VALIDATION_FAILED', /Roadmap changed/);
+      'ROADMAP_CHANGED', /Roadmap changed/);
   });
 });

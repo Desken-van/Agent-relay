@@ -212,12 +212,12 @@ export function effectiveWaits(readiness: RoadmapViewReadiness, ref: RoadmapItem
 /* -------------------------------------------------------------------------- */
 
 /**
- * The roadmap moved on since the caller read it. Recognised by type, never by its words; its code stays
- * `VALIDATION_FAILED` so a caller that does not care keeps the behaviour it always had. Never retried.
+ * The roadmap moved on since the caller read it. Recognised by type in the main process and by its stable
+ * code across IPC, never by its words. Never retried.
  */
 export class RoadmapRevisionConflictError extends AgentRelayError {
   constructor(details?: string) {
-    super('VALIDATION_FAILED', 'Roadmap changed. Refresh.', details === undefined ? undefined : { details });
+    super('ROADMAP_CHANGED', 'Roadmap changed. Refresh.', details === undefined ? undefined : { details });
     this.name = 'RoadmapRevisionConflictError';
   }
 }

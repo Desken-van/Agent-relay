@@ -112,7 +112,7 @@ describe('Roadmap over IPC', () => {
     const rows = roadmapRows();
     const published = events.events.length;
     expect(await invoke('roadmap:createNode', { projectId: 'project-1', expectedRevision: 0, kind: 'goal', parentId: null, title: 'Late' }))
-      .toMatchObject({ ok: false, error: { code: 'VALIDATION_FAILED', message: 'Roadmap changed. Refresh.' } });
+      .toMatchObject({ ok: false, error: { code: 'ROADMAP_CHANGED', message: 'Roadmap changed. Refresh.' } });
     expect(await invoke('roadmap:createNode', { projectId: 'project-1', expectedRevision: 1, kind: 'epic', parentId: null, title: 'Orphan' }))
       .toMatchObject({ ok: false, error: { code: 'VALIDATION_FAILED' } });
     expect(roadmapRows()).toEqual(rows);

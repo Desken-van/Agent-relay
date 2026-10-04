@@ -432,7 +432,7 @@ The repository is available as `container.roadmap`; no workflow or renderer path
 
 1. `INSERT OR IGNORE` the head at revision 0, then
    `UPDATE roadmap_heads SET revision = revision + 1, updated_at = ? WHERE project_id = ? AND revision = ?`.
-   Zero rows changed means the roadmap moved on: throw `VALIDATION_FAILED` ("Roadmap changed. Refresh.") with
+   Zero rows changed means the roadmap moved on: throw `ROADMAP_CHANGED` ("Roadmap changed. Refresh.") with
    nothing written. The caller shows the new state; nothing is retried automatically.
 2. Read and validate the existing snapshot. Corrupt stored data cannot be silently repaired by an upsert.
    Reject duplicate change ids, ids listed for both removal and writing, foreign-project rows, changes to
@@ -495,8 +495,8 @@ repository. Each write:
 
 `afterCommit` ([`sqlite.ts`](../src/main/db/sqlite.ts)) runs a callback after the OUTERMOST commit — at once
 outside a transaction — and drops it if the savepoint or transaction that registered it rolls back, including a
-released savepoint whose outer transaction later rolls back. Every callback runs even if one throws; the first
-error is then re-thrown, after the commit it cannot undo.
+released savepoint whose outer transaction later rolls back. Every callback runs even if one throws; its error
+is logged without making committed work look like a failed write.
 
 The read, `view`, returns the snapshot with `unassignedTaskIds` (Tasks-list order), per-node progress, per-item
 readiness, the dependencies on a cycle right now and those `R` could not resolve — one consistent transaction.
@@ -531,7 +531,12 @@ as a placement, and the continuation exists in every case.
 
 - Storage is implemented in 13B: migration 24, the repository and its file-backed tests.
 - Services, cycle rejection, readiness and roll-up, the continuation hook, IPC and events are implemented in 13C.
-- The Roadmap and Kanban screens (13D); Electron acceptance (13E); automatic decomposition and Ornith (15A–15B).
+- The Roadmap screen in 13D authors goals, phases, epics, acceptance criteria and dependencies. Its Kanban view
+  places existing tasks under epics or leaves them Unassigned. Both views show derived progress and readiness,
+  refresh after a roadmap event, retain unsaved node drafts for explicit reapply or discard, and require a fresh
+  revision after a conflict. A damaged roadmap does not hide
+  the project's task list. Continuation creation reports a placement failure separately from task creation.
+- Electron acceptance is 13E; automatic decomposition and Ornith are 15A–15B.
 
 Known limitations of the model as defined: acceptance records no note or evidence link, only the state and
 `updated_at` (an acknowledged stopped task included); there is no audit trail of roadmap changes beyond the
