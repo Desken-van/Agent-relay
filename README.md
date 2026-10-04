@@ -118,6 +118,21 @@ npm run build
 npm start        # run the production build
 ```
 
+### Portable Windows package
+
+On Windows x64, `npm run package:win` builds
+`release/Agent Relay-win32-x64/Agent Relay.exe`. Keep the whole folder together;
+it contains Electron, production dependencies and both native helpers. This is
+an unsigned portable build, with no installer or automatic updates. It uses the
+same normal application profile as Agent Relay. Do not run two copies against
+that profile at once.
+
+`npm run test:e2e:packaged` builds the folder and runs the Roadmap acceptance
+with isolated temporary profiles and repositories. It covers legacy migration,
+hierarchy/order persistence across restart, dependency readiness and layouts at
+1040, 1440 and 1920 pixels. Synthetic task statuses test readiness; this does not
+execute an AI implementation or prove the separate live Ornith/CoAI acceptance.
+
 > **If you launch Electron by hand from a VS Code terminal** and see
 > *"The requested module 'electron' does not provide an export named
 > 'BrowserWindow'"*, the cause is `ELECTRON_RUN_AS_NODE=1`, which VS Code's

@@ -486,7 +486,7 @@ repository. Each write:
 
 1. parses its input through the strict schema IPC uses (text trimmed, line endings normalised, then checked by
    the 13A persisted schemas), so a caller that bypasses IPC is normalised and refused the same way;
-2. runs in one transaction: read the snapshot, refuse a stale `expectedRevision` (`VALIDATION_FAILED`, "Roadmap
+2. runs in one transaction: read the snapshot, refuse a stale `expectedRevision` (`ROADMAP_CHANGED`, "Roadmap
    changed. Refresh.", no automatic retry), build the complete next state under the policies of §3, validate it
    whole (`parseRoadmapSnapshot`), refuse a new cycle (`RoadmapCycleError`, naming the edges), and hand the
    difference to `apply` — every row of every destination group whose order changed, as §7 requires;
@@ -536,10 +536,17 @@ as a placement, and the continuation exists in every case.
   refresh after a roadmap event, retain unsaved node drafts for explicit reapply or discard, and require a fresh
   revision after a conflict. A damaged roadmap does not hide
   the project's task list. Continuation creation reports a placement failure separately from task creation.
-- 13E runs the built Electron application against a disposable profile and Git fixture. It covers hierarchy and
-  criterion authoring, Kanban placement without changing task workflow state, dependency creation, event refresh
-  with an unsaved draft, persistence across restart, and task access when stored roadmap data is damaged.
-  Automatic decomposition and Ornith are 15A–15B.
+- 13E runs both the built Electron application and the portable Windows x64 package against disposable profiles
+  and Git fixtures. It covers hierarchy/criterion authoring, Kanban placement and ordering, dependency creation,
+  pending/blocked/ready badges, event refresh with an unsaved draft, persistence across restart, task access when
+  stored roadmap data is damaged, and Roadmap/Kanban/Dependencies layouts at widths 1040, 1440 and 1920.
+  A pre-migration-24 profile verifies every stable legacy task remains reachable and its complete row unchanged.
+  Busy tasks are deliberately excluded from that UI fixture: existing startup recovery owns their transitions;
+  the repository migration tests cover every workflow status without invoking recovery. Readiness transitions
+  use synthetic task facts, not AI execution. Run `npm run test:e2e:packaged` for the packaged acceptance;
+  it asserts `app.isPackaged` and uses the ordinary production startup path. The unsigned portable folder is
+  not the installer/signing/multi-platform release campaign (Phase 11), or the live Ornith/CoAI smoke (12B).
+  Automatic decomposition and scheduling remain 15A–15B.
 
 Known limitations of the model as defined: acceptance records no note or evidence link, only the state and
 `updated_at` (an acknowledged stopped task included); there is no audit trail of roadmap changes beyond the

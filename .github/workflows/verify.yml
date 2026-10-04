@@ -41,3 +41,6 @@ jobs:
       # lint -> typecheck (node + web) -> vitest -> electron-vite build.
       - name: Verify
         run: npm run verify
+
+      - name: Portable Windows Roadmap acceptance
+        run: npm run test:e2e:packaged

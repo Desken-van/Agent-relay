@@ -9,9 +9,13 @@ import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright-core';
+import { createSqliteDatabase } from '../../src/main/db/sqlite';
+import { MIGRATIONS } from '../../src/main/db/migrations';
+import { TASK_STATUSES } from '../../src/shared/domain/workflow';
 
 const require = createRequire(import.meta.url);
 const electronExecutable = require('electron') as string;
+const packagedExecutable = process.env.AGENT_RELAY_E2E_EXECUTABLE;
 const repositoryRoot = resolve(import.meta.dirname, '..', '..');
 const builtMain = resolve(repositoryRoot, 'out/main/index.js');
 
@@ -32,12 +36,20 @@ function environment(profile: string): Record<string, string> {
 
 async function launch(profile: string): Promise<{ app: ElectronApplication; page: Page }> {
   const app = await electron.launch({
-    executablePath: electronExecutable,
-    args: ['--disable-gpu', builtMain],
+    executablePath: packagedExecutable ?? electronExecutable,
+    args: packagedExecutable ? ['--disable-gpu'] : ['--disable-gpu', builtMain],
     cwd: repositoryRoot,
     env: environment(profile),
     timeout: 30_000
   });
+  // A packaged acceptance must exercise production startup/CSP, not Electron's
+  // default app loading a source checkout. Close on a bad launch assertion too.
+  try {
+    expect(await app.evaluate(({ app }) => app.isPackaged)).toBe(Boolean(packagedExecutable));
+  } catch (error) {
+    await app.close();
+    throw error;
+  }
   const page = await app.firstWindow();
   page.setDefaultTimeout(15_000);
   return { app, page };
@@ -112,12 +124,30 @@ describe('Roadmap Electron acceptance', () => {
       await expect.poll(async () => page.getByRole('combobox', { name: 'Place Task B' }).inputValue()).not.toBe('');
       expect(await page.locator('.roadmap__column').filter({ has: page.getByRole('heading', { name: 'Renderer' }) }).textContent())
         .toMatch(/Task A[\s\S]*Task B/);
+      const rendererColumn = page.locator('.roadmap__column').filter({ has: page.getByRole('heading', { name: 'Renderer' }) });
+      await rendererColumn.locator('.roadmap__task').filter({ has: page.getByRole('button', { name: 'Task B', exact: true }) })
+        .getByRole('button', { name: 'Up', exact: true }).click();
+      await expect.poll(async () => rendererColumn.locator('.roadmap__task-title').allTextContents()).toEqual(['Task B', 'Task A']);
 
       await page.getByRole('tab', { name: 'Dependencies' }).click();
       await page.getByRole('combobox', { name: 'Dependent' }).selectOption({ label: 'task: Task B' });
       await page.getByRole('combobox', { name: 'Waits for' }).selectOption({ label: 'task: Task A' });
       await page.getByRole('button', { name: 'Add dependency' }).click();
       await page.getByText('Dependencies (1)').waitFor();
+      await page.getByRole('tab', { name: 'Kanban' }).click();
+      const dependent = page.locator('.roadmap__task').filter({ has: page.getByRole('button', { name: 'Task B', exact: true }) });
+      await expect.poll(async () => dependent.locator('.roadmap__task-meta .roadmap__readiness').textContent()).toBe('pending');
+      // Synthetic workflow facts only; real task execution is outside this Roadmap acceptance.
+      const workflowDb = new DatabaseSync(join(profile, 'agent-relay.sqlite'));
+      try { workflowDb.prepare("UPDATE tasks SET status = 'FAILED' WHERE id = ?").run(taskA.id); }
+      finally { workflowDb.close(); }
+      await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+      await expect.poll(async () => dependent.locator('.roadmap__task-meta .roadmap__readiness').textContent()).toBe('blocked');
+      const completeDb = new DatabaseSync(join(profile, 'agent-relay.sqlite'));
+      try { completeDb.prepare("UPDATE tasks SET status = 'COMPLETED' WHERE id = ?").run(taskA.id); }
+      finally { completeDb.close(); }
+      await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+      await expect.poll(async () => dependent.locator('.roadmap__task-meta .roadmap__readiness').textContent()).toBe('ready');
 
       // A second writer changes the revision while a local draft is open. The event must refresh
       // the view and keep the draft until the person explicitly discards or reapplies it.
@@ -147,10 +177,27 @@ describe('Roadmap Electron acceptance', () => {
       await resumed.getByRole('tab', { name: 'Kanban' }).click();
       expect(await resumed.getByRole('combobox', { name: 'Place Task A' }).inputValue()).not.toBe('');
       expect(await resumed.getByRole('combobox', { name: 'Place Task B' }).inputValue()).not.toBe('');
+      const resumedColumn = resumed.locator('.roadmap__column').filter({ has: resumed.getByRole('heading', { name: 'Renderer' }) });
+      expect(await resumedColumn.locator('.roadmap__task-title').allTextContents()).toEqual(['Task B', 'Task A']);
+      expect(await resumedColumn.locator('.roadmap__task').filter({ has: resumed.getByRole('button', { name: 'Task B', exact: true }) })
+        .locator('.roadmap__task-meta .roadmap__readiness').textContent()).toBe('ready');
       await resumed.getByRole('tab', { name: 'Dependencies' }).click();
       await resumed.getByText('Dependencies (1)').waitFor();
       const tasks = await invoke<Array<{ id: string; status: string }>>(resumed, 'tasks:list', { projectId: project.id });
-      expect(tasks.filter((task) => task.id === taskA.id || task.id === taskB.id).map((task) => task.status)).toEqual(['DRAFT', 'DRAFT']);
+      expect(tasks.find((task) => task.id === taskA.id)?.status).toBe('COMPLETED');
+      expect(tasks.find((task) => task.id === taskB.id)?.status).toBe('DRAFT');
+      for (const width of [1040, 1440, 1920]) {
+        await running.evaluate(({ BrowserWindow }, width) => { BrowserWindow.getAllWindows()[0]!.setSize(width, 940); }, width);
+        for (const tab of ['Roadmap', 'Kanban', 'Dependencies']) {
+          await resumed.getByRole('tab', { name: tab, exact: true }).click();
+          expect(await resumed.evaluate(() => {
+            const browser = globalThis as unknown as { document: { documentElement: { scrollWidth: number } }; innerWidth: number };
+            return browser.document.documentElement.scrollWidth <= browser.innerWidth;
+          })).toBe(true);
+          const box = await resumed.getByRole('tab', { name: tab, exact: true }).boundingBox();
+          expect(box && box.width > 0 && box.x >= 0 && box.x + box.width <= width).toBeTruthy();
+        }
+      }
 
       // Corrupt only the disposable profile after closing Electron. A damaged roadmap must
       // fail closed while the project's existing tasks remain reachable from the screen.
@@ -169,9 +216,66 @@ describe('Roadmap Electron acceptance', () => {
       await third.page.getByRole('button', { name: /Task A/ }).click();
       expect(await third.page.locator('.topbar__title').textContent()).toBe('Run');
     } finally {
-      await running?.close();
-      rmSync(profile, { recursive: true, force: true });
-      rmSync(repo, { recursive: true, force: true });
+      try { await running?.close(); }
+      finally {
+        rmSync(profile, { recursive: true, force: true });
+        rmSync(repo, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('upgrades a pre-Roadmap profile and keeps every stable legacy task reachable and unchanged', async () => {
+    const profile = mkdtempSync(join(tmpdir(), 'agent-relay-roadmap-e2e-legacy-'));
+    const repo = mkdtempSync(join(tmpdir(), 'agent-relay-roadmap-e2e-repo-'));
+    const file = join(profile, 'agent-relay.sqlite');
+    const busy = new Set(['SPECIFYING', 'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING']);
+    const statuses = TASK_STATUSES.filter((status) => !busy.has(status));
+    let running: ElectronApplication | null = null;
+    try {
+      git(repo, ['init', '-b', 'main']);
+      const db = createSqliteDatabase(file);
+      let before: unknown[];
+      try {
+        db.exec('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)');
+        for (const migration of MIGRATIONS.filter((entry) => entry.version <= 23)) {
+          db.transaction(() => {
+            migration.up(db);
+            db.prepare('INSERT INTO schema_migrations VALUES (?,?,?)').run(migration.version, migration.name, '2026-09-29T10:00:00.000Z');
+          })();
+        }
+        db.prepare(`INSERT INTO projects(id,name,local_path,project_type,default_branch,github_visibility,created_at,updated_at)
+          VALUES ('legacy','13E fixture',?,'existing','main','private',?,?)`).run(repo, '2026-09-29T10:00:00.000Z', '2026-09-29T10:00:00.000Z');
+        for (const status of statuses) {
+          db.prepare(`INSERT INTO tasks(id,project_id,title,original_request,status,created_at,updated_at)
+            VALUES (?,'legacy',?,'Original request',?,?,?)`).run(status, `Legacy ${status}`, status, '2026-09-29T10:00:00.000Z', '2026-09-29T10:00:00.000Z');
+        }
+        before = db.prepare('SELECT * FROM tasks ORDER BY id').all();
+      } finally { db.close(); }
+      const launched = await launch(profile);
+      running = launched.app;
+      await openRoadmap(launched.page);
+      await launched.page.getByRole('tab', { name: 'Kanban' }).click();
+      expect(await launched.page.locator('.roadmap__task-title').allTextContents()).toEqual([...statuses].sort().map((status) => `Legacy ${status}`));
+      for (const status of statuses) {
+        await launched.page.getByRole('button', { name: `Legacy ${status}`, exact: true }).click();
+        expect(await launched.page.locator('.topbar__title').textContent()).toBe('Run');
+        await launched.page.locator('.rail__nav').getByRole('button', { name: 'Roadmap', exact: true }).click();
+        await launched.page.getByRole('tab', { name: 'Kanban' }).click();
+      }
+      await running.close();
+      running = null;
+      const persisted = new DatabaseSync(file, { readOnly: true });
+      try {
+        expect(persisted.prepare('SELECT * FROM tasks ORDER BY id').all()).toEqual(before);
+        expect(persisted.prepare('SELECT version FROM schema_migrations WHERE version = 24').get()).toEqual({ version: 24 });
+        expect(persisted.prepare('SELECT * FROM roadmap_task_placements').all()).toEqual([]);
+      } finally { persisted.close(); }
+    } finally {
+      try { await running?.close(); }
+      finally {
+        rmSync(profile, { recursive: true, force: true });
+        rmSync(repo, { recursive: true, force: true });
+      }
     }
   });
 });
