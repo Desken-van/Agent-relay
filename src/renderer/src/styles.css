@@ -1989,6 +1989,7 @@ details.card[open] > summary::before {
 .roadmap__metrics strong { display: block; color: var(--text); font-size: 13px; text-transform: capitalize; }
 .roadmap__criterion, .roadmap__ack { display: flex; align-items: center; gap: 8px; }
 .roadmap__criterion .input { flex: 1; min-width: 0; }
+.roadmap__saved-description { white-space: pre-wrap; overflow-wrap: anywhere; }
 .roadmap__parent-select { max-width: 230px; }
 .roadmap__waits { list-style: none; display: grid; gap: 8px; margin: 0; padding: 0; }
 .roadmap__waits li { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }

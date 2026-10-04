@@ -533,7 +533,8 @@ as a placement, and the continuation exists in every case.
 - Services, cycle rejection, readiness and roll-up, the continuation hook, IPC and events are implemented in 13C.
 - The Roadmap screen in 13D authors goals, phases, epics, acceptance criteria and dependencies. Its Kanban view
   places existing tasks under epics or leaves them Unassigned. Both views show derived progress and readiness,
-  refresh after a roadmap event, and require a fresh revision after a conflict. A damaged roadmap does not hide
+  refresh after a roadmap event, retain unsaved node drafts for explicit reapply or discard, and require a fresh
+  revision after a conflict. A damaged roadmap does not hide
   the project's task list. Continuation creation reports a placement failure separately from task creation.
 - Electron acceptance is 13E; automatic decomposition and Ornith are 15A–15B.
 

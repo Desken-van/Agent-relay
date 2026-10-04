@@ -1,10 +1,11 @@
 /** @vitest-environment jsdom */
 import { afterEach, describe, expect, it } from 'vitest';
-import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import { App } from '../../src/renderer/src/App';
 import { roadmapView } from '../../src/shared/domain/roadmap-operations';
 import type { RoadmapNode } from '../../src/shared/domain/roadmap';
 import { taskSchema } from '../../src/shared/domain/models';
+import type { AppEvent } from '../../src/shared/ipc';
 import { fail, installBridge, ok, renderApp } from './harness';
 
 const project = {
@@ -78,6 +79,94 @@ describe('Roadmap authoring through the renderer', () => {
     await waitFor(() => expect(screen.getByText('Revision 4')).toBeTruthy());
     expect(bridge.callsTo('roadmap:createNode')).toHaveLength(1);
     expect((screen.getByRole('button', { name: 'Create goal' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('keeps an unsaved node draft across a stale revision and requires an explicit reapply', async () => {
+    const original: RoadmapNode = {
+      ...goal, acceptanceCriteria: [{ id: 'criterion-1', text: 'Original criterion' }]
+    };
+    const changedElsewhere: RoadmapNode = {
+      ...original, title: 'Saved elsewhere', acceptanceCriteria: [{ id: 'criterion-1', text: 'Server criterion' }]
+    };
+    const saved: RoadmapNode = {
+      ...original, title: 'My draft', acceptanceCriteria: [
+        { id: 'criterion-1', text: 'My criterion' },
+        { id: 'criterion-2', text: 'New criterion' }
+      ]
+    };
+    let current = view(5, [original]);
+    let writes = 0;
+    const bridge = installBridge({
+      'projects:list': () => ok<'projects:list'>([project]),
+      'tasks:list': () => ok<'tasks:list'>([]),
+      'roadmap:get': () => ok<'roadmap:get'>(current),
+      'roadmap:updateNode': () => {
+        writes += 1;
+        return writes === 1 ? fail('Roadmap changed. Refresh.') : ok<'roadmap:updateNode'>(view(7, [saved]));
+      }
+    });
+    renderApp(<App />);
+    await openRoadmap();
+    await screen.findByText('Ship roadmap');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Title' }), { target: { value: 'My draft' } });
+    fireEvent.change(screen.getByRole('textbox', { name: 'Criterion 1' }), { target: { value: 'My criterion' } });
+    fireEvent.click(screen.getByRole('button', { name: '+ Criterion' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Criterion 2' }), { target: { value: 'New criterion' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save details' }));
+    await screen.findByText('The roadmap changed while you were editing.');
+    expect(bridge.callsTo('roadmap:updateNode')).toHaveLength(1);
+
+    current = view(6, [changedElsewhere]);
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await screen.findByText(/Your unsaved draft is from revision 5/);
+    expect((screen.getByRole('textbox', { name: 'Title' }) as HTMLInputElement).value).toBe('My draft');
+    expect((screen.getByRole('textbox', { name: 'Criterion 1' }) as HTMLInputElement).value).toBe('My criterion');
+    expect((screen.getByRole('button', { name: 'Save details' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('tab', { name: 'Kanban' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Roadmap' }));
+    expect((screen.getByRole('textbox', { name: 'Title' }) as HTMLInputElement).value).toBe('My draft');
+    fireEvent.click(screen.getByText('Current saved details'));
+    expect(screen.getByText('Title: Saved elsewhere')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Use my draft' }));
+    expect((screen.getByRole('button', { name: 'Save details' }) as HTMLButtonElement).disabled).toBe(false);
+    expect(bridge.callsTo('roadmap:updateNode')).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Save details' }));
+    await waitFor(() => expect(screen.getByText('Revision 7')).toBeTruthy());
+    expect(bridge.callsTo('roadmap:updateNode').map((entry) => entry.input)).toEqual([
+      {
+        projectId: 'p', expectedRevision: 5, nodeId: goal.id, title: 'My draft', description: '',
+        acceptanceCriteria: [{ id: 'criterion-1', text: 'My criterion' }, { text: 'New criterion' }]
+      },
+      {
+        projectId: 'p', expectedRevision: 6, nodeId: goal.id, title: 'My draft', description: '',
+        acceptanceCriteria: [{ id: 'criterion-1', text: 'My criterion' }, { text: 'New criterion' }]
+      }
+    ]);
+  });
+
+  it('preserves a draft on a roadmap event until the person discards it', async () => {
+    let current = view(2, [goal]);
+    const listeners = new Set<(event: AppEvent) => void>();
+    installBridge({
+      'projects:list': () => ok<'projects:list'>([project]),
+      'tasks:list': () => ok<'tasks:list'>([]),
+      'roadmap:get': () => ok<'roadmap:get'>(current)
+    });
+    (window.agentRelay as { onEvent: (listener: (event: AppEvent) => void) => () => void }).onEvent = (listener) => {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    };
+    renderApp(<App />);
+    await openRoadmap();
+    await screen.findByText('Ship roadmap');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Title' }), { target: { value: 'Unsaved title' } });
+    current = view(3, [{ ...goal, title: 'New saved title' }]);
+    act(() => { for (const listener of listeners) listener({ kind: 'roadmap-updated', projectId: 'p', revision: 3 }); });
+    await screen.findByText(/Your unsaved draft is from revision 2/);
+    expect((screen.getByRole('textbox', { name: 'Title' }) as HTMLInputElement).value).toBe('Unsaved title');
+    fireEvent.click(screen.getByRole('button', { name: 'Discard draft' }));
+    expect((screen.getByRole('textbox', { name: 'Title' }) as HTMLInputElement).value).toBe('New saved title');
+    expect((screen.getByRole('button', { name: 'Save details' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('keeps the task navigation available when the roadmap cannot load', async () => {

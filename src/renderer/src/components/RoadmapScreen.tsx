@@ -9,6 +9,14 @@ import { Card, Empty, Field, Notice, Spinner } from './primitives';
 
 type Write = (request: (revision: number) => Promise<IpcResult<RoadmapView>>) => Promise<boolean>;
 type Tab = 'tree' | 'board' | 'dependencies';
+interface CriterionDraft { key: string; id?: string; text: string }
+interface NodeDraft {
+  baseRevision: number;
+  title: string;
+  description: string;
+  criteria: CriterionDraft[];
+}
+let nextCriterionKey = 0;
 
 const byPosition = <T extends { position: number; id?: string; taskId?: string }>(rows: readonly T[]): T[] =>
   [...rows].sort((a, b) => a.position - b.position || (a.id ?? a.taskId ?? '').localeCompare(b.id ?? b.taskId ?? ''));
@@ -32,6 +40,7 @@ function itemName(ref: RoadmapItemRef, view: RoadmapView, tasks: readonly Task[]
 export function RoadmapScreen(): React.JSX.Element {
   const { selectedProject, tasks, refreshTasks, selectTask, setSection } = useStore();
   const projectId = selectedProject?.id;
+  const projectTasks = useMemo(() => tasks.filter((task) => task.projectId === projectId), [tasks, projectId]);
   useEffect(() => {
     if (projectId) void refreshTasks(projectId);
   }, [projectId, refreshTasks]);
@@ -40,7 +49,7 @@ export function RoadmapScreen(): React.JSX.Element {
     <RoadmapProject
       key={selectedProject.id}
       projectId={selectedProject.id}
-      tasks={tasks.filter((task) => task.projectId === selectedProject.id)}
+      tasks={projectTasks}
       openTask={(taskId) => { selectTask(taskId); setSection('run'); }}
     />
   );
@@ -58,6 +67,7 @@ function RoadmapProject({ projectId, tasks, openTask }: {
   const [busy, setBusy] = useState(false);
   const [tab, setTab] = useState<Tab>('tree');
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, NodeDraft>>({});
   const requestSerial = useRef(0);
   const alive = useRef(false);
   const writing = useRef(false);
@@ -178,8 +188,15 @@ function RoadmapProject({ projectId, tasks, openTask }: {
       <RoadmapTree view={view} selectedNodeId={selectedNode?.id ?? null} onSelect={setSelectedNodeId} write={write} canWrite={canWrite} />
       <div className="roadmap__detail">
         {selectedNode ? <NodeInspector
-          key={`${selectedNode.id}:${view.revision}`}
+          key={selectedNode.id}
           node={selectedNode} view={view} tasks={tasks} write={write} canWrite={canWrite}
+          draft={drafts[selectedNode.id] ?? null}
+          onDraftChange={(next) => setDrafts((current) => ({ ...current, [selectedNode.id]: next }))}
+          onDraftDiscard={() => setDrafts((current) => {
+            const next = { ...current };
+            delete next[selectedNode.id];
+            return next;
+          })}
         /> : <Card><Empty title="Start with a goal" hint="A goal contains phases, and each phase contains epics for tasks." /></Card>}
       </div>
     </div> : null}
@@ -248,21 +265,28 @@ function CreateNodeForm({ kind, parentId, projectId, write, canWrite, onDone }: 
   </form>;
 }
 
-interface CriterionDraft { key: string; id?: string; text: string }
-
-function NodeInspector({ node, view, tasks, write, canWrite }: {
+function NodeInspector({ node, view, tasks, write, canWrite, draft, onDraftChange, onDraftDiscard }: {
   node: RoadmapNode;
   view: RoadmapView;
   tasks: readonly Task[];
   write: Write;
   canWrite: boolean;
+  draft: NodeDraft | null;
+  onDraftChange: (draft: NodeDraft) => void;
+  onDraftDiscard: () => void;
 }): React.JSX.Element {
-  const [title, setTitle] = useState(node.title);
-  const [description, setDescription] = useState(node.description);
-  const [criteria, setCriteria] = useState<CriterionDraft[]>(node.acceptanceCriteria.map((criterion) => ({ key: criterion.id, ...criterion })));
+  const editor = draft ?? {
+    baseRevision: view.revision,
+    title: node.title,
+    description: node.description,
+    criteria: node.acceptanceCriteria.map((criterion) => ({ key: criterion.id, ...criterion }))
+  };
+  const { title, description, criteria } = editor;
+  const updateDraft = (changes: Partial<NodeDraft>) => onDraftChange({ ...editor, ...changes });
+  const needsDecision = draft !== null && draft.baseRevision !== view.revision;
   const [addingChild, setAddingChild] = useState(false);
-  const [acknowledge, setAcknowledge] = useState(false);
-  const nextKey = useRef(0);
+  const [acknowledgment, setAcknowledgment] = useState<{ revision: number; checked: boolean } | null>(null);
+  const acknowledge = acknowledgment?.revision === view.revision && acknowledgment.checked;
   const open = node.state === 'open';
   const progress = view.progress[node.id];
   const readiness = view.readiness.nodes[node.id];
@@ -292,39 +316,54 @@ function NodeInspector({ node, view, tasks, write, canWrite }: {
           <span><strong>{readiness?.status ?? 'ready'}</strong> readiness</span>
         </div>
         {progress?.hasStoppedWork ? <Notice tone="warn">Stopped work: {progress.stoppedTaskIds.map((id) => tasks.find((task) => task.id === id)?.title ?? id).join(', ')}</Notice> : null}
+        {needsDecision ? <Notice tone="warn">
+          <strong>Your unsaved draft is from revision {draft.baseRevision}; the roadmap is now at revision {view.revision}.</strong>
+          <div>Review the saved version before choosing whether to use your draft. No edit has been retried.</div>
+          <details>
+            <summary>Current saved details</summary>
+            <div>Title: {node.title}</div>
+            <div className="roadmap__saved-description">Description: {node.description || '(empty)'}</div>
+            <div>Criteria: {node.acceptanceCriteria.length === 0 ? '(none)' : node.acceptanceCriteria.map((criterion) => criterion.text).join(' · ')}</div>
+          </details>
+          <div className="row row--wrap">
+            <button type="button" className="btn btn--sm" disabled={!canWrite || !open}
+              onClick={() => updateDraft({ baseRevision: view.revision })}>Use my draft</button>
+            <button type="button" className="btn btn--sm btn--ghost" onClick={onDraftDiscard}>Discard draft</button>
+          </div>
+        </Notice> : null}
         <form className="stack" onSubmit={(event) => {
           event.preventDefault();
           void write((expectedRevision) => call('roadmap:updateNode', {
             projectId: view.projectId, expectedRevision, nodeId: node.id, title, description,
             acceptanceCriteria: criteria.map(({ id, text }) => ({ ...(id ? { id } : {}), text }))
-          }));
+          })).then((saved) => { if (saved) onDraftDiscard(); });
         }}>
-          <Field label="Title"><input className="input" required maxLength={200} value={title} disabled={!open} onChange={(event) => setTitle(event.target.value)} /></Field>
-          <Field label="Description"><textarea className="textarea" rows={4} value={description} disabled={!open} onChange={(event) => setDescription(event.target.value)} /></Field>
+          <Field label="Title"><input className="input" required maxLength={200} value={title} disabled={!open} onChange={(event) => updateDraft({ title: event.target.value })} /></Field>
+          <Field label="Description"><textarea className="textarea" rows={4} value={description} disabled={!open} onChange={(event) => updateDraft({ description: event.target.value })} /></Field>
           <div className="field__label">Acceptance criteria</div>
           {criteria.length === 0 ? <span className="faint">No criteria recorded.</span> : null}
           {criteria.map((criterion, criterionIndex) => <div className="roadmap__criterion" key={criterion.key}>
             <input className="input" aria-label={`Criterion ${criterionIndex + 1}`} value={criterion.text} disabled={!open}
-              onChange={(event) => setCriteria((rows) => rows.map((row) => row.key === criterion.key ? { ...row, text: event.target.value } : row))} />
+              onChange={(event) => updateDraft({ criteria: criteria.map((row) => row.key === criterion.key ? { ...row, text: event.target.value } : row) })} />
             {open ? <button type="button" className="btn btn--sm btn--ghost" aria-label={`Move criterion ${criterionIndex + 1} up`}
-              disabled={criterionIndex === 0} onClick={() => setCriteria((rows) => {
-                const reordered = [...rows];
+              disabled={criterionIndex === 0} onClick={() => {
+                const reordered = [...criteria];
                 [reordered[criterionIndex - 1], reordered[criterionIndex]] = [reordered[criterionIndex]!, reordered[criterionIndex - 1]!];
-                return reordered;
-              })}>↑</button> : null}
+                updateDraft({ criteria: reordered });
+              }}>↑</button> : null}
             {open ? <button type="button" className="btn btn--sm btn--ghost" aria-label={`Move criterion ${criterionIndex + 1} down`}
-              disabled={criterionIndex === criteria.length - 1} onClick={() => setCriteria((rows) => {
-                const reordered = [...rows];
+              disabled={criterionIndex === criteria.length - 1} onClick={() => {
+                const reordered = [...criteria];
                 [reordered[criterionIndex], reordered[criterionIndex + 1]] = [reordered[criterionIndex + 1]!, reordered[criterionIndex]!];
-                return reordered;
-              })}>↓</button> : null}
+                updateDraft({ criteria: reordered });
+              }}>↓</button> : null}
             {open ? <button type="button" className="btn btn--sm btn--ghost" aria-label={`Remove criterion ${criterionIndex + 1}`}
-              onClick={() => setCriteria((rows) => rows.filter((row) => row.key !== criterion.key))}>Remove</button> : null}
+              onClick={() => updateDraft({ criteria: criteria.filter((row) => row.key !== criterion.key) })}>Remove</button> : null}
           </div>)}
           {open ? <div className="row row--wrap">
             <button type="button" className="btn btn--sm" disabled={!canWrite || criteria.length >= 50}
-              onClick={() => { nextKey.current += 1; setCriteria((rows) => [...rows, { key: `new-${nextKey.current}`, text: '' }]); }}>+ Criterion</button>
-            <button type="submit" className="btn btn--sm btn--primary" disabled={!canWrite || !changed || criteria.some((row) => !row.text.trim())}>Save details</button>
+              onClick={() => { nextCriterionKey += 1; updateDraft({ criteria: [...criteria, { key: `new-${nextCriterionKey}`, text: '' }] }); }}>+ Criterion</button>
+            <button type="submit" className="btn btn--sm btn--primary" disabled={!canWrite || needsDecision || !changed || criteria.some((row) => !row.text.trim())}>Save details</button>
           </div> : null}
         </form>
       </div>
@@ -346,7 +385,7 @@ function NodeInspector({ node, view, tasks, write, canWrite }: {
             {parentOptions.map((parent) => <option key={parent.id} value={parent.id}>{parent.title}</option>)}
           </select> : null}
         </div> : null}
-        {open && progress?.hasStoppedWork ? <label className="roadmap__ack"><input type="checkbox" checked={acknowledge} onChange={(event) => setAcknowledge(event.target.checked)} /> I acknowledge the stopped work above.</label> : null}
+        {open && progress?.hasStoppedWork ? <label className="roadmap__ack"><input type="checkbox" checked={acknowledge} onChange={(event) => setAcknowledgment({ revision: view.revision, checked: event.target.checked })} /> I acknowledge the stopped work above.</label> : null}
         <div className="row row--wrap">
           {open ? <>
             <button type="button" className="btn btn--sm btn--recommended" disabled={!canWrite || (progress?.hasStoppedWork && !acknowledge)} onClick={() => transition('accept')}>Accept {node.kind}</button>
@@ -397,10 +436,17 @@ function KanbanBoard({ view, tasks, write, canWrite, openTask }: {
   const epics = byPosition(view.nodes.filter((node) => node.kind === 'epic' && node.parentId === phase?.id));
   const taskById = new Map(tasks.map((task) => [task.id, task]));
   const factById = new Map(view.tasks.map((fact) => [fact.id, fact]));
+  const placementByTask = new Map(view.placements.map((placement) => [placement.taskId, placement]));
+  const placementsByEpic = new Map<string, RoadmapTaskPlacement[]>();
+  for (const placement of view.placements) {
+    const rows = placementsByEpic.get(placement.epicId);
+    if (rows) rows.push(placement);
+    else placementsByEpic.set(placement.epicId, [placement]);
+  }
   const columns: { id: string | null; title: string; rows: RoadmapTaskPlacement[]; taskIds: readonly string[]; node: RoadmapNode | null }[] = [
     { id: null, title: 'Unassigned', rows: [], taskIds: view.unassignedTaskIds, node: null },
     ...epics.map((epic) => {
-      const rows = byPosition(view.placements.filter((placement) => placement.epicId === epic.id));
+      const rows = byPosition(placementsByEpic.get(epic.id) ?? []);
       return { id: epic.id, title: epic.title, rows, taskIds: rows.map((row) => row.taskId), node: epic };
     })
   ];
@@ -421,7 +467,7 @@ function KanbanBoard({ view, tasks, write, canWrite, openTask }: {
         {column.taskIds.map((taskId, index) => {
           const task = taskById.get(taskId);
           const fact = factById.get(taskId);
-          const placement = column.rows.find((row) => row.taskId === taskId);
+          const placement = placementByTask.get(taskId);
           const readiness = view.readiness.tasks[taskId];
           const waits = effectiveWaits(view.readiness, { kind: 'task', taskId });
           const frozen = column.node !== null && column.node.state !== 'open';
@@ -459,13 +505,17 @@ function DependenciesPanel({ view, tasks, write, canWrite }: {
   write: Write;
   canWrite: boolean;
 }): React.JSX.Element {
-  const options: { ref: RoadmapItemRef; label: string }[] = [
+  const nodeNames = useMemo(() => new Map(view.nodes.map((node) => [node.id, node.title])), [view.nodes]);
+  const taskNames = useMemo(() => new Map(tasks.map((task) => [task.id, task.title])), [tasks]);
+  const options: { ref: RoadmapItemRef; label: string }[] = useMemo(() => [
     ...view.nodes.map((node) => ({ ref: { kind: 'node', nodeId: node.id } as const, label: `${node.kind}: ${node.title}` })),
-    ...view.tasks.map((fact) => ({ ref: { kind: 'task', taskId: fact.id } as const, label: `task: ${tasks.find((task) => task.id === fact.id)?.title ?? fact.id}` }))
-  ];
+    ...view.tasks.map((fact) => ({ ref: { kind: 'task', taskId: fact.id } as const, label: `task: ${taskNames.get(fact.id) ?? fact.id}` }))
+  ], [view.nodes, view.tasks, taskNames]);
   const [dependent, setDependent] = useState('');
   const [prerequisite, setPrerequisite] = useState('');
-  const label = (ref: RoadmapItemRef) => itemName(ref, view, tasks);
+  const label = (ref: RoadmapItemRef) => ref.kind === 'node'
+    ? nodeNames.get(ref.nodeId) ?? ref.nodeId
+    : taskNames.get(ref.taskId) ?? ref.taskId;
   return <div className="roadmap__dependencies">
     <Card title="Add dependency">
       <p className="muted">The dependent waits until the prerequisite is accepted or completed. Readiness is guidance; it does not start or stop tasks.</p>
