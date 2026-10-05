@@ -1133,6 +1133,15 @@ export function RunView(): React.JSX.Element {
             actions={<SpecificationStatusTag approvedAt={task.specificationApprovedAt} />}
           >
             <SpecificationPanel specification={specification} />
+            {task.status === 'READY_FOR_IMPLEMENTATION' && task.currentRound > 0 && task.specificationGroundingJson && detail.continuationOf === null ? (
+              <div className="stack" style={{ marginTop: 12 }}>
+                <div className="faint">Regenerating preserves task files, clears approval, and requires a new plan review.</div>
+                <button className="btn" disabled={otherOperationBusy || primaryPending !== null}
+                  onClick={() => dispatchAction({ key: 'generate_specification', label: 'Regenerate specification', enabled: true, disabledReason: null })}>
+                  Regenerate specification
+                </button>
+              </div>
+            ) : null}
           </Card>
         ) : null}
 

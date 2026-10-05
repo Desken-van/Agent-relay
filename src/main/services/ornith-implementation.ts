@@ -337,6 +337,9 @@ Rules:
   with "files" set to exactly those file(s) (it reports line numbers, not byte offsets). A chunk
   may be shorter than your "limit" so the result fits; "bytesRead" says how much you got.
 - A "read_file" result also reports "lineEnding" for the WHOLE file: "lf", "crlf", "mixed" or "none".
+  "utf8Bom" reports whether its raw bytes start with a UTF-8 BOM. "trailingLfBytes" counts consecutive
+  LF bytes at the end of the WHOLE file. Successful reads validate UTF-8; these facts and "sha256"
+  come from raw bytes, even when content is a partial slice. Content preserves real CR/LF characters.
   In your JSON reply, "\\r\\n" (one backslash before each letter) decodes to the real CR and LF
   characters, but "\\\\r\\\\n" (doubled backslashes) decodes to four literal characters (backslash, r,
   backslash, n) that will NOT match a line break. Write each real line break in "oldText" and

@@ -222,3 +222,12 @@ describe('triage sees the whole specification', () => {
     expect(text).toContain('name the field(s) you checked');
   });
 });
+
+it('generation, revision and review share feasible byte evidence and safe recovery instructions', () => {
+  for (const prompt of [generation('ornith'), revision('ornith'), implementerCapabilitiesSection('ornith', 'reviewer')]) {
+    const text = flat(prompt);
+    expect(text).toContain('utf8Bom and trailingLfBytes');
+    expect(text).toContain('never require nonexistent suite coverage as a condition of finish');
+    expect(text).toContain('Do not make a retry fail solely because that task-created file already exists');
+  }
+});

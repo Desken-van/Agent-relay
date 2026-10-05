@@ -49,6 +49,8 @@ export interface VerificationFailureInput {
  * paired with the short, fixed label the reason names it by.
  */
 const INFRASTRUCTURE_SIGNATURES: readonly { readonly pattern: RegExp; readonly label: string }[] = [
+  { pattern: /Electron failed to install correctly\b/, label: 'the installed Electron runtime is incomplete or inaccessible' },
+  { pattern: /Electron is missing or incomplete\b/, label: 'the installed Electron runtime is incomplete or inaccessible' },
   { pattern: /\[vitest-pool-runner\]: Timeout waiting for worker to respond/, label: 'a Vitest worker stopped answering (worker timeout)' },
   { pattern: /\[vitest-pool\]: Timeout starting \w+ runner/, label: 'a Vitest worker did not start in time' },
   { pattern: /\[vitest-pool\]: Failed to start \w+ worker/, label: 'a Vitest worker could not be started' },
@@ -121,6 +123,12 @@ export function classifyVerificationFailure(input: VerificationFailureInput): Ve
         'whether a check hung or the machine was too slow.'
     };
   }
+  const text = boundedVerificationOutputWindow(input.output);
+  const implementation = labelsMatching(IMPLEMENTATION_SIGNATURES, text);
+  const infrastructure = labelsMatching(INFRASTRUCTURE_SIGNATURES, text);
+  if (input.exitCode === null && implementation.length === 0 && infrastructure.length > 0) {
+    return { kind: 'infrastructure', reason: `Verification could not start: ${joinLabels(infrastructure)}. Repair the installed verification tooling; the task files are preserved.` };
+  }
   if (input.exitCode === null) {
     return {
       kind: 'infrastructure',
@@ -129,9 +137,6 @@ export function classifyVerificationFailure(input: VerificationFailureInput): Ve
     };
   }
 
-  const text = boundedVerificationOutputWindow(input.output);
-  const implementation = labelsMatching(IMPLEMENTATION_SIGNATURES, text);
-  const infrastructure = labelsMatching(INFRASTRUCTURE_SIGNATURES, text);
   const exit = `npm run verify failed (exit ${input.exitCode})`;
 
   if (implementation.length > 0 && infrastructure.length > 0) {
