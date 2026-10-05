@@ -1653,6 +1653,15 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       expect(forModel.content).toBe(content); // classification never changes what is returned
     });
 
+    it('reports raw BOM and final LF evidence even when the returned slice omits them', async () => {
+      const content = '\ufeff' + 'x'.repeat(300) + '\n\n';
+      const forModel = await readBack('bom.txt', content, 20);
+      expect(forModel).toMatchObject({ utf8Bom: true, trailingLfBytes: 2, lineEnding: 'lf', totalBytes: 305 });
+      expect(forModel.content).toBe('x'.repeat(17));
+      const clean = await readBack('no-bom.txt', '# Ornith smoke test\n\nCreated by Ornith through Agent Relay.\n');
+      expect(clean).toMatchObject({ utf8Bom: false, trailingLfBytes: 1, totalBytes: 60 });
+    });
+
     it('classifies from the complete file, not from the returned slice', async () => {
       const content = `${'x'.repeat(300)}\r\nsecond line\r\n`;
       const forModel = await readBack('window.txt', content, 50);

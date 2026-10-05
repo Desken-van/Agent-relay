@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it } from 'vitest';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { createHarness, type Harness } from '../helpers/harness';
@@ -85,4 +85,67 @@ it('bounds Vitest workers even in an older task tree and overrides an inherited 
   } finally {
     if (previous === undefined) delete process.env.VITEST_MAX_WORKERS; else process.env.VITEST_MAX_WORKERS = previous;
   }
+}, 30_000);
+
+function installedElectron(modules = join(root, 'node_modules')) {
+  const distribution = join(modules, 'electron', 'dist');
+  mkdirSync(distribution, { recursive: true });
+  writeFileSync(join(modules, 'electron', 'package.json'), '{"version":"43.3.0"}');
+  writeFileSync(join(modules, 'electron', 'path.txt'), 'electron.exe');
+  writeFileSync(join(distribution, 'version'), '43.3.0');
+  return distribution;
+}
+it('prepares ignored Vite caches through the physical dependency directory before verification', async () => {
+  const modules = join(target.project.localPath, 'node_modules');
+  mkdirSync(join(modules, 'vite'), { recursive: true });
+  writeFileSync(join(modules, 'vite', 'package.json'), '{}');
+  symlinkSync(modules, join(root, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+  const result = await verifier.execute(target, new AbortController().signal, () => {});
+  expect(result.exitCode).toBe(0);
+  expect(existsSync(join(modules, '.vite-temp'))).toBe(true);
+  expect(existsSync(join(modules, '.vite', 'vitest'))).toBe(true);
+}, 30_000);
+it('fails before starting the long script when Electron has no executable', async () => {
+  installedElectron();
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ scripts: { verify: 'node -e "process.exit(77)"' } }));
+  const result = await verifier.execute(target, new AbortController().signal, () => {});
+  expect(result.exitCode).toBeNull(); // would be 77 if the long script had started
+  expect(result.failed).toBe(true);
+  expect(result.stderr).toMatch(/Electron.*repair/i);
+}, 30_000);
+it('passes the physical Electron distribution through a dependency link instead of an inherited override', async () => {
+  const modules = join(target.project.localPath, 'node_modules');
+  const distribution = installedElectron(modules);
+  symlinkSync(modules, join(root, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+  writeFileSync(join(distribution, 'electron.exe'), 'fixture');
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ scripts: { verify: 'node -e "console.log(process.env.ELECTRON_OVERRIDE_DIST_PATH)"' } }));
+  const previous = process.env.ELECTRON_OVERRIDE_DIST_PATH;
+  process.env.ELECTRON_OVERRIDE_DIST_PATH = 'unrelated-host-distribution';
+  try {
+    const result = await verifier.execute(target, new AbortController().signal, () => {});
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(distribution);
+    expect(process.env.ELECTRON_OVERRIDE_DIST_PATH).toBe('unrelated-host-distribution');
+  } finally {
+    if (previous === undefined) delete process.env.ELECTRON_OVERRIDE_DIST_PATH; else process.env.ELECTRON_OVERRIDE_DIST_PATH = previous;
+  }
+}, 30_000);
+
+it('refuses a redirected Vite cache before writing through it', async () => {
+  const modules = join(root, 'node_modules');
+  const outside = join(target.project.localPath, 'cache-outside');
+  mkdirSync(join(modules, 'vite'), { recursive: true });
+  writeFileSync(join(modules, 'vite', 'package.json'), '{}');
+  mkdirSync(outside);
+  symlinkSync(outside, join(modules, '.vite'), process.platform === 'win32' ? 'junction' : 'dir');
+  await expect(verifier.execute(target, new AbortController().signal, () => {})).rejects.toThrow(/plain directory/);
+  expect(existsSync(join(outside, 'vitest'))).toBe(false);
+}, 30_000);
+it('requires both Vite cache paths to be ignored before creating either', async () => {
+  const modules = join(root, 'node_modules');
+  mkdirSync(join(modules, 'vite'), { recursive: true });
+  writeFileSync(join(modules, 'vite', 'package.json'), '{}');
+  writeFileSync(join(root, '.gitignore'), 'node_modules/.vite-temp/\n');
+  await expect(verifier.execute(target, new AbortController().signal, () => {})).rejects.toThrow(/ignored/);
+  expect(existsSync(join(modules, '.vite-temp'))).toBe(false);
 }, 30_000);

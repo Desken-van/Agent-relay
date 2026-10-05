@@ -9,6 +9,7 @@ import { hashSnapshotFile, GitCodeSnapshotSource } from '../adapters/git/git-cod
 import { locateExecutable } from '../adapters/process/executable-locator';
 import type { ProcessRunner, ProcessResult } from '../adapters/process/process-runner';
 import { assertSafeWorktreePath, isSamePath } from './path-safety';
+import { prepareVerificationEnvironment, VerificationEnvironmentError } from './verification-environment';
 
 export interface VerificationTarget { task: Task; project: Project; settings: Settings }
 export interface VerificationExecutor {
@@ -87,6 +88,14 @@ export class WorktreeVerification implements VerificationExecutor {
       ? join(dirname(npm.path), 'node_modules', 'npm', 'bin', 'npm-cli.js')
       : await realpath(npm.path);
     await lstat(npmCli);
+    let toolingEnvironment: Record<string, string>;
+    try { toolingEnvironment = await prepareVerificationEnvironment(root, this.runner, signal); }
+    catch (error) {
+      if (!(error instanceof VerificationEnvironmentError)) throw error;
+      // A known preflight refusal is infrastructure evidence, not an unknown throw or a failed test.
+      return { command: 'npm run verify (not started)', exitCode: null, stdout: '', stderr: error.message,
+        timedOut: false, cancelled: signal.aborted, durationMs: 0, failed: true };
+    }
     progress({ type: 'log', text: 'Command: npm run verify (existing worktree; no implementation agent)' });
     // No `onLine`/`onStderrLine`: the child's stdout/stderr must never be streamed as a progress event,
     // because every progress event is both persisted to `run_events` and pushed live to the renderer as
@@ -103,7 +112,7 @@ export class WorktreeVerification implements VerificationExecutor {
       cwd: root, signal, timeoutMs: settings.processTimeoutMs, maxOutputBytes: settings.maxStoredLogBytes,
       omitEnvNames: ['NODE_ENV'],
       // Applies even to existing task trees whose config predates the worker bound.
-      env: { VITEST_MAX_WORKERS: String(VERIFICATION_VITEST_MAX_WORKERS) }
+      env: { ...toolingEnvironment, VITEST_MAX_WORKERS: String(VERIFICATION_VITEST_MAX_WORKERS) }
     });
   }
 }

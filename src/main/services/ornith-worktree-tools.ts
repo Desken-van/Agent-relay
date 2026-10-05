@@ -1060,6 +1060,9 @@ export class OrnithWorktreeTools {
         // the returned slice: a window that happens to hold no line break must not
         // report "none" for a CRLF file.
         const lineEnding = classifyLineEnding(raw);
+        const utf8Bom = raw.length >= 3 && raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf;
+        let trailingLfBytes = 0;
+        while (trailingLfBytes < raw.length && raw[raw.length - 1 - trailingLfBytes] === 0x0a) trailingLfBytes += 1;
         const packed = packReadSlice(
           raw,
           action.offset,
@@ -1072,6 +1075,8 @@ export class OrnithWorktreeTools {
               bytesRead: slice.bytesRead,
               totalBytes,
               lineEnding,
+              utf8Bom,
+              trailingLfBytes,
               // The offset a following chunk starts at; `null` once the end of
               // the file has been returned, so "is there more" never has to be
               // inferred from `eof` alone.

@@ -190,3 +190,23 @@ describe('what a stored verification run is read back as', () => {
     expect(verificationFailureKind(verificationRun({ version: 2 }))).toBe('unknown');
   });
 });
+
+it('recognizes the live Electron installation failure without sending it to an implementation agent', () => {
+  const output = "Error: Electron failed to install correctly. Please delete node_modules/electron";
+  expect(classifyVerificationFailure(failed(output)).kind).toBe('infrastructure');
+  const run = runSchema.parse({ id: 'legacy-electron', taskId: 't', agent: 'system', runType: 'verification', status: 'failed', round: 1,
+    startedAt: '2026-10-05T14:43:54.281Z', finishedAt: '2026-10-05T15:07:36.803Z', finalMessage: null, errorMessage: null,
+    structuredResult: JSON.stringify({version: 1, command: 'npm run verify', identity: 'a'.repeat(64), passed: false,
+      exitCode: 1, durationMs: 1000, reason: 'unknown', outcome: 'failed', failureKind: 'unknown', outputSummary: output}) });
+  expect(verificationFailureKind(run)).toBe('infrastructure');
+});
+it('keeps an Electron installation error mixed with a real assertion as unknown', () => {
+  expect(classifyVerificationFailure(failed('Error: Electron failed to install correctly.\nAssertionError: wrong result')).kind).toBe('unknown');
+});
+
+it('names an Electron preflight refusal before the command starts without leaking paths', () => {
+  const result = classifyVerificationFailure(failed('Electron is missing or incomplete. Repair dependencies.', { exitCode: null, durationMs: 0 }));
+  expect(result.kind).toBe('infrastructure');
+  expect(result.reason).toContain('installed Electron runtime');
+  expect(result.reason).toContain('Repair');
+});

@@ -63,6 +63,15 @@ It has exactly these actions and nothing else: ${ORNITH_ACTION_KINDS.join(', ')}
 - It edits files only through create_file, replace_text (exact text, with the file's current
   sha256 from its own read) and delete_file. There are no file handles: never instruct it to
   open, seek, append through a handle, flush or close a file, or to write raw bytes.
+- read_file validates UTF-8 and reports raw-byte sha256, totalBytes, whole-file lineEnding,
+  utf8Bom and trailingLfBytes. Its content preserves CR/LF (a UTF-8 BOM is omitted from decoded
+  content, so use utf8Bom). Compare the complete content, not a partial slice, for exact text.
+  Use these facts for byte-format requirements; they are separate from the project test suite.
+- Never assume npm run verify checks a new document or its bytes. Name an existing test only
+  after reading it, or permit adding one. If tests cannot change, use read_file facts instead;
+  never require nonexistent suite coverage as a condition of finish.
+- When this task already has a correct file from an earlier round, verify and preserve it.
+  Do not make a retry fail solely because that task-created file already exists.
 - Its own "run_verification" action runs the project's verification inside its loop and returns
   the outcome, exit code and a short sanitized summary; it may use it once the work is complete.
 ${NO_RELAY_UI}
