@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it } from 'vitest';
-import { mkdirSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, symlinkSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { createHarness, type Harness } from '../helpers/harness';
@@ -124,7 +124,7 @@ it('passes the physical Electron distribution through a dependency link instead 
   try {
     const result = await verifier.execute(target, new AbortController().signal, () => {});
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain(distribution);
+    expect(result.stdout).toContain(realpathSync(distribution));
     expect(process.env.ELECTRON_OVERRIDE_DIST_PATH).toBe('unrelated-host-distribution');
   } finally {
     if (previous === undefined) delete process.env.ELECTRON_OVERRIDE_DIST_PATH; else process.env.ELECTRON_OVERRIDE_DIST_PATH = previous;
