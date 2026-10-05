@@ -124,7 +124,8 @@ it('passes the physical Electron distribution through a dependency link instead 
   try {
     const result = await verifier.execute(target, new AbortController().signal, () => {});
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain(realpathSync(distribution));
+    // fs.promises.realpath uses the native resolver, which expands Windows 8.3 names.
+    expect(result.stdout).toContain(realpathSync.native(distribution));
     expect(process.env.ELECTRON_OVERRIDE_DIST_PATH).toBe('unrelated-host-distribution');
   } finally {
     if (previous === undefined) delete process.env.ELECTRON_OVERRIDE_DIST_PATH; else process.env.ELECTRON_OVERRIDE_DIST_PATH = previous;
