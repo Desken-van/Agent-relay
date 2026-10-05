@@ -6,7 +6,8 @@
  * another branch, at another commit, and carry uncommitted edits, none of which
  * the task branch will contain. Codex reads the task's own worktree when it
  * exists, and otherwise a temporary, clean, detached checkout of the base
- * branch's commit — the commit the task branch is then cut from. Only Git is used:
+ * branch's commit — the commit the task branch is then cut from. Only read-only Git
+ * and guarded file digests are used:
  * no file is copied, nothing in the source checkout is touched, nothing is forced.
  */
 
@@ -22,6 +23,8 @@ import {
 } from '../../shared/domain/specification-grounding';
 import type { RepositoryInfo } from '../../shared/domain/git';
 import type { Clock, GitAdapter } from '../ports';
+import type { ProcessRunner } from '../adapters/process/process-runner';
+import { stableWorktreeFileIdentity } from './worktree-file-identity';
 import { assertSafeWorktreePath, isInsideDirectory, isSamePath } from './path-safety';
 
 /** Under the worktrees root, beside the task worktrees and never inside a repository. */
@@ -54,7 +57,7 @@ function files(list: readonly string[]): string {
 }
 
 export class SpecificationGroundingService {
-  constructor(private readonly deps: { readonly git: GitAdapter; readonly clock: Clock }) {}
+  constructor(private readonly deps: { readonly git: GitAdapter; readonly clock: Clock; readonly runner?: ProcessRunner }) {}
 
   /** The temporary checkout's path for one task: keyed by the whole task id, so tasks never share one. */
   checkoutPathFor(task: Task, settings: Settings): string {
@@ -69,14 +72,20 @@ export class SpecificationGroundingService {
 
     if (task.worktreePath !== null && task.branchName !== null) {
       const { commit, info } = await this.worktreeCommit(task, project, settings);
-      // In any round: uncommitted content is something no commit can name, so nothing could
-      // later prove the worktree still holds what Codex read. Refused, never read. Agent Relay
-      // never discards the changes (a person's edits, or an earlier round's work).
+      let worktreeFingerprint: string | undefined;
       if (!info.isClean) {
-        throw new AgentRelayError('GIT_DIRTY', 'The task worktree has uncommitted changes, so a specification cannot be tied to one commit.', {
-          details: files(info.dirtyFiles),
-          remediation: 'Commit or discard those changes in the task worktree yourself, then generate the specification again. Agent Relay never discards them.'
-        });
+        // Preserve earlier round work. Legacy/first-round dirty trees still fail closed.
+        if (task.currentRound === 0 || !this.deps.runner) {
+          throw new AgentRelayError('GIT_DIRTY', 'The task worktree has uncommitted changes, so a specification cannot be tied to one commit.', {
+            details: files(info.dirtyFiles),
+            remediation: 'Regeneration of preserved round changes requires exact file capture. Agent Relay never discards them.'
+          });
+        }
+        worktreeFingerprint = await stableWorktreeFileIdentity(task.worktreePath, this.deps.runner);
+        const after = await this.worktreeCommit(task, project, settings);
+        if (after.commit !== commit || after.info.isClean !== info.isClean) {
+          throw new AgentRelayError('VALIDATION_FAILED', 'The specification checkout changed during capture.');
+        }
       }
       return {
         path: task.worktreePath,
@@ -87,6 +96,7 @@ export class SpecificationGroundingService {
           branch: task.branchName,
           commit,
           clean: info.isClean,
+          ...(worktreeFingerprint === undefined ? {} : { worktreeFingerprint }),
           implementationProvider: task.implementationProvider,
           capturedAt,
           stale: null
@@ -177,8 +187,11 @@ export class SpecificationGroundingService {
           reason: `the task branch moved from ${shortCommit(recorded.commit)} to ${shortCommit(commit)}.`
         };
       }
-      // A trusted record is always a clean checkout (`unverifiable` covers the rest), so any
-      // uncommitted change since is a change to what was read.
+      if (recorded.worktreeFingerprint !== undefined) {
+        const mismatch = await this.fileIdentityMismatch(recorded, task, project, settings);
+        return mismatch === null ? { ok: true } : { ok: false, kind: 'mismatch', reason: mismatch };
+      }
+      // A legacy clean record has no byte fingerprint: uncommitted changes invalidate it.
       if (!info.isClean) {
         return { ok: false, kind: 'mismatch', reason: `the task worktree now has uncommitted changes (${files(info.dirtyFiles)}).` };
       }
@@ -204,7 +217,7 @@ export class SpecificationGroundingService {
 
   /**
    * After Codex has read `target`: is the checkout still exactly the commit its record names,
-   * and still clean? Returns why not, or null. A Git failure throws — it is not an answer.
+   * and still clean (or byte-identical to its preserved snapshot)? Returns why not, or null. A Git failure throws — it is not an answer.
    * The record is only written after this says null, so a commit or an edit made while Codex
    * was reading can never be stored under the commit that was there before it.
    */
@@ -225,7 +238,18 @@ export class SpecificationGroundingService {
     if (info.headCommit !== recorded.commit) {
       return `it moved from ${shortCommit(recorded.commit)} to ${shortCommit(info.headCommit)}.`;
     }
+    if (recorded.worktreeFingerprint !== undefined) return this.fileIdentityMismatch(recorded, task, project, settings);
     if (!info.isClean) return `it now has uncommitted changes (${files(info.dirtyFiles)}).`;
+    return null;
+  }
+
+  private async fileIdentityMismatch(recorded: SpecificationGrounding, task: Task, project: Project, settings: Settings): Promise<string | null> {
+    if (!this.deps.runner || task.worktreePath === null) return 'the exact specification file identity cannot be checked.';
+    const actual = await stableWorktreeFileIdentity(task.worktreePath, this.deps.runner);
+    const after = await this.worktreeCommit(task, project, settings);
+    if (after.commit !== recorded.commit || after.info.isClean !== recorded.clean || actual !== recorded.worktreeFingerprint) {
+      return 'the task worktree file bytes changed after they were captured.';
+    }
     return null;
   }
 

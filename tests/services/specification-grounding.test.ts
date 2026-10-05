@@ -68,6 +68,11 @@ describe('the grounding record', () => {
     const dirty = makeGrounding({ checkout: 'task_worktree', branch: 'agent-relay/task', clean: false, implementationProvider: 'codex' });
     const unverifiable = specificationGroundingState({ ...base, specificationGroundingJson: JSON.stringify(dirty), implementationProvider: 'ornith' });
     expect(unverifiable.kind).toBe('unverifiable');
+    const captured = { ...dirty, worktreeFingerprint: 'a'.repeat(64) };
+    expect(specificationGroundingState({ ...base, specificationGroundingJson: JSON.stringify(captured) }).kind).toBe('recorded');
+    expect(specificationGroundingState({ ...base, implementationProvider: 'ornith', specificationGroundingJson: JSON.stringify(captured) }).kind).toBe('provider_changed');
+    expect(parseSpecificationGrounding(JSON.stringify({ ...captured, worktreeFingerprint: 'invalid' }))).toBeNull();
+    expect(specificationGroundingState({ ...base, specificationGroundingJson: JSON.stringify({ ...captured, checkout: 'base_commit' }) }).kind).toBe('unverifiable');
     expect(specificationGroundingProblem(unverifiable)).toMatch(/uncommitted changes, which no commit can name/);
     expect(specificationGroundingState({ ...base, specificationGroundingJson: JSON.stringify(makeGrounding()) }).kind).toBe('recorded');
   });

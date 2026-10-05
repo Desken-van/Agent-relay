@@ -12,7 +12,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, renameSync, symlinkSync, rmdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CliGitAdapter } from '../../src/main/adapters/git/git-adapter';
@@ -69,7 +69,7 @@ interface Scenario {
  * older commit, with an uncommitted edit. Line endings are stored exactly as written.
  */
 function scenario(options: { sourceOnMain?: boolean } = {}): Scenario {
-  const harness = createHarness({ orchestratorGit: new CliGitAdapter(new ExecaProcessRunner()) });
+  const harness = createHarness({ orchestratorGit: new CliGitAdapter(new ExecaProcessRunner()), processRunner: new ExecaProcessRunner() });
   harnesses.push(harness);
   const repo = join(dirname(harness.worktreesRoot), 'source');
   mkdirSync(join(repo, 'docs'), { recursive: true });
@@ -283,17 +283,71 @@ describe('a target that changed after the specification is detected, surfaced an
     expect(groundingOf(value, task.id)).toMatchObject({ checkout: 'task_worktree', commit: value.base, stale: null });
   });
 
-  it('refuses an uncommitted edit after the first round too: no commit could show later that the worktree still holds it', async () => {
+  it('regenerates after a round from exact tracked and untracked bytes without committing or discarding them', async () => {
     const { value, task, worktree } = await approvedOnItsBranch();
-    const recorded = value.harness.tasks.findById(task.id)!.specificationGroundingJson;
     value.harness.tasks.update(task.id, { currentRound: 1 });
-    const earlierWork = crlfText(3, 'an earlier round, not committed');
+    const earlierWork = crlfText(3, 'earlier');
     writeFileSync(join(worktree, FILE), earlierWork);
+    writeFileSync(join(worktree, 'new.txt'), 'untracked work\n');
+    const beforeStatus = git(worktree, 'status', '--porcelain=v1');
 
-    await expect(value.harness.orchestrator.generateSpecification(task.id)).rejects.toMatchObject({ code: 'GIT_DIRTY' });
-    expect(value.seen).toHaveLength(1);
-    expect(value.harness.tasks.findById(task.id)!.specificationGroundingJson).toBe(recorded);
+    await value.harness.orchestrator.generateSpecification(task.id);
+    expect(value.seen).toHaveLength(2);
+    const recorded = groundingOf(value, task.id)!;
+    expect(recorded).toMatchObject({ checkout: 'task_worktree', commit: value.base, clean: false, stale: null });
+    expect(recorded.worktreeFingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(value.harness.tasks.findById(task.id)!.specificationApprovedAt).toBeNull();
+    expect(git(worktree, 'status', '--porcelain=v1')).toBe(beforeStatus);
     expect(readFileSync(join(worktree, FILE), 'utf8')).toBe(earlierWork);
+    expect(readFileSync(join(worktree, 'new.txt'), 'utf8')).toBe('untracked work\n');
+    await value.harness.orchestrator.verifySpecificationGrounding(task.id);
+    expect(() => value.harness.orchestrator.approveSpecification(task.id)).not.toThrow();
+
+    writeFileSync(join(worktree, 'new.txt'), 'different work\n');
+    await value.harness.orchestrator.generateSpecification(task.id);
+    expect(value.seen.at(-1)!.threadId).toBeNull(); // same commit, different bytes: no stale Codex memory
+    expect(groundingOf(value, task.id)!.worktreeFingerprint).not.toBe(recorded.worktreeFingerprint);
+    await value.harness.orchestrator.verifySpecificationGrounding(task.id);
+    writeFileSync(join(worktree, 'new.txt'), 'another change\n');
+    await expect(value.harness.orchestrator.verifySpecificationGrounding(task.id)).rejects.toThrow(/file bytes changed/);
+  });
+
+  it('refuses redirected files before Codex reads preserved round changes', async () => {
+    const { value, task, worktree } = await approvedOnItsBranch();
+    value.harness.tasks.update(task.id, { currentRound: 1 });
+    const docs = join(worktree, 'docs');
+    const preserved = join(worktree, 'docs-preserved');
+    renameSync(docs, preserved);
+    symlinkSync(join(value.repo, 'docs'), docs, process.platform === 'win32' ? 'junction' : 'dir');
+    try {
+      await expect(value.harness.orchestrator.generateSpecification(task.id)).rejects.toThrow(/unreadable or unsafe/);
+      expect(value.seen).toHaveLength(1);
+      expect(readFileSync(join(value.repo, FILE), 'utf8')).toBe(DIRTY);
+    } finally {
+      rmdirSync(docs); // remove the junction itself, never recursively traverse its target
+      renameSync(preserved, docs);
+    }
+  });
+
+  it('rejects a same-size edit during dirty regeneration even when Git status and line counts stay the same', async () => {
+    const { value, task, worktree } = await approvedOnItsBranch();
+    value.harness.tasks.update(task.id, { currentRound: 1 });
+    writeFileSync(join(worktree, FILE), crlfText(3, 'earlier'));
+    const before = value.harness.tasks.findById(task.id)!;
+    const status = git(worktree, 'status', '--porcelain=v1');
+    const numstat = git(worktree, 'diff', '--numstat');
+    const read = value.harness.codex.createSpecification;
+    value.harness.codex.createSpecification = async (request, context) => {
+      const result = await read(request, context);
+      writeFileSync(join(worktree, FILE), crlfText(3, 'changed'));
+      return result;
+    };
+    await expect(value.harness.orchestrator.generateSpecification(task.id)).rejects.toThrow(/file bytes changed/);
+    expect(value.seen).toHaveLength(2);
+    expect(git(worktree, 'status', '--porcelain=v1')).toBe(status);
+    expect(git(worktree, 'diff', '--numstat')).toBe(numstat);
+    expect(value.harness.tasks.findById(task.id)!.specificationJson).toBe(before.specificationJson);
+    expect(readFileSync(join(worktree, FILE), 'utf8')).toBe(crlfText(3, 'changed'));
   });
 });
 

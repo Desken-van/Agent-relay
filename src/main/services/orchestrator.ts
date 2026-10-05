@@ -234,7 +234,7 @@ export class Orchestrator {
   private readonly grounding: SpecificationGroundingService;
 
   constructor(private readonly deps: OrchestratorDeps) {
-    this.grounding = new SpecificationGroundingService({ git: deps.git, clock: deps.clock });
+    this.grounding = new SpecificationGroundingService({ git: deps.git, clock: deps.clock, runner: deps.processRunner });
   }
 
   /* ------------------------------------------------------------------ */
@@ -753,7 +753,9 @@ export class Orchestrator {
       const sameTarget =
         previous.kind === 'recorded' &&
         previous.grounding.commit === target.grounding.commit &&
-        previous.grounding.checkout === target.grounding.checkout;
+        previous.grounding.checkout === target.grounding.checkout &&
+        previous.grounding.clean === target.grounding.clean &&
+        previous.grounding.worktreeFingerprint === target.grounding.worktreeFingerprint;
       let result: Awaited<ReturnType<CodexAdapter['createSpecification']>>;
       try {
         result = await this.deps.codex.createSpecification(
