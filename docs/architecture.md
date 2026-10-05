@@ -846,6 +846,17 @@ is recorded:
 | Gate `prepared` | run its review |
 | Obsolete gate | run a review only if a correction completed; otherwise none |
 
+**Recovering a lost plan-review reply.** On providers whose read-only `status`
+returns an indexed `pending` list, Agent Relay validates that list together with
+its latest completed PlanReview round receipt. Reconciliation restores it to
+`awaiting_resolve` only for the same session, unchanged recorded tool contract,
+and exactly the round after `rounds_at_open`. Finding order and the honest
+reviewer count are preserved, including reviewer failures. The revision guard
+still discards late reads; restoration never dispatches another review or
+resolution and never approves the specification. Older providers without pending
+findings keep the explicit unrecoverable state. Missing, malformed or ambiguous
+round metadata cannot be treated as an empty successful review.
+
 `plan_review_corrections` holds one row per gate that needed a revision, with
 `UNIQUE(source_gate_id)` as the idempotency key: a retry reopens the SAME row, so
 one gate can never yield two corrections, two versions or two review rounds. The row

@@ -21,6 +21,7 @@ import type {
   ExternalPlanReviewRound,
   ExternalPlanReviewSession,
   ExternalPlanReviewStatus,
+  ExternalPlanReviewPendingRound,
   ExternalPlanReviewSubject
 } from '../../ports';
 
@@ -83,8 +84,9 @@ const findingSchema = z
  * Passthrough rather than strict: the provider is free to add fields, and this
  * adapter must not fail a recovery because it learned something new. Only the
  * fields below are ever read, and `rounds` is read for one purpose — proving
- * whether a non-idempotent plan round has already run. Note what is absent:
- * status carries no findings, so a completed round cannot be restored from it.
+ * whether a non-idempotent plan round has already run. For backwards compatibility,
+ * older status replies carry no findings. New replies may carry indexed pending
+ * findings; those are parsed separately with their completed round receipt.
  */
 const roundStatusSchema = z.enum(['running', 'done', 'interrupted']);
 
@@ -140,6 +142,31 @@ const statusSchema = z
     rounds: z.array(statusRoundSchema).max(MAX_REPORTED_ROUNDS)
   })
   .passthrough();
+
+const pendingReceiptSchema = z.object({
+  number: z.number().int().positive(),
+  verdict: lowerEnum(PLAN_REVIEW_VERDICTS),
+  gatingCount: z.number().int().nonnegative(),
+  threshold: z.number().int().nonnegative(),
+  reviewers: z.string().min(1).max(2_000),
+  findings: z.array(findingSchema).max(256)
+});
+
+function pendingReceipt(value: z.infer<typeof statusSchema>): ExternalPlanReviewPendingRound | null {
+  if (value.stage !== 'PlanReview' || !value.awaitingResolve || value.pending === undefined) return null;
+  const plan = value.rounds.filter(round => round.stage === 'PlanReview');
+  const latest = plan.at(-1);
+  const parsed = pendingReceiptSchema.safeParse({
+    ...latest, threshold: value.threshold, findings: value.pending
+  });
+  // Only the latest completed plan round can own the pending list. Numbering
+  // must agree with the full history; missing metadata never grants recovery.
+  if (!parsed.success || value.planProceeded || latest?.status !== 'done' ||
+      plan.some((round, index) => round.number !== index + 1 || round.status === 'running')) {
+    throw new AgentRelayError('PARSE_FAILED', 'Coai returned an invalid pending plan-round receipt.');
+  }
+  return parsed.data;
+}
 
 const resolutionSchema = z.object({
   stage: stageSchema,
@@ -301,6 +328,7 @@ export class CoaiPlanReviewer implements ExternalPlanReviewer {
     // run", which is the most dangerous sentence this recovery can say.
     const plan = value.rounds.filter((round) => round.stage === 'PlanReview');
     return {
+      pendingRound: pendingReceipt(value),
       sessionId: value.sessionId,
       stage: value.stage,
       awaitingResolve: value.awaitingResolve,

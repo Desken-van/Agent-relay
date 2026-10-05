@@ -181,7 +181,7 @@ export type StatusReading =
   | { readonly kind: 'running' }
   /** No plan round exists for this session at all. */
   | { readonly kind: 'no-rounds' }
-  /** A finished round is waiting for decisions the status cannot show. */
+  /** A finished round is waiting for decisions. */
   | { readonly kind: 'awaiting-decisions' }
   /** The plan gate is behind us and the provider says so on every field. */
   | { readonly kind: 'proceeded' }
@@ -1363,11 +1363,27 @@ export class PlanReviewGateService {
     }
 
     switch (reading.kind) {
-      case 'awaiting-decisions':
+      case 'awaiting-decisions': {
+        const pending = state.pendingRound;
+        // Restore exactly the round this dispatch sent, under its recorded
+        // contract. Keep historical identity; decisions still require resolve.
+        if (pending != null && gate.roundsAtOpen !== null &&
+            pending.number === gate.roundsAtOpen + 1 && pending.number === state.planRounds.total &&
+            gate.contractFingerprint !== null && contractMismatchAt() === null &&
+            state.stage === 'PlanReview' && !containsSecretShape(JSON.stringify(pending))) {
+          return settle({
+            ...identity, status: 'awaiting_resolve', verdict: pending.verdict,
+            findingsJson: JSON.stringify(pending.findings), decisionsJson: null,
+            reviewers: pending.reviewers, gatingCount: pending.gatingCount, threshold: pending.threshold,
+            triageJson: null, triageForFindings: null, autoDecisionsJson: null,
+            reconciledAt, lastError: null
+          });
+        }
         // A round finished and its findings are not readable here. Checked
         // before anything that could re-arm a dispatch, so that a pending round
         // can never be mistaken for an absent one.
         return settle({ ...identity, lastError: FINDINGS_UNRECOVERABLE });
+      }
       case 'no-rounds':
         // What an empty round list proves depends entirely on what this gate
         // had already dispatched, and only one phase makes it conclusive.

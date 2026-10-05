@@ -383,6 +383,51 @@ describe('durable external plan review gate', () => {
     expect(value.reviewer.resolveCalls).toHaveLength(0);
   });
 
+  it('restores a lost round from status and still requires explicit decisions before proceeding', async () => {
+    const value = setup();
+    const { task } = await ready(value);
+    value.reviewer.reviewError = new Error('answer lost');
+    await expect(value.service.review(task.id)).rejects.toThrow(/lost/);
+    const before = value.harness.planReviewGates.findByTask(task.id)!;
+    value.reviewer.state = { ...value.reviewer.state,
+      planRounds: planRounds({ total: 1, done: 1 }), awaitingResolve: true,
+      pendingRound: { number: 1, verdict: 'proceed', gatingCount: 1, threshold: 6,
+        reviewers: '1 of 2 reviewers answered; failed: second reviewer timeout', findings: [finding('Byte repair')] } };
+    const gate = await value.build().reconcile(task.id);
+    expect(gate).toMatchObject({ status: 'awaiting_resolve', verdict: 'proceed', lastError: null,
+      findingsJson: JSON.stringify([finding('Byte repair')]), reviewers: value.reviewer.state.pendingRound!.reviewers,
+      sessionId: before.sessionId, contractFingerprint: before.contractFingerprint,
+      serverName: before.serverName, serverVersion: before.serverVersion });
+    expect(value.reviewer.reviewCalls).toHaveLength(1);
+    expect(value.reviewer.resolveCalls).toHaveLength(0);
+    expect(value.reviewer.statusCalls).toHaveLength(1);
+    expect((await resolveCurrent(value, task.id, [{ finding: 0, action: 'reject', reason: 'Verified contrary evidence.' }])).status).toBe('proceeded');
+  });
+
+  it.each(['foreign-session', 'changed-contract', 'older-round', 'extra-round', 'unknown-open-count'])(
+    'does not restore pending findings from %s evidence', async (scenario) => {
+      const value = setup();
+      const { task } = await ready(value);
+      value.reviewer.reviewError = new Error('answer lost');
+      await expect(value.service.review(task.id)).rejects.toThrow(/lost/);
+      value.reviewer.state = { ...value.reviewer.state,
+        planRounds: planRounds({ total: 1, done: 1 }), awaitingResolve: true,
+        pendingRound: { number: 1, verdict: 'proceed', gatingCount: 0, threshold: 6,
+          reviewers: 'all 2 reviewers answered', findings: [] } };
+      if (scenario === 'foreign-session') value.reviewer.state = { ...value.reviewer.state, sessionId: 'another' };
+      if (scenario === 'changed-contract') value.reviewer.state = { ...value.reviewer.state, contractFingerprint: 'a'.repeat(64) };
+      if (scenario === 'older-round') value.reviewer.state = { ...value.reviewer.state,
+        pendingRound: { ...value.reviewer.state.pendingRound!, number: 0 } };
+      if (scenario === 'extra-round') value.reviewer.state = { ...value.reviewer.state,
+        planRounds: planRounds({ total: 2, done: 2 }), pendingRound: { ...value.reviewer.state.pendingRound!, number: 2 } };
+      if (scenario === 'unknown-open-count') value.harness.planReviewGates.update(
+        value.harness.planReviewGates.findByTask(task.id)!.id, { roundsAtOpen: null });
+      expect(await value.service.reconcile(task.id)).toMatchObject({ status: 'reviewing', findingsJson: null });
+      expect(value.reviewer.reviewCalls).toHaveLength(1);
+      expect(value.reviewer.resolveCalls).toHaveLength(0);
+    }
+  );
+
   it('keeps an unknown round unknown when the provider cannot return its findings', async () => {
     const value = setup();
     const { task } = await ready(value);

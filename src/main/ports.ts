@@ -1475,7 +1475,8 @@ export interface ExternalPlanReviewResolution {
  *
  * Deliberately narrow. The provider's status surface reports which stage the
  * session is in and which rounds it has recorded, but it does NOT return the
- * findings of a completed round. Anything not listed here cannot be recovered
+ * findings of a completed round on older servers. Newer servers return an indexed
+ * pending receipt. Anything not listed here cannot be recovered
  * by reading, and must therefore leave a gate in its unknown phase rather than
  * being guessed at.
  */
@@ -1484,13 +1485,25 @@ export interface ExternalPlanReviewRoundCounts {
   readonly total: number;
   /** Still executing. The provider is mid-round; nothing here may start another. */
   readonly running: number;
-  /** Finished and recorded. Its findings are NOT readable through status. */
+  /** Finished and recorded. Newer providers also return an indexed pending receipt. */
   readonly done: number;
   /** Started and never finished. Not a result, and never counted as one. */
   readonly interrupted: number;
 }
 
+export interface ExternalPlanReviewPendingRound {
+  readonly number: number;
+  readonly verdict: PlanReviewVerdict;
+  readonly gatingCount: number;
+  readonly threshold: number;
+  readonly reviewers: string;
+  /** In the exact order the provider accepts decision indexes. */
+  readonly findings: readonly PlanReviewFinding[];
+}
+
 export interface ExternalPlanReviewStatus {
+  /** Absent on older providers; absence never means an empty finding list. */
+  readonly pendingRound?: ExternalPlanReviewPendingRound | null;
   /** Required by the provider's contract; never invented when absent. */
   readonly sessionId: string;
   readonly stage: string;
