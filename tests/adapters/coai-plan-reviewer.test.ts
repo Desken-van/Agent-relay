@@ -203,6 +203,47 @@ describe('Coai plan reviewer adapter', () => {
     ]);
   });
 
+  it('recovers indexed pending findings with the completed plan round receipt using status only', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('status', statusValue({
+      awaitingResolve: true, threshold: 6,
+      rounds: [{ stage: 'PlanReview', number: 1, status: 'done', verdict: 'proceed',
+        gatingCount: 1, reviewers: '1 of 2 reviewers answered; failed: second reviewer timeout' }],
+      pending: [{ severity: 'Major', category: 'Feasibility', title: 'Byte repair',
+        why: 'The repair cannot change bytes.', fix: 'Block on an unsupported repair.', providers: ['codex'] }]
+    })));
+    const answer = await new CoaiPlanReviewer(client, config).status({ repositoryPath: 'C:\\repo', branch: 'agent/task' });
+    expect(answer).toMatchObject({ pendingRound: { number: 1, verdict: 'proceed', gatingCount: 1,
+      threshold: 6, findings: [{ severity: 'major', category: 'feasibility', title: 'Byte repair' }] } });
+    expect(client.calls.map(call => call.tool)).toEqual(['status']);
+  });
+
+  it.each(['missing-number', 'wrong-number', 'running', 'missing-reviewers', 'malformed-finding'])(
+    'rejects a pending receipt with %s rather than inventing findings', async (scenario) => {
+      const client = new FakeMcpClient();
+      const round: Record<string, unknown> = { stage: 'PlanReview', number: 1, status: 'done',
+        verdict: 'proceed', gatingCount: 0, reviewers: 'all 2 reviewers answered' };
+      if (scenario === 'missing-number') delete round.number;
+      if (scenario === 'wrong-number') round.number = 2;
+      if (scenario === 'running') round.status = 'running';
+      if (scenario === 'missing-reviewers') delete round.reviewers;
+      client.responses.push(result('status', statusValue({ awaitingResolve: true, threshold: 6,
+        rounds: [round], pending: scenario === 'malformed-finding' ? [{}] : [] })));
+      await expect(new CoaiPlanReviewer(client, config).status({ repositoryPath: 'C:\\repo', branch: 'agent/task' }))
+        .rejects.toMatchObject({ code: 'PARSE_FAILED' });
+      expect(client.calls.map(call => call.tool)).toEqual(['status']);
+    }
+  );
+
+  it('preserves an explicit empty pending list as a recoverable clean round', async () => {
+    const client = new FakeMcpClient();
+    client.responses.push(result('status', statusValue({ awaitingResolve: true, threshold: 6,
+      rounds: [{ stage: 'PlanReview', number: 1, status: 'done', verdict: 'proceed',
+        gatingCount: 0, reviewers: 'all 2 reviewers answered' }], pending: [] })));
+    expect(await new CoaiPlanReviewer(client, config).status({ repositoryPath: 'C:\\repo', branch: 'agent/task' }))
+      .toMatchObject({ pendingRound: { number: 1, findings: [] } });
+  });
+
   it('reports the documented absent-session refusal as typed positive evidence', async () => {
     const client = new FakeMcpClient();
     client.responses.push(result('status', {
