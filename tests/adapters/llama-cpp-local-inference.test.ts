@@ -493,6 +493,25 @@ describe('local inference request', () => {
     // Never the machine-local model source.
     expect(JSON.stringify(body)).not.toContain('ornith-8b-q4');
     expect('chat_template_kwargs' in body).toBe(false);
+    expect('response_format' in body).toBe(false);
+  });
+
+  it('maps a JSON schema to llama.cpp constrained decoding', async () => {
+    const { provider, calls } = await started(() => json(completion()));
+    const schema = {
+      type: 'object',
+      properties: { action: { const: 'git_status' } },
+      required: ['action'],
+      additionalProperties: false
+    };
+    await provider.infer(
+      request({ responseFormat: { type: 'json_schema', name: 'ornith_action_v1', schema } })
+    );
+
+    expect(JSON.parse(String(posts(calls)[0]?.init.body)).response_format).toEqual({
+      type: 'json_schema',
+      json_schema: { name: 'ornith_action_v1', strict: true, schema }
+    });
   });
 
   it('lowers but never raises the configured output cap', async () => {
@@ -503,6 +522,13 @@ describe('local inference request', () => {
     const sent = posts(calls);
     expect(JSON.parse(String(sent[0]?.init.body)).max_tokens).toBe(4);
     expect(JSON.parse(String(sent[1]?.init.body)).max_tokens).toBe(256);
+  });
+
+  it('passes a request-local deterministic temperature through to llama.cpp', async () => {
+    const { provider, calls } = await started(() => json(completion()));
+    await provider.infer(request({ temperature: 0 }));
+
+    expect(JSON.parse(String(posts(calls)[0]?.init.body)).temperature).toBe(0);
   });
 
   it('passes chat template parameters through, false included', async () => {

@@ -543,4 +543,30 @@ describe('OrnithWorktreeTools containment and budgets', () => {
       }
     }
   });
+
+  it('returns a bounded matched-line preview, exact byte offset and file hash from search', async () => {
+    const boundary = tools();
+    const result = await boundary.searchText({
+      version: 1,
+      action: 'search_text',
+      query: 'omega',
+      caseSensitive: false,
+      limit: 10,
+      files: ['fixture.txt']
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const raw = readFileSync(join(worktree, 'fixture.txt'));
+    expect(result.forModel).toEqual({
+      matches: [{
+        path: 'fixture.txt',
+        line: 1,
+        byteOffset: 0,
+        preview: expect.stringContaining('alpha π omega'),
+        sha256: createHash('sha256').update(raw).digest('hex')
+      }],
+      truncated: false
+    });
+  });
 });

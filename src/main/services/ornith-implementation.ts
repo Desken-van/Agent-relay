@@ -23,7 +23,9 @@
  */
 
 import {
+  ORNITH_ACTION_JSON_SCHEMA,
   ORNITH_LIMITS,
+  ORNITH_NONTERMINAL_ACTION_KINDS,
   containsAbsoluteMachinePath,
   parseOrnithCompletion,
   type OrnithAction,
@@ -43,6 +45,8 @@ import type { TaskSpecification } from '../../shared/schemas/codex';
 import type { AgentProgressEvent, ImplementationResult, OrnithHealthyLease, OrnithInferenceLeaseService } from '../ports';
 import type { ProcessRunner } from '../adapters/process/process-runner';
 import { OrnithWorktreeTools, type OrnithOperationBudget, type OrnithToolResult } from './ornith-worktree-tools';
+
+type OrnithResponseSchema = NonNullable<LocalInferenceRequest['responseFormat']>['schema'];
 
 /* -------------------------------------------------------------------------- */
 /* Request / result                                                           */
@@ -107,9 +111,203 @@ export interface OrnithImplementationResult extends ImplementationResult {
 
 interface RollingResult {
   readonly turn: number;
-  readonly action: OrnithActionKind;
+  readonly action: OrnithActionKind | 'protocol_error';
   /** Bounded JSON text: either the tool's `forModel`, or a denial description. */
   readonly resultText: string;
+}
+
+interface ReadCoverage {
+  readonly sha256: string;
+  readonly ranges: readonly { start: number; end: number }[];
+  /** Exact byte position immediately after the file when a successful read reached EOF. */
+  readonly eofAt: number | null;
+}
+
+const RECOVERABLE_TOOL_CODES = new Set<OrnithDenialCode>([
+  'duplicate_action',
+  'verification_not_ready',
+  'file_exists',
+  'file_not_found',
+  'stale_hash',
+  'replacement_mismatch',
+  'timeout'
+]);
+
+/**
+ * Only cool down an action when repeating that action kind cannot be the
+ * immediate repair. A stale hash or mismatched replacement must keep
+ * `replace_text` available: the safe recovery is another replacement using
+ * the trusted current hash/exact text, not deleting and recreating the file.
+ */
+const COOLDOWN_TOOL_CODES = new Set<OrnithDenialCode>([
+  'verification_not_ready',
+  'file_exists',
+  'file_not_found',
+  'timeout'
+]);
+
+const ORNITH_OBSERVATION_ACTIONS: readonly OrnithActionKind[] = [
+  'list_files',
+  'read_file',
+  'search_text',
+  'git_status',
+  'git_diff'
+];
+
+function nextUnreadAction(
+  action: Extract<OrnithAction, { action: 'read_file' }>,
+  coverage: ReadCoverage | undefined
+): Extract<OrnithAction, { action: 'read_file' }> | null {
+  if (coverage === undefined) return action;
+  if (coverage.eofAt !== null && action.offset >= coverage.eofAt) return null;
+  const requestedEnd = Math.min(
+    action.offset + action.limit,
+    coverage.eofAt ?? Number.POSITIVE_INFINITY
+  );
+  let start = action.offset;
+  const ranges = [...coverage.ranges].sort((left, right) => left.start - right.start);
+  for (const range of ranges) {
+    if (range.end <= start) continue;
+    if (range.start > start) break;
+    start = Math.max(start, range.end);
+  }
+  if (start >= requestedEnd) return null;
+  const nextCovered = ranges.find((range) => range.start > start && range.start < requestedEnd);
+  return {
+    ...action,
+    offset: start,
+    limit: Math.max(1, (nextCovered?.start ?? requestedEnd) - start)
+  };
+}
+
+function addReadCoverage(coverage: Map<string, ReadCoverage>, value: unknown): void {
+  if (typeof value !== 'object' || value === null) return;
+  const result = value as Record<string, unknown>;
+  if (
+    typeof result.path !== 'string' ||
+    typeof result.offset !== 'number' ||
+    typeof result.bytesRead !== 'number' ||
+    typeof result.sha256 !== 'string'
+  ) return;
+  const previous = coverage.get(result.path);
+  const ranges = previous?.sha256 === result.sha256 ? [...previous.ranges] : [];
+  if (result.bytesRead > 0) {
+    ranges.push({ start: result.offset, end: result.offset + result.bytesRead });
+  }
+  const eofAt = result.eof === true
+    ? result.offset + result.bytesRead
+    : previous?.sha256 === result.sha256
+      ? previous.eofAt
+      : null;
+  coverage.set(result.path, { sha256: result.sha256, ranges, eofAt });
+}
+
+function finishSummaryReportsBlockage(summary: string): boolean {
+  const normalized = summary.replace(/\s+/gu, ' ').trim();
+  return /(?:^|[.!?]\s+)(?:i|we)\s+(?:cannot|can't|could not|couldn't)\b/iu.test(normalized) ||
+    /(?:^|[.!?]\s+)(?:i am|we are)\s+blocked\b/iu.test(normalized);
+}
+
+function addKnownFileHashes(hashes: Map<string, string>, value: unknown): void {
+  if (typeof value !== 'object' || value === null) return;
+  const result = value as Record<string, unknown>;
+  if (typeof result.path === 'string' && typeof result.sha256 === 'string') {
+    hashes.set(result.path, result.sha256);
+  }
+  if (!Array.isArray(result.matches)) return;
+  for (const match of result.matches) {
+    if (typeof match !== 'object' || match === null) continue;
+    const record = match as Record<string, unknown>;
+    if (typeof record.path === 'string' && typeof record.sha256 === 'string') {
+      hashes.set(record.path, record.sha256);
+    }
+  }
+}
+
+function reusableReadOnlyActionKey(action: OrnithAction): string | null {
+  return action.action === 'list_files' ||
+    action.action === 'search_text' ||
+    action.action === 'git_status' ||
+    action.action === 'git_diff'
+    ? JSON.stringify(action)
+    : null;
+}
+
+function responseSchemaWithoutActions(actions: readonly OrnithActionKind[]): OrnithResponseSchema {
+  const schema = structuredClone(ORNITH_ACTION_JSON_SCHEMA);
+  const excluded = new Set(actions);
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const entry of value) visit(entry);
+      return;
+    }
+    if (typeof value !== 'object' || value === null) return;
+    const record = value as Record<string, unknown>;
+    for (const key of ['anyOf', 'oneOf']) {
+      const branches = record[key];
+      if (!Array.isArray(branches)) continue;
+      record[key] = branches.filter((branch) => {
+        if (typeof branch !== 'object' || branch === null) return true;
+        const properties = (branch as Record<string, unknown>).properties;
+        if (typeof properties !== 'object' || properties === null) return true;
+        const actionProperty = (properties as Record<string, unknown>).action;
+        if (typeof actionProperty !== 'object' || actionProperty === null) return true;
+        return !excluded.has((actionProperty as Record<string, unknown>).const as OrnithActionKind);
+      });
+    }
+    for (const child of Object.values(record)) visit(child);
+  };
+  visit(schema);
+  return schema;
+}
+
+function redactBoundRootPaths(
+  value: string,
+  roots: readonly { path: string; replacement: string }[]
+): string {
+  return [...roots]
+    .filter(({ path }) => path.trim().length > 0)
+    .sort((left, right) => right.path.length - left.path.length)
+    .reduce((redacted, { path, replacement }) => {
+      const normalized = path.replace(/[\\/]+$/u, '');
+      const pattern = normalized
+        .split(/[\\/]+/u)
+        .map((segment) => segment.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'))
+        .join('[\\\\/]');
+      return redacted.replace(new RegExp(pattern, 'giu'), replacement);
+    }, value);
+}
+
+function promptRequestWithBoundRootsRedacted(
+  request: OrnithImplementationRequest
+): OrnithPromptPreflightInput {
+  const roots = [
+    { path: request.worktreePath, replacement: '[worktree-root]' },
+    { path: request.worktreesRoot, replacement: '[worktrees-root]' },
+    { path: request.repositoryPath, replacement: '[repository-root]' }
+  ];
+  const redact = (value: string): string => redactBoundRootPaths(value, roots);
+  return {
+    specification: {
+      title: redact(request.specification.title),
+      summary: redact(request.specification.summary),
+      acceptanceCriteria: request.specification.acceptanceCriteria.map(redact),
+      constraints: request.specification.constraints.map(redact),
+      assumptions: request.specification.assumptions.map(redact),
+      suggestedTests: request.specification.suggestedTests.map(redact),
+      implementationPrompt: redact(request.specification.implementationPrompt)
+    },
+    ruleEvidence: request.ruleEvidence === null ? null : redact(request.ruleEvidence),
+    acceptedPlanReviewAddenda: request.acceptedPlanReviewAddenda === null
+      ? null
+      : redact(request.acceptedPlanReviewAddenda),
+    correctionFindings: request.correctionFindings === null
+      ? null
+      : redact(request.correctionFindings),
+    round: request.round,
+    maxRounds: request.maxRounds,
+    lease: request.lease
+  };
 }
 
 function renderSpecification(specification: TaskSpecification): string {
@@ -158,11 +356,31 @@ Rules:
 - "replace_text" requires the file's CURRENT sha256 (given in the last read_file/create_file/
   replace_text result for that file) and fails with no write if oldText does not occur
   exactly once.
+- Use "create_file" only for a path that does not exist. Use "replace_text" to edit an
+  existing file. Never delete and recreate an existing file as a workaround for a stale
+  hash or replacement mismatch; refresh the hash/exact text and retry "replace_text".
+- Use "delete_file" only when the approved specification explicitly requires that file
+  to be removed. A failed edit is never permission to delete the file.
 - You have no git commit, push, merge, checkout, reset, or remote access of any kind —
   do not ask for one, it does not exist.
 - Call "run_verification" only when you believe the work is complete; Agent Relay itself
-  re-verifies afterward regardless.
-- Call "finish" only when the acceptance criteria are met. Call "blocked" only when you
+  re-verifies afterward regardless. Verification is unavailable until a repository mutation
+  has produced a changed file, and becomes unavailable again after it runs until another
+  mutation changes the worktree.
+- Treat PRIOR TOOL RESULTS as memory. Never request a byte range that a successful
+  read_file result already returned for the same file and sha256. Use search_text plus
+  small, non-overlapping read_file ranges for long files, then edit and move on.
+- read_file offset and limit are UTF-8 BYTE positions/counts, never line numbers. A
+  reviewer location such as README.md:495 means line 495, not byte offset 495. Find
+  the named text with search_text or inspect git_diff; never guess a byte offset from
+  a review line number.
+- A successful git_diff result contains the current patch and exact edit anchors. A
+  successful list_files/git_status result proves those paths exist. Do not claim a file
+  is absent or inaccessible after those results prove otherwise.
+- Every turn must advance the task. Do not repeat a successful read, search, status or
+  diff action unless a later write could have changed its result.
+- Call "finish" only when the acceptance criteria are met; its summary must describe
+  completed work and must not report inability or blockage. Call "blocked" when you
   cannot proceed and must stop.
 - Every reply is judged on its own: nothing you say outside the JSON is read.`;
 
@@ -234,8 +452,7 @@ function authoritativePromptText(request: OrnithPromptPreflightInput): string {
       ? `=== USER-ACCEPTED EXTERNAL PLAN-REVIEW ADDENDA ===\n${request.acceptedPlanReviewAddenda}`
       : null,
     request.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${request.ruleEvidence}` : null,
-    request.correctionFindings ? `=== EVIDENCE FROM THE PREVIOUS ATTEMPT ===\n${request.correctionFindings}` : null,
-    ORNITH_PROTOCOL_INSTRUCTIONS
+    request.correctionFindings ? `=== EVIDENCE FROM THE PREVIOUS ATTEMPT ===\n${request.correctionFindings}` : null
   ]
     .filter((part): part is string => part !== null)
     .join('\n\n');
@@ -248,7 +465,10 @@ function authoritativePromptText(request: OrnithPromptPreflightInput): string {
  */
 export function preflightOrnithPrompt(input: OrnithPromptPreflightInput): OrnithPromptPreflight {
   const budget = promptBudgetFor(input.lease);
-  const authoritativeBytes = Buffer.byteLength(authoritativePromptText(input), 'utf8');
+  const authoritativeBytes = Buffer.byteLength(
+    `${ORNITH_PROTOCOL_INSTRUCTIONS}\n\n${authoritativePromptText(input)}`,
+    'utf8'
+  );
   const fixedBudgetBytes = Buffer.byteLength(`=== REMAINING BUDGET ===
 Model turns remaining: ${ORNITH_LIMITS.maxModelTurns}
 Non-terminal actions remaining: ${ORNITH_LIMITS.maxNonterminalActions}
@@ -261,15 +481,38 @@ Round ${input.round} of at most ${input.maxRounds}.
 
 Reply with exactly one JSON action now.`, 'utf8');
   const requiredPromptBytes = authoritativeBytes + 2 + fixedBudgetBytes;
-  if (requiredPromptBytes <= budget.maxPromptBytes) return { ok: true, budget };
+  // A stateless turn is useful only if at least one bounded tool result can be
+  // carried into the next request. Previously the first read could consume
+  // half of the nominal prompt window even when the immutable specification
+  // already occupied most of it; buildOrnithPromptText then silently omitted
+  // that result and the model repeated the read forever. Reserve explicit
+  // rolling-context headroom and clamp every individual result to that exact
+  // remainder.
+  const rollingEntryOverheadBytes = 512;
+  const minimumRetainedToolResultBytes = 2_048;
+  const availableRollingBytes = budget.maxPromptBytes - requiredPromptBytes;
+  if (availableRollingBytes >= minimumRetainedToolResultBytes + rollingEntryOverheadBytes) {
+    return {
+      ok: true,
+      budget: {
+        ...budget,
+        maxToolResultBytes: Math.min(
+          budget.maxToolResultBytes,
+          availableRollingBytes - rollingEntryOverheadBytes
+        )
+      }
+    };
+  }
+  const requiredWithRollingContext =
+    requiredPromptBytes + rollingEntryOverheadBytes + minimumRetainedToolResultBytes;
   return {
     ok: false,
     reason:
-      `The immutable Ornith prompt needs ${requiredPromptBytes} bytes, but the retained ` +
+      `The immutable Ornith prompt plus one retained tool result needs ${requiredWithRollingContext} bytes, but the retained ` +
       `${input.lease.contextLimitTokens}-token runtime allows at most ${budget.maxPromptBytes} prompt bytes ` +
       `after output and template reserves.`,
     requiredContextTokens:
-      requiredPromptBytes + budget.maxOutputTokens + ORNITH_LIMITS.contextSafetyTokens
+      requiredWithRollingContext + budget.maxOutputTokens + ORNITH_LIMITS.contextSafetyTokens
   };
 }
 
@@ -281,7 +524,8 @@ function buildOrnithPromptText(
 ): string | null {
   const authoritative = authoritativePromptText(request);
 
-  if (Buffer.byteLength(authoritative, 'utf8') > promptBudget.maxPromptBytes) {
+  const protocolBytes = Buffer.byteLength(ORNITH_PROTOCOL_INSTRUCTIONS, 'utf8');
+  if (protocolBytes + Buffer.byteLength(authoritative, 'utf8') > promptBudget.maxPromptBytes) {
     return null;
   }
 
@@ -296,7 +540,7 @@ Maximum retained tool-result bytes: ${promptBudget.maxToolResultBytes}
 Round ${request.round} of at most ${request.maxRounds}.`;
 
   const fixedTail = `${budget}\n\nReply with exactly one JSON action now.`;
-  const fixedBytes = Buffer.byteLength(`${authoritative}\n\n${fixedTail}`, 'utf8');
+  const fixedBytes = protocolBytes + Buffer.byteLength(`${authoritative}\n\n${fixedTail}`, 'utf8');
   if (fixedBytes > promptBudget.maxPromptBytes) return null;
   const rollingByteBudget = Math.min(
     ORNITH_LIMITS.maxRollingContextBytes,
@@ -329,7 +573,7 @@ Round ${request.round} of at most ${request.maxRounds}.`;
     .filter((part) => part.length > 0)
     .join('\n\n');
 
-  return Buffer.byteLength(full, 'utf8') > promptBudget.maxPromptBytes
+  return protocolBytes + Buffer.byteLength(full, 'utf8') > promptBudget.maxPromptBytes
     ? // The rolling section alone pushed it over; drop history entirely and
       // retry with just the authoritative content and budget, which was
       // already proven to fit above.
@@ -339,11 +583,15 @@ Round ${request.round} of at most ${request.maxRounds}.`;
 
 function toMessages(promptText: string): LocalInferenceMessage[] {
   const CHUNK = 190_000;
-  const messages: LocalInferenceMessage[] = [];
+  const messages: LocalInferenceMessage[] = [
+    { role: 'system', content: ORNITH_PROTOCOL_INSTRUCTIONS }
+  ];
   for (let offset = 0; offset < promptText.length; offset += CHUNK) {
     messages.push({ role: 'user', content: promptText.slice(offset, offset + CHUNK) });
   }
-  return messages.length > 0 ? messages : [{ role: 'user', content: promptText }];
+  return promptText.length > 0
+    ? messages
+    : [...messages, { role: 'user', content: 'Reply with exactly one JSON action now.' }];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -386,11 +634,19 @@ export class OrnithImplementationService {
 
     const deadline = Date.now() + request.loopDeadlineMs;
     const rolling: RollingResult[] = [];
+    const readCoverage = new Map<string, ReadCoverage>();
+    const knownFileHashes = new Map<string, string>();
+    const successfulReadOnlyActions = new Set<string>();
     let turnsUsed = 0;
     let nonterminalActionsUsed = 0;
     let verificationsUsed = 0;
     let cumulativeReadBytes = 0;
     let cumulativeWriteBytes = 0;
+    let malformedRetries = 0;
+    let verificationReady = false;
+    let verificationPassedForCurrentSnapshot = false;
+    let nonMutatingActionsSinceWrite = 0;
+    const actionCooldowns = new Map<OrnithActionKind, number>();
     const outcomes: Array<{ sequence: number; action: OrnithActionKind; ok: boolean; code?: OrnithDenialCode }> = [];
     const finish = (
       disposition: 'pass' | 'fail', message: string,
@@ -410,25 +666,43 @@ export class OrnithImplementationService {
       }
     });
 
-    // These sources are authoritative and must be included byte-for-byte.
-    // Unsafe host paths or credentials therefore cause refusal before the
-    // first inference instead of being silently rewritten.
-    const promptSources = [
+    // Credential-shaped input is never rewritten. Bound checkout roots are
+    // different: Relay and its specification agent may legitimately mention
+    // them, but Ornith can only act through repository-relative tools. Replace
+    // those exact, already-verified roots with stable labels before inference,
+    // then refuse any other absolute machine path that remains.
+    const rawPromptSources = [
       renderSpecification(request.specification),
       request.acceptedPlanReviewAddenda,
       request.ruleEvidence,
       request.correctionFindings
     ].filter((value): value is string => value !== null);
-    if (promptSources.some((value) => containsSecretShape(value) || containsAbsoluteMachinePath(value))) {
+    if (rawPromptSources.some((value) => containsSecretShape(value))) {
       return finish(
         'fail',
-        'The approved Ornith inputs contain credential-shaped text or an absolute machine path.',
+        'The approved Ornith inputs contain credential-shaped text.',
         'security',
         ['disallowed_action']
       );
     }
 
-    const promptPreflight = preflightOrnithPrompt(request);
+    const promptRequest = promptRequestWithBoundRootsRedacted(request);
+    const promptSources = [
+      renderSpecification(promptRequest.specification),
+      promptRequest.acceptedPlanReviewAddenda,
+      promptRequest.ruleEvidence,
+      promptRequest.correctionFindings
+    ].filter((value): value is string => value !== null);
+    if (promptSources.some((value) => containsAbsoluteMachinePath(value))) {
+      return finish(
+        'fail',
+        'The approved Ornith inputs contain an absolute machine path outside the bound checkout.',
+        'security',
+        ['disallowed_action']
+      );
+    }
+
+    const promptPreflight = preflightOrnithPrompt(promptRequest);
     if (!promptPreflight.ok) {
       return finish(
         'fail',
@@ -487,7 +761,7 @@ export class OrnithImplementationService {
         );
       }
 
-      const promptText = buildOrnithPromptText(request, rolling, {
+      const promptText = buildOrnithPromptText(promptRequest, rolling, {
         turns: Math.max(0, ORNITH_LIMITS.maxModelTurns - turnsUsed),
         actions: Math.max(0, ORNITH_LIMITS.maxNonterminalActions - nonterminalActionsUsed),
         verifications: Math.max(0, ORNITH_LIMITS.maxVerificationCalls - verificationsUsed),
@@ -505,11 +779,48 @@ export class OrnithImplementationService {
       }
 
       const requestId = `ornith-${Date.now().toString(36)}-${turnsUsed}`;
+      const excludedActions = new Set([...actionCooldowns.entries()]
+        .filter(([, remaining]) => remaining > 0)
+        .map(([action]) => action));
+      if (!verificationReady || tools.changedFileCount() === 0) {
+        excludedActions.add('run_verification');
+      }
+      if (
+        nonMutatingActionsSinceWrite >= ORNITH_LIMITS.maxNonMutatingActionsBetweenWrites ||
+        (turnsUsed >= ORNITH_LIMITS.maxModelTurns - 5 && tools.changedFileCount() > 0)
+      ) {
+        for (const action of ORNITH_OBSERVATION_ACTIONS) excludedActions.add(action);
+      }
+      if (verificationPassedForCurrentSnapshot) {
+        for (const action of ORNITH_NONTERMINAL_ACTION_KINDS) excludedActions.add(action);
+      }
+      for (const [action, remaining] of actionCooldowns) {
+        if (remaining <= 1) actionCooldowns.delete(action);
+        else actionCooldowns.set(action, remaining - 1);
+      }
       const inferRequest: LocalInferenceRequest = {
         version: LOCAL_INFERENCE_CONTRACT_VERSION,
         requestId,
         messages: toMessages(promptText),
-        maxOutputTokens: promptBudget.maxOutputTokens
+        maxOutputTokens: promptBudget.maxOutputTokens,
+        // The protocol should choose the best next action, not sample a
+        // different workflow on each retry. Schema gates below provide the
+        // exploration needed to recover from a refused action.
+        temperature: 0,
+        // Ornith is an action generator inside a bounded machine protocol.
+        // Hidden reasoning consumes the same output budget but cannot be
+        // parsed or acted upon, so require the Qwen-compatible non-thinking
+        // template path for every turn.
+        chatTemplateParameters: { enable_thinking: false },
+        responseFormat: {
+          type: 'json_schema',
+          name: excludedActions.size === 0
+            ? 'ornith_action_v1'
+            : 'ornith_action_v1_recovery',
+          schema: excludedActions.size === 0
+            ? ORNITH_ACTION_JSON_SCHEMA
+            : responseSchemaWithoutActions([...excludedActions])
+        }
       };
 
       turnsUsed += 1;
@@ -568,8 +879,38 @@ export class OrnithImplementationService {
 
       const parsed = parseOrnithCompletion(response.completion);
       if (!parsed.ok) {
-        return finish('fail', 'Ornith returned output that could not be accepted.', 'configuration', [parsed.code]);
+        malformedRetries += 1;
+        if (parsed.attemptedAction !== undefined) {
+          actionCooldowns.set(
+            parsed.attemptedAction,
+            Math.max(actionCooldowns.get(parsed.attemptedAction) ?? 0, 4)
+          );
+        }
+        if (malformedRetries <= ORNITH_LIMITS.maxMalformedRetries) {
+          rolling.push({
+            turn: turnsUsed,
+            action: 'protocol_error',
+            resultText: boundedJson({
+              ok: false,
+              code: parsed.code,
+              reason: parsed.reason,
+              instruction: 'Return exactly one complete action matching the supplied JSON schema. No action was executed.'
+            }, promptBudget.maxToolResultBytes)
+          });
+          request.onProgress({
+            type: 'progress',
+            text: `Ornith protocol output was rejected; retry ${malformedRetries} of ${ORNITH_LIMITS.maxMalformedRetries}.`
+          });
+          continue;
+        }
+        return finish(
+          'fail',
+          `Ornith returned output that could not be accepted: ${parsed.reason}`,
+          'configuration',
+          [parsed.code]
+        );
       }
+      malformedRetries = 0;
       const action = parsed.action;
 
       // The identity/health check inside `inferForOrnith` covers the instant
@@ -621,6 +962,49 @@ export class OrnithImplementationService {
             ['disallowed_action']
           );
         }
+        if (request.runType === 'correction' && tools.changedFileCount() === 0) {
+          actionCooldowns.set('finish', Math.max(actionCooldowns.get('finish') ?? 0, 4));
+          rolling.push({
+            turn: turnsUsed,
+            action: 'finish',
+            resultText: boundedJson({
+              ok: false,
+              code: 'verification_not_ready',
+              reason: 'A correction cannot finish before this run makes at least one repository mutation.',
+              instruction: 'Apply the requested correction with create_file, replace_text, or delete_file before finishing.'
+            }, promptBudget.maxToolResultBytes)
+          });
+          request.onProgress({
+            type: 'tool_use',
+            text: 'Ornith finish denied because the correction made no changes.',
+            data: {
+              sequence: nonterminalActionsUsed + 1,
+              action: 'finish',
+              ok: false,
+              code: 'verification_not_ready',
+              providerId: request.lease.providerId,
+              modelId: request.lease.modelId,
+              runtimeInstanceId: request.lease.runtimeInstanceId
+            }
+          });
+          continue;
+        }
+        if (finishSummaryReportsBlockage(action.summary)) {
+          request.onProgress({
+            type: 'tool_use',
+            text: 'Ornith used finish for a blocked outcome; Agent Relay rejected it.',
+            data: {
+              sequence: nonterminalActionsUsed + 1,
+              action: 'finish',
+              ok: false,
+              code: 'blocked',
+              providerId: request.lease.providerId,
+              modelId: request.lease.modelId,
+              runtimeInstanceId: request.lease.runtimeInstanceId
+            }
+          });
+          return finish('fail', 'Ornith reported that it could not continue.', 'configuration', ['blocked']);
+        }
         request.onProgress({ type: 'assistant_message', text: 'Ornith finished.' });
         return finish('pass', action.summary, 'verification', []);
       }
@@ -653,6 +1037,7 @@ export class OrnithImplementationService {
 
       const changedPath = 'path' in action && (action.action === 'create_file' || action.action === 'replace_text' || action.action === 'delete_file')
         ? action.path : null;
+      const readOnlyActionKey = reusableReadOnlyActionKey(action);
       if (changedPath !== null && tools.wouldExceedChangedFileLimit(changedPath)) {
         return finish(
           'fail',
@@ -665,10 +1050,19 @@ export class OrnithImplementationService {
       let toolResult: OrnithToolResult;
       const operationStarted = Date.now();
       if (action.action === 'run_verification') {
-        if (verificationsUsed >= ORNITH_LIMITS.maxVerificationCalls) {
+        if (!verificationReady || tools.changedFileCount() === 0) {
+          toolResult = {
+            ok: false,
+            code: 'verification_not_ready',
+            reason:
+              'Verification is available only after a repository mutation has produced a changed file, ' +
+              'and only once per resulting snapshot. Make the required edit first.'
+          };
+        } else if (verificationsUsed >= ORNITH_LIMITS.maxVerificationCalls) {
           return finish('fail', 'The verification-call budget for this run is exhausted.', 'configuration', ['limit_verification_calls_exceeded']);
         } else {
           verificationsUsed += 1;
+          verificationReady = false;
           // The caller's closure additionally clamps this to its own process
           // timeout — see the `runVerification` field doc and the Orchestrator
           // wiring, which is where `settings.processTimeoutMs` is known.
@@ -691,6 +1085,7 @@ export class OrnithImplementationService {
               writeBytes: 0,
               auditSummary: `run_verification -> ${result.passed ? 'passed' : 'failed'}`
             };
+            verificationPassedForCurrentSnapshot = result.passed;
           } catch (error) {
             if (request.signal.aborted) {
               throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
@@ -709,41 +1104,90 @@ export class OrnithImplementationService {
           }
         }
       } else {
-        const operationRemainingMs = deadline - Date.now();
-        if (operationRemainingMs <= 0) {
-          return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+        const requestedReadPath = action.action === 'read_file' ? action.path : null;
+        let effectiveAction: Exclude<OrnithAction, { action: 'finish' } | { action: 'blocked' } | { action: 'run_verification' }> | null = action;
+        let duplicateReason: string | null = null;
+        if (readOnlyActionKey !== null && successfulReadOnlyActions.has(readOnlyActionKey)) {
+          effectiveAction = null;
+          duplicateReason =
+            'That read-only action already succeeded and no write has changed its result. ' +
+            'Use its PRIOR TOOL RESULT and choose a different action.';
+        } else if (action.action === 'read_file') {
+          effectiveAction = nextUnreadAction(action, readCoverage.get(action.path));
         }
-        const operationSignal = deadlineSignal(request.signal, operationRemainingMs);
-        try {
-          if (!(await tools.assertCheckoutIdentity(operationSignal.signal))) {
-            return finish('fail', 'The task worktree checkout identity changed.', 'security', ['checkout_identity_changed']);
-          }
-          toolResult = await this.dispatchToolAction(tools, action, operationSignal.signal, {
-            readBytes: ORNITH_LIMITS.maxCumulativeReadBytes - cumulativeReadBytes,
-            writeBytes: ORNITH_LIMITS.maxCumulativeWriteBytes - cumulativeWriteBytes
-          }, promptBudget.maxToolResultBytes);
-        } catch (error) {
-          if (request.signal.aborted) throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
-          if (operationSignal.timedOut()) {
+        if (effectiveAction === null) {
+          toolResult = {
+            ok: false,
+            code: 'duplicate_action',
+            reason: duplicateReason ??
+              `That byte range of "${requestedReadPath ?? 'the requested file'}" was already returned and remains available in PRIOR TOOL RESULTS. ` +
+              'Use an unread range, search a named file, make the edit, or finish.'
+          };
+        } else {
+          const operationRemainingMs = deadline - Date.now();
+          if (operationRemainingMs <= 0) {
             return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
           }
-          throw error;
-        } finally {
-          operationSignal.dispose();
-        }
-        if (operationSignal.timedOut() || Date.now() >= deadline) {
-          return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+          const operationSignal = deadlineSignal(request.signal, operationRemainingMs);
+          try {
+            if (!(await tools.assertCheckoutIdentity(operationSignal.signal))) {
+              return finish('fail', 'The task worktree checkout identity changed.', 'security', ['checkout_identity_changed']);
+            }
+            toolResult = await this.dispatchToolAction(tools, effectiveAction, operationSignal.signal, {
+              readBytes: ORNITH_LIMITS.maxCumulativeReadBytes - cumulativeReadBytes,
+              writeBytes: ORNITH_LIMITS.maxCumulativeWriteBytes - cumulativeWriteBytes
+            }, promptBudget.maxToolResultBytes);
+          } catch (error) {
+            if (request.signal.aborted) throw new AgentRelayError('CANCELLED', 'The Ornith run was cancelled.');
+            if (operationSignal.timedOut()) {
+              return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+            }
+            throw error;
+          } finally {
+            operationSignal.dispose();
+          }
+          if (operationSignal.timedOut() || Date.now() >= deadline) {
+            return finish('fail', 'The Ornith implementation loop exceeded its overall time budget.', 'configuration', ['limit_deadline_exceeded']);
+          }
         }
       }
 
       const durationMs = Date.now() - operationStarted;
       if (!toolResult.ok) {
+        nonMutatingActionsSinceWrite += 1;
         outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code });
         request.onProgress({
           type: 'tool_use',
           text: `Ornith action ${action.action} denied (${toolResult.code}).`,
           data: { sequence: nonterminalActionsUsed, action: action.action, ok: false, code: toolResult.code, durationMs }
         });
+        if (RECOVERABLE_TOOL_CODES.has(toolResult.code)) {
+          if (COOLDOWN_TOOL_CODES.has(toolResult.code)) {
+            actionCooldowns.set(action.action, Math.max(actionCooldowns.get(action.action) ?? 0, 4));
+          }
+          const knownSha = 'path' in action ? knownFileHashes.get(action.path) : undefined;
+          const recoveryReason = toolResult.code === 'stale_hash' && knownSha !== undefined
+            ? `${toolResult.reason} Use the exact current SHA-256 ${knownSha}.`
+            : toolResult.reason;
+          const recoveryInstruction = toolResult.code === 'stale_hash'
+            ? 'Retry the intended replace_text or delete_file with the exact current SHA-256. Do not delete and recreate an existing file to repair an edit.'
+            : toolResult.code === 'replacement_mismatch'
+              ? 'Read or search for a small exact current fragment, then retry replace_text with that unique oldText. Do not delete and recreate the file.'
+              : toolResult.code === 'file_exists'
+                ? 'The file already exists. Edit it with replace_text using its current SHA-256; do not delete and recreate it.'
+                : 'Correct the next action and do not repeat this request unchanged.';
+          rolling.push({
+            turn: turnsUsed,
+            action: action.action,
+            resultText: boundedJson({
+              ok: false,
+              code: toolResult.code,
+              reason: recoveryReason,
+              instruction: recoveryInstruction
+            }, promptBudget.maxToolResultBytes)
+          });
+          continue;
+        }
         return finish('fail', 'Agent Relay refused an unsafe or over-limit Ornith action.', 'security', [toolResult.code]);
       }
 
@@ -755,6 +1199,28 @@ export class OrnithImplementationService {
       }
       cumulativeReadBytes += toolResult.readBytes;
       cumulativeWriteBytes += toolResult.writeBytes;
+      if (action.action === 'read_file') addReadCoverage(readCoverage, toolResult.forModel);
+      addKnownFileHashes(knownFileHashes, toolResult.forModel);
+      if (readOnlyActionKey !== null) successfulReadOnlyActions.add(readOnlyActionKey);
+      if ('path' in action && (
+        action.action === 'create_file' || action.action === 'replace_text' || action.action === 'delete_file'
+      )) {
+        readCoverage.delete(action.path);
+        knownFileHashes.delete(action.path);
+        successfulReadOnlyActions.clear();
+      }
+      if (
+        action.action === 'create_file' ||
+        action.action === 'replace_text' ||
+        action.action === 'delete_file'
+      ) {
+        verificationReady = tools.changedFileCount() > 0;
+        verificationPassedForCurrentSnapshot = false;
+        nonMutatingActionsSinceWrite = 0;
+        if (verificationReady) actionCooldowns.delete('run_verification');
+      } else {
+        nonMutatingActionsSinceWrite += 1;
+      }
       outcomes.push({ sequence: nonterminalActionsUsed, action: action.action, ok: true });
 
       request.onProgress({

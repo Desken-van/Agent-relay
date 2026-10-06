@@ -572,6 +572,34 @@ describe('local inference request', () => {
     );
     expect(parsed.chatTemplateParameters).toEqual({ enable_thinking: false });
   });
+
+  it('accepts a bounded request temperature, including deterministic zero', () => {
+    expect(localInferenceRequestSchema.parse(request({ temperature: 0 })).temperature).toBe(0);
+    expect(localInferenceRequestSchema.safeParse(request({ temperature: -0.01 })).success).toBe(false);
+    expect(localInferenceRequestSchema.safeParse(request({ temperature: 2.01 })).success).toBe(false);
+  });
+
+  it('accepts a JSON-schema response format and rejects unknown formats', () => {
+    const parsed = localInferenceRequestSchema.parse(
+      request({
+        responseFormat: {
+          type: 'json_schema',
+          name: 'ornith_action_v1',
+          schema: { type: 'object', additionalProperties: false }
+        }
+      })
+    );
+    expect(parsed.responseFormat).toEqual({
+      type: 'json_schema',
+      name: 'ornith_action_v1',
+      schema: { type: 'object', additionalProperties: false }
+    });
+    expect(
+      localInferenceRequestSchema.safeParse(
+        request({ responseFormat: { type: 'json_object', name: 'x', schema: {} } })
+      ).success
+    ).toBe(false);
+  });
 });
 
 describe('local inference prompt', () => {

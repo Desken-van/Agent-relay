@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ExecaProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
 import { OrnithImplementationService } from '../../src/main/services/ornith-implementation';
-import type { OrnithHealthyLease, OrnithInferenceLeaseService } from '../../src/main/ports';
+import type { AgentProgressEvent, OrnithHealthyLease, OrnithInferenceLeaseService } from '../../src/main/ports';
 import { AgentRelayError } from '../../src/shared/domain/errors';
 import {
   LOCAL_INFERENCE_CONTRACT_VERSION,
@@ -182,6 +182,17 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(requests).toHaveLength(2);
     for (const request of requests) {
       expect(request.maxOutputTokens).toBe(1_024);
+      expect(request.messages[0]).toMatchObject({
+        role: 'system',
+        content: expect.stringContaining('Every reply you send MUST be exactly one JSON object')
+      });
+      expect(request.messages.filter((message) => message.role === 'system')).toHaveLength(1);
+      expect(request.responseFormat).toMatchObject({
+        type: 'json_schema',
+        name: 'ornith_action_v1_recovery'
+      });
+      expect(request.chatTemplateParameters).toEqual({ enable_thinking: false });
+      expect(request.responseFormat?.schema).toMatchObject({ $schema: expect.any(String) });
       const bytes = request.messages.reduce(
         (sum, message) => sum + Buffer.byteLength(message.content, 'utf8'),
         0
@@ -190,6 +201,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
     }
     const secondPrompt = requests[1]!.messages.map((message) => message.content).join('');
     expect(secondPrompt).toContain('"path":"large-context.txt"');
+    expect(secondPrompt).toContain('x'.repeat(512));
     expect(secondPrompt).not.toContain('x'.repeat(10_000));
   }, 60_000);
 
@@ -252,6 +264,49 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(readFileSync(join(worktree, 'fixture.txt'), 'utf8')).toContain('ornith');
   }, 60_000);
 
+  it('does not allow verification before a changed snapshot or twice for the same snapshot', async () => {
+    const sha256 = createHash('sha256').update(readFileSync(join(worktree, 'fixture.txt'))).digest('hex');
+    const actions = [
+      { version: 1, action: 'run_verification' },
+      {
+        version: 1,
+        action: 'replace_text',
+        path: 'fixture.txt',
+        sha256,
+        replacements: [{ oldText: 'fixture', newText: 'ornith' }]
+      },
+      { version: 1, action: 'run_verification' },
+      { version: 1, action: 'run_verification' },
+      { version: 1, action: 'finish', summary: 'Updated and verified the changed fixture.' }
+    ];
+    const requests: LocalInferenceRequest[] = [];
+    let verifications = 0;
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(request, JSON.stringify(actions[requests.length - 1]!));
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal),
+      runVerification: async () => {
+        verifications += 1;
+        return { passed: true, summary: 'passed' };
+      }
+    });
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(verifications).toBe(1);
+    expect(result.ornithAudit.outcomes.filter((outcome) => outcome.code === 'verification_not_ready')).toHaveLength(2);
+    expect(JSON.stringify(requests[0]!.responseFormat?.schema)).not.toContain('run_verification');
+    expect(JSON.stringify(requests[2]!.responseFormat?.schema)).toContain('run_verification');
+    expect(JSON.stringify(requests[3]!.responseFormat?.schema)).not.toContain('run_verification');
+    expect(requests.every((request) => request.temperature === 0)).toBe(true);
+  }, 60_000);
+
   it('refuses unsafe prompt sources before the first inference', async () => {
     let calls = 0;
     const leaseService: OrnithInferenceLeaseService = {
@@ -280,21 +335,327 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(calls).toBe(0);
   });
 
-  it('does not retry malformed output or execute a following action', async () => {
+  it('redacts the exact bound checkout roots without weakening rejection of other absolute paths', async () => {
+    const requests: LocalInferenceRequest[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(request, JSON.stringify({
+          version: 1,
+          action: 'finish',
+          summary: 'Used only repository-relative tools.'
+        }));
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal),
+      specification: {
+        ...specification,
+        implementationPrompt: `Work in ${repository} and never expose ${worktree}.`
+      },
+      acceptedPlanReviewAddenda: `The dirty source checkout ${repository} was not copied.`
+    });
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(requests).toHaveLength(1);
+    const prompt = requests[0]!.messages.map((message) => message.content).join('\n');
+    expect(prompt).toContain('[repository-root]');
+    expect(prompt).toContain('[worktree-root]');
+    expect(prompt).not.toContain(repository);
+    expect(prompt).not.toContain(worktree);
+
+    let unsafeCalls = 0;
+    const unsafeResult = await new OrnithImplementationService().implement({
+      ...baseRequest({
+        ...leaseService,
+        inferForOrnith: async (_lease, request) => {
+          unsafeCalls += 1;
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'not reached' }));
+        }
+      }, new AbortController().signal),
+      specification: {
+        ...specification,
+        implementationPrompt: 'Read C:\\Users\\someone-else\\private.txt.'
+      }
+    });
+    expect(unsafeResult.assessment.reasonCodes).toContain('disallowed_action');
+    expect(unsafeCalls).toBe(0);
+  });
+
+  it('returns recoverable tool feedback for duplicate reads and continues the same run', async () => {
+    const actions = [
+      { version: 1, action: 'read_file', path: 'fixture.txt', offset: 0, limit: 4 },
+      { version: 1, action: 'read_file', path: 'fixture.txt', offset: 0, limit: 4 },
+      { version: 1, action: 'read_file', path: 'fixture.txt', offset: 0, limit: 8 },
+      { version: 1, action: 'finish', summary: 'Read the file without repeating repository I/O.' }
+    ];
+    const requests: LocalInferenceRequest[] = [];
+    const events: AgentProgressEvent[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(request, JSON.stringify(actions[requests.length - 1]!));
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal),
+      onProgress: (event) => events.push(event)
+    });
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(result.ornithAudit.readBytes).toBe(Buffer.byteLength(readFileSync(join(worktree, 'fixture.txt'), 'utf8'), 'utf8') * 2);
+    expect(result.ornithAudit.outcomes).toContainEqual(expect.objectContaining({
+      action: 'read_file', ok: false, code: 'duplicate_action'
+    }));
+    const finalPrompt = requests.at(-1)!.messages.map((message) => message.content).join('\n');
+    expect(finalPrompt).toContain('duplicate_action');
+    expect(requests[2]!.responseFormat?.name).toBe('ornith_action_v1_recovery');
+    expect(JSON.stringify(requests[2]!.responseFormat?.schema)).toContain('"const":"read_file"');
+    expect(events.some((event) => event.type === 'tool_use' && event.text.includes('duplicate_action'))).toBe(true);
+  });
+
+  it('remembers EOF so repeated zero-byte reads are denied without repository I/O', async () => {
+    const actions = [
+      { version: 1, action: 'read_file', path: 'fixture.txt', offset: 8, limit: 100 },
+      { version: 1, action: 'read_file', path: 'fixture.txt', offset: 8, limit: 100 },
+      { version: 1, action: 'finish', summary: 'Confirmed the bounded file end once.' }
+    ];
+    const requests: LocalInferenceRequest[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(request, JSON.stringify(actions[requests.length - 1]!));
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal)
+    );
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(result.ornithAudit.readBytes).toBe(
+      Buffer.byteLength(readFileSync(join(worktree, 'fixture.txt'), 'utf8'), 'utf8')
+    );
+    expect(result.ornithAudit.outcomes).toContainEqual(expect.objectContaining({
+      action: 'read_file', ok: false, code: 'duplicate_action'
+    }));
+    expect(JSON.stringify(requests[2]!.responseFormat?.schema)).toContain('"const":"read_file"');
+  });
+
+  it('does not execute the same successful read-only action twice without an intervening write', async () => {
+    const actions = [
+      { version: 1, action: 'list_files', prefix: '', limit: 20 },
+      { version: 1, action: 'list_files', prefix: '', limit: 20 },
+      { version: 1, action: 'finish', summary: 'Reused the first manifest page.' }
+    ];
+    const requests: LocalInferenceRequest[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(request, JSON.stringify(actions[requests.length - 1]!));
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal)
+    );
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(result.ornithAudit.outcomes).toContainEqual(expect.objectContaining({
+      action: 'list_files', ok: false, code: 'duplicate_action'
+    }));
+    expect(requests[2]!.responseFormat?.name).toBe('ornith_action_v1_recovery');
+    expect(JSON.stringify(requests[2]!.responseFormat?.schema)).toContain('"const":"list_files"');
+  });
+
+  it('lets Ornith recover from a missing read target instead of terminating the run', async () => {
+    const actions = [
+      { version: 1, action: 'read_file', path: 'missing.txt', offset: 0, limit: 100 },
+      { version: 1, action: 'finish', summary: 'Recovered from the missing optional file.' }
+    ];
+    let calls = 0;
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => completed(request, JSON.stringify(actions[calls++]!))
+    };
+
+    const result = await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal)
+    );
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(calls).toBe(2);
+    expect(result.ornithAudit.outcomes).toContainEqual(expect.objectContaining({
+      action: 'read_file', ok: false, code: 'file_not_found'
+    }));
+  });
+
+  it('keeps replace_text available and recovers with the trusted current hash after a stale attempt', async () => {
+    const currentSha = createHash('sha256').update(readFileSync(join(worktree, 'fixture.txt'))).digest('hex');
+    const actions = [
+      { version: 1, action: 'read_file', path: 'fixture.txt', offset: 0, limit: 100 },
+      {
+        version: 1,
+        action: 'replace_text',
+        path: 'fixture.txt',
+        sha256: '0'.repeat(64),
+        replacements: [{ oldText: 'fixture', newText: 'ornith' }]
+      },
+      {
+        version: 1,
+        action: 'replace_text',
+        path: 'fixture.txt',
+        sha256: currentSha,
+        replacements: [{ oldText: 'fixture', newText: 'ornith' }]
+      },
+      { version: 1, action: 'run_verification' },
+      { version: 1, action: 'finish', summary: 'Recovered with the corrected hash.' }
+    ];
+    const requests: LocalInferenceRequest[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(request, JSON.stringify(actions[requests.length - 1]!));
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal)
+    );
+
+    expect(result.assessment.disposition).toBe('pass');
+    const recoveryPrompt = requests[2]!.messages.map((message) => message.content).join('\n');
+    expect(recoveryPrompt).toContain(`Use the exact current SHA-256 ${currentSha}.`);
+    expect(recoveryPrompt).toContain('Do not delete and recreate an existing file');
+    expect(JSON.stringify(requests[2]!.responseFormat?.schema)).toContain('replace_text');
+    expect(readFileSync(join(worktree, 'fixture.txt'), 'utf8')).toContain('ornith');
+  });
+
+  it('treats create_file on an existing path as recoverable and directs the model to replace_text', async () => {
+    const currentSha = createHash('sha256').update(readFileSync(join(worktree, 'fixture.txt'))).digest('hex');
+    const actions = [
+      { version: 1, action: 'create_file', path: 'fixture.txt', content: 'unsafe overwrite' },
+      {
+        version: 1,
+        action: 'replace_text',
+        path: 'fixture.txt',
+        sha256: currentSha,
+        replacements: [{ oldText: 'fixture', newText: 'recovered' }]
+      },
+      { version: 1, action: 'run_verification' },
+      { version: 1, action: 'finish', summary: 'Recovered without recreating the file.' }
+    ];
+    const requests: LocalInferenceRequest[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(request, JSON.stringify(actions[requests.length - 1]!));
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal)
+    );
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(result.ornithAudit.outcomes).toContainEqual(expect.objectContaining({
+      action: 'create_file', ok: false, code: 'file_exists'
+    }));
+    const recoveryPrompt = requests[1]!.messages.map((message) => message.content).join('\n');
+    expect(recoveryPrompt).toContain('Edit it with replace_text');
+    expect(JSON.stringify(requests[1]!.responseFormat?.schema)).not.toContain('create_file');
+    expect(JSON.stringify(requests[1]!.responseFormat?.schema)).toContain('replace_text');
+    expect(readFileSync(join(worktree, 'fixture.txt'), 'utf8')).toContain('recovered');
+  });
+
+  it('repairs a bounded malformed completion without executing it', async () => {
     let calls = 0;
     const leaseService: OrnithInferenceLeaseService = {
       acquireOrnithLease: async () => lease(),
       recheckOrnithLease: async () => true,
       inferForOrnith: async (_lease, request) => {
         calls += 1;
-        return completed(request, calls === 1 ? 'not-json' : JSON.stringify({ version: 1, action: 'create_file', path: 'bad.txt', content: 'bad' }));
+        return completed(request, calls === 1
+          ? 'not-json'
+          : JSON.stringify({ version: 1, action: 'finish', summary: 'Recovered with a valid action.' }));
       }
     };
 
     const result = await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
 
+    expect(result.assessment.disposition).toBe('pass');
+    expect(calls).toBe(2);
+    expect(() => readFileSync(join(worktree, 'bad.txt'), 'utf8')).toThrow();
+  });
+
+  it('cools down a known malformed action and resets the retry streak after valid progress', async () => {
+    const malformedList = JSON.stringify({
+      version: 1,
+      action: 'list_files',
+      prefix: '../outside',
+      limit: 20
+    });
+    const completions = [
+      malformedList,
+      malformedList,
+      malformedList,
+      JSON.stringify({ version: 1, action: 'git_status' }),
+      malformedList,
+      JSON.stringify({ version: 1, action: 'finish', summary: 'Recovered after valid progress.' })
+    ];
+    const requests: LocalInferenceRequest[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(request, completions[requests.length - 1]!);
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal)
+    );
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(requests).toHaveLength(6);
+    expect(JSON.stringify(requests[1]!.responseFormat?.schema)).not.toContain('list_files');
+    expect(JSON.stringify(requests[4]!.responseFormat?.schema)).not.toContain('list_files');
+  });
+
+  it('stops after the fixed malformed-completion retry budget without executing anything', async () => {
+    let calls = 0;
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        calls += 1;
+        return completed(request, 'not-json');
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal)
+    );
+
     expect(result.assessment.reasonCodes).toContain('malformed_output');
-    expect(calls).toBe(1);
+    expect(calls).toBe(ORNITH_LIMITS.maxMalformedRetries + 1);
+    expect(result.ornithAudit.actions).toBe(0);
     expect(() => readFileSync(join(worktree, 'bad.txt'), 'utf8')).toThrow();
   });
 
@@ -302,11 +663,11 @@ describe('OrnithImplementationService limits and cancellation', () => {
     const content = 'x'.repeat(ORNITH_LIMITS.maxFileBytes);
     writeFileSync(join(worktree, 'large.txt'), content, 'utf8');
     let calls = 0;
-    const actions = Array.from({ length: 5 }, () => JSON.stringify({
+    const actions = Array.from({ length: 5 }, (_, offset) => JSON.stringify({
       version: 1,
       action: 'read_file',
       path: 'large.txt',
-      offset: 0,
+      offset,
       limit: 1
     }));
     actions.push(JSON.stringify({ version: 1, action: 'finish', summary: 'must not be reached' }));
@@ -446,6 +807,64 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(result.assessment.disposition).toBe('fail');
     expect(result.assessment.reasonCodes).toContain('runtime_unhealthy');
     expect(result.finalMessage).not.toContain('must never be persisted');
+  });
+
+  it('rejects a blocked narrative disguised as a successful `finish` action', async () => {
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => completed(request, JSON.stringify({
+        version: 1,
+        action: 'finish',
+        summary: 'I cannot complete this task because the required file is unavailable.'
+      }))
+    };
+
+    const result = await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal)
+    );
+
+    expect(result.assessment.disposition).toBe('fail');
+    expect(result.assessment.reasonCodes).toContain('blocked');
+    expect(result.finalMessage).toBe('Ornith reported that it could not continue.');
+  });
+
+  it('does not accept a correction report until that run actually mutates the repository', async () => {
+    const currentSha = createHash('sha256').update(readFileSync(join(worktree, 'fixture.txt'))).digest('hex');
+    const actions = [
+      { version: 1, action: 'finish', summary: 'Claimed the correction was complete without editing.' },
+      {
+        version: 1,
+        action: 'replace_text',
+        path: 'fixture.txt',
+        sha256: currentSha,
+        replacements: [{ oldText: 'fixture', newText: 'corrected' }]
+      },
+      { version: 1, action: 'run_verification' },
+      { version: 1, action: 'finish', summary: 'Corrected and verified the fixture.' }
+    ];
+    const requests: LocalInferenceRequest[] = [];
+    const events: AgentProgressEvent[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(request, JSON.stringify(actions[requests.length - 1]!));
+      }
+    };
+
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal),
+      runType: 'correction',
+      correctionFindings: 'Replace fixture with corrected.',
+      onProgress: (event) => events.push(event)
+    });
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(JSON.stringify(requests[1]!.responseFormat?.schema)).not.toContain('"const":"finish"');
+    expect(events.some((event) => event.type === 'tool_use' && event.text.includes('made no changes'))).toBe(true);
+    expect(readFileSync(join(worktree, 'fixture.txt'), 'utf8')).toContain('corrected');
   });
 
   it('rejects a `finish` summary containing an absolute machine path and never persists the offending text', async () => {

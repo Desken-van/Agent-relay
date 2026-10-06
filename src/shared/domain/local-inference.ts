@@ -391,11 +391,9 @@ export type ChatTemplateParameters = z.infer<typeof chatTemplateParametersSchema
  * Caller-adjustable defaults for a request, when the settings UI has no
  * per-request caller to ask.
  *
- * Deliberately narrow: the only two things the existing request contract lets
- * a caller vary are `maxOutputTokens` and `chatTemplateParameters`, so those
- * are the only two an operator may set a default for. Adding a default for a
- * field the request contract does not have (temperature, sampling, seed,
- * streaming, tools) would be a default for nothing.
+ * Deliberately narrow: operators may set only `maxOutputTokens` and
+ * `chatTemplateParameters` as defaults. Sampling temperature is request-local
+ * and application-owned; seed, streaming and tools are not request fields.
  */
 export const localInferenceRequestDefaultsSchema = z
   .object({
@@ -700,7 +698,21 @@ export const localInferenceRequestSchema = z
       LOCAL_INFERENCE_LIMITS.outputTokensMax,
       'The request output token cap'
     ).optional(),
-    chatTemplateParameters: chatTemplateParametersSchema.optional()
+    /** Optional request-local sampling temperature; zero is deterministic. */
+    temperature: z.number().min(0).max(2).optional(),
+    chatTemplateParameters: chatTemplateParametersSchema.optional(),
+    /**
+     * Optional llama.cpp-compatible constrained decoding. The schema remains
+     * application-owned and travels as JSON data, never as runtime arguments.
+     */
+    responseFormat: z
+      .object({
+        type: z.literal('json_schema'),
+        name: safeIdSchema(LOCAL_INFERENCE_LIMITS.modelIdMax, 'response schema name'),
+        schema: z.record(z.string(), z.json())
+      })
+      .strict()
+      .optional()
   })
   .strict();
 

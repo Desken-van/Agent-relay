@@ -1060,11 +1060,24 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
       stream: false,
       n: 1,
       max_tokens: maxTokens,
+      ...(parsed.temperature === undefined ? {} : { temperature: parsed.temperature }),
       // Present only when supplied. `false` and `0` travel unchanged: they are
       // values, and a template parameter that means "off" has to arrive as off.
       ...(effectiveChatTemplateParameters === undefined
         ? {}
-        : { chat_template_kwargs: effectiveChatTemplateParameters })
+        : { chat_template_kwargs: effectiveChatTemplateParameters }),
+      ...(parsed.responseFormat === undefined
+        ? {}
+        : {
+            response_format: {
+              type: 'json_schema',
+              json_schema: {
+                name: parsed.responseFormat.name,
+                strict: true,
+                schema: parsed.responseFormat.schema
+              }
+            }
+          })
     });
 
     const requestBytes = Buffer.byteLength(bodyText, 'utf8');

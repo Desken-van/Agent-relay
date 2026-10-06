@@ -6,8 +6,9 @@
  * completion it returns is exactly one JSON object naming exactly one of the
  * actions below, parsed with `JSON.parse` and nothing more forgiving — no
  * Markdown-fence stripping, no substring recovery, no "the model probably
- * meant". A completion that is not exactly this shape is a terminal failure
- * for the attempt, not something to repair or retry.
+ * meant". A completion that is not exactly this shape is never repaired or
+ * executed. The bounded service loop may request a fresh completion, but it
+ * does not reinterpret the rejected text.
  *
  * This module is pure data and pure functions. It knows nothing about the
  * filesystem, Git, or the local-inference runtime; `src/main/services/
@@ -39,6 +40,9 @@ export const ORNITH_LIMITS = {
   /** Whole run. */
   maxModelTurns: 40,
   maxNonterminalActions: 39,
+  maxMalformedRetries: 3,
+  /** Force a write, verification or terminal decision after bounded observation. */
+  maxNonMutatingActionsBetweenWrites: 16,
   maxLoopDeadlineMs: 30 * 60_000,
 
   /** Rolling stateless-request context. */
@@ -102,6 +106,8 @@ export const ORNITH_DENIAL_CODES = [
   'lease_busy',
   'malformed_output',
   'oversized_output',
+  'duplicate_action',
+  'verification_not_ready',
   'unknown_action',
   'disallowed_action',
   'invalid_path',
@@ -369,6 +375,18 @@ export const ornithActionSchema = z.discriminatedUnion('action', [
 export type OrnithAction = z.infer<typeof ornithActionSchema>;
 export type OrnithActionKind = OrnithAction['action'];
 
+/**
+ * The exact grammar sent to runtimes that support OpenAI-compatible structured
+ * outputs. Parsing below remains authoritative; constrained decoding prevents
+ * prose, fences and action-schema drift before they reach that boundary.
+ */
+export const ORNITH_ACTION_JSON_SCHEMA = z.record(z.string(), z.json()).parse(
+  z.toJSONSchema(ornithActionSchema, {
+    target: 'draft-7',
+    io: 'input'
+  })
+);
+
 export const ORNITH_ACTION_KINDS: readonly OrnithActionKind[] = [
   'list_files',
   'read_file',
@@ -406,7 +424,45 @@ export function isOrnithTerminalAction(kind: OrnithActionKind): boolean {
 
 export type OrnithActionParseResult =
   | { readonly ok: true; readonly action: OrnithAction }
-  | { readonly ok: false; readonly code: OrnithDenialCode; readonly reason: string };
+  | {
+      readonly ok: false;
+      readonly code: OrnithDenialCode;
+      readonly reason: string;
+      /** Closed, safe discriminator when JSON named a known but malformed action. */
+      readonly attemptedAction?: OrnithActionKind;
+    };
+
+interface BoundedSchemaIssue {
+  readonly code: string;
+  readonly path: readonly PropertyKey[];
+  readonly errors?: readonly (readonly BoundedSchemaIssue[])[];
+}
+
+/** Report schema structure only — never the rejected values or raw completion. */
+function boundedSchemaIssueSummary(issues: readonly BoundedSchemaIssue[]): string {
+  const summaries: string[] = [];
+  const visit = (entries: readonly BoundedSchemaIssue[]): void => {
+    for (const issue of entries) {
+      if (summaries.length >= 8) return;
+      if (issue.code === 'invalid_union' && Array.isArray(issue.errors)) {
+        for (const branch of issue.errors) {
+          visit(branch);
+          if (summaries.length >= 8) return;
+        }
+        continue;
+      }
+      const path = issue.path
+        .map((segment) => typeof segment === 'number'
+          ? `[${segment}]`
+          : /^[A-Za-z0-9_-]+$/u.test(String(segment)) ? String(segment) : '?')
+        .join('.');
+      const summary = `${path.length > 0 ? path : '<root>'}:${issue.code}`;
+      if (!summaries.includes(summary)) summaries.push(summary);
+    }
+  };
+  visit(issues);
+  return summaries.join(', ').slice(0, ORNITH_LIMITS.maxErrorChars - 80);
+}
 
 /**
  * Parse one raw model completion into exactly one accepted action.
@@ -440,10 +496,23 @@ export function parseOrnithCompletion(raw: string): OrnithActionParseResult {
 
   const result = ornithActionSchema.safeParse(parsed);
   if (!result.success) {
+    const attempted = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>).action
+      : undefined;
+    const attemptedAction = typeof attempted === 'string' &&
+      ORNITH_ACTION_KINDS.includes(attempted as OrnithActionKind)
+      ? attempted as OrnithActionKind
+      : undefined;
+    const issueSummary = boundedSchemaIssueSummary(
+      result.error.issues as readonly BoundedSchemaIssue[]
+    );
     return {
       ok: false,
       code: 'malformed_output',
-      reason: 'The completion did not match the Ornith action schema.'
+      reason:
+        `The completion did not match the Ornith action schema` +
+        `${issueSummary.length > 0 ? ` (${issueSummary})` : ''}.`,
+      ...(attemptedAction === undefined ? {} : { attemptedAction })
     };
   }
   return { ok: true, action: result.data };

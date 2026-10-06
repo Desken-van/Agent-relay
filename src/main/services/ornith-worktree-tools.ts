@@ -23,6 +23,8 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { AgentRelayError } from '../../shared/domain/errors';
 import {
   ORNITH_LIMITS,
+  containsAbsoluteMachinePath,
+  redactAbsoluteMachinePaths,
   type OrnithAction,
   type OrnithDenialCode
 } from '../../shared/domain/ornith';
@@ -633,7 +635,13 @@ export class OrnithWorktreeTools {
       }
 
       const needle = action.caseSensitive ? action.query : action.query.toLowerCase();
-      const matches: { path: string; line: number }[] = [];
+      const matches: Array<{
+        path: string;
+        line: number;
+        byteOffset: number;
+        preview: string;
+        sha256: string;
+      }> = [];
       let readBytesTotal = 0;
 
       for (const path of candidates) {
@@ -641,6 +649,7 @@ export class OrnithWorktreeTools {
         const resolved = await this.resolveSafe(path, { mustExist: true, forWrite: false }, bounded);
         if (!resolved.ok) continue;
         let content: string;
+        let sha256: string;
         try {
           const stats = await lstat(resolved.absolutePath);
           if (stats.size > ORNITH_LIMITS.maxReadBytes) continue;
@@ -658,6 +667,7 @@ export class OrnithWorktreeTools {
           }
           const raw = safeRead.raw;
           readBytesTotal += raw.byteLength;
+          sha256 = createHash('sha256').update(raw).digest('hex');
           content = new TextDecoder('utf-8', { fatal: true }).decode(raw);
         } catch {
           continue; // binary or unreadable: silently skipped, matching a literal-text search's scope
@@ -665,11 +675,20 @@ export class OrnithWorktreeTools {
         const haystack = action.caseSensitive ? content : content.toLowerCase();
         if (!haystack.includes(needle)) continue;
         const lines = content.split('\n');
+        let byteOffset = 0;
         for (let index = 0; index < lines.length && matches.length < action.limit; index += 1) {
-          const line = action.caseSensitive ? lines[index] : lines[index]?.toLowerCase();
+          const sourceLine = lines[index] ?? '';
+          const line = action.caseSensitive ? sourceLine : sourceLine.toLowerCase();
           if (line !== undefined && line.includes(needle)) {
-            matches.push({ path, line: index + 1 });
+            const boundedPreview = safeUtf8Slice(Buffer.from(sourceLine, 'utf8'), 0, 1_024).text;
+            const preview = containsSecretShape(boundedPreview)
+              ? '[preview omitted: credential-shaped text]'
+              : containsAbsoluteMachinePath(boundedPreview)
+                ? redactAbsoluteMachinePaths(boundedPreview)
+                : boundedPreview;
+            matches.push({ path, line: index + 1, byteOffset, preview, sha256 });
           }
+          byteOffset += Buffer.byteLength(sourceLine, 'utf8') + (index < lines.length - 1 ? 1 : 0);
         }
       }
 

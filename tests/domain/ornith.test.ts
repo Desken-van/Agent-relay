@@ -414,6 +414,24 @@ describe('parseOrnithCompletion', () => {
   it('rejects a JSON array instead of an object', () => {
     const result = parseOrnithCompletion('[]');
     expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('<root>:invalid_type');
+  });
+
+  it('reports only bounded schema paths and issue codes for a shaped near-miss', () => {
+    const result = parseOrnithCompletion(JSON.stringify({
+      version: 1,
+      action: 'read_file',
+      path: 'README.md',
+      offset: 'zero',
+      limit: 100
+    }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain('offset:invalid_type');
+      expect(result.reason).not.toContain('zero');
+      expect(result.reason.length).toBeLessThanOrEqual(ORNITH_LIMITS.maxErrorChars);
+      expect(result.attemptedAction).toBe('read_file');
+    }
   });
 
   it('rejects an unrecognised action', () => {
@@ -428,9 +446,7 @@ describe('parseOrnithCompletion', () => {
     if (!result.ok) expect(result.code).toBe('oversized_output');
   });
 
-  it('never asks for repair: malformed output is terminal, not retried', () => {
-    // Enforced by contract, not by this test alone: parseOrnithCompletion has
-    // no retry/repair path and returns a denial code on the first parse.
+  it('returns a denial result for malformed output without repairing the text', () => {
     const result = parseOrnithCompletion('not json at all');
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.code).toBe('malformed_output');
