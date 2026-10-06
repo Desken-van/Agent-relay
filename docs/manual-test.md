@@ -854,6 +854,7 @@ never touched.
 > `%APPDATA%\agent-relay` is left alone; nothing is migrated or deleted. Set it
 > only for the child process, so it does not leak into later sessions:
 >
+>
 > ```powershell
 > $env:AGENT_RELAY_DATA_DIR = 'H:\some-throwaway-dir'; npm run dev
 > ```
