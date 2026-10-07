@@ -1,0 +1,88 @@
+{
+  "folders": [
+    {
+      "name": "Agent Relay",
+      "path": "."
+    }
+  ],
+  "settings": {
+    "typescript.tsdk": "node_modules/typescript/lib",
+    "eslint.useFlatConfig": true,
+    "files.exclude": {
+      "out": true,
+      "build": true
+    },
+    "search.exclude": {
+      "node_modules": true,
+      "out": true,
+      "build": true,
+      "package-lock.json": true
+    },
+    // Terminals spawned by VS Code inherit ELECTRON_RUN_AS_NODE=1 from the
+    // extension host, which turns Electron into plain Node. scripts/launch.mjs
+    // already strips it; this keeps ad-hoc `npx electron-vite` working too.
+    "terminal.integrated.env.linux": { "ELECTRON_RUN_AS_NODE": null },
+    "terminal.integrated.env.osx": { "ELECTRON_RUN_AS_NODE": null },
+    "terminal.integrated.env.windows": { "ELECTRON_RUN_AS_NODE": null }
+  },
+  "extensions": {
+    "recommendations": ["dbaeumer.vscode-eslint", "vitest.explorer"]
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Agent Relay: dev",
+        "type": "node",
+        "request": "launch",
+        "cwd": "${workspaceFolder}",
+        "program": "${workspaceFolder}/scripts/launch.mjs",
+        "args": ["dev"],
+        "console": "integratedTerminal",
+        "skipFiles": ["<node_internals>/**"]
+      },
+      {
+        "name": "Agent Relay: dev (isolated data dir)",
+        "type": "node",
+        "request": "launch",
+        "cwd": "${workspaceFolder}",
+        "program": "${workspaceFolder}/scripts/launch.mjs",
+        "args": ["dev"],
+        "env": { "AGENT_RELAY_DATA_DIR": "${workspaceFolder}/.agent-relay-data" },
+        "console": "integratedTerminal",
+        "skipFiles": ["<node_internals>/**"]
+      },
+      {
+        "name": "Agent Relay: preview (built)",
+        "type": "node",
+        "request": "launch",
+        "cwd": "${workspaceFolder}",
+        "program": "${workspaceFolder}/scripts/launch.mjs",
+        "args": ["preview"],
+        "console": "integratedTerminal",
+        "skipFiles": ["<node_internals>/**"]
+      },
+      {
+        "name": "Vitest: current file",
+        "type": "node",
+        "request": "launch",
+        "cwd": "${workspaceFolder}",
+        "program": "${workspaceFolder}/node_modules/vitest/vitest.mjs",
+        "args": ["run", "${relativeFile}"],
+        "console": "integratedTerminal",
+        "skipFiles": ["<node_internals>/**"]
+      }
+    ]
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      { "label": "dev", "type": "npm", "script": "dev", "isBackground": true, "problemMatcher": [] },
+      { "label": "test", "type": "npm", "script": "test", "group": { "kind": "test", "isDefault": true }, "problemMatcher": [] },
+      { "label": "lint", "type": "npm", "script": "lint", "problemMatcher": ["$eslint-stylish"] },
+      { "label": "typecheck", "type": "npm", "script": "typecheck", "problemMatcher": ["$tsc"] },
+      { "label": "build", "type": "npm", "script": "build", "group": { "kind": "build", "isDefault": true }, "problemMatcher": [] },
+      { "label": "verify", "type": "npm", "script": "verify", "problemMatcher": [] }
+    ]
+  }
+}

@@ -20,3 +20,6 @@ Thumbs.db
 # Vitest / TS build info
 *.tsbuildinfo
 coverage/
+
+# Isolated app data for the "dev (isolated data dir)" launch config
+.agent-relay-data/
