@@ -590,6 +590,28 @@ describe('OrnithWorktreeTools containment and budgets', () => {
     }
   );
 
+  it('list_files returns file paths only — no directory entries, types or symlink details — and a listed symlink is still refused by read_file', async () => {
+    mkdirSync(join(worktree, 'docs', 'nested'), { recursive: true });
+    mkdirSync(join(worktree, 'empty-directory'));
+    writeFileSync(join(worktree, 'docs', 'nested', 'deep.md'), 'deep\n', 'utf8');
+    symlinkSync('../fixture.txt', join(worktree, 'docs', 'link.txt'));
+
+    const boundary = tools();
+    const listed = await boundary.listFiles({ version: 1, action: 'list_files', prefix: '', limit: 200 });
+    expect(listed.ok).toBe(true);
+    if (!listed.ok) return;
+    expect(listed.forModel).toEqual({
+      files: ['docs/link.txt', 'docs/nested/deep.md', 'fixture.txt'],
+      nextCursor: null,
+      total: 3
+    });
+
+    expect(await boundary.readFile({ version: 1, action: 'read_file', path: 'docs/link.txt', offset: 0, limit: 64 }))
+      .toMatchObject({ ok: false, code: 'path_symlink' });
+    expect(await boundary.readFile({ version: 1, action: 'read_file', path: 'docs/missing.md', offset: 0, limit: 64 }))
+      .toMatchObject({ ok: false, code: 'file_not_found' });
+  });
+
   it('never invokes Git with a mutating subcommand across every read and write action', async () => {
     const recorded: string[][] = [];
     const boundary = toolsRecordingGitArgv(recorded);

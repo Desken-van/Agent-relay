@@ -477,7 +477,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       ...baseRequest(leaseService, new AbortController().signal),
       specification: {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(21_376)}`
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(20_623)}`
       }
     });
 
@@ -505,8 +505,9 @@ describe('OrnithImplementationService limits and cancellation', () => {
     // tests/adapters/ornith-worktree-tools.test.ts, where the budget is supplied
     // directly rather than derived from preflight.
     // chars values are recalibrated whenever ORNITH_PROTOCOL_INSTRUCTIONS' fixed
-    // byte length changes (most recently: the failed-verification evidence rule, +624 bytes; before that
-    // the run_verification budget/repeat rule and the scope-gate wording),
+    // byte length changes (most recently: the list_files result, per-action timeout narrowing and
+    // run-ending failure rules, +753 bytes; before that the failed-verification evidence rule, +624
+    // bytes, the run_verification budget/repeat rule and the scope-gate wording),
     // since that text is part of the same authoritative/fixed prompt budget this
     // filler trades off against. Recompute empirically (binary-search
     // `preflightOrnithPrompt` for the `chars` that yields each target budget)
@@ -1168,6 +1169,52 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(result.ornithAudit.outcomes[0]).toMatchObject({ action: 'search_text', ok: false, code: 'timeout' });
     });
 
+    it('tells the model how to narrow a timed-out request in that action’s own parameters', async () => {
+      (ORNITH_LIMITS as { searchTimeoutMs: number }).searchTimeoutMs = 1;
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          if (requests.length === 1) {
+            return completed(request, JSON.stringify({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 }));
+          }
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Pivoted away from the timed-out search.' }));
+        }
+      };
+
+      await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
+
+      const prompt = requests[1]!.messages.map((message) => message.content).join('\n');
+      const feedback = /[^\n]*read-only recovery attempt[^\n]*/.exec(prompt)?.[0] ?? '';
+      expect(feedback).toContain('Name fewer \\"files\\", use a more specific query or a smaller \\"limit\\" before retrying');
+      expect(feedback).not.toContain('offset');
+    });
+
+    it('states in the protocol what list_files returns, how each action narrows, and that other failures end the run', async () => {
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Done.' }));
+        }
+      };
+
+      await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
+
+      const prompt = requests[0]!.messages.map((message) => message.content).join('\n').replace(/\s+/g, ' ');
+      expect(prompt).toContain(
+        'A "list_files" result lists only the PATHS of tracked and untracked (not ignored) files at or under the prefix: no directories, types, sizes or symlink details.'
+      );
+      expect(prompt).toContain('git_diff: fewer "paths"; git_status cannot be narrowed, so continue without it');
+      expect(prompt).not.toContain('a shorter prefix');
+      expect(prompt).toContain('Any failure these rules do not call recoverable ends the run at once');
+      expect(prompt).toContain('A "search_text", "read_file" or "git_diff" that fails with code "limit_read_bytes_exceeded"');
+    });
+
     it('exhausts the read-only recovery budget and ends the run classified as configuration, not security', async () => {
       (ORNITH_LIMITS as { searchTimeoutMs: number }).searchTimeoutMs = 1;
       let calls = 0;
@@ -1461,7 +1508,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
           correctionFindings: null,
           round: 1,
           maxRounds: 3,
-          lease: lease({ contextLimitTokens: 16_384, maxOutputTokens: 1_024 })
+          lease: lease({ contextLimitTokens: 20_480, maxOutputTokens: 1_024 })
         });
         expect(checked.ok).toBe(true);
         if (!checked.ok) throw new Error('preflight unexpectedly refused');

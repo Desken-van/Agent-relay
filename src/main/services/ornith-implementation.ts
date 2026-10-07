@@ -302,12 +302,20 @@ Rules:
   "nextCursor" rule below, not this one.)
 - Never repeat an identical list_files, read_file, search_text, git_status, or git_diff action after it succeeds.
   Use the returned files, cursor, or status to choose a different next action.
+- A "list_files" result lists only the PATHS of tracked and untracked (not ignored) files at or
+  under the prefix: no directories, types, sizes or symlink details. A listed path can still be
+  refused by "read_file" (a symlink, or not UTF-8 text).
 - A "list_files", "read_file", "search_text", "git_status", or "git_diff" action that fails with
   code "timeout" is recoverable a bounded number of times per run: choose a DIFFERENT, narrower
-  request (fewer "files", a shorter prefix, a smaller byte range) on your next turn — repeating
-  the identical request will be refused outright once, not retried.
-- A "search_text" or "read_file" that fails with code "limit_read_bytes_exceeded" gets exactly ONE
-  such recovery chance per run: on your next turn, either make the scoped edit now using context you
+  request on your next turn (list_files: a deeper prefix or smaller limit; read_file: a smaller
+  range; search_text: fewer "files" or a smaller limit; git_diff: fewer "paths"; git_status cannot
+  be narrowed, so continue without it). Repeating the identical request will be refused once.
+- Any failure these rules do not call recoverable ends the run at once: for example a "read_file"
+  or "git_diff" path that is not an existing repository file, a symlink, a file that is not UTF-8
+  text, or a Git error. Read only paths a "list_files" or "search_text" result gave you, existing
+  files the specification names, or files you created; never guess a path.
+- A "search_text", "read_file" or "git_diff" that fails with code "limit_read_bytes_exceeded" gets
+  exactly ONE such recovery chance per run: on your next turn, either make the scoped edit now using context you
   already have, or call "blocked" — repeating the identical request will be refused outright.
 - "search_text" reads the FULL content of every candidate file toward the same cumulative read
   budget as "read_file" (files over 64 KB and binary files are skipped, never searched: use
@@ -1214,8 +1222,8 @@ export class OrnithImplementationService {
               'then "finish".'
             : priorFailureCode !== null
             ? `The identical ${action.action} request (${describeActionParams(action)}) already failed ` +
-              `(${priorFailureCode}) and was not retried unchanged. Narrow "files", the query, offset, or limit ` +
-              'before retrying — repeating the exact same request will not succeed.'
+              `(${priorFailureCode}) and was not retried unchanged. ${narrowingAdvice(action)} — repeating the ` +
+              'exact same request will not succeed.'
             : `The identical ${action.action} request already succeeded and was not executed again. ` +
               'Use its prior result and choose a different action; narrow the query or page only if the result was truncated.'
         };
@@ -1558,8 +1566,8 @@ export class OrnithImplementationService {
               : isBudgetDenial
               ? `${toolResult.reason} (${describeActionParams(action)}) ${budgetRecoveryAdvice(action, tools.changedFileCount())}`
               : `${toolResult.reason} (${describeActionParams(action)}) ${remaining} read-only recovery ` +
-                `attempt${remaining === 1 ? '' : 's'} remain this run. Narrow "files", the query, offset, or limit ` +
-                'before retrying; repeating this exact request will be refused.'
+                `attempt${remaining === 1 ? '' : 's'} remain this run. ${narrowingAdvice(action)}; repeating ` +
+                'this exact request will be refused.'
           };
           rolling.push({ turn: turnsUsed, action: action.action, resultText: JSON.stringify(recoveryFeedback) });
           continue;
@@ -1724,6 +1732,28 @@ function describeActionParams(action: OrnithAction): string {
       return `paths=${action.paths ? JSON.stringify(action.paths) : '<whole manifest>'}`;
     default:
       return '(no parameters)';
+  }
+}
+
+/**
+ * How a refused read-only request can be made narrower, in the parameters THAT action has: a
+ * "files" list belongs to search_text alone, git_diff names "paths", and git_status has nothing to
+ * narrow at all, so its only way forward is another action.
+ */
+function narrowingAdvice(action: OrnithAction): string {
+  switch (action.action) {
+    case 'list_files':
+      return 'Use a deeper "prefix" or a smaller "limit" before retrying';
+    case 'read_file':
+      return 'Read a smaller range ("offset"/"limit") before retrying';
+    case 'search_text':
+      return 'Name fewer "files", use a more specific query or a smaller "limit" before retrying';
+    case 'git_diff':
+      return 'Name fewer "paths" before retrying';
+    case 'git_status':
+      return 'git_status has no parameters to narrow: continue with a different action instead';
+    default:
+      return 'Change the request before retrying';
   }
 }
 
