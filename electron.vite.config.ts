@@ -6,6 +6,12 @@ import { defineConfig, externalizeDepsPlugin } from 'electron-vite';
 
 const root = import.meta.dirname;
 
+/** The native executables `scripts/build-native.mjs` builds on each platform, by file name. */
+const NATIVE_EXECUTABLES: Partial<Record<NodeJS.Platform, readonly string[]>> = {
+  win32: ['agent-relay-windows-job.exe', 'agent-relay-fs-guard.exe'],
+  linux: ['agent-relay-fs-guard']
+};
+
 /**
  * Put separately executed Agent Relay assets next to the built main bundle.
  *
@@ -13,10 +19,10 @@ const root = import.meta.dirname;
  * so a synchronous query can be killed on timeout. The Windows job launcher
  * and the Ornith filesystem-mutation guard are native executables — the
  * former owns the Job Object for managed inference runtimes, the latter
- * performs handle-relative create/replace/delete/mkdirp against a task
- * worktree. Their adapters look beside their own module: the source tree in
- * development and `out/main` in a build. These copies make the lookup
- * identical in both.
+ * performs handle- or descriptor-relative create/replace/delete/mkdirp
+ * against a task worktree (Windows and Linux each have their own). Their
+ * adapters look beside their own module: the source tree in development and
+ * `out/main` in a build. These copies make the lookup identical in both.
  */
 function copyMainProcessAssets(): Plugin {
   return {
@@ -29,13 +35,12 @@ function copyMainProcessAssets(): Plugin {
         resolve(root, 'src/main/adapters/operations', name),
         resolve(destination, name)
       );
-      if (process.platform === 'win32') {
-        for (const executable of ['agent-relay-windows-job.exe', 'agent-relay-fs-guard.exe']) {
-          copyFileSync(
-            resolve(root, 'build/Release', executable),
-            resolve(destination, executable)
-          );
-        }
+      for (const executable of NATIVE_EXECUTABLES[process.platform] ?? []) {
+        // copyFileSync keeps the executable bit on POSIX.
+        copyFileSync(
+          resolve(root, 'build/Release', executable),
+          resolve(destination, executable)
+        );
       }
     }
   };

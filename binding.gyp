@@ -36,7 +36,25 @@
                 "AdditionalOptions": ["/utf-8", "/EHsc"]
               }
             }
-          },
+          }
+        ],
+        [
+          "OS=='linux'",
+          {
+            "sources": ["native/linux-fs-guard.cpp"],
+            "cflags_cc!": ["-fno-exceptions"],
+            "cflags_cc": [
+              "-fexceptions",
+              "-Wall",
+              "-Wextra",
+              "-fstack-protector-strong",
+              "-fPIE"
+            ],
+            "ldflags": ["-pie", "-Wl,-z,relro,-z,now"]
+          }
+        ],
+        [
+          "OS!='win' and OS!='linux'",
           {
             "type": "none"
           }

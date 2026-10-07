@@ -20,6 +20,10 @@ import { OrnithWorktreeTools, type OrnithToolResult } from '../../src/main/servi
 import { ORNITH_LIMITS, containsAbsoluteMachinePath } from '../../src/shared/domain/ornith';
 
 const runner = new ExecaProcessRunner();
+/** Platforms with a native filesystem-mutation guard: these run its real race cases. */
+const NATIVE_GUARD_PLATFORM = process.platform === 'win32' || process.platform === 'linux';
+/** A Windows junction, or a Linux directory symlink: either way an ancestor that points elsewhere. */
+const DIRECTORY_LINK_TYPE = process.platform === 'win32' ? 'junction' : 'dir';
 const locatedGit = locateExecutable('git');
 if (!locatedGit) throw new Error('Git is required by the Ornith worktree-tool suite.');
 const gitPath = locatedGit.path;
@@ -323,12 +327,13 @@ describe('OrnithWorktreeTools containment and budgets', () => {
    * fires (`resolveSafe`, `readRegularFileSafely`, `assertCheckoutIdentity`)
    * is pathname-based and therefore already stale by the time the guard
    * process is spawned. These cases swap the destination ancestor to a real
-   * Windows junction *after* every one of those JavaScript-level checks has
+   * Windows junction or Linux directory symlink *after* every one of those
+   * JavaScript-level checks has
    * already passed cleanly, and prove the guard's own from-scratch,
    * handle-relative walk still refuses the mutation and nothing escapes the
    * worktree — independent of, and later than, anything JavaScript checked.
    */
-  it.runIf(process.platform === 'win32')(
+  it.runIf(NATIVE_GUARD_PLATFORM)(
     'the native mutation guard independently refuses create, replace, delete and mkdirp when the ancestor is swapped after every JavaScript-level recheck',
     async () => {
       const directory = join(worktree, 'nested');
@@ -341,7 +346,7 @@ describe('OrnithWorktreeTools containment and budgets', () => {
 
       const swapToJunctionOutside = (): void => {
         rmSync(directory, { recursive: true, force: true });
-        symlinkSync(outside, directory, 'junction');
+        symlinkSync(outside, directory, DIRECTORY_LINK_TYPE);
       };
       const restoreDirectory = (): void => {
         // `nested` is the junction after a refusal, but can still be the real directory after
@@ -439,7 +444,7 @@ describe('OrnithWorktreeTools containment and budgets', () => {
     180_000
   );
 
-  it.runIf(process.platform === 'win32')(
+  it.runIf(NATIVE_GUARD_PLATFORM)(
     'the native mutation guard refuses create, replace, delete and mkdirp when the entire worktree root is replaced by an ordinary directory after validation',
     async () => {
       const originalContent = readFileSync(join(worktree, 'fixture.txt'), 'utf8');
@@ -511,7 +516,7 @@ describe('OrnithWorktreeTools containment and budgets', () => {
     }
   );
 
-  it.runIf(process.platform === 'win32')(
+  it.runIf(NATIVE_GUARD_PLATFORM)(
     'replace refuses a different same-name file introduced after the JavaScript hash check even when its content and hash are identical',
     async () => {
       const originalContent = readFileSync(join(worktree, 'fixture.txt'), 'utf8');
@@ -543,7 +548,7 @@ describe('OrnithWorktreeTools containment and budgets', () => {
     }
   );
 
-  it.runIf(process.platform === 'win32')(
+  it.runIf(NATIVE_GUARD_PLATFORM)(
     'normal create, replace, and delete still succeed byte-for-byte through the native mutation guard',
     async () => {
       const boundary = tools();

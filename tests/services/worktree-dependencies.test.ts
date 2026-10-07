@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { ExecaProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
@@ -64,6 +64,10 @@ describe('local worktree dependency preparation', () => {
       writeFileSync(join(repositoryPath, 'build', 'Release', 'agent-relay-windows-job.exe'), 'fixture-launcher');
       writeFileSync(join(repositoryPath, 'build', 'Release', 'agent-relay-fs-guard.exe'), 'fixture-fs-guard');
     }
+    if (process.platform === 'linux') {
+      mkdirSync(join(repositoryPath, 'build', 'Release'), { recursive: true });
+      writeFileSync(join(repositoryPath, 'build', 'Release', 'agent-relay-fs-guard'), 'fixture-fs-guard', { mode: 0o755 });
+    }
 
     await prepare.prepare({ repositoryPath, worktreePath });
     await prepare.prepare({ repositoryPath, worktreePath });
@@ -76,6 +80,13 @@ describe('local worktree dependency preparation', () => {
         .toBe('fixture-launcher');
       expect(readFileSync(join(worktreePath, 'build', 'Release', 'agent-relay-fs-guard.exe'), 'utf8'))
         .toBe('fixture-fs-guard');
+    }
+    if (process.platform === 'linux') {
+      const helper = join(worktreePath, 'build', 'Release', 'agent-relay-fs-guard');
+      expect(readFileSync(helper, 'utf8')).toBe('fixture-fs-guard');
+      // Still executable in the worktree, and still the only build output copied there.
+      expect(lstatSync(helper).mode & 0o111).not.toBe(0);
+      expect(readdirSync(join(worktreePath, 'build', 'Release'))).toEqual(['agent-relay-fs-guard']);
     }
     expect(execFileSync('git', ['status', '--short'], { cwd: worktreePath, encoding: 'utf8' })).toBe('');
   });

@@ -614,6 +614,24 @@ terminal failure for that attempt.
   is applied — performs no write at all. Writes are staged to a sibling
   temporary file in the same directory and renamed into place, so a writer
   never observes a partially-written file.
+- Every one of those checks is pathname-based, and so already stale by the
+  time a write happens. The write itself is therefore performed by a small
+  native helper (`src/main/adapters/process/fs-guard.ts`): on Windows
+  `native/windows-fs-guard.cpp`, which walks NT handles relative to the root
+  handle; on Linux `native/linux-fs-guard.cpp`, which walks
+  `openat(…, O_DIRECTORY | O_NOFOLLOW)` descriptors relative to the root
+  descriptor, refuses any component on another device or mount, stages new
+  content in an anonymous `O_TMPFILE`, replaces with
+  `renameat2(RENAME_EXCHANGE)` and re-verifies what it swapped out (swapping
+  back if it changed), and deletes by moving the target aside atomically
+  before re-verifying it. Each helper re-validates the relative path itself,
+  refuses a root whose native identity differs from the one bound before the
+  first model-driven write (a recreated directory at the same path
+  included), and re-checks the target's identity and SHA-256 itself. A
+  replace keeps the file's permission bits. A timeout or cancellation leaves
+  the old content or the complete new content, never a partial file. On any
+  other platform, or without the built helper, every write is refused as
+  unavailable with a reason that says which; there is no pathname fallback.
 - `git status`/`git diff` use a fixed, narrow, read-only argv shape only —
   `git diff` accepts model-selected *paths* after a literal `--`, never a
   ref, revision, or option — through the same `ProcessRunner` (no shell,

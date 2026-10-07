@@ -51,10 +51,11 @@ const MANIFESTS = [
 const NON_NPM_LOCKFILES = ['pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'] as const;
 const NPM_LOCKFILES = ['package-lock.json', 'npm-shrinkwrap.json'] as const;
 
-const WINDOWS_NATIVE_HELPERS = [
-  'agent-relay-windows-job.exe',
-  'agent-relay-fs-guard.exe'
-] as const;
+/** The ignored, locally built native helpers each platform's `scripts/build-native.mjs` produces. */
+const NATIVE_HELPERS: Partial<Record<NodeJS.Platform, readonly string[]>> = {
+  win32: ['agent-relay-windows-job.exe', 'agent-relay-fs-guard.exe'],
+  linux: ['agent-relay-fs-guard']
+};
 
 async function bytes(path: string): Promise<Buffer | null> {
   try {
@@ -194,7 +195,7 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
       case 'not_node_project':
         return;
       case 'ready_local':
-        await this.prepareWindowsNativeHelpers(target.repositoryPath, target.worktreePath);
+        await this.prepareNativeHelpers(target.repositoryPath, target.worktreePath);
         return;
       case 'link_broken':
         throw new AgentRelayError('WORKTREE_INVALID', status.detail, {
@@ -221,7 +222,7 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
     if (await existingNodeModules(nodeModulesTarget) === 'link') {
       // Idempotent: checkStatus already proved this points at the registered
       // checkout's real node_modules.
-      await this.prepareWindowsNativeHelpers(repositoryPath, worktreePath);
+      await this.prepareNativeHelpers(repositoryPath, worktreePath);
       return;
     }
 
@@ -235,14 +236,14 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
         const [actual, expected] = await Promise.all([realpath(nodeModulesTarget), realpath(source)]);
         if (isSamePath(actual, expected)) {
-          await this.prepareWindowsNativeHelpers(repositoryPath, worktreePath);
+          await this.prepareNativeHelpers(repositoryPath, worktreePath);
           return;
         }
       }
       throw error;
     }
 
-    await this.prepareWindowsNativeHelpers(repositoryPath, worktreePath);
+    await this.prepareNativeHelpers(repositoryPath, worktreePath);
   }
 
   /**
@@ -349,7 +350,7 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
         after
       );
     }
-    await this.prepareWindowsNativeHelpers(target.repositoryPath, target.worktreePath);
+    await this.prepareNativeHelpers(target.repositoryPath, target.worktreePath);
     return this.installOutcome('succeeded', 'Dependencies installed in the task worktree.', after);
   }
 
@@ -385,24 +386,22 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
   }
 
   /**
-   * node-gyp places Agent Relay's native Windows helpers outside node_modules.
-   * A dependency junction alone therefore cannot run the process-contract and
+   * node-gyp places Agent Relay's native helpers outside node_modules. A
+   * dependency link alone therefore cannot run the process-contract and
    * Ornith containment tests in a worktree. Copy only the known ignored,
    * locally built binaries from the registered checkout; never copy the whole
    * build directory, whose other outputs must remain isolated per worktree.
    */
-  private async prepareWindowsNativeHelpers(repositoryPath: string, worktreePath: string): Promise<void> {
-    if (process.platform !== 'win32') return;
-
-    for (const helper of WINDOWS_NATIVE_HELPERS) {
-      await this.prepareWindowsNativeHelper(repositoryPath, worktreePath, helper);
+  private async prepareNativeHelpers(repositoryPath: string, worktreePath: string): Promise<void> {
+    for (const helper of NATIVE_HELPERS[process.platform] ?? []) {
+      await this.prepareNativeHelper(repositoryPath, worktreePath, helper);
     }
   }
 
-  private async prepareWindowsNativeHelper(
+  private async prepareNativeHelper(
     repositoryPath: string,
     worktreePath: string,
-    helper: (typeof WINDOWS_NATIVE_HELPERS)[number]
+    helper: string
   ): Promise<void> {
     const source = join(repositoryPath, 'build', 'Release', helper);
     const sourceBytes = await bytes(source);
@@ -416,7 +415,7 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
     try {
       const value = await lstat(target);
       if (!value.isFile() || value.isSymbolicLink()) {
-        throw new AgentRelayError('WORKTREE_INVALID', 'The worktree Windows process launcher path is not a regular file.');
+        throw new AgentRelayError('WORKTREE_INVALID', 'A worktree native helper path is not a regular file.');
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;

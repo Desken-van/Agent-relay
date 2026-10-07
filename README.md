@@ -94,7 +94,8 @@ Every action button carries a **blast-radius marker**:
 | **Claude Code CLI** | implementation | `winget install --id Anthropic.ClaudeCode -e` |
 | **`llama-server` (local runtime)** | Ornith implementation only | Optional — configure under Settings → Local inference; see `docs/local-inference.md` |
 | **GitHub CLI (`gh`)** | publishing only | Optional — everything else works without it |
-| **Python + Visual Studio C++ Build Tools** | building from source on Windows | `npm install` uses `node-gyp` to build Agent Relay's Job Object launcher |
+| **Python + Visual Studio C++ Build Tools** | building from source on Windows | `npm install` uses `node-gyp` to build Agent Relay's Job Object launcher and Ornith filesystem guard |
+| **Python 3, `make` and a C++17 compiler (`g++` or `clang++`)** | building from source on Linux | `npm install` uses `node-gyp` to build the Ornith filesystem guard (`npm run build:native` rebuilds it) |
 
 Optional provider tools may be absent: the app stays usable and tells you what
 to install. A source checkout on Windows does have one native build step. It
@@ -103,6 +104,12 @@ the production bundle copies that executable beside the main-process bundle.
 The launcher contains managed local-inference runtimes in a Windows Job Object.
 If it is missing, local inference fails before starting a runtime rather than
 falling back to an uncontained process.
+
+Ornith's repository edits go through a native filesystem guard that Windows and
+Linux source checkouts build the same way (`build/Release/agent-relay-fs-guard`
+on Linux). Without it, or on any other platform, Ornith can still read the
+repository but every edit is refused with a reason naming the missing helper;
+there is no unguarded fallback.
 
 ---
 
