@@ -640,7 +640,8 @@ describe('local-model profiles', () => {
       const summaries = summarizeLocalInferenceProfiles(settings, 'default', 'healthy');
       for (const summary of summaries) {
         expect(Object.keys(summary).sort()).toEqual(
-          ['activeStateKind', 'activity', 'displayName', 'enabled', 'id', 'isDefault'].sort()
+          // `runtime` is the runtime kind (llama_cpp | strata): a label, never a path or an executable.
+          ['activeStateKind', 'activity', 'displayName', 'enabled', 'id', 'isDefault', 'runtime'].sort()
         );
       }
     });
@@ -648,8 +649,8 @@ describe('local-model profiles', () => {
     it('marks exactly the active profile, carrying its live state kind, and the configured default', () => {
       const summaries = summarizeLocalInferenceProfiles(settings, 'default', 'healthy');
       expect(summaries).toEqual([
-        { id: 'default', displayName: 'Local model', enabled: true, isDefault: true, activity: 'active', activeStateKind: 'healthy' },
-        { id: 'second', displayName: 'Second profile', enabled: false, isDefault: false, activity: 'inactive', activeStateKind: null }
+        { id: 'default', displayName: 'Local model', enabled: true, isDefault: true, runtime: 'llama_cpp', activity: 'active', activeStateKind: 'healthy' },
+        { id: 'second', displayName: 'Second profile', enabled: false, isDefault: false, runtime: 'llama_cpp', activity: 'inactive', activeStateKind: null }
       ]);
     });
 

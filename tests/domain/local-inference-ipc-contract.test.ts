@@ -168,6 +168,7 @@ describe('local-inference IPC contract', () => {
       displayName: 'Local model',
       enabled: true,
       isDefault: true,
+      runtime: 'llama_cpp',
       activity: 'inactive',
       activeStateKind: null
     };

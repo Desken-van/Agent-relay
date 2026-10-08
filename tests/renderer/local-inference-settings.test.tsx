@@ -322,3 +322,52 @@ describe('local inference settings', () => {
     expect(input.localInference.defaultProfileId).toBeNull();
   });
 });
+
+describe('a Strata runtime in the profile editor', () => {
+  it('switches a profile to Strata: shows its own fields, hides llama.cpp\'s, and saves the Strata profile', async () => {
+    renderApp(<SettingsView />);
+    await screen.findByLabelText(/^Enable local inference/);
+    await openDefaultProfileEditor();
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Runtime' }), { target: { value: 'strata' } });
+    expect(screen.queryByRole('combobox', { name: /^Executable/ })).toBeNull();
+    expect(screen.queryByRole('combobox', { name: /^Model source/ })).toBeNull();
+    expect(screen.queryByLabelText(/^Fixed runtime arguments/)).toBeNull();
+
+    fireEvent.change(screen.getByLabelText(/^Strata Python interpreter/), { target: { value: 'C:\\strata\\.venv\\Scripts\\python.exe' } });
+    fireEvent.change(screen.getByLabelText(/^Strata server script/), { target: { value: 'C:\\strata\\serve\\server.py' } });
+    fireEvent.change(screen.getByLabelText(/^Strata model config/), { target: { value: 'C:\\strata\\strata-coder-iq1_m.json' } });
+    fireEvent.change(screen.getByLabelText(/^Strata model name/), { target: { value: 'qwen3.8-flash-next-coder-iq1_m' } });
+    // The list names it a Strata profile.
+    expect(screen.getAllByText(/· Strata/).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole('button', { name: /^Save settings$/ }));
+
+    await waitFor(() => expect(bridge.callsTo('settings:update')).toHaveLength(1));
+    const saved = (bridge.callsTo('settings:update')[0]?.input as Settings).localInference.profiles[0]!;
+    expect(saved).toMatchObject({
+      adapterKind: 'strata',
+      executable: { kind: 'explicit_path', path: 'C:\\strata\\.venv\\Scripts\\python.exe' },
+      strata: { serverScript: 'C:\\strata\\serve\\server.py', engineConfig: 'C:\\strata\\strata-coder-iq1_m.json' },
+      model: { source: { kind: 'runtime_id', runtimeModelId: 'qwen3.8-flash-next-coder-iq1_m' } },
+      fixedArguments: []
+    });
+  });
+
+  it('keeps Save disabled while the Strata paths are missing, and switching back to llama.cpp drops them', async () => {
+    renderApp(<SettingsView />);
+    await screen.findByLabelText(/^Enable local inference/);
+    await openDefaultProfileEditor();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Runtime' }), { target: { value: 'strata' } });
+    expect((screen.getByRole('button', { name: /^Save settings$/ }) as HTMLButtonElement).disabled).toBe(true);
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Runtime' }), { target: { value: 'llama_cpp' } });
+    expect(screen.getByRole('combobox', { name: /^Executable/ })).toBeTruthy();
+    fireEvent.change(screen.getByRole('combobox', { name: /^Executable/ }), { target: { value: 'discovered' } });
+    fireEvent.change(screen.getByLabelText(/^Port/), { target: { value: '18081' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Save settings$/ }));
+    await waitFor(() => expect(bridge.callsTo('settings:update')).toHaveLength(1));
+    const saved = (bridge.callsTo('settings:update')[0]?.input as Settings).localInference.profiles[0]!;
+    expect(saved.adapterKind).toBe('llama_cpp');
+    expect(saved).not.toHaveProperty('strata');
+  });
+});

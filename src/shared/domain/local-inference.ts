@@ -276,6 +276,84 @@ export const localInferenceModelSchema = z
 
 export type LocalInferenceModel = z.infer<typeof localInferenceModelSchema>;
 
+/* -------------------------------------------------------------------------- */
+/* Runtime kind                                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which kind of local runtime a profile starts. `llama_cpp` is a llama-server process, launched with argv
+ * Agent Relay builds; `strata` is a Strata server (https://github.com/Niko1221/Strata: its Python HTTP server
+ * plus its engine), launched from the files its own setup wrote. Both speak the same OpenAI-compatible chat
+ * completion contract to Agent Relay, and both are owned the same way: started by Agent Relay, supervised as
+ * one process tree, stopped by it. Neither is ever an agent: tasks, file changes, verification and
+ * publication stay Agent Relay's.
+ */
+export const LOCAL_INFERENCE_ADAPTER_KINDS = ['llama_cpp', 'strata'] as const;
+export type LocalInferenceAdapterKind = (typeof LOCAL_INFERENCE_ADAPTER_KINDS)[number];
+
+/**
+ * Where a Strata runtime comes from: the `serve/server.py` of its checkout and the model config its setup
+ * wrote (`strata-<model>.json`: the engine, its arguments, the model name and context). The interpreter is the
+ * profile's explicit executable (the Python of Strata's own `.venv`). Paths only; what is IN the config is
+ * checked by the adapter before anything is launched.
+ */
+export const localInferenceStrataServerSchema = z
+  .object({
+    serverScript: absolutePathSchema(LOCAL_INFERENCE_LIMITS.workingDirectoryMax, 'Strata server script path'),
+    engineConfig: absolutePathSchema(LOCAL_INFERENCE_LIMITS.workingDirectoryMax, 'Strata model config path')
+  })
+  .strict();
+
+export type LocalInferenceStrataServer = z.infer<typeof localInferenceStrataServerSchema>;
+
+/**
+ * The fields that must agree with the runtime kind. A Strata profile runs the interpreter it names (never a
+ * PATH lookup), identifies its model by the runtime's own model name (what Strata's `/health` reports), and
+ * takes its arguments from Strata's config, so it has no fixed arguments of its own. A llama.cpp profile has
+ * no Strata block.
+ */
+function checkAdapterShape(
+  value: {
+    adapterKind: LocalInferenceAdapterKind;
+    strata?: LocalInferenceStrataServer | undefined;
+    executable: LocalInferenceExecutable;
+    model: LocalInferenceModel;
+    fixedArguments: readonly string[];
+  },
+  ctx: z.RefinementCtx
+): void {
+  if (value.adapterKind === 'llama_cpp') {
+    if (value.strata !== undefined) {
+      ctx.addIssue({ code: 'custom', path: ['strata'], message: 'Only a Strata runtime has Strata server paths.' });
+    }
+    return;
+  }
+  if (value.strata === undefined) {
+    ctx.addIssue({ code: 'custom', path: ['strata'], message: 'A Strata runtime needs its server script and model config paths.' });
+  }
+  if (value.executable.kind !== 'explicit_path') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['executable'],
+      message: 'A Strata runtime runs the Python interpreter of its own setup: name it as an explicit path.'
+    });
+  }
+  if (value.model.source.kind !== 'runtime_id') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['model', 'source'],
+      message: 'A Strata runtime is identified by its model name (the "model_name" of its config), not a model file.'
+    });
+  }
+  if (value.fixedArguments.length > 0) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['fixedArguments'],
+      message: 'A Strata runtime takes its arguments from its own model config; it has no fixed arguments here.'
+    });
+  }
+}
+
 /** The `--model` argv value for a configured model. Never an identity. */
 export function modelArgumentFor(model: LocalInferenceModel): string {
   return model.source.kind === 'path' ? model.source.path : model.source.runtimeModelId;
@@ -515,10 +593,13 @@ export const localInferenceProfileSchema = localInferenceRuntimeConfigShape
     displayName: profileDisplayNameSchema,
     /** Selectable for a new task binding. Independent of whether this exact profile is the one currently retained — see `activeProfileId`. */
     enabled: z.boolean(),
-    adapterKind: z.literal('llama_cpp')
+    adapterKind: z.enum(LOCAL_INFERENCE_ADAPTER_KINDS),
+    /** Present exactly when `adapterKind` is `strata`. */
+    strata: localInferenceStrataServerSchema.optional()
   })
   .strict()
-  .superRefine(checkOutputCeiling);
+  .superRefine(checkOutputCeiling)
+  .superRefine(checkAdapterShape);
 
 export type LocalInferenceProfile = z.infer<typeof localInferenceProfileSchema>;
 
@@ -730,6 +811,9 @@ export const localInferenceConfigSchema = z
   .object({
     version: z.literal(LOCAL_INFERENCE_CONTRACT_VERSION),
     providerId: safeIdSchema(LOCAL_INFERENCE_LIMITS.providerIdMax, 'provider id'),
+    /** Which runtime this configuration launches; a configuration without one is llama.cpp's, as before. */
+    adapterKind: z.enum(LOCAL_INFERENCE_ADAPTER_KINDS).default('llama_cpp'),
+    strata: localInferenceStrataServerSchema.optional(),
     executable: localInferenceExecutableSchema,
     model: localInferenceModelSchema,
     workingDirectory: absolutePathSchema(
@@ -785,6 +869,7 @@ export const localInferenceConfigSchema = z
     )
   })
   .strict()
+  .superRefine(checkAdapterShape)
   .superRefine((value, ctx) => {
     // Each of these is a pair that is individually valid and jointly nonsense.
     // Left unchecked, the first two produce a runtime that can never answer and
@@ -1254,6 +1339,16 @@ export const LOCAL_INFERENCE_ACTIVE_KINDS: readonly LocalInferenceStateKind[] = 
   'stopping'
 ];
 
+/** How a runtime kind is named to the operator. */
+export function localRuntimeLabel(kind: LocalInferenceAdapterKind): string {
+  return kind === 'strata' ? 'Strata' : 'llama.cpp';
+}
+
+/** The suffix a profile name carries wherever it is offered: none for llama.cpp (as before), " · Strata" for Strata. */
+export function localRuntimeTag(kind: LocalInferenceAdapterKind): string {
+  return kind === 'strata' ? ` · ${localRuntimeLabel(kind)}` : '';
+}
+
 export function isLocalInferenceActive(kind: LocalInferenceStateKind): boolean {
   return LOCAL_INFERENCE_ACTIVE_KINDS.includes(kind);
 }
@@ -1275,6 +1370,8 @@ export interface LocalInferenceProfileSummary {
   readonly displayName: string;
   readonly enabled: boolean;
   readonly isDefault: boolean;
+  /** Which kind of runtime it starts — shown wherever the profile is offered, so a Strata model is never presented as anything else. */
+  readonly runtime: LocalInferenceAdapterKind;
   /** Whether this is the profile the retained runtime is bound to (or would next start as). */
   readonly activity: 'active' | 'inactive';
   /** The retained runtime's own current state, only when `activity === 'active'`. */
@@ -1293,6 +1390,7 @@ export function summarizeLocalInferenceProfiles(
       displayName: profile.displayName,
       enabled: profile.enabled,
       isDefault: profile.id === settings.defaultProfileId,
+      runtime: profile.adapterKind,
       activity: active ? 'active' : 'inactive',
       activeStateKind: active ? activeStateKind : null
     };

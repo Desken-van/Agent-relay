@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { CLAUDE_MODEL_ALIASES } from '@shared/domain/models';
 import type { ImplementationProvider, ReviewProvider } from '@shared/domain/execution-providers';
-import type { LocalInferenceProfileSummary } from '@shared/domain/local-inference';
+import { localRuntimeTag, type LocalInferenceProfileSummary } from '@shared/domain/local-inference';
 import {
   choiceFromModel,
   choiceToModel,
@@ -241,6 +241,7 @@ export function TasksView(): React.JSX.Element {
                     {localInferenceProfiles.map((profile) => (
                       <option key={profile.id} value={profile.id} disabled={!profile.enabled}>
                         {profile.displayName}
+                        {localRuntimeTag(profile.runtime)}
                         {profile.isDefault ? ' (default)' : ''}
                         {profile.enabled ? '' : ' — disabled'}
                       </option>

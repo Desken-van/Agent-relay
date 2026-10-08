@@ -203,8 +203,14 @@ function completionBody(current, completionIndex) {
   return JSON.stringify(payload);
 }
 
-async function handleHealth(current, response) {
+async function handleHealth(current, response, healthIndex) {
   if (typeof current.healthDelayMs === 'number') await delay(current.healthDelayMs);
+
+  // `healthBodies`, when present, answers successive /health requests with these bodies in order (the last one
+  // repeats): a runtime that is up but still loading, then ready — the way a Strata server reports it.
+  if (Array.isArray(current.healthBodies) && current.healthBodies.length > 0) {
+    return send(response, 200, JSON.stringify(current.healthBodies[Math.min(healthIndex, current.healthBodies.length - 1)]));
+  }
 
   switch (current.health) {
     case 'hang':
@@ -290,7 +296,10 @@ const server = createServer((request, response) => {
     });
     recordEvidence();
 
-    if (request.url === '/health') return handleHealth(current, response);
+    if (request.url === '/health') {
+      const healthIndex = evidence.requests.filter((entry) => entry.path === '/health').length - 1;
+      return handleHealth(current, response, healthIndex);
+    }
     if (request.url === '/v1/chat/completions') {
       const completionIndex = evidence.requests.filter((entry) => entry.path === '/v1/chat/completions').length - 1;
       return handleCompletion(current, response, completionIndex);

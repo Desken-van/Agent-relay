@@ -64,6 +64,8 @@ export interface FakeRuntimeScenario {
   /** `GET /health` behaviour. */
   readonly health?: 'ok' | 'loading' | 'malformed' | 'not_object' | 'non2xx' | 'hang' | 'huge';
   readonly healthDelayMs?: number;
+  /** Answers successive `/health` requests with these bodies in order (the last one repeats); overrides `health`. */
+  readonly healthBodies?: readonly Record<string, unknown>[];
 
   /** `POST /v1/chat/completions` behaviour. */
   readonly completion?:
