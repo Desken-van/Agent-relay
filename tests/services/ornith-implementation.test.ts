@@ -629,14 +629,17 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(preflight.budget.maxToolResultBytes).toBe(384);
 
       // A single legal, existing path whose own JSON representation alone exceeds the
-      // 384-byte budget. `prefix` set to its exact name means the very first
+      // 384-byte budget. `prefix` set to its exact path means the very first
       // list_files call resolves to just this one entry, regardless of what else
       // exists in the manifest or how it sorts alphabetically. 130 multi-byte (3
       // UTF-8 bytes each) characters keep the actual filesystem path short (well
       // under Windows' ~260-character MAX_PATH) while still exceeding the byte
-      // budget once JSON-encoded: 130 real characters is a legal, if unusual, file
-      // name, not a path-length attack.
-      const oversizedName = '文'.repeat(130);
+      // budget once JSON-encoded. They are split over two path components because
+      // Linux limits ONE component to 255 bytes, and 130 such characters are 390:
+      // a legal, if unusual, path on every platform, not a path-length attack.
+      const oversizedName = `${'文'.repeat(65)}/${'文'.repeat(65)}`;
+      expect(Buffer.byteLength(JSON.stringify(oversizedName), 'utf8')).toBeGreaterThan(384);
+      mkdirSync(join(worktree, '文'.repeat(65)));
       writeFileSync(join(worktree, oversizedName), 'export {};\n', 'utf8');
 
       const leaseService: OrnithInferenceLeaseService = {
@@ -711,9 +714,13 @@ describe('OrnithImplementationService limits and cancellation', () => {
       };
       // Multi-byte (3 UTF-8 bytes each) names: short enough in UTF-16 code units to
       // stay well under Windows' MAX_PATH, long enough in UTF-8 bytes that every
-      // {path,line} match entry alone exceeds the 384-byte budget.
+      // {path,line} match entry alone exceeds the 384-byte budget. Split over two
+      // components so none exceeds Linux's 255-byte limit for one component.
+      mkdirSync(join(worktree, '文'.repeat(60)));
       for (let index = 0; index < 3; index += 1) {
-        writeFileSync(join(worktree, `${'文'.repeat(120)}${index}.txt`), 'needle appears here\n', 'utf8');
+        const path = `${'文'.repeat(60)}/${'文'.repeat(60)}${index}.txt`;
+        expect(Buffer.byteLength(JSON.stringify({ path, line: 1 }), 'utf8')).toBeGreaterThan(384);
+        writeFileSync(join(worktree, path), 'needle appears here\n', 'utf8');
       }
 
       let calls = 0;
