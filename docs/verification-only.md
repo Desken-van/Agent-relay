@@ -76,6 +76,18 @@ Older stored implementation failures with worker evidence in their summaries use
 this same recovery route without rewriting their history. Publication still
 requires a passing verification and review of the exact current snapshot.
 
+Besides assertion, TypeScript, ESLint and build errors, two module errors that
+`node --test` (spec or tap reporter) prints when a test file cannot even load
+count as an implementation failure: an identifier declared twice, and a name a
+module does not export. Only when node:test's own summary counts a failure, Node
+located the error in a file of the task worktree outside `node_modules`, a
+missing export was requested from a relative project module, and no other
+SyntaxError or Node module-environment error (a package that is not installed,
+an unsupported file kind) appears beside it. Anything else — another SyntaxError,
+a dependency, the dot reporter's bare "test failed" — stays unknown. The summary
+keeps such an error with its location relative to the worktree
+(`src/strings.js:3`); other machine paths, `file://` URLs included, are omitted.
+
 Bounded, redacted summaries prioritize concrete error messages over test titles
 and stack tails. They are evidence excerpts, not full logs. A historical summary
 cannot recover assertion details that were already discarded.

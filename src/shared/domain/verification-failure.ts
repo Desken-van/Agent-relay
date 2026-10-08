@@ -7,7 +7,8 @@
  * the test runner's own machinery (a worker that stopped answering, a process that never started) is not,
  * and asking a model to "fix" it would spend a round and a correction prompt on nothing. So the two must be
  * told apart — but only on positive evidence. The rules here are deliberately narrow: `implementation` needs
- * an explicit lint, typecheck, build or test-assertion failure without runner failure; mixed failures are
+ * an explicit lint, typecheck, build or test-assertion failure, or one of two node:test module errors located
+ * in the project's own files, without runner failure; mixed failures are
  * `unknown` and require bounded diagnosis; `infrastructure` needs a known
  * runner-level signature and NO such failure beside it; a command the process layer stopped at the output
  * retention limit is `output_limit` (nothing about the files is established, and the same command under the
@@ -41,6 +42,12 @@ export interface VerificationFailureInput {
   readonly outputLimitBytes?: number;
   /** The command's stdout and stderr as the process layer returned them (already secret-redacted, bounded). */
   readonly output: string;
+  /**
+   * The directory the command ran in, as configured and as resolved (Node prints resolved paths). Only a
+   * module error Node located inside one of these, outside `node_modules`, can be the files' own; without
+   * them no such error is ever read as one.
+   */
+  readonly worktreeRoots?: readonly string[];
 }
 
 /**
@@ -73,6 +80,80 @@ const IMPLEMENTATION_SIGNATURES: readonly { readonly pattern: RegExp; readonly l
   { pattern: /✖ \d+ problems? \(\d+ errors?/, label: 'ESLint reported errors' },
   { pattern: /\berror during build\b|\bRollupError\b|\[vite\]: Rollup failed/i, label: 'the build failed' }
 ];
+
+/**
+ * node:test (`node --test`, spec and tap reporters) reports a test file that could not even be loaded as one
+ * failed test whose only evidence is the error Node printed above it: the `file://…:LINE` location, the code
+ * frame, then the message. Two such messages are the files' own, and only under all of these conditions:
+ * node:test's own summary counts a failure; Node located the error in a file of this worktree outside
+ * `node_modules`; a missing export was requested from a relative module of the project; no other
+ * SyntaxError appears (a test's own `JSON.parse`, a dependency, an unsupported syntax for this Node); and no
+ * Node module-environment error appears beside it (a package that is not installed, a file kind Node cannot
+ * load). Anything else stays unknown. The dot reporter keeps only "test failed", so it stays unknown too.
+ */
+const NODE_TEST_FAILED_SUMMARY = /^(?:ℹ|#) fail [1-9]\d*$/m;
+const NODE_DUPLICATE_DECLARATION = /^SyntaxError: Identifier '[^'\n]{1,200}' has already been declared$/;
+const NODE_MISSING_EXPORT = /^SyntaxError: The requested module '([^'\n]{1,500})' does not provide an export named '[^'\n]{1,200}'$/;
+const NODE_SYNTAX_ERROR = /\bSyntaxError\b/;
+const NODE_LOCATION = /^(file:\/\/\S+?):\d+$/;
+const NODE_LOCATION_LOOKBACK_LINES = 5;
+const NODE_ENVIRONMENT_ERRORS =
+  /\bERR_(?:MODULE_NOT_FOUND|UNKNOWN_FILE_EXTENSION|REQUIRE_ESM|UNSUPPORTED_DIR_IMPORT|UNSUPPORTED_ESM_URL_SCHEME|PACKAGE_PATH_NOT_EXPORTED|PACKAGE_IMPORT_NOT_DEFINED|INVALID_PACKAGE_CONFIG)\b/;
+const NODE_DUPLICATE_DECLARATION_LABEL = 'node:test could not load a test because a project file declares the same name twice';
+const NODE_MISSING_EXPORT_LABEL = 'node:test could not load a test because a project module does not export a name that is imported from it';
+const ESCAPE = String.fromCharCode(27);
+const ANSI_SEQUENCE = new RegExp(`${ESCAPE}\\[[0-9;?]*[ -/]*[@-~]`, 'g');
+
+function normalizedPath(path: string): string {
+  return path.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+/** The path a `file://` URL names, or null when it cannot be decoded. */
+function fileUrlPath(url: string): string | null {
+  let path: string;
+  try {
+    path = decodeURIComponent(url.slice('file://'.length));
+  } catch {
+    return null;
+  }
+  return /^\/[A-Za-z]:\//.test(path) ? path.slice(1) : path;
+}
+
+/** True when `path` is a file inside one of `roots`, not under `node_modules` and without dot segments. */
+function isProjectFile(path: string, roots: readonly string[]): boolean {
+  const file = normalizedPath(path);
+  const windows = /^[A-Za-z]:\//.test(file);
+  return roots.some((root) => {
+    const prefix = `${normalizedPath(root)}/`;
+    if (prefix === '/') return false;
+    const inside = windows ? file.toLowerCase().startsWith(prefix.toLowerCase()) : file.startsWith(prefix);
+    if (!inside) return false;
+    return file.slice(prefix.length).split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..' && segment !== 'node_modules');
+  });
+}
+
+function nodeTestSourceFailures(text: string, roots: readonly string[]): string[] {
+  if (roots.length === 0 || !NODE_TEST_FAILED_SUMMARY.test(text) || NODE_ENVIRONMENT_ERRORS.test(text)) return [];
+  // The tap reporter prefixes each line of the child's stderr with "# "; spec prints it as is.
+  const lines = text.split('\n').map((line) => line.replace(/^\s*(?:#\s)?/, '').trimEnd());
+  const labels = new Set<string>();
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    if (!NODE_SYNTAX_ERROR.test(line)) continue;
+    const duplicate = NODE_DUPLICATE_DECLARATION.test(line);
+    const missingExport = NODE_MISSING_EXPORT.exec(line);
+    if (!duplicate && missingExport === null) return [];
+    if (missingExport !== null && !/^\.\.?\//.test(missingExport[1]!)) return [];
+    let location: string | null = null;
+    for (let back = index - 1; back >= Math.max(0, index - NODE_LOCATION_LOOKBACK_LINES) && location === null; back -= 1) {
+      location = NODE_LOCATION.exec(lines[back]!)?.[1] ?? null;
+    }
+    const path = location === null ? null : fileUrlPath(location);
+    if (path === null || !isProjectFile(path, roots)) return [];
+    labels.add(duplicate ? NODE_DUPLICATE_DECLARATION_LABEL : NODE_MISSING_EXPORT_LABEL);
+  }
+  return [...labels];
+}
 
 const CANCELLED_REASON = 'Verification cancelled; success was not established.';
 
@@ -124,7 +205,10 @@ export function classifyVerificationFailure(input: VerificationFailureInput): Ve
     };
   }
   const text = boundedVerificationOutputWindow(input.output);
-  const implementation = labelsMatching(IMPLEMENTATION_SIGNATURES, text);
+  const implementation = [
+    ...labelsMatching(IMPLEMENTATION_SIGNATURES, text),
+    ...nodeTestSourceFailures(text.replace(ANSI_SEQUENCE, '').replace(/\r\n?/g, '\n'), input.worktreeRoots ?? [])
+  ];
   const infrastructure = labelsMatching(INFRASTRUCTURE_SIGNATURES, text);
   if (input.exitCode === null && implementation.length === 0 && infrastructure.length > 0) {
     return { kind: 'infrastructure', reason: `Verification could not start: ${joinLabels(infrastructure)}. Repair the installed verification tooling; the task files are preserved.` };

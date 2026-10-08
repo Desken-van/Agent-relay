@@ -57,6 +57,7 @@ import type { TaskSpecification } from '../../shared/schemas/codex';
 import type { AgentProgressEvent, ImplementationResult, OrnithHealthyLease, OrnithInferenceLeaseService } from '../ports';
 import type { ProcessRunner } from '../adapters/process/process-runner';
 import { OrnithWorktreeTools, type OrnithOperationBudget, type OrnithToolResult } from './ornith-worktree-tools';
+import { verificationWorktreeRoots } from './worktree-verification';
 
 /* -------------------------------------------------------------------------- */
 /* Request / result                                                           */
@@ -1364,6 +1365,7 @@ export class OrnithImplementationService {
           const classified = classifyVerificationExecution(execution, { budgetExpired, budgetMs });
           // What a failed command failed ON — the files, or the test runner itself — from the same bounded
           // output the summary is built from, so the model is not told to change files over a runner failure.
+          const worktreeRoots = await verificationWorktreeRoots(request.worktreePath);
           const failure = classified.outcome === 'passed'
             ? null
             : classifyVerificationFailure({
@@ -1371,7 +1373,8 @@ export class OrnithImplementationService {
                 exitCode: execution.exitCode,
                 durationMs: execution.durationMs,
                 outputLimitExceeded: execution.outputLimitExceeded === true,
-                output: execution.output
+                output: execution.output,
+                worktreeRoots
               });
           const attempt: OrnithVerificationAttempt = {
             sequence: nonterminalActionsUsed,
@@ -1380,7 +1383,7 @@ export class OrnithImplementationService {
             exitCode: execution.exitCode,
             durationMs: Math.max(0, Math.round(execution.durationMs)),
             reason: classified.reason === null ? null : classified.reason.slice(0, 400),
-            summary: summarizeVerificationOutput(execution.output),
+            summary: summarizeVerificationOutput(execution.output, undefined, { worktreeRoots }),
             code: null,
             fingerprint: shortFingerprint(fingerprint),
             ...(failure === null ? {} : { failureKind: failure.kind })

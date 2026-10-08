@@ -17,6 +17,15 @@ export interface VerificationExecutor {
   execute(target: VerificationTarget, signal: AbortSignal, progress: (event: AgentProgressEvent) => void): Promise<ProcessResult>;
 }
 
+/**
+ * The directory `npm run verify` runs in, as configured and as the filesystem resolves it (Node prints
+ * resolved module paths): what the failure classifier and the output summary recognise as the project's own.
+ */
+export async function verificationWorktreeRoots(worktreePath: string): Promise<string[]> {
+  const resolved = await realpath(worktreePath).catch(() => null);
+  return resolved === null || resolved === worktreePath ? [worktreePath] : [worktreePath, resolved];
+}
+
 /** Executes the existing project's verify script, never an LLM or renderer command.
  * Scripts are trusted project code and can write build/test artifacts. */
 export class WorktreeVerification implements VerificationExecutor {
