@@ -250,12 +250,38 @@ describe('Ornith verification repair Electron acceptance', () => {
       await page.getByRole('button', { name: new RegExp(taskTitle) }).dblclick();
       await page.locator('button.rail__item').filter({ hasText: 'Run' }).click();
       const primary = page.locator('button.btn--recommended').first();
-      const primaryLabel = async (): Promise<string | null> => (await primary.textContent({ timeout: 2_000 }).catch(() => null))?.trim() ?? null;
+      /**
+       * The primary action as the operator meets it, and the state that decides whether it can be pressed. The
+       * label alone proves nothing: task events bring the next action's label while the request that led to it
+       * is still finishing (its spinner and pending flag are still on — the action keeps the same key), and the
+       * Ornith action also waits for the local runtime to be Healthy or released for Relay's own verification.
+       */
+      const primaryState = async (): Promise<string> => JSON.stringify(await page.evaluate(async () => {
+        // This file is checked without DOM typings; the page's own `document`, as `invokeIpc` reaches `agentRelay`.
+        const button = (globalThis as any).document.querySelector('button.btn--recommended') as {
+          readonly textContent: string | null;
+          readonly disabled: boolean;
+          getAttribute(name: string): string | null;
+          querySelector(selector: string): unknown;
+        } | null;
+        const runtime = await (globalThis as any).agentRelay.invoke('localInference:getState', {});
+        return {
+          label: button?.textContent?.trim() ?? null,
+          enabled: button !== null && !button.disabled,
+          pending: button?.querySelector('.spinner') !== null,
+          disabledReason: button?.getAttribute('title') ?? null,
+          runtime: runtime.ok ? runtime.data : null
+        };
+      }));
+      const untilAvailable = (label: RegExp, timeoutMs: number): Promise<void> => expect_(primaryState, (text) => {
+        const state = JSON.parse(text ?? '{}') as { label?: string | null; enabled?: boolean; pending?: boolean };
+        return label.test(state.label ?? '') && state.enabled === true && state.pending === false;
+      }, timeoutMs);
 
       /* Round 1: Ornith duplicates the function; Relay's node --test cannot load the test file. */
-      await expect_(primaryLabel, (label) => /Run implementation · Ornith/.test(label ?? ''));
+      await untilAvailable(/Run implementation · Ornith/, 15_000);
       await primary.click();
-      await expect_(primaryLabel, (label) => /Fix verification failures · Ornith/.test(label ?? ''), 90_000);
+      await untilAvailable(/Fix verification failures · Ornith/, 90_000);
       const afterFirst = await readTask();
       expect(afterFirst.status).toBe('READY_FOR_IMPLEMENTATION');
       expect(afterFirst.lastError).toContain('a project file declares the same name twice');
@@ -266,7 +292,8 @@ describe('Ornith verification repair Electron acceptance', () => {
       expect(failed.outputSummary).toContain("src/strings.js:");
       expect(failed.outputSummary).toContain("SyntaxError: Identifier 'whisper' has already been declared");
       expect(failed.outputSummary).not.toContain(worktree);
-      expect(await primary.isEnabled()).toBe(true);
+      // Pressable for the right reason: the runtime is the one Relay released for its own verification.
+      expect(JSON.parse(await primaryState())).toMatchObject({ enabled: true, disabledReason: null, runtime: { kind: 'stopped', releasedForVerification: true } });
       expect(runtime.completionRequests()).toHaveLength(3);
       const firstRuntimePid = runtime.evidence().pid;
 
@@ -280,7 +307,7 @@ describe('Ornith verification repair Electron acceptance', () => {
         ]
       });
       await primary.click();
-      await expect_(primaryLabel, (label) => /Run review/.test(label ?? ''), 90_000);
+      await untilAvailable(/Run review/, 90_000);
       expect(runtime.evidence().pid).not.toBe(firstRuntimePid);
       const repairPrompt = runtime.completionRequests()[0]!.body;
       expect(repairPrompt).toContain('EVIDENCE FROM THE PREVIOUS ATTEMPT');
