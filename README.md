@@ -159,8 +159,14 @@ put one. Each tool authenticates itself.
 
 ### Codex
 
-The Codex CLI is installed as a dependency of `@openai/codex-sdk`, so you do not
-need a separate install.
+Agent Relay runs one Codex for specifications, reviews, diagnostics and the model
+list, chosen in this order: the path set in **Settings → Codex path**; otherwise the
+Codex CLI installed on your PATH; otherwise the copy bundled with
+`@openai/codex-sdk`, so a separate install is optional. A configured path that does
+not exist is reported as an error, never replaced by another Codex. The bundled
+copy may be older than the Codex you use elsewhere, which matters because Codex
+builds share `~/.codex`. On Windows only a `codex.exe` on PATH counts; an npm
+`codex.cmd` shim is skipped.
 
 ```powershell
 npx codex login          # opens a browser; ChatGPT or API-key sign-in

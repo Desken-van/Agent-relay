@@ -497,7 +497,9 @@ describe('Codex model catalogue', () => {
     const result = await catalog.list();
 
     expect(result.available).toBe(false);
-    expect(result.detail).toMatch(/could not be found/i);
+    // The configured path is named, and nothing else is tried in its place.
+    expect(result.detail).toMatch(/Codex path set in Settings \(C:\\definitely\\not\\here\\codex\.exe\) is not an executable file/);
+    expect(result.detail).toMatch(/does not fall back/);
     expect(runner.calls).toHaveLength(0);
   });
 
