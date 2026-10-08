@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
+import { delimiter, join, resolve } from 'node:path';
 import {
   ExecaProcessRunner,
-  runOrThrow
+  runOrThrow,
+  withoutOwnNodeBinaries
 } from '../../src/main/adapters/process/process-runner';
 import { redactAndTruncate, redactSecrets, scrubEnvironment } from '../../src/shared/util/redact';
 import {
@@ -104,6 +106,56 @@ describe('environment scrubbing', () => {
   it('matches the passthrough list case-insensitively', () => {
     const scrubbed = scrubEnvironment({ gh_token: 'x' }, ['GH_TOKEN']);
     expect(scrubbed.gh_token).toBe('x');
+  });
+});
+
+describe('PATH entries a child inherits', () => {
+  const app = resolve('/opt/agent-relay');
+  const moduleDirectory = join(app, 'src', 'main', 'adapters', 'process');
+  const pathOf = (...entries: string[]): NodeJS.ProcessEnv => ({ PATH: entries.join(delimiter), HOME: '/home/user' });
+
+  it('drops the node_modules/.bin that npm put in front for Agent Relay itself and for every ancestor of it', () => {
+    const env = withoutOwnNodeBinaries(pathOf(
+      join(app, 'node_modules', '.bin'),
+      join(resolve('/opt'), 'node_modules', '.bin'),
+      join(resolve('/'), 'node_modules', '.bin'),
+      '/usr/local/bin',
+      '/usr/bin'
+    ), moduleDirectory);
+    expect(env.PATH).toBe(['/usr/local/bin', '/usr/bin'].join(delimiter));
+    expect(env.HOME).toBe('/home/user');
+  });
+
+  it('keeps every other node_modules/.bin: a worktree, another project, a sibling of the app', () => {
+    const kept = [
+      join(resolve('/work/task'), 'node_modules', '.bin'),
+      join(resolve('/opt/other-project'), 'node_modules', '.bin'),
+      join(app, 'packages', 'tool', 'node_modules', '.bin'),
+      '/usr/bin'
+    ];
+    expect(withoutOwnNodeBinaries(pathOf(...kept), moduleDirectory).PATH).toBe(kept.join(delimiter));
+  });
+
+  it('finds the variable whatever its case, and leaves an environment without one alone', () => {
+    expect(withoutOwnNodeBinaries({ Path: [join(app, 'node_modules', '.bin'), '/usr/bin'].join(delimiter) }, moduleDirectory))
+      .toEqual({ Path: '/usr/bin' });
+    expect(withoutOwnNodeBinaries({ HOME: '/home/user' }, moduleDirectory)).toEqual({ HOME: '/home/user' });
+  });
+
+  it.runIf(process.platform !== 'win32')('a real child never sees Agent Relay\'s own node_modules/.bin, even when the app was started by npm', async () => {
+    const own = resolve('node_modules', '.bin');
+    const previous = process.env.PATH;
+    process.env.PATH = [own, previous ?? ''].join(delimiter);
+    try {
+      const result = await new ExecaProcessRunner().run('/bin/sh', ['-c', 'printf %s "$PATH"']);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.split(delimiter)).not.toContain(own);
+      // An explicit PATH from the caller is still honoured as given.
+      const explicit = await new ExecaProcessRunner().run('/bin/sh', ['-c', 'printf %s "$PATH"'], { env: { PATH: `${own}${delimiter}/usr/bin` } });
+      expect(explicit.stdout).toBe(`${own}${delimiter}/usr/bin`);
+    } finally {
+      process.env.PATH = previous;
+    }
   });
 });
 
