@@ -128,6 +128,45 @@ describe('local worktree dependency preparation', () => {
       expect((await prepare.checkStatus({ repositoryPath, worktreePath })).state).toBe('ready_linked');
     });
 
+    it('accepts a dangling link only when it is its own link to a package the checkout removed, and prunes it', async () => {
+      mkdirSync(join(source(), 'removed-package'));
+      await prepare.prepare({ repositoryPath, worktreePath });
+      rmSync(join(source(), 'removed-package'), { recursive: true });
+      // Now dangling, but exactly the link Agent Relay made: stale, not broken.
+      expect(() => realpathSync(join(target(), 'removed-package'))).toThrow();
+      expect((await prepare.checkStatus({ repositoryPath, worktreePath })).state).toBe('ready_linked');
+
+      await prepare.prepare({ repositoryPath, worktreePath });
+
+      expect(() => lstatSync(join(target(), 'removed-package'))).toThrow();
+      expect(readFileSync(join(target(), '.fixture'), 'utf8')).toBe('installed');
+      expect((await prepare.checkStatus({ repositoryPath, worktreePath })).state).toBe('ready_linked');
+    });
+
+    it('reports a dangling link to anywhere else as broken, for an existing package or an unknown name, and prepare refuses it', async () => {
+      await prepare.prepare({ repositoryPath, worktreePath });
+      const nowhere = join(root, 'nowhere', 'package');
+      // An existing package's link replaced by one to a foreign, missing directory.
+      rmSync(join(target(), '.fixture'));
+      symlinkSync(nowhere, join(target(), '.fixture'), 'dir');
+      const status = await prepare.checkStatus({ repositoryPath, worktreePath });
+      expect(status).toEqual({
+        state: 'link_broken',
+        detail: 'A worktree node_modules link is broken or points outside the registered project checkout.'
+      });
+      await expect(prepare.prepare({ repositoryPath, worktreePath })).rejects.toThrow(/broken or points outside/);
+      expect(readlinkSync(join(target(), '.fixture'))).toBe(nowhere);
+      expect(readFileSync(join(source(), '.fixture'), 'utf8')).toBe('installed');
+
+      // A dangling link under a name the checkout never had.
+      rmSync(join(target(), '.fixture'));
+      symlinkSync(realpathSync(join(source(), '.fixture')), join(target(), '.fixture'));
+      symlinkSync(nowhere, join(target(), 'phantom-package'), 'dir');
+      expect((await prepare.checkStatus({ repositoryPath, worktreePath })).state).toBe('link_broken');
+      await expect(prepare.prepare({ repositoryPath, worktreePath })).rejects.toThrow(/broken or points outside/);
+      expect(readlinkSync(join(target(), 'phantom-package'))).toBe(nowhere);
+    });
+
     it('reports a foreign entry or a link elsewhere as broken, and prepare refuses it', async () => {
       await prepare.prepare({ repositoryPath, worktreePath });
       const elsewhere = join(root, 'elsewhere');

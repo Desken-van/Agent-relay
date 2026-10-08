@@ -1,4 +1,4 @@
-import { copyFile, lstat, mkdir, readdir, readFile, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readdir, readFile, readlink, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { AgentRelayError } from '../../shared/domain/errors';
 import {
@@ -108,9 +108,21 @@ async function existingNodeModules(path: string): Promise<'missing' | 'directory
 }
 
 /**
+ * True when `link` is, byte for byte, the link {@link LocalWorktreeDependencyPreparer} makes for
+ * `name`: it points at `<real path of the registered checkout's node_modules>/<name>`. Only such a
+ * link may dangle (its package was removed from the checkout, or the checkout's own entry dangles);
+ * any other dangling link is foreign or damaged.
+ */
+async function isOwnLink(link: string, sourceReal: string, name: string): Promise<boolean> {
+  const destination = await readlink(link).catch(() => null);
+  return destination !== null && isSamePath(destination, join(sourceReal, name));
+}
+
+/**
  * Why a linked node_modules directory cannot be trusted, or null. Every entry other than a
- * worktree-local cache must be a link to the registered checkout's entry of the same name; a link
- * whose entry the checkout no longer has is stale (prepare removes it), not broken.
+ * worktree-local cache must be a link to the registered checkout's entry of the same name. A
+ * dangling link is accepted only when it is exactly the link Agent Relay made for that name (its
+ * package was removed from the checkout: prepare drops it); any other dangling link is broken.
  */
 async function linkedDirectoryProblem(target: string, source: string): Promise<string | null> {
   const expected = await realpath(source).catch(() => null);
@@ -124,7 +136,10 @@ async function linkedDirectoryProblem(target: string, source: string): Promise<s
     const entry = await lstat(join(target, name));
     if (!entry.isSymbolicLink()) return 'The worktree node_modules holds an entry that is not a link to the registered checkout.';
     const actual = await realpath(join(target, name)).catch(() => null);
-    if (actual === null) continue;
+    if (actual === null) {
+      if (await isOwnLink(join(target, name), expected, name)) continue;
+      return 'A worktree node_modules link is broken or points outside the registered project checkout.';
+    }
     const wanted = await realpath(join(expected, name)).catch(() => null);
     if (wanted === null || !isSamePath(actual, wanted)) {
       return 'A worktree node_modules link points outside the registered project checkout.';
@@ -326,9 +341,10 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         const entry = await lstat(link);
+        if (entry.isSymbolicLink() && await isOwnLink(link, sourceReal, name)) continue;
         const actual = entry.isSymbolicLink() ? await realpath(link).catch(() => null) : null;
-        const expected = await realpath(join(sourceReal, name));
-        if (actual === null || !isSamePath(actual, expected)) {
+        const expected = await realpath(join(sourceReal, name)).catch(() => null);
+        if (actual === null || expected === null || !isSamePath(actual, expected)) {
           throw new AgentRelayError('WORKTREE_INVALID', 'A worktree node_modules entry is not a link to the registered checkout.');
         }
       }
