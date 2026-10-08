@@ -61,6 +61,30 @@ describe('local inference lifecycle panel', () => {
     );
   });
 
+  it('reads the state and profiles again when the saved local-inference settings change, and not otherwise', async () => {
+    let current: LocalInferenceState = { kind: 'stopped' };
+    const bridge = installBridge({
+      'localInference:getState': () => ok<'localInference:getState'>(current),
+      'localInference:listProfiles': () => ok<'localInference:listProfiles'>([])
+    });
+    const saved = { profiles: ['default'] };
+    const { rerender } = render(<LocalInferenceLifecyclePanel enabled unsaved={false} savedLocalInference={saved} />);
+    await settle();
+    expect(bridge.calls).toHaveLength(2);
+
+    // A re-render with the same saved settings reads nothing.
+    rerender(<LocalInferenceLifecyclePanel enabled unsaved={false} savedLocalInference={saved} />);
+    await settle();
+    expect(bridge.calls).toHaveLength(2);
+
+    // The chosen profile was deleted and saved: the panel shows what the main process now says.
+    current = { kind: 'unavailable', reason: 'The selected local-model profile "default" no longer exists.' };
+    rerender(<LocalInferenceLifecyclePanel enabled unsaved={false} savedLocalInference={{ profiles: [] }} />);
+    await settle();
+    expect(bridge.calls).toHaveLength(4);
+    await waitFor(() => expect(screen.getByText(/no longer exists/)).toBeTruthy());
+  });
+
   it('renders exactly one lifecycle button and one Run test inference button, with no duplicate controls, across every state', async () => {
     const cases: LocalInferenceState[] = [
       { kind: 'unavailable', reason: 'not found' },
