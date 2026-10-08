@@ -584,6 +584,71 @@ describe.runIf(process.platform === 'linux')('Linux native filesystem-mutation g
       expect(readdirSync(root)).toEqual([]);
     });
 
+    describe('the whole worktree root moved away from its registered path at the commit', () => {
+      // Landlock binds the helper to the root directory object, which can itself be renamed away. These cases
+      // pause the helper at its commit, move the bound root to outside/moved-root and leave the registered path
+      // empty, pointing back at it through a symlink, or missing. Every mutation must refuse with ROOT_INVALID
+      // and leave the moved root exactly as it was: no change may survive outside the registered path.
+      const attacks = {
+        'replaced by an empty directory': (moved: string) => { renameSync(root, moved); mkdirSync(root); },
+        'replaced by a symlink to its new place': (moved: string) => { renameSync(root, moved); symlinkSync(moved, root, 'dir'); },
+        'moved away with nothing left behind': (moved: string) => { renameSync(root, moved); }
+      } as const;
+
+      for (const [attackName, attack] of Object.entries(attacks)) {
+        for (const [op, call] of [
+          ['create', 'linkat'],
+          ['mkdirp', 'mkdirat'],
+          ['replace', 'renameat2'],
+          ['delete', 'renameat2']
+        ] as const) {
+          it(`${op}: root ${attackName} just before ${call} — refused, rolled back, nothing changed anywhere`, async () => {
+            mkdirSync(join(root, 'sub'));
+            writeFileSync(join(root, 'sub', 'a.txt'), 'original\n');
+            const identity = await identify(guard);
+            const { dev, ino } = fileIdentity(join(root, 'sub', 'a.txt'));
+            const moved = join(outside, 'moved-root');
+            const ids = [root, identity.volumeId, identity.fileId];
+            const args = {
+              create: ['create', ...ids, 'sub/new.txt'],
+              mkdirp: ['mkdirp', ...ids, 'sub/deeper/deepest'],
+              replace: ['replace', ...ids, dev, ino, 'sub/a.txt', sha('original\n')],
+              delete: ['delete', ...ids, dev, ino, 'sub/a.txt', sha('original\n')]
+            }[op];
+
+            const result = await raced(args, 'changed\n', {}, call, () => attack(moved));
+
+            expect(result).toEqual({ exitCode: 1, line: 'ERR:ROOT_INVALID', paused: true });
+            // The bound root, wherever it now is, holds exactly what it held before.
+            expect(readdirSync(moved)).toEqual(['sub']);
+            expect(readdirSync(join(moved, 'sub'))).toEqual(['a.txt']);
+            expect(readFileSync(join(moved, 'sub', 'a.txt'), 'utf8')).toBe('original\n');
+            expect(fileIdentity(join(moved, 'sub', 'a.txt'))).toEqual({ dev, ino });
+            // Nothing appeared at the registered path either.
+            if (attackName === 'replaced by an empty directory') expect(readdirSync(root)).toEqual([]);
+            if (attackName === 'replaced by a symlink to its new place') expect(lstatSync(root).isSymbolicLink()).toBe(true);
+            if (attackName === 'moved away with nothing left behind') expect(existsSync(root)).toBe(false);
+            expect(readdirSync(outside).sort()).toEqual(['moved-root', 'secret.txt']);
+          });
+        }
+      }
+
+      it('a root that stays at its registered path is unaffected: all four mutations still succeed', async () => {
+        mkdirSync(join(root, 'sub'));
+        writeFileSync(join(root, 'sub', 'a.txt'), 'original\n');
+        const identity = await identify(guard);
+        expect(await guard.mkdirp(root, identity, 'sub/deeper', never, TIMEOUT_MS)).toEqual({ ok: true });
+        expect(await guard.createFile(root, identity, 'sub/deeper/new.txt', 'new\n', never, TIMEOUT_MS)).toEqual({ ok: true });
+        const target = fileIdentity(join(root, 'sub', 'a.txt'));
+        expect(await guard.replaceFile(root, identity, target, 'sub/a.txt', 'changed\n', sha('original\n'), never, TIMEOUT_MS)).toEqual({ ok: true });
+        const replaced = fileIdentity(join(root, 'sub', 'a.txt'));
+        expect(await guard.deleteFile(root, identity, replaced, 'sub/a.txt', sha('changed\n'), never, TIMEOUT_MS)).toEqual({ ok: true });
+        expect(readdirSync(join(root, 'sub'))).toEqual(['deeper']);
+        expect(readFileSync(join(root, 'sub', 'deeper', 'new.txt'), 'utf8')).toBe('new\n');
+        expectNoStagingLeftovers(root);
+      });
+    });
+
     describe('a parent directory moved out of the worktree after the helper opened it', () => {
       /** `root/sub/a.txt`; the attack moves `root/sub` to `outside/sub` while the helper is paused. */
       function prepare(): void {

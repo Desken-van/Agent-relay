@@ -25,6 +25,21 @@
  * longer beneath the root. A kernel without Landlock gets no mutation at all
  * (`ERR:UNSUPPORTED`), never an unconfined one.
  *
+ * Landlock binds the helper to the root directory OBJECT, which can itself be
+ * renamed away from the registered path (an unprivileged Linux process cannot
+ * pin a directory against rename the way the Windows helper's missing
+ * FILE_SHARE_DELETE does). So every mutation is also bound to the registered
+ * path: immediately before and immediately after its visible commit, the
+ * helper resolves `root` from "/" again (openat2, no symlink followed) and
+ * requires it to name the bound root. If the check after the commit fails, the
+ * commit is undone through the same descriptors (the created link removed,
+ * the exchange reversed, the quarantined file put back, the created
+ * directories removed) and the helper reports `ERR:ROOT_INVALID`. `OK` thus
+ * means the change was confirmed inside the directory that, at that instant,
+ * the registered path named. What no unprivileged mechanism can stop is the
+ * root being moved away and back between the commit and that check; the
+ * change then ends where the registered path names, never elsewhere.
+ *
  * Protocol (identical argv and stdout to the Windows helper, so the
  * TypeScript side shares one parser):
  *
@@ -97,6 +112,7 @@
 
 #include <fcntl.h>
 #include <linux/landlock.h>
+#include <linux/openat2.h>
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/random.h>
@@ -368,6 +384,8 @@ std::vector<std::string> splitAndValidate(const std::string& relative) {
 struct Root {
   Fd fd;
   FileInfo info;
+  /** The registered, canonical worktree path the caller bound. */
+  std::string path;
 };
 
 /**
@@ -379,7 +397,7 @@ Root openRoot(const std::string& root, const RootIdentity* expected) {
   if (root.empty() || root[0] != '/') fail(GuardError::kInvalidArguments);
   const int fd = open(root.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (fd < 0) fail(GuardError::kRootInvalid);
-  Root result{Fd(fd), FileInfo{}};
+  Root result{Fd(fd), FileInfo{}, root};
   int error = 0;
   if (!statAt(result.fd.value, "", result.info, error)) fail(GuardError::kRootInvalid);
   if (!S_ISDIR(result.info.mode)) fail(GuardError::kRootInvalid);
@@ -411,7 +429,8 @@ void confineBeneathRoot(const Root& root) {
       LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
       LANDLOCK_ACCESS_FS_MAKE_SYM;
   uint64_t allowed = LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
-      LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_MAKE_REG;
+      LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_MAKE_DIR |
+      LANDLOCK_ACCESS_FS_MAKE_REG;
   if (abi >= 2) {
     handled |= LANDLOCK_ACCESS_FS_REFER;
     allowed |= LANDLOCK_ACCESS_FS_REFER;
@@ -495,7 +514,8 @@ void assertSameMount(const FileInfo& info, const FileInfo& root) {
  * relative to `parent`, never re-resolving anything by absolute path and never
  * following a symlink.
  */
-Fd openOrCreateChildDirectory(int parent, const std::string& name, bool createIfMissing, const FileInfo& root) {
+Fd openOrCreateChildDirectory(
+    int parent, const std::string& name, bool createIfMissing, const FileInfo& root, bool* created = nullptr) {
   for (int attempt = 0; attempt < 4; ++attempt) {
     const int fd = openat(parent, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd >= 0) {
@@ -509,7 +529,11 @@ Fd openOrCreateChildDirectory(int parent, const std::string& name, bool createIf
     if (error == ENOENT) {
       if (!createIfMissing) fail(GuardError::kNotFound);
       // Mode 0777 is filtered by the process umask, exactly like Node's mkdir.
-      if (mkdirat(parent, name.c_str(), 0777) == 0 || errno == EEXIST) continue;
+      if (mkdirat(parent, name.c_str(), 0777) == 0) {
+        if (created != nullptr) *created = true;
+        continue;
+      }
+      if (errno == EEXIST) continue;
       if (errno == ENOENT) fail(GuardError::kNotFound);
       failAccess("mkdirat refused", errno, parent, root);
     }
@@ -521,14 +545,65 @@ Fd openOrCreateChildDirectory(int parent, const std::string& name, bool createIf
   fail(GuardError::kInternal);
 }
 
-/** Walk (and optionally create) every segment relative to the root descriptor. */
-Fd walkDirectories(const Root& root, const std::vector<std::string>& segments, bool createIfMissing) {
+/** A directory this run created: its parent, its name, and its identity. */
+struct CreatedDirectory {
+  Fd parent;
+  std::string name;
+  FileInfo info;
+};
+
+/**
+ * Walk (and optionally create) every segment relative to the root descriptor.
+ * When `created` is given, every directory this call made is recorded in it,
+ * outermost first, so the walk can be undone.
+ */
+Fd walkDirectories(
+    const Root& root, const std::vector<std::string>& segments, bool createIfMissing,
+    std::vector<CreatedDirectory>* created = nullptr) {
   Fd current(fcntl(root.fd.value, F_DUPFD_CLOEXEC, 0));
   if (current.value < 0) fail(GuardError::kInternal);
   for (const auto& segment : segments) {
-    current = openOrCreateChildDirectory(current.value, segment, createIfMissing, root.info);
+    bool made = false;
+    Fd next = openOrCreateChildDirectory(current.value, segment, createIfMissing, root.info, &made);
+    if (made && created != nullptr) {
+      CreatedDirectory record{Fd(fcntl(current.value, F_DUPFD_CLOEXEC, 0)), segment, infoOf(next.value)};
+      if (record.parent.value < 0) fail(GuardError::kInternal);
+      created->push_back(std::move(record));
+    }
+    current = std::move(next);
   }
   return current;
+}
+
+/**
+ * True when the registered root path, resolved again from "/" right now and
+ * without following any symlink, names the bound root directory. O_PATH
+ * resolution is not subject to Landlock, so this sees the real filesystem.
+ */
+bool registeredPathNamesRoot(const Root& root) {
+  struct open_how how {};
+  how.flags = O_PATH | O_DIRECTORY | O_CLOEXEC;
+  how.resolve = RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+  const Fd current(static_cast<int>(syscall(SYS_openat2, AT_FDCWD, root.path.c_str(), &how, sizeof(how))));
+  if (current.value < 0) {
+    if (errno == ENOSYS) {
+      diagnose("openat2 is unavailable; the registered worktree path cannot be confirmed", errno);
+      fail(GuardError::kUnsupported);
+    }
+    return false;
+  }
+  FileInfo info;
+  int error = 0;
+  if (!statAt(current.value, "", info, error)) return false;
+  return info.dev == root.info.dev && info.ino == root.info.ino && info.birth == root.info.birth;
+}
+
+/** Refuse, before anything changes, unless the registered path still names the bound root. */
+void requireRegisteredRoot(const Root& root) {
+  if (!registeredPathNamesRoot(root)) {
+    diagnose("the registered worktree path no longer names the bound root; nothing was changed", 0);
+    fail(GuardError::kRootInvalid);
+  }
 }
 
 struct OpenedTarget {
@@ -930,7 +1005,22 @@ void doMkdirp(const std::string& rootPath, const RootIdentity& expected, const s
   const auto segments = splitAndValidate(relDir);
   const Root root = openConfinedRoot(rootPath, expected);
   if (segments.empty()) return;
-  walkDirectories(root, segments, true);
+  requireRegisteredRoot(root);
+  deferTermination();
+  std::vector<CreatedDirectory> created;
+  walkDirectories(root, segments, true, &created);
+  if (registeredPathNamesRoot(root)) return;
+  // Undo, innermost first, only directories this run made and that are still empty.
+  bool undone = true;
+  for (auto it = created.rbegin(); it != created.rend(); ++it) {
+    if (!nameRefersTo(it->parent.value, it->name, it->info) ||
+        unlinkat(it->parent.value, it->name.c_str(), AT_REMOVEDIR) != 0) {
+      diagnose("removing a directory created under a moved worktree root refused", errno);
+      undone = false;
+    }
+  }
+  diagnose("the registered worktree path stopped naming the bound root during mkdirp", 0);
+  fail(undone ? GuardError::kRootInvalid : GuardError::kInternal);
 }
 
 std::vector<std::string> parentSegmentsOf(const std::vector<std::string>& segments) {
@@ -953,10 +1043,19 @@ void doCreate(
   stageContent(staged, parent.value, root.info, content);
 
   abandonIfTerminationPending();
+  requireRegisteredRoot(root);
   // Linked from the open descriptor, never from the staging name, so what
   // appears at the destination is exactly the staged inode. A hard link never
   // replaces an existing name.
   if (!linkFromFd(staged, finalName)) fail(GuardError::kAlreadyExists);
+  if (!registeredPathNamesRoot(root)) {
+    // The root was moved away from its registered path: take the link back.
+    if (!nameRefersTo(parent.value, finalName, staged.info) || unlinkat(parent.value, finalName.c_str(), 0) != 0) {
+      diagnose("removing a file created under a moved worktree root refused", errno);
+      fail(GuardError::kInternal);
+    }
+    fail(GuardError::kRootInvalid);
+  }
   // The destructor drops a named staging file's extra name.
   syncDirectory(parent.value);
 }
@@ -990,6 +1089,7 @@ void doReplace(
   }
   materialize(staged);
   abandonIfTerminationPending();
+  requireRegisteredRoot(root);
 
   // The only commit: an atomic exchange, so the original is never unlinked
   // before the replacement is proven. Without it nothing is changed.
@@ -1007,15 +1107,19 @@ void doReplace(
   // inode is what is now visible, and what it displaced is the inode verified
   // above, still with the verified content.
   staged.committed = true;
-  if (!nameRefersTo(parent.value, finalName, staged.info) ||
-      !nameRefersTo(parent.value, staged.name, target.info) ||
-      !stillVerified(target.fd.value, targetDev, targetIno, expectedSha256)) {
+  const bool verified = nameRefersTo(parent.value, finalName, staged.info) &&
+      nameRefersTo(parent.value, staged.name, target.info) &&
+      stillVerified(target.fd.value, targetDev, targetIno, expectedSha256);
+  // Checked after the commit, before the original's name is given up: a root
+  // moved away from its registered path gets the exchange reversed.
+  const bool registered = verified && registeredPathNamesRoot(root);
+  if (!verified || !registered) {
     if (renameat2(parent.value, staged.name.c_str(), parent.value, finalName.c_str(), RENAME_EXCHANGE) != 0) {
       diagnose("restoring a replaced file after a failed re-verification refused", errno);
       fail(GuardError::kInternal);
     }
     staged.committed = false;  // the staging name is ours again; the destructor removes it
-    fail(GuardError::kHashMismatch);
+    fail(verified ? GuardError::kRootInvalid : GuardError::kHashMismatch);
   }
   if (unlinkat(parent.value, staged.name.c_str(), 0) != 0) {
     diagnose("removing the replaced file's staging name failed", errno);
@@ -1055,6 +1159,7 @@ void doDelete(
 
   deferTermination();
   abandonIfTerminationPending();
+  requireRegisteredRoot(root);
   // Take the name away from the target atomically, then prove what was taken.
   std::string quarantine;
   for (int attempt = 0;; ++attempt) {
@@ -1071,14 +1176,18 @@ void doDelete(
     failAccess("moving the target aside refused", error, parent.value, root.info);
   }
 
-  if (!nameRefersTo(parent.value, quarantine, target.info) ||
-      !stillVerified(target.fd.value, targetDev, targetIno, expectedSha256)) {
+  const bool verified = nameRefersTo(parent.value, quarantine, target.info) &&
+      stillVerified(target.fd.value, targetDev, targetIno, expectedSha256);
+  // Checked after the name was taken away and before the file is unlinked: a
+  // root moved away from its registered path gets the file put back.
+  const bool registered = verified && registeredPathNamesRoot(root);
+  if (!verified || !registered) {
     const int error = moveNoReplace(parent.value, quarantine, finalName);
     if (error != 0) {
       diagnose("restoring a file after a failed re-verification refused; it is kept under its quarantine name", error);
       fail(GuardError::kInternal);
     }
-    fail(GuardError::kHashMismatch);
+    fail(verified ? GuardError::kRootInvalid : GuardError::kHashMismatch);
   }
   if (unlinkat(parent.value, quarantine.c_str(), 0) != 0) {
     diagnose("unlinkat refused", errno);
