@@ -167,6 +167,27 @@ starts at `{ "kind": "stopped" }` (or the disabled `unavailable` DTO, when
 `enabled` is false) and performs no discovery, version probe, launch, health
 request, inference, retry, fallback, or automatic start.
 
+### Quitting
+
+Quitting Agent Relay stops the runtime it started. The first quit request is
+held while the ordinary `stop()` runs against the retained provider — a
+starting runtime is cancelled, a healthy one stopped, an inferring one stopped
+after the Ornith run using it is told to unwind, a stopping one joined — and
+the application waits at most the active profile's `shutdownTimeoutMs` plus a
+5 s grace before quitting anyway (reporting an unconfirmed stop on stderr). A
+quit requested again meanwhile starts nothing new. Only the provider this
+application owns is stopped; no process is looked up by name. On POSIX,
+`SIGTERM`, `SIGINT` and `SIGHUP` sent to the application are handled as a quit
+in the same way; a second such signal exits immediately without waiting.
+
+An application that ends without a quit — `SIGKILL`, a crash, power loss —
+stops nothing. On Linux the runtime leads its own process group and keeps
+running (verified with `SIGKILL`). A new launch starts at `stopped` and does not
+know about it, so it has to be stopped by hand. On Windows the
+runtime additionally lives in the launcher's kill-on-close Job Object
+(described below), which is unchanged by this; Agent Relay has not re-verified
+that path on Windows as part of this change.
+
 ### Renderer Settings and lifecycle panel
 
 The Settings screen's "Local inference" card exposes every field above:

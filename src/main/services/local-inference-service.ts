@@ -14,6 +14,7 @@
 
 import {
   LOCAL_INFERENCE_CONTRACT_VERSION,
+  LOCAL_INFERENCE_LIMITS,
   LOCAL_INFERENCE_PROTOCOL,
   parseLocalInferenceConfig,
   summarizeLocalInferenceProfiles,
@@ -30,6 +31,7 @@ import type {
   IdGenerator,
   LocalInferenceLifecycleService,
   LocalInferenceProvider,
+  LocalInferenceQuitOutcome,
   LocalInferenceReleaseOutcome,
   LocalInferenceRuntimeRelease,
   OrnithHealthyLease,
@@ -127,6 +129,8 @@ export class LocalInferenceService
   private boundProfileFingerprint: string | null = null;
   /** Which profile the retained (or about-to-be-retained) runtime is bound to. Volatile, never persisted. */
   private selectedProfileId: string | null = null;
+  /** The one quit-time stop, shared by every call to `stopForQuit`. */
+  private quitStop: Promise<LocalInferenceQuitOutcome> | null = null;
   /**
    * The one outstanding Ornith execution lease, if any.
    *
@@ -345,6 +349,35 @@ export class LocalInferenceService
 
     if (provider === null) return Promise.resolve({ kind: 'stopped' });
     return this.stopRetainedProvider(provider);
+  }
+
+  /**
+   * Quitting: stop the runtime this service owns, through the ordinary operator `stop()` (which also tells
+   * an Ornith run using it to unwind), and wait at most the profile's shutdown budget plus a grace — the
+   * provider's own stop escalates to SIGKILL within that budget. A runtime that is starting, healthy,
+   * inferring or already stopping is stopped or joined the same way `stop()` does it. The first call's
+   * outcome is shared by every later one, so a repeated quit never starts a second stop.
+   */
+  stopForQuit(): Promise<LocalInferenceQuitOutcome> {
+    if (this.quitStop !== null) return this.quitStop;
+    if (this.provider === null) {
+      this.quitStop = Promise.resolve({ kind: 'not_running' });
+      return this.quitStop;
+    }
+    const ceilingMs =
+      (this.activeProfile()?.shutdownTimeoutMs ?? LOCAL_INFERENCE_LIMITS.shutdownTimeoutMsMax) + LOCAL_RUNTIME_RELEASE_GRACE_MS;
+    this.quitStop = settleWithin(this.stop(), ceilingMs).then((settled): LocalInferenceQuitOutcome => {
+      if (settled.kind === 'settled' && settled.value.kind === 'stopped') return { kind: 'stopped' };
+      if (settled.kind === 'expired') {
+        return { kind: 'unconfirmed', reason: `The local runtime did not confirm it stopped within ${ceilingMs}ms.` };
+      }
+      if (settled.kind === 'settled') {
+        const state = settled.value;
+        return { kind: 'unconfirmed', reason: 'reason' in state ? state.reason : `The local runtime is ${state.kind}.` };
+      }
+      return { kind: 'unconfirmed', reason: 'The local runtime stop failed.' };
+    });
+    return this.quitStop;
   }
 
   /**

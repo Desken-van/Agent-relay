@@ -1062,3 +1062,111 @@ describe('releasing the runtime around Relay verification', () => {
     expect(service.state()).not.toMatchObject({ releasedForVerification: true });
   });
 });
+
+describe('stopping the runtime because the application quits', () => {
+  it('has nothing to do when no runtime was ever started', async () => {
+    const provider = new StubProvider();
+    const service = selectedService({ settings: new MutableSettings(), createProvider: () => provider, ids: testIds() });
+    await expect(service.stopForQuit()).resolves.toEqual({ kind: 'not_running' });
+    expect(provider.stopCalls).toBe(0);
+  });
+
+  it('stops a healthy runtime it owns, once, however many times quitting asks', async () => {
+    const provider = new StubProvider();
+    const service = selectedService({ settings: new MutableSettings(), createProvider: () => provider, ids: testIds() });
+    await service.start();
+
+    const first = service.stopForQuit();
+    const second = service.stopForQuit();
+    expect(second).toBe(first);
+    await expect(first).resolves.toEqual({ kind: 'stopped' });
+    await expect(service.stopForQuit()).resolves.toEqual({ kind: 'stopped' });
+    expect(provider.stopCalls).toBe(1);
+    expect(service.state()).toEqual({ kind: 'stopped' });
+  });
+
+  it('stops a runtime that is still starting', async () => {
+    const provider = new StubProvider();
+    const service = selectedService({ settings: new MutableSettings(), createProvider: () => provider, ids: testIds() });
+    provider.startGate = new Promise<void>(() => undefined);
+    void service.start();
+    await Promise.resolve();
+    expect(service.state()).toMatchObject({ kind: 'starting' });
+
+    await expect(service.stopForQuit()).resolves.toEqual({ kind: 'stopped' });
+    expect(provider.stopCalls).toBe(1);
+  });
+
+  it('stops a runtime in the middle of an Ornith inference, telling that run to unwind first', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    const lease = await service.acquireOrnithLease('default', settings.defaultFingerprint());
+    let unwound = 0;
+    lease.onIndependentStop(() => { unwound += 1; });
+    provider.inferGate = new Promise<void>(() => undefined);
+    void service.inferForOrnith(lease, {
+      version: LOCAL_INFERENCE_CONTRACT_VERSION,
+      requestId: 'in-flight',
+      messages: [{ role: 'user', content: 'still thinking' }]
+    });
+    await Promise.resolve();
+
+    await expect(service.stopForQuit()).resolves.toEqual({ kind: 'stopped' });
+    expect(unwound).toBe(1);
+    expect(provider.stopCalls).toBe(1);
+  });
+
+  it('joins a stop already in flight instead of starting a second one', async () => {
+    const provider = new StubProvider();
+    const service = selectedService({ settings: new MutableSettings(), createProvider: () => provider, ids: testIds() });
+    await service.start();
+    let finishStop!: () => void;
+    provider.stopGate = new Promise<void>((resolve) => { finishStop = resolve; });
+    const operatorStop = service.stop();
+
+    const quitting = service.stopForQuit();
+    finishStop();
+    await expect(quitting).resolves.toEqual({ kind: 'stopped' });
+    await expect(operatorStop).resolves.toEqual({ kind: 'stopped' });
+    expect(provider.stopAttempts).toBe(1);
+  });
+
+  it('never waits past the profile\'s shutdown budget plus grace, and says the stop is unconfirmed', async () => {
+    vi.useFakeTimers();
+    try {
+      const settings = new MutableSettings();
+      const provider = new StubProvider();
+      const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+      await service.start();
+      provider.stopGate = new Promise<void>(() => undefined);
+
+      const quitting = service.stopForQuit();
+      const budget = settings.defaultProfile().shutdownTimeoutMs + 5_000;
+      await vi.advanceTimersByTimeAsync(budget - 1);
+      let settled = false;
+      void quitting.then(() => { settled = true; });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(quitting).resolves.toEqual({
+        kind: 'unconfirmed',
+        reason: `The local runtime did not confirm it stopped within ${budget}ms.`
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports a stop that ends in anything but stopped as unconfirmed', async () => {
+    const provider = new StubProvider();
+    const service = selectedService({ settings: new MutableSettings(), createProvider: () => provider, ids: testIds() });
+    await service.start();
+    provider.stopResult = { kind: 'failed', reason: 'The runtime tree could not be confirmed stopped.' };
+    await expect(service.stopForQuit()).resolves.toEqual({
+      kind: 'unconfirmed',
+      reason: 'The runtime tree could not be confirmed stopped.'
+    });
+  });
+});

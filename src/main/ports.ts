@@ -1665,7 +1665,20 @@ export interface LocalInferenceLifecycleService {
    * explicit `stop()` first, never an implicit restart of whatever was running.
    */
   selectActiveProfile(profileId: string): void;
+  /**
+   * Stop the runtime this application owns because the application is quitting: the same operator stop,
+   * waited on for at most the profile's shutdown budget plus a short grace, never longer. Repeated calls
+   * join the first one. Never touches a process this application did not start.
+   */
+  stopForQuit(): Promise<LocalInferenceQuitOutcome>;
 }
+
+/** What quitting did to the application's own local runtime. */
+export type LocalInferenceQuitOutcome =
+  | { readonly kind: 'not_running' }
+  | { readonly kind: 'stopped' }
+  /** The stop did not confirm within its ceiling, or failed; the runtime may still be alive. */
+  | { readonly kind: 'unconfirmed'; readonly reason: string };
 
 /**
  * The application-wide right to run one Ornith turn sequence against the

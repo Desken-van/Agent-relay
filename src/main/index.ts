@@ -27,6 +27,7 @@ import { shell } from 'electron/common';
 import { buildApplication, type Application } from './container';
 import { DATA_DIR_ENV_VAR, prepareDataDirOverride } from './infra/data-dir';
 import { registerIpc, unregisterIpc } from './ipc/register-ipc';
+import { createQuitCoordinator } from './quit-coordinator';
 import { ElectronConfirmationService } from './services/confirmation-service';
 import { WindowEventPublisher } from './services/event-bus';
 
@@ -228,7 +229,35 @@ if (!userDataReady) {
     if (process.platform !== 'darwin') app.quit();
   });
 
-  app.on('before-quit', () => {
+  // Stop the application's own local runtime before quitting (bounded), then quit for real.
+  const quitCoordinator = createQuitCoordinator({
+    stopRuntime: () => application?.localInference.stopForQuit() ?? null,
+    quit: () => app.quit(),
+    report: (outcome) => {
+      if (outcome.kind === 'unconfirmed') {
+        console.error(`Agent Relay: quitting without a confirmed local runtime stop. ${outcome.reason}`);
+      }
+    }
+  });
+
+  // A polite termination request (logout, shutdown, `kill`, Ctrl+C in the terminal that ran it) is a
+  // quit, so the runtime is stopped the same bounded way. Without this, Node's default action ends the
+  // process at once and the runtime outlives it on Linux. A second signal is taken as "now": exit
+  // immediately, even if the runtime stop has not finished.
+  let terminationRequests = 0;
+  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
+    process.on(signal, () => {
+      terminationRequests += 1;
+      if (terminationRequests === 1) app.quit();
+      else app.exit(1);
+    });
+  }
+
+  app.on('before-quit', (event) => {
+    if (!quitCoordinator.beforeQuit()) {
+      event.preventDefault();
+      return;
+    }
     unregisterIpc();
     application?.close();
     application = null;
