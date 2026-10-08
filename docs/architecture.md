@@ -1746,6 +1746,11 @@ claude --print --output-format stream-json --verbose
   dependency preparer may reuse the registered checkout's existing
   `node_modules`. It creates only an ignored local link, only while package and
   lock manifests match, and never runs a package manager or reaches the network.
+  On Windows the link is a `node_modules` junction; elsewhere it is a real,
+  marked `node_modules` directory with one link per entry of the registered
+  checkout's (tool caches excluded), since Git treats a symlink as a file that a
+  `node_modules/` rule does not ignore. A whole-directory link left by an
+  earlier build is replaced; any entry that is not such a link is refused.
   Existing worktree-owned dependencies are left alone; missing or incompatible
   dependencies fail with an actionable message before an agent starts.
 

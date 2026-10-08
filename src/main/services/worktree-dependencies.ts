@@ -1,4 +1,4 @@
-import { copyFile, lstat, mkdir, readFile, realpath, rm, symlink } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readdir, readFile, realpath, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { AgentRelayError } from '../../shared/domain/errors';
 import {
@@ -78,16 +78,59 @@ function sameManifest(name: (typeof MANIFESTS)[number], left: Buffer, right: Buf
   return left.toString('utf8').replace(/\r\n/g, '\n') === right.toString('utf8').replace(/\r\n/g, '\n');
 }
 
-async function existingNodeModules(path: string): Promise<'missing' | 'directory' | 'link'> {
+/**
+ * Windows links node_modules itself, as a junction: Git treats a junction as the directory a
+ * `node_modules/` rule ignores. Elsewhere a symlink is not a directory to Git — `node_modules/`
+ * does not ignore it, and Git will not even evaluate a path beneath it — so the worktree gets a
+ * real `node_modules` directory whose entries are links to the registered checkout's entries.
+ */
+const LINK_WHOLE_DIRECTORY = process.platform === 'win32';
+
+/** Marks a worktree node_modules directory whose entries Agent Relay linked; holds the source's real path. */
+const LINKED_DIRECTORY_MARKER = '.agent-relay-linked-dependencies';
+
+/** Caches tools write inside node_modules: kept per worktree, never linked from the registered checkout. */
+const LOCAL_ENTRIES: ReadonlySet<string> = new Set(['.vite', '.vite-temp', '.cache', LINKED_DIRECTORY_MARKER]);
+
+async function existingNodeModules(path: string): Promise<'missing' | 'directory' | 'link' | 'linked_directory'> {
   try {
     const value = await lstat(path);
     if (value.isSymbolicLink()) return 'link';
-    if (value.isDirectory()) return 'directory';
+    if (value.isDirectory()) {
+      const marker = await lstat(join(path, LINKED_DIRECTORY_MARKER)).catch(() => null);
+      return marker?.isFile() ? 'linked_directory' : 'directory';
+    }
     throw new AgentRelayError('WORKTREE_INVALID', 'The worktree node_modules path is not a directory.');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'missing';
     throw error;
   }
+}
+
+/**
+ * Why a linked node_modules directory cannot be trusted, or null. Every entry other than a
+ * worktree-local cache must be a link to the registered checkout's entry of the same name; a link
+ * whose entry the checkout no longer has is stale (prepare removes it), not broken.
+ */
+async function linkedDirectoryProblem(target: string, source: string): Promise<string | null> {
+  const expected = await realpath(source).catch(() => null);
+  if (expected === null) return 'The registered checkout no longer has node_modules to link from.';
+  const recorded = (await readFile(join(target, LINKED_DIRECTORY_MARKER), 'utf8').catch(() => '')).trim();
+  if (!isSamePath(recorded, expected)) {
+    return 'The worktree node_modules links were made from a different checkout.';
+  }
+  for (const name of await readdir(target)) {
+    if (LOCAL_ENTRIES.has(name)) continue;
+    const entry = await lstat(join(target, name));
+    if (!entry.isSymbolicLink()) return 'The worktree node_modules holds an entry that is not a link to the registered checkout.';
+    const actual = await realpath(join(target, name)).catch(() => null);
+    if (actual === null) continue;
+    const wanted = await realpath(join(expected, name)).catch(() => null);
+    if (wanted === null || !isSamePath(actual, wanted)) {
+      return 'A worktree node_modules link points outside the registered project checkout.';
+    }
+  }
+  return null;
 }
 
 /** Which package manager the WORKTREE's own lockfile names, or `null` if none is present at all. */
@@ -129,6 +172,12 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
 
     if (targetKind === 'directory') {
       return { state: 'ready_local', detail: 'Dependencies are installed locally in this task worktree.' };
+    }
+
+    if (targetKind === 'linked_directory') {
+      const problem = await linkedDirectoryProblem(target, source);
+      if (problem !== null) return { state: 'link_broken', detail: problem };
+      return { state: 'ready_linked', detail: 'Dependencies are linked from the registered checkout.' };
     }
 
     if (targetKind === 'link') {
@@ -219,14 +268,30 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
 
     const { repositoryPath, worktreePath } = target;
     const nodeModulesTarget = join(worktreePath, 'node_modules');
-    if (await existingNodeModules(nodeModulesTarget) === 'link') {
+    const source = join(repositoryPath, 'node_modules');
+    const existing = await existingNodeModules(nodeModulesTarget);
+    if (!LINK_WHOLE_DIRECTORY) {
+      if (existing === 'link') {
+        // A whole-directory link from an earlier build, already proved to point at the registered
+        // checkout: removing the link itself never touches what it points to.
+        await unlink(nodeModulesTarget);
+      }
+      if (existing !== 'linked_directory') {
+        await this.assertIgnored(worktreePath, 'node_modules/.agent-relay-dependency-probe', 'node_modules');
+        await mkdir(nodeModulesTarget);
+        await writeFile(join(nodeModulesTarget, LINKED_DIRECTORY_MARKER), `${await realpath(source)}\n`, { flag: 'wx' });
+      }
+      await this.linkEntries(source, nodeModulesTarget);
+      await this.prepareNativeHelpers(repositoryPath, worktreePath);
+      return;
+    }
+    if (existing === 'link') {
       // Idempotent: checkStatus already proved this points at the registered
       // checkout's real node_modules.
       await this.prepareNativeHelpers(repositoryPath, worktreePath);
       return;
     }
 
-    const source = join(repositoryPath, 'node_modules');
     await this.assertIgnored(worktreePath, 'node_modules/.agent-relay-dependency-probe', 'node_modules');
     try {
       await symlink(await realpath(source), nodeModulesTarget, process.platform === 'win32' ? 'junction' : 'dir');
@@ -244,6 +309,35 @@ export class LocalWorktreeDependencyPreparer implements WorktreeDependencyPrepar
     }
 
     await this.prepareNativeHelpers(repositoryPath, worktreePath);
+  }
+
+  /**
+   * Make `target` (a real, marked directory) hold exactly one link per entry of the registered
+   * checkout's node_modules, worktree-local caches aside: add what is missing, drop links whose
+   * entry the checkout no longer has. Anything that is not such a link is refused, never replaced.
+   */
+  private async linkEntries(source: string, target: string): Promise<void> {
+    const sourceReal = await realpath(source);
+    const wanted = (await readdir(sourceReal)).filter((name) => !LOCAL_ENTRIES.has(name));
+    for (const name of wanted) {
+      const link = join(target, name);
+      try {
+        await symlink(join(sourceReal, name), link);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        const entry = await lstat(link);
+        const actual = entry.isSymbolicLink() ? await realpath(link).catch(() => null) : null;
+        const expected = await realpath(join(sourceReal, name));
+        if (actual === null || !isSamePath(actual, expected)) {
+          throw new AgentRelayError('WORKTREE_INVALID', 'A worktree node_modules entry is not a link to the registered checkout.');
+        }
+      }
+    }
+    const kept = new Set(wanted);
+    for (const name of await readdir(target)) {
+      if (LOCAL_ENTRIES.has(name) || kept.has(name)) continue;
+      if ((await lstat(join(target, name))).isSymbolicLink()) await unlink(join(target, name));
+    }
   }
 
   /**

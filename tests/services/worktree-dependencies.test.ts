@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { ExecaProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
@@ -73,8 +73,15 @@ describe('local worktree dependency preparation', () => {
     await prepare.prepare({ repositoryPath, worktreePath });
 
     const target = join(worktreePath, 'node_modules');
-    expect(lstatSync(target).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(target)).toBeTruthy();
+    if (process.platform === 'win32') {
+      expect(lstatSync(target).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(target)).toBeTruthy();
+    } else {
+      // A real directory, so the project's `node_modules/` rule ignores it, holding one link per entry.
+      expect(lstatSync(target).isDirectory()).toBe(true);
+      expect(lstatSync(join(target, '.fixture')).isSymbolicLink()).toBe(true);
+      expect(realpathSync(join(target, '.fixture'))).toBe(realpathSync(join(repositoryPath, 'node_modules', '.fixture')));
+    }
     if (process.platform === 'win32') {
       expect(readFileSync(join(worktreePath, 'build', 'Release', 'agent-relay-windows-job.exe'), 'utf8'))
         .toBe('fixture-launcher');
@@ -89,6 +96,52 @@ describe('local worktree dependency preparation', () => {
       expect(readdirSync(join(worktreePath, 'build', 'Release'))).toEqual(['agent-relay-fs-guard']);
     }
     expect(execFileSync('git', ['status', '--short'], { cwd: worktreePath, encoding: 'utf8' })).toBe('');
+  });
+
+  describe.skipIf(process.platform === 'win32')('a linked node_modules directory (every platform but Windows)', () => {
+    const source = (): string => join(repositoryPath, 'node_modules');
+    const target = (): string => join(worktreePath, 'node_modules');
+
+    it('replaces a whole-directory link from an earlier build without touching what it pointed to', async () => {
+      symlinkSync(realpathSync(source()), target(), 'dir');
+      expect((await prepare.checkStatus({ repositoryPath, worktreePath })).state).toBe('ready_linked');
+
+      await prepare.prepare({ repositoryPath, worktreePath });
+
+      expect(lstatSync(target()).isDirectory()).toBe(true);
+      expect(readFileSync(join(source(), '.fixture'), 'utf8')).toBe('installed');
+      expect(readFileSync(join(target(), '.fixture'), 'utf8')).toBe('installed');
+      expect(execFileSync('git', ['status', '--short'], { cwd: worktreePath, encoding: 'utf8' })).toBe('');
+    });
+
+    it('follows the registered checkout: adds new entries, drops links it no longer has, keeps local caches', async () => {
+      await prepare.prepare({ repositoryPath, worktreePath });
+      mkdirSync(join(target(), '.vite'));
+      mkdirSync(join(source(), 'new-package'));
+      rmSync(join(source(), '.fixture'));
+
+      await prepare.prepare({ repositoryPath, worktreePath });
+
+      expect(realpathSync(join(target(), 'new-package'))).toBe(realpathSync(join(source(), 'new-package')));
+      expect(() => lstatSync(join(target(), '.fixture'))).toThrow();
+      expect(lstatSync(join(target(), '.vite')).isDirectory()).toBe(true);
+      expect((await prepare.checkStatus({ repositoryPath, worktreePath })).state).toBe('ready_linked');
+    });
+
+    it('reports a foreign entry or a link elsewhere as broken, and prepare refuses it', async () => {
+      await prepare.prepare({ repositoryPath, worktreePath });
+      const elsewhere = join(root, 'elsewhere');
+      mkdirSync(elsewhere);
+      rmSync(join(target(), '.fixture'));
+      symlinkSync(elsewhere, join(target(), '.fixture'), 'dir');
+      expect((await prepare.checkStatus({ repositoryPath, worktreePath })).state).toBe('link_broken');
+      await expect(prepare.prepare({ repositoryPath, worktreePath })).rejects.toThrow(/outside the registered project checkout/);
+
+      rmSync(join(target(), '.fixture'));
+      writeFileSync(join(target(), 'injected.js'), 'module.exports = 1;');
+      expect((await prepare.checkStatus({ repositoryPath, worktreePath })).state).toBe('link_broken');
+      expect(readFileSync(join(target(), 'injected.js'), 'utf8')).toBe('module.exports = 1;');
+    });
   });
 
   it('refuses to reuse dependencies when the lockfile differs', async () => {

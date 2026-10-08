@@ -440,7 +440,11 @@ For each task, on the first *Send to Claude*:
    implementation or verification. An existing worktree `node_modules` is kept;
    otherwise the registered checkout's installed dependencies are linked only
    when the package manifests match and Git proves `node_modules` is ignored.
-   This is local-only: Agent Relay never downloads packages implicitly.
+   On Windows `node_modules` itself is a junction. Elsewhere it is a real
+   directory holding one link per installed package, because Git does not apply
+   a `node_modules/` rule to a symlink; tool caches such as `.vite` stay local to
+   the worktree. This is local-only: Agent Relay never downloads packages
+   implicitly.
 
 Claude runs with its working directory set to that worktree and nowhere else.
 Your checkout is only ever read.
