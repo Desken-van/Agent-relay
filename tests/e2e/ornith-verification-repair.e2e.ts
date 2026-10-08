@@ -15,10 +15,16 @@
  * Relay verifies again and the task reaches review; the original repository is untouched. Only the
  * specification is seeded in the database, as in `ornith-implementation.e2e.ts`: this suite must not depend
  * on a live Codex.
+ *
+ * It runs twice: with a llama.cpp profile, and with a Strata profile configured through the same Settings
+ * screen against a fake Strata install (its `serve/server.py` is the fake runtime, started by Node in place of
+ * Strata's Python; its engine prints a version; its model config names the model and context). The repair
+ * path is the same; what the Strata run adds is that the runtime is Strata's, end to end.
  */
 
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
@@ -113,7 +119,30 @@ async function fillHeld(field: Locator, value: string): Promise<void> {
   throw new Error(`The field did not keep the value ${JSON.stringify(value)}.`);
 }
 
-async function startLocalInference(page: Page, port: number): Promise<void> {
+type RuntimeKind = 'llama_cpp' | 'strata';
+
+/** What a ready Strata server answers on /health for the fake model. */
+const STRATA_READY = { status: 'ok', max_context: 32768, model: 'fake-model', images: false, api_key: false, loaded: true, service: 'strata' };
+
+/** How the fake runtime answers /health for each runtime kind. */
+const healthFor = (kind: RuntimeKind): Record<string, unknown> => (kind === 'strata' ? { healthBodies: [STRATA_READY] } : { health: 'ok' });
+
+/** A fake Strata install in the fake runtime's own directory (its working directory and scenario home). */
+function fakeStrataInstall(dir: string): { serverScript: string; engineConfig: string } {
+  mkdirSync(join(dir, 'serve'), { recursive: true });
+  mkdirSync(join(dir, 'engine'), { recursive: true });
+  const serverScript = join(dir, 'serve', 'server.py');
+  // Node runs a file of unknown extension as CommonJS: this "server.py" is the fake runtime.
+  writeFileSync(serverScript, `import(${JSON.stringify(pathToFileURL(FAKE_LOCAL_INFERENCE_RUNTIME_PATH).href)});\n`);
+  const engine = join(dir, 'engine', 'strata.mjs');
+  writeFileSync(engine, '#!/usr/bin/env node\nprocess.stdout.write("strata 0.1.41 (fake)\\n");\n');
+  chmodSync(engine, 0o755);
+  const engineConfig = join(dir, 'strata-fake.json');
+  writeFileSync(engineConfig, JSON.stringify({ exe: engine, args: ['--max-context', '32768'], model_name: 'fake-model' }));
+  return { serverScript, engineConfig };
+}
+
+async function startLocalInference(page: Page, port: number, kind: RuntimeKind, runtimeDir: string): Promise<void> {
   await page.getByRole('button', { name: 'Settings' }).click();
   const settingsCard = card(page, /^Local inference$/);
   await settingsCard.waitFor();
@@ -121,17 +150,34 @@ async function startLocalInference(page: Page, port: number): Promise<void> {
   await settingsCard.getByLabel(/^Enable "Local model" for new task selection$/).check();
   await settingsCard.getByRole('button', { name: /Local model/ }).click();
   await settingsCard.getByText(/^Editing: Local model/).waitFor();
-  await settingsCard.getByRole('combobox', { name: /^Executable/ }).selectOption('explicit_path');
-  await settingsCard.getByRole('combobox', { name: /^Model source/ }).selectOption('runtime_id');
-  const fields: readonly [Locator, string][] = [
-    [settingsCard.getByRole('textbox', { name: 'Executable path', exact: true }), FAKE_LOCAL_INFERENCE_RUNTIME_PATH],
+  const common: readonly [Locator, string][] = [
     [settingsCard.getByLabel(/^Model id/), 'fake-model'],
-    [settingsCard.getByLabel('Runtime model identifier'), 'fake-model'],
     [settingsCard.getByLabel(/^Port/), String(port)],
     // As in ornith-implementation.e2e.ts: room for the immutable prompt, plus the correction evidence.
     [settingsCard.getByLabel('Context size (tokens)'), '16384'],
     [settingsCard.getByLabel('Default max output tokens'), '1024']
   ];
+  let fields: readonly [Locator, string][];
+  if (kind === 'strata') {
+    const install = fakeStrataInstall(runtimeDir);
+    await settingsCard.getByRole('combobox', { name: 'Runtime', exact: true }).selectOption('strata');
+    fields = [
+      // Node stands in for the Python of Strata's own .venv.
+      [settingsCard.getByLabel(/^Strata Python interpreter/), process.execPath],
+      [settingsCard.getByLabel(/^Strata server script/), install.serverScript],
+      [settingsCard.getByLabel(/^Strata model config/), install.engineConfig],
+      [settingsCard.getByLabel(/^Strata model name/), 'fake-model'],
+      ...common
+    ];
+  } else {
+    await settingsCard.getByRole('combobox', { name: /^Executable/ }).selectOption('explicit_path');
+    await settingsCard.getByRole('combobox', { name: /^Model source/ }).selectOption('runtime_id');
+    fields = [
+      [settingsCard.getByRole('textbox', { name: 'Executable path', exact: true }), FAKE_LOCAL_INFERENCE_RUNTIME_PATH],
+      [settingsCard.getByLabel('Runtime model identifier'), 'fake-model'],
+      ...common
+    ];
+  }
   for (const [field, value] of fields) await fillHeld(field, value);
   // All of them, once more, right before saving.
   for (const [field, value] of fields) if ((await field.inputValue()) !== value) await fillHeld(field, value);
@@ -140,6 +186,8 @@ async function startLocalInference(page: Page, port: number): Promise<void> {
   await save.click();
   await page.getByText('Settings saved').waitFor();
   const lifecycle = card(page, 'Local inference lifecycle');
+  // The runtime is named for what it is wherever the profile is offered.
+  if (kind === 'strata') await expect_(async () => lifecycle.textContent(), (text) => (text ?? '').includes('Local model · Strata'));
   await lifecycle.getByRole('combobox', { name: /^Active profile/ }).selectOption('default');
   await lifecycle.getByRole('button', { name: 'Check capabilities' }).click();
   await expect_(async () => lifecycle.textContent(), (text) => (text ?? '').includes('Executable available: yes'));
@@ -164,11 +212,11 @@ function verificationRecords(profile: string, taskId: string): VerificationRecor
   }
 }
 
-describe('Ornith verification repair Electron acceptance', () => {
+describe.each(['llama_cpp', 'strata'] as const)('Ornith verification repair Electron acceptance (%s runtime)', (kind) => {
   it('turns a node:test failure of Ornith\'s edit into one repair round over the same worktree, then review', async () => {
     const profile = mkdtempSync(join(tmpdir(), 'agent-relay-ornith-repair-e2e-'));
     const repoDir = mkdtempSync(join(tmpdir(), 'agent-relay-ornith-repair-e2e-repo-'));
-    const runtime = new FakeLocalInferenceRuntime().scenario({ health: 'ok' });
+    const runtime = new FakeLocalInferenceRuntime().scenario(healthFor(kind));
     const port = await freePort();
 
     git(repoDir, ['init', '-b', 'main']);
@@ -196,7 +244,7 @@ describe('Ornith verification repair Electron acceptance', () => {
     // whose scripted answers start from the first again: each round gets its own sequence.
     const duplicated = `${SHOUT}${WHISPER}${WHISPER}`;
     runtime.scenario({
-      health: 'ok',
+      ...healthFor(kind),
       completionTextSequence: [
         JSON.stringify({ version: 1, action: 'read_file', path: 'src/strings.js', offset: 0, limit: 4096 }),
         JSON.stringify({ version: 1, action: 'replace_text', path: 'src/strings.js', sha256: sha256(SHOUT), replacements: [{ oldText: SHOUT, newText: duplicated }] }),
@@ -208,7 +256,7 @@ describe('Ornith verification repair Electron acceptance', () => {
     try {
       const { app, page } = await launch(profile, runtime.path);
       running = app;
-      await startLocalInference(page, port);
+      await startLocalInference(page, port, kind, runtime.path);
 
       const project = await invokeIpc<{ id: string }>(page, 'projects:addExisting', { localPath: repoDir, name: 'Repair Project', defaultBranch: 'main' });
       const taskTitle = 'Add a whisper function';
@@ -299,7 +347,7 @@ describe('Ornith verification repair Electron acceptance', () => {
 
       /* The repair round: handed the located error, working on the same files. */
       runtime.scenario({
-        health: 'ok',
+        ...healthFor(kind),
         completionTextSequence: [
           JSON.stringify({ version: 1, action: 'read_file', path: 'src/strings.js', offset: 0, limit: 4096 }),
           JSON.stringify({ version: 1, action: 'replace_text', path: 'src/strings.js', sha256: sha256(duplicated), replacements: [{ oldText: `${WHISPER}${WHISPER}`, newText: WHISPER }] }),
@@ -329,6 +377,18 @@ describe('Ornith verification repair Electron acceptance', () => {
       expect(git(repoDir, ['log', '--oneline']).trim()).toBe(originalLog);
       expect(readFileSync(join(repoDir, 'src', 'strings.js'), 'utf8')).toBe(SHOUT);
       expect(git(repoDir, ['remote']).trim()).toBe('');
+
+      // Both Ornith rounds are recorded as runs of the runtime that actually served them.
+      {
+        const db = new DatabaseSync(join(profile, 'agent-relay.sqlite'), { readOnly: true });
+        try {
+          const served = (db.prepare("SELECT structured_result FROM runs WHERE task_id = ? AND agent = 'ornith' ORDER BY started_at ASC")
+            .all(task.id) as { structured_result: string }[]).map((row) => (JSON.parse(row.structured_result) as { runtimeProviderId?: string }).runtimeProviderId);
+          expect(served).toEqual(kind === 'strata' ? ['local-strata', 'local-strata'] : ['local-llama-cpp', 'local-llama-cpp']);
+        } finally {
+          db.close();
+        }
+      }
 
       await running.close();
       running = null;
