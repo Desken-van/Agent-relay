@@ -412,14 +412,16 @@ describe('Local inference Electron acceptance', () => {
         .toBe(String(port));
 
       // Opening the lifecycle panel performs only getState and listProfiles; it must not have probed,
-      // launched, health-checked, inferred or started anything on its own. Nothing selects a profile on
-      // restart either — "no profile selected" is the strongest possible proof nothing auto-started, and
-      // the prompt/result from the previous session must be gone.
+      // launched, health-checked, inferred or started anything on its own. The profile chosen in the first
+      // session was saved, but it is disabled for new tasks, so the restore declines it and says so: no
+      // profile is active, which is also the strongest possible proof nothing auto-started, and the
+      // prompt/result from the previous session must be gone.
       const reopenedLifecycle = card(second.page, 'Local inference lifecycle');
       await reopenedLifecycle.waitFor();
       await expect.poll(async () => reopenedLifecycle.textContent()).toMatch(
-        /No local-model profile is selected/
+        /The previously selected local-model profile "Local model" is disabled for new tasks, so it was not restored/
       );
+      expect(await reopenedLifecycle.getByRole('combobox', { name: /^Active profile/ }).inputValue()).toBe('');
       const reopenedText = await reopenedLifecycle.textContent();
       expect(reopenedText).not.toContain('Completion');
       expect(reopenedText).not.toContain(REDACTED_COMPLETION_TEXT);

@@ -191,7 +191,7 @@ export class LocalInferenceService
     }
     if (!profile.enabled) {
       this.restoreProblem =
-        `The previously selected local-model profile "${profile.displayName}" is disabled. Enable it or choose another in Settings → Local inference.`;
+        `The previously selected local-model profile "${profile.displayName}" is disabled for new tasks, so it was not restored. Select it again, enable it, or choose another in Settings → Local inference.`;
       return;
     }
     this.selectedProfileId = profile.id;

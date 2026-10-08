@@ -1235,7 +1235,10 @@ describe('the chosen local-model profile across restarts', () => {
     expect(service.activeProfileId()).toBeNull();
     const state = service.state();
     expect(state.kind).toBe('unavailable');
-    expect('reason' in state && state.reason).toMatch(/is disabled\. Enable it or choose another/);
+    expect('reason' in state && state.reason).toMatch(/is disabled for new tasks, so it was not restored\. Select it again/);
+    // Declining the restore does not forbid the choice: selecting it by hand still works, as before.
+    service.selectActiveProfile('default');
+    expect(service.activeProfileId()).toBe('default');
   });
 
   it('reports a stored choice it cannot read, and choosing a profile clears that report', () => {
