@@ -1673,6 +1673,22 @@ export interface LocalInferenceLifecycleService {
   stopForQuit(): Promise<LocalInferenceQuitOutcome>;
 }
 
+/** The local-model profile selection saved by an earlier run, as read back. */
+export type LocalInferenceSavedSelection =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'saved'; readonly profileId: string }
+  /** Something is stored, but it is not a valid profile id. */
+  | { readonly kind: 'unreadable' };
+
+/**
+ * Where the operator's chosen local-model profile survives a restart. Only the choice is kept: never a
+ * runtime state, so restoring it starts nothing.
+ */
+export interface LocalInferenceSelectionStore {
+  read(): LocalInferenceSavedSelection;
+  write(profileId: string): void;
+}
+
 /** What quitting did to the application's own local runtime. */
 export type LocalInferenceQuitOutcome =
   | { readonly kind: 'not_running' }

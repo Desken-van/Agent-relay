@@ -32,6 +32,7 @@ import type {
   LocalInferenceLifecycleService,
   LocalInferenceProvider,
   LocalInferenceQuitOutcome,
+  LocalInferenceSelectionStore,
   LocalInferenceReleaseOutcome,
   LocalInferenceRuntimeRelease,
   OrnithHealthyLease,
@@ -117,6 +118,8 @@ export type LocalInferenceProviderFactory = (
 
 export interface LocalInferenceServiceOptions {
   readonly settings: SettingsRepository;
+  /** Where the chosen profile survives a restart. Absent: the choice lasts only for this run. */
+  readonly selection?: LocalInferenceSelectionStore;
   readonly createProvider: LocalInferenceProviderFactory;
   /** Generates the request id for a manual test inference. Never reused. */
   readonly ids: IdGenerator;
@@ -127,8 +130,13 @@ export class LocalInferenceService
 {
   private provider: LocalInferenceProvider | null = null;
   private boundProfileFingerprint: string | null = null;
-  /** Which profile the retained (or about-to-be-retained) runtime is bound to. Volatile, never persisted. */
+  /**
+   * Which profile the retained (or about-to-be-retained) runtime is bound to. The choice is saved through
+   * `options.selection` and restored at construction; the runtime state never is.
+   */
   private selectedProfileId: string | null = null;
+  /** Why the saved choice was not restored at startup, shown until the operator chooses a profile. */
+  private restoreProblem: string | null = null;
   /** The one quit-time stop, shared by every call to `stopForQuit`. */
   private quitStop: Promise<LocalInferenceQuitOutcome> | null = null;
   /**
@@ -159,7 +167,35 @@ export class LocalInferenceService
    */
   private lifecycleGeneration = 0;
 
-  constructor(private readonly options: LocalInferenceServiceOptions) {}
+  constructor(private readonly options: LocalInferenceServiceOptions) {
+    this.restoreSelection();
+  }
+
+  /**
+   * Bring back the profile chosen in an earlier run: only the choice — nothing is constructed, launched or
+   * contacted. A choice that no longer names an enabled profile is not restored, and says why.
+   */
+  private restoreSelection(): void {
+    const saved = this.options.selection?.read() ?? { kind: 'none' };
+    if (saved.kind === 'none') return;
+    if (saved.kind === 'unreadable') {
+      this.restoreProblem =
+        'The saved local-model profile choice could not be read. Choose a profile in Settings → Local inference.';
+      return;
+    }
+    const profile = this.options.settings.get().localInference.profiles.find((candidate) => candidate.id === saved.profileId);
+    if (profile === undefined) {
+      this.restoreProblem =
+        `The previously selected local-model profile "${saved.profileId}" no longer exists. Choose a profile in Settings → Local inference.`;
+      return;
+    }
+    if (!profile.enabled) {
+      this.restoreProblem =
+        `The previously selected local-model profile "${profile.displayName}" is disabled. Enable it or choose another in Settings → Local inference.`;
+      return;
+    }
+    this.selectedProfileId = profile.id;
+  }
 
   activeProfileId(): string | null {
     return this.selectedProfileId;
@@ -185,6 +221,8 @@ export class LocalInferenceService
       throw new AgentRelayError('NOT_FOUND', `No local-model profile with id ${profileId}.`);
     }
     this.selectedProfileId = profileId;
+    this.restoreProblem = null;
+    this.options.selection?.write(profileId);
     this.releasedForVerification = null;
     this.lifecycleGeneration += 1;
     // A terminal provider bound to the PREVIOUS profile has nothing left to preserve; the next bind
@@ -700,7 +738,11 @@ export class LocalInferenceService
 
   private unavailableReason(): string | null {
     if (!this.options.settings.get().localInference.enabled) return LOCAL_INFERENCE_DISABLED_REASON;
-    if (this.selectedProfileId === null) return NO_ACTIVE_PROFILE_REASON;
+    if (this.selectedProfileId === null) return this.restoreProblem ?? NO_ACTIVE_PROFILE_REASON;
+    // Selected, then removed from Settings: say so, rather than fail to bind a provider for it later.
+    if (this.provider === null && this.activeProfile() === null) {
+      return `The selected local-model profile "${this.selectedProfileId}" no longer exists. Choose a profile in Settings → Local inference.`;
+    }
     return null;
   }
 

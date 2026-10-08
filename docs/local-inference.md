@@ -167,6 +167,17 @@ starts at `{ "kind": "stopped" }` (or the disabled `unavailable` DTO, when
 `enabled` is false) and performs no discovery, version probe, launch, health
 request, inference, retry, fallback, or automatic start.
 
+The profile chosen in the lifecycle panel is durable too: it is saved when it
+is chosen (in the settings table, under its own key outside the Settings form,
+so saving Settings never overwrites it) and restored at the next launch as the
+active profile — only the choice; the runtime still starts at `stopped` and
+nothing is launched. A saved choice that names a profile which no longer exists,
+is disabled, or cannot be read is not restored: the state is `unavailable` with
+a reason saying which and what to do, until a profile is chosen. A selected
+profile removed from Settings while the application runs is reported the same
+way. Switching profiles while the runtime is starting, healthy, inferring or
+stopping is still refused until it is stopped.
+
 ### Quitting
 
 Quitting Agent Relay stops the runtime it started. The first quit request is

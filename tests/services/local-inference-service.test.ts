@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { LocalInferenceProvider, SettingsRepository } from '../../src/main/ports';
+import type {
+  LocalInferenceProvider,
+  LocalInferenceSavedSelection,
+  LocalInferenceSelectionStore,
+  SettingsRepository
+} from '../../src/main/ports';
 import {
   assembleLocalInferenceConfig,
   LOCAL_INFERENCE_APPLICATION_LIMITS,
@@ -1168,5 +1173,104 @@ describe('stopping the runtime because the application quits', () => {
       kind: 'unconfirmed',
       reason: 'The runtime tree could not be confirmed stopped.'
     });
+  });
+});
+
+describe('the chosen local-model profile across restarts', () => {
+  /** An in-memory stand-in for the settings-table key, shared by successive service instances. */
+  function memoryStore(initial: LocalInferenceSavedSelection = { kind: 'none' }): LocalInferenceSelectionStore & { writes: string[] } {
+    let saved = initial;
+    const writes: string[] = [];
+    return {
+      writes,
+      read: () => saved,
+      write: (profileId) => { writes.push(profileId); saved = { kind: 'saved', profileId }; }
+    };
+  }
+
+  it('saves the choice, and a new run restores it without constructing or starting anything', async () => {
+    const settings = new MutableSettings();
+    const selection = memoryStore();
+    const first = new LocalInferenceService({ settings, selection, createProvider: () => new StubProvider(), ids: testIds() });
+    first.selectActiveProfile('default');
+    expect(selection.writes).toEqual(['default']);
+
+    let constructed = 0;
+    const restarted = new LocalInferenceService({
+      settings,
+      selection,
+      createProvider: () => { constructed += 1; return new StubProvider(); },
+      ids: testIds()
+    });
+    expect(restarted.activeProfileId()).toBe('default');
+    expect(restarted.state()).toEqual({ kind: 'stopped' });
+    expect(restarted.listProfiles().find((profile) => profile.id === 'default')).toMatchObject({ activity: 'active' });
+    expect(constructed).toBe(0);
+  });
+
+  it('does not restore a profile that no longer exists, and says so', () => {
+    const settings = new MutableSettings();
+    const service = new LocalInferenceService({
+      settings,
+      selection: memoryStore({ kind: 'saved', profileId: 'removed-profile' }),
+      createProvider: () => new StubProvider(),
+      ids: testIds()
+    });
+    expect(service.activeProfileId()).toBeNull();
+    expect(service.state()).toEqual({
+      kind: 'unavailable',
+      reason: 'The previously selected local-model profile "removed-profile" no longer exists. Choose a profile in Settings → Local inference.'
+    });
+  });
+
+  it('does not restore a disabled profile, and says which one and what to do', () => {
+    const settings = new MutableSettings();
+    settings.patchDefaultProfile({ enabled: false });
+    const service = new LocalInferenceService({
+      settings,
+      selection: memoryStore({ kind: 'saved', profileId: 'default' }),
+      createProvider: () => new StubProvider(),
+      ids: testIds()
+    });
+    expect(service.activeProfileId()).toBeNull();
+    const state = service.state();
+    expect(state.kind).toBe('unavailable');
+    expect('reason' in state && state.reason).toMatch(/is disabled\. Enable it or choose another/);
+  });
+
+  it('reports a stored choice it cannot read, and choosing a profile clears that report', () => {
+    const settings = new MutableSettings();
+    const selection = memoryStore({ kind: 'unreadable' });
+    const service = new LocalInferenceService({ settings, selection, createProvider: () => new StubProvider(), ids: testIds() });
+    expect(service.state()).toEqual({
+      kind: 'unavailable',
+      reason: 'The saved local-model profile choice could not be read. Choose a profile in Settings → Local inference.'
+    });
+    service.selectActiveProfile('default');
+    expect(service.state()).toEqual({ kind: 'stopped' });
+  });
+
+  it('still refuses a switch while the runtime is active, and saves nothing for it', async () => {
+    const settings = new MutableSettings();
+    const selection = memoryStore();
+    const service = new LocalInferenceService({ settings, selection, createProvider: () => new StubProvider(), ids: testIds() });
+    service.selectActiveProfile('default');
+    await service.start();
+    expect(() => service.selectActiveProfile('default')).toThrow();
+    expect(selection.writes).toEqual(['default']);
+  });
+
+  it('a selected profile removed from Settings is reported as gone, not as an internal error on start', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    settings.update({ localInference: { ...settings.get().localInference, profiles: [], defaultProfileId: null } });
+    const expected = {
+      kind: 'unavailable',
+      reason: 'The selected local-model profile "default" no longer exists. Choose a profile in Settings → Local inference.'
+    };
+    expect(service.state()).toEqual(expected);
+    await expect(service.start()).resolves.toEqual(expected);
+    expect(provider.launches).toBe(0);
   });
 });
