@@ -587,8 +587,10 @@ describe.runIf(process.platform === 'linux')('Linux native filesystem-mutation g
     describe('the whole worktree root moved away from its registered path at the commit', () => {
       // Landlock binds the helper to the root directory object, which can itself be renamed away. These cases
       // pause the helper at its commit, move the bound root to outside/moved-root and leave the registered path
-      // empty, pointing back at it through a symlink, or missing. Every mutation must refuse with ROOT_INVALID
-      // and leave the moved root exactly as it was: no change may survive outside the registered path.
+      // empty, pointing back at it through a symlink, or missing — a move still in effect at the check after the
+      // commit. Every mutation must detect it, refuse with ROOT_INVALID and leave the moved root as it was.
+      // A root moved out AND BACK between the two checks is not detected; that limited case is reproduced by
+      // scripts/diagnostics/linux-fs-guard-root-race.mjs, not asserted here.
       const attacks = {
         'replaced by an empty directory': (moved: string) => { renameSync(root, moved); mkdirSync(root); },
         'replaced by a symlink to its new place': (moved: string) => { renameSync(root, moved); symlinkSync(moved, root, 'dir'); },

@@ -25,20 +25,30 @@
  * longer beneath the root. A kernel without Landlock gets no mutation at all
  * (`ERR:UNSUPPORTED`), never an unconfined one.
  *
- * Landlock binds the helper to the root directory OBJECT, which can itself be
- * renamed away from the registered path (an unprivileged Linux process cannot
- * pin a directory against rename the way the Windows helper's missing
- * FILE_SHARE_DELETE does). So every mutation is also bound to the registered
- * path: immediately before and immediately after its visible commit, the
- * helper resolves `root` from "/" again (openat2, no symlink followed) and
- * requires it to name the bound root. If the check after the commit fails, the
- * commit is undone through the same descriptors (the created link removed,
- * the exchange reversed, the quarantined file put back, the created
- * directories removed) and the helper reports `ERR:ROOT_INVALID`. `OK` thus
- * means the change was confirmed inside the directory that, at that instant,
- * the registered path named. What no unprivileged mechanism can stop is the
- * root being moved away and back between the commit and that check; the
- * change then ends where the registered path names, never elsewhere.
+ * Landlock binds the helper to the root directory OBJECT, not to the
+ * registered path: if the root itself is renamed away, accesses beneath it are
+ * still allowed. Unlike the Windows helper, whose root handle omits
+ * FILE_SHARE_DELETE and so stops the root being renamed while it is held, this
+ * helper does not stop the root being moved. Its Linux contract is therefore:
+ *
+ *  - Precondition: while an operation runs, no other process moves the
+ *    worktree root (or an ancestor of it).
+ *  - Immediately before and immediately after its visible commit, the helper
+ *    resolves `root` from "/" again (openat2, no symlink followed) and requires
+ *    it to name the bound root. A move that is still in effect at the check
+ *    after the commit is detected: the commit is undone through the same
+ *    descriptors (the created link removed, the exchange reversed, the
+ *    quarantined file put back, the created directories removed) and the
+ *    helper reports `ERR:ROOT_INVALID`.
+ *  - A root moved out and back again between those two checks is not
+ *    detected: the mutation then takes effect, for that interval, outside the
+ *    registered path, and the helper reports `OK` with the change inside the
+ *    registered path afterwards.
+ *  - The checks and the rollback are detection, not a strict defence against
+ *    a process that moves the root during an operation.
+ *
+ * `scripts/diagnostics/linux-fs-guard-root-race.mjs` reproduces that last,
+ * limited case.
  *
  * Protocol (identical argv and stdout to the Windows helper, so the
  * TypeScript side shares one parser):

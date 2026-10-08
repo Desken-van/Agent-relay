@@ -630,18 +630,27 @@ terminal failure for that attempt.
   refuses every open, link, rename, mkdir and unlink whose directory is not
   beneath the root at the instant of the call, including a directory the
   helper opened and someone then moved out of the worktree. Landlock binds to
-  the root directory object, which can itself be renamed away (no unprivileged
-  Linux mechanism pins a directory against rename, unlike the Windows helper's
-  handle without `FILE_SHARE_DELETE`), so each mutation is also bound to the
-  registered path: just before and just after its visible commit the helper
-  resolves that path again from `/` without following symlinks and requires
-  it to name the bound root. If the check after the commit fails, the commit
-  is undone through the same descriptors and the result is
-  `checkout_identity_changed`; `OK` means the change was confirmed inside the
-  directory the registered path named at that instant. A root moved away and
-  back between the commit and that check cannot be prevented, but the change
-  then ends up where the registered path points, never elsewhere. Without Landlock,
-  `RENAME_EXCHANGE`, `RENAME_NOREPLACE` or descriptor-based `linkat`, the
+  the root directory object, not to the registered path, and unlike the
+  Windows helper (whose root handle omits `FILE_SHARE_DELETE`, so the root
+  cannot be renamed while it is held) the Linux helper does not stop the root
+  itself being moved. Its contract on Linux is:
+  - *Precondition:* while an operation runs, no other process moves the
+    worktree root or one of its ancestors.
+  - Just before and just after its visible commit the helper resolves the
+    registered path again from `/` without following symlinks and requires it
+    to name the bound root. A move still in effect at the check after the
+    commit is detected: the commit is undone through the same descriptors and
+    the result is `checkout_identity_changed`.
+  - A root moved out and back between those two checks is not detected: the
+    mutation then takes effect briefly outside the registered path, and the
+    helper reports success with the change inside the registered path
+    afterwards.
+  - The checks and the rollback are detection, not a strict defence against a
+    process that moves the root during an operation.
+    `scripts/diagnostics/linux-fs-guard-root-race.mjs` reproduces this limited
+    case.
+
+  Without Landlock, `RENAME_EXCHANGE`, `RENAME_NOREPLACE` or descriptor-based `linkat`, the
   helper refuses (`unavailable`) before anything changes; there is no weaker
   fallback. A directory moved out between the helper naming its staged copy
   and the exchange keeps that staged copy (new content only; the original is
