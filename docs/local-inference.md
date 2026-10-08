@@ -150,8 +150,12 @@ generation that extracts the first JSON object from the text, silently dropping
 prose, a code fence or a second object. Agent Relay's Ornith parser requires the
 whole completion to be exactly one action, so a Strata request carries no
 response format: the raw text reaches that parser unchanged, and an answer that
-is not exactly one valid action is malformed output, as with llama.cpp. Every
-file change is still Agent Relay's own tool; Strata never receives tools.
+is not exactly one valid action is malformed output, as with llama.cpp. What it
+does carry is one fixed system message stating that format ("exactly one JSON
+object ... no text before or after"), counted toward the prompt limit: without
+it the Coder model answered a real Ornith prompt with a sentence of prose on
+every attempt; with it, with exactly one action on every turn. Every file
+change is still Agent Relay's own tool; Strata never receives tools.
 
 Everywhere a profile is offered, a Strata profile carries "· Strata" after its
 name, and its runs are recorded with the provider id `local-strata` and the

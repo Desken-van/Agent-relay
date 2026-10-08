@@ -19,6 +19,7 @@ import {
 import {
   judgeStrataHealth,
   readStrataEngineConfig,
+  STRATA_ORNITH_FORMAT_MESSAGE,
   strataRuntimeArgv
 } from '../../src/main/adapters/local-inference/strata-runtime';
 import { parseLocalInferenceConfig, type LocalInferenceConfig } from '../../src/shared/domain/local-inference';
@@ -211,9 +212,30 @@ describe('a Strata runtime: inference', () => {
     if (outcome.kind !== 'completed') return;
     expect(outcome.response.providerId).toBe('local-strata');
     expect(outcome.response.completion).toBe('{"version":1,"action":"git_status"}');
-    const body = JSON.parse(built.runtime.completionRequests()[0]!.body) as Record<string, unknown>;
+    const body = JSON.parse(built.runtime.completionRequests()[0]!.body) as { messages: { role: string; content: string }[] };
     expect(body).not.toHaveProperty('response_format');
     expect(body).toMatchObject({ stream: false, n: 1, model: MODEL, chat_template_kwargs: { enable_thinking: false } });
+    // The output format is stated in a fixed system message of its own, ahead of the request's messages.
+    expect(body.messages[0]).toEqual(STRATA_ORNITH_FORMAT_MESSAGE);
+    expect(body.messages.slice(1)).toEqual([{ role: 'user', content: 'Say something short.' }]);
+  });
+
+  it('sends a request that is not an Ornith action exactly as given: no format message, no response format', async () => {
+    const built = await harness({ healthBodies: [ready()], completionText: 'Hello.' });
+    await built.provider.start();
+    await built.provider.infer(fakeInferenceRequest());
+    const body = JSON.parse(built.runtime.completionRequests()[0]!.body) as { messages: unknown[] };
+    expect(body).not.toHaveProperty('response_format');
+    expect(body.messages).toEqual([{ role: 'user', content: 'Say something short.' }]);
+  });
+
+  it('counts the format message toward the prompt byte limit', async () => {
+    const built = await harness({ healthBodies: [ready()] }, {}, { maxPromptBytes: 300 });
+    await built.provider.start();
+    const content = 'x'.repeat(300 - Buffer.byteLength(STRATA_ORNITH_FORMAT_MESSAGE.content) + 1);
+    const outcome = await built.provider.infer(fakeInferenceRequest({ structuredOutput: 'ornith_action_v1', messages: [{ role: 'user', content }] }));
+    expect(outcome).toMatchObject({ kind: 'failed', dispatchOutcome: 'not_dispatched' });
+    expect(built.runtime.completionRequests()).toHaveLength(0);
   });
 
   it('cancels an inference by ending the runtime tree, and never reports it as completed', async () => {

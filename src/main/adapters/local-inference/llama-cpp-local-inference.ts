@@ -65,7 +65,7 @@ import {
   unsafeProviderProse
 } from '../../../shared/util/provider-text';
 import type { LocalInferenceProvider } from '../../ports';
-import { judgeStrataHealth, readStrataEngineConfig, strataRuntimeArgv } from './strata-runtime';
+import { judgeStrataHealth, readStrataEngineConfig, STRATA_ORNITH_FORMAT_MESSAGE, strataRuntimeArgv } from './strata-runtime';
 import {
   launchFor,
   locateExecutable,
@@ -1058,7 +1058,13 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
       );
     }
 
-    const promptBytes = parsed.messages.reduce(
+    // A Strata model is told the one-action format in a system message of its own (see `strata-runtime.ts`);
+    // it is part of the prompt, so it counts toward the same limit.
+    const wireMessages =
+      this.config.adapterKind === 'strata' && parsed.structuredOutput === 'ornith_action_v1'
+        ? [STRATA_ORNITH_FORMAT_MESSAGE, ...parsed.messages]
+        : parsed.messages;
+    const promptBytes = wireMessages.reduce(
       (total, message) => total + Buffer.byteLength(message.content, 'utf8'),
       0
     );
@@ -1087,7 +1093,7 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
         : undefined);
     const bodyText = JSON.stringify({
       model: this.config.model.id,
-      messages: parsed.messages.map((message) => ({
+      messages: wireMessages.map((message) => ({
         role: message.role,
         content: message.content
       })),

@@ -16,12 +16,27 @@
  *  * Its `json_schema` response format is a prompt plus a check after generation that extracts the first
  *    JSON object from the text — prose, a fence or a second object are dropped silently. Agent Relay's own
  *    parser requires the whole completion to be exactly one action, so the adapter does not ask Strata for a
- *    response format: the model's raw text reaches that parser unchanged.
+ *    response format: the model's raw text reaches that parser unchanged. What that format adds that does
+ *    matter is a system message stating the output format: without one, the Coder model answered a real
+ *    Ornith prompt with a sentence of prose instead of an action on every attempt (STRATA-1 control run,
+ *    five of five); with the short one below and no response format, it answered with exactly one action on
+ *    every turn. So that message is sent, and the strict check stays Agent Relay's.
  */
 
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
-import { LOCAL_INFERENCE_HOST, type LocalInferenceConfig } from '../../../shared/domain/local-inference';
+import { LOCAL_INFERENCE_HOST, type LocalInferenceConfig, type LocalInferenceMessage } from '../../../shared/domain/local-inference';
+
+/**
+ * The system message an Ornith request to a Strata model starts with: the output format, in fixed words,
+ * nothing about the task. It is part of the prompt (and counted as such); the protocol itself is unchanged.
+ */
+export const STRATA_ORNITH_FORMAT_MESSAGE: LocalInferenceMessage = Object.freeze({
+  role: 'system',
+  content:
+    'OUTPUT FORMAT REQUIREMENT: Reply with exactly one JSON object: one Ornith action from the protocol below. ' +
+    'No Markdown, code fences, commentary or any text before or after the JSON object.'
+});
 
 /** A model config is a few hundred bytes; anything this large is not one. */
 const STRATA_CONFIG_MAX_BYTES = 64 * 1024;
