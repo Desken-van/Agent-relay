@@ -121,7 +121,11 @@ export function classifyVerificationExecution(
 const ESCAPE = String.fromCharCode(27);
 const ANSI_SEQUENCE = new RegExp(`${ESCAPE}\\[[0-9;?]*[ -/]*[@-~]`, 'g');
 const FAILING_LINE = /^\s*(FAIL\b|×|✗|✖)|AssertionError|\bError:|\bnpm error\b|^\s*(Test Files|Tests)\s/;
-const DIAGNOSTIC_LINE = /AssertionError|\berror TS\d{4,5}\b|✖ \d+ problems?|\bError:|\bTypeError:|\bRollupError|error during build|\[vitest-pool/;
+const DIAGNOSTIC_LINE = /AssertionError|\berror TS\d{4,5}\b|✖ \d+ problems?|\bError:|\bTypeError:|\bSyntaxError:|\bReferenceError:|\bRollupError|error during build|\[vitest-pool/;
+/** Node prints where a SyntaxError is (`src/strings.js:3`, once relativized) a few lines above the message. */
+const SYNTAX_ERROR_LINE = /\bSyntaxError:/;
+const LOCATION_LINE = /^\s*(?:#\s)?[^\s:]+:\d+$/;
+const LOCATION_LOOKBACK_LINES = 5;
 const SUMMARY_LINE_MAX = 200;
 const SUMMARY_TAIL_LINES = 8;
 const SUMMARY_FAILING_LINES = 6;
@@ -170,10 +174,14 @@ function clipLine(line: string): string {
  */
 export function summarizeVerificationOutput(
   raw: string,
-  maxChars: number = ORNITH_LIMITS.maxVerificationSummaryChars
+  maxChars: number = ORNITH_LIMITS.maxVerificationSummaryChars,
+  options: { readonly worktreeRoots?: readonly string[] } = {}
 ): string {
   const cleaned = redactAbsoluteMachinePaths(
-    redactSecrets(stripControlCharacters(boundInput(raw).replace(ANSI_SEQUENCE, '').replace(/\r\n?/g, '\n')))
+    redactSecrets(stripControlCharacters(relativizeWorktreePaths(
+      boundInput(raw).replace(ANSI_SEQUENCE, '').replace(/\r\n?/g, '\n'),
+      options.worktreeRoots ?? []
+    )))
   );
   const lines = cleaned
     .split('\n')
@@ -186,7 +194,7 @@ export function summarizeVerificationOutput(
 
   // Reserve space for actual error messages before failing-test titles and stack tails.
   // Otherwise six early test titles can consume every slot and erase the later assertion.
-  const diagnostic = [...new Set(lines.filter(line => DIAGNOSTIC_LINE.test(line)))].slice(0, SUMMARY_FAILING_LINES);
+  const diagnostic = [...new Set(diagnosticLines(lines))].slice(0, SUMMARY_FAILING_LINES);
   const tailLines = lines.slice(-SUMMARY_TAIL_LINES);
   const failing = [...new Set(lines.filter(line => FAILING_LINE.test(line) && !diagnostic.includes(line) && !tailLines.includes(line)))].slice(0, SUMMARY_FAILING_LINES);
   const tail = tailLines.filter(line => !diagnostic.includes(line));
@@ -198,6 +206,67 @@ export function summarizeVerificationOutput(
       : `…${text.slice(text.length - (limit - 1))}`;
   }
   return text;
+}
+
+/**
+ * The lines that state an error, each SyntaxError preceded by the location Node printed for it: without it a
+ * repair round is told that a name is declared twice but not in which file.
+ */
+function diagnosticLines(lines: readonly string[]): string[] {
+  const picked: string[] = [];
+  lines.forEach((line, index) => {
+    if (!DIAGNOSTIC_LINE.test(line)) return;
+    if (SYNTAX_ERROR_LINE.test(line)) {
+      for (let back = index - 1; back >= Math.max(0, index - LOCATION_LOOKBACK_LINES); back -= 1) {
+        if (LOCATION_LINE.test(lines[back]!)) {
+          picked.push(lines[back]!);
+          break;
+        }
+      }
+    }
+    picked.push(line);
+  });
+  return picked;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** A `file:` URL as it appears in output; the same stop characters the machine-path redaction uses. */
+const FILE_URL = /\bfile:\/\/[^\s)\]}"'>,;]*/g;
+
+/**
+ * A path inside the worktree the command ran in becomes relative to it (`src/strings.js:3`), so the summary
+ * still says which project file failed after every other machine path is redacted. Plain paths with either
+ * separator, and `file:` URLs — those DECODED and compared as the path they name: Node percent-encodes
+ * what a directory name may contain (a space, "#", "?", "%"), and re-encoding the root to match would have
+ * to reproduce its exact rules.
+ */
+function relativizeWorktreePaths(text: string, roots: readonly string[]): string {
+  const slashedRoots = roots.map((root) => root.replace(/\\/g, '/').replace(/\/+$/, '')).filter((root) => root.length >= 2);
+  if (slashedRoots.length === 0) return text;
+  let result = text.replace(FILE_URL, (url) => {
+    let path: string;
+    try {
+      path = decodeURIComponent(url.slice('file://'.length));
+    } catch {
+      return url;
+    }
+    if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+    for (const root of slashedRoots) {
+      const prefix = `${root}/`;
+      const inside = /^[A-Za-z]:/.test(root) ? path.toLowerCase().startsWith(prefix.toLowerCase()) : path.startsWith(prefix);
+      if (inside) return path.slice(prefix.length);
+    }
+    return url;
+  });
+  for (const slashed of slashedRoots) {
+    for (const spelling of new Set([`${slashed}/`, `${slashed.replace(/\//g, '\\')}\\`])) {
+      result = result.replace(new RegExp(escapeRegExp(spelling), /^[A-Za-z]:/.test(slashed) ? 'gi' : 'g'), '');
+    }
+  }
+  return result;
 }
 
 /** One sentence per attempt, in the same words for the timeline, the Run screen and the task's own error. */

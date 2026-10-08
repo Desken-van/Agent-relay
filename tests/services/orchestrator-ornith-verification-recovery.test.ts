@@ -14,12 +14,13 @@ import type {
 } from '../../src/main/services/ornith-implementation';
 import type { ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import type { VerificationExecutor } from '../../src/main/services/worktree-verification';
-import type { Task } from '../../src/shared/domain/models';
+import type { Project, Task } from '../../src/shared/domain/models';
 import { readOrnithRunEvidence, type OrnithVerificationAttempt } from '../../src/shared/domain/ornith-verification';
 import { ORNITH_LIMITS } from '../../src/shared/domain/ornith';
 import { readVerification } from '../../src/shared/domain/verification';
 import { runGuidance } from '../../src/shared/domain/run-guidance';
 import { createHarness, type Harness } from '../helpers/harness';
+import { NODE_TEST_DUPLICATE_DECLARATION_SPEC, NODE_TEST_MISSING_EXPORT_SPEC } from '../helpers/node-test-output-fixtures';
 
 const unusedProcessRunner: ProcessRunner = {
   run: async () => {
@@ -164,6 +165,8 @@ afterEach(() => {
 async function taskAfterOrnithRound(input: {
   ornith: OrnithImplementationService;
   verification: VerificationExecutor;
+  taskOverrides?: Partial<Task>;
+  projectOverrides?: Partial<Project>;
 }): Promise<{ readonly harness: Harness; readonly task: Task }> {
   harness = createHarness({
     ornith: input.ornith,
@@ -171,8 +174,10 @@ async function taskAfterOrnithRound(input: {
     processRunner: unusedProcessRunner,
     verification: input.verification
   });
-  const project = harness.createProject();
-  const created = harness.createTask(project.id, { implementationProvider: 'ornith' });
+  const localPath = input.projectOverrides?.localPath;
+  if (localPath !== undefined) harness.git.repository = { ...harness.git.repository, root: localPath };
+  const project = harness.createProject(input.projectOverrides);
+  const created = harness.createTask(project.id, { implementationProvider: 'ornith', ...input.taskOverrides });
   await harness.orchestrator.generateSpecification(created.id);
   harness.orchestrator.approveSpecification(created.id);
   const task = await harness.orchestrator.sendToClaude(created.id);
@@ -510,5 +515,85 @@ describe('an Ornith round that changed nothing', () => {
     expect(value.action).toMatchObject({ key: 'run_implementation', label: 'Retry implementation · Ornith' });
     expect('secondaryAction' in value).toBe(false);
     expect(value.verification ?? null).toBeNull();
+  });
+});
+
+describe('a node:test failure of the files Ornith changed (the live control-run failure)', () => {
+  // The harness's default project path is a Windows one; these run on every platform.
+  const projectOverrides: Partial<Project> = { localPath: process.platform === 'win32' ? 'C:\\repo' : '/repo' };
+  /** Verification whose output is what `node --test` printed for this task's own worktree. */
+  function nodeTestVerification(outputs: readonly ((root: string) => string)[], root: () => string): ScriptedVerification {
+    let calls = 0;
+    return {
+      get calls() {
+        return calls;
+      },
+      identity: async () => 'a'.repeat(64),
+      execute: async () => {
+        const output = outputs[Math.min(calls, outputs.length - 1)]!(root());
+        calls += 1;
+        return { command: 'npm run verify', exitCode: 1, stdout: output, stderr: '', failed: true, timedOut: false, cancelled: false, durationMs: 412 };
+      }
+    };
+  }
+
+  it('is classified as the files\' own, offers one repair that receives the located error over the same changes, and then stops for the operator', async () => {
+    let worktree = '';
+    const verification = nodeTestVerification([NODE_TEST_DUPLICATE_DECLARATION_SPEC, NODE_TEST_MISSING_EXPORT_SPEC], () => worktree);
+    const requests: OrnithImplementationRequest[] = [];
+    const ornith = fakeOrnith(async (request) => {
+      requests.push(request);
+      // The first round is stopped by its deadline after editing; the repair finishes normally.
+      return requests.length === 1 ? deadlineAfterEditsResult() : finishedAfterFailedVerificationResult();
+    });
+    const { harness: h, task } = await taskAfterOrnithRound({ ornith, verification, projectOverrides });
+    worktree = task.worktreePath!;
+    const worktreesBefore = h.git.createdWorktrees.length;
+    expect(task.currentRound).toBe(1);
+    expect(verification.calls).toBe(0);
+
+    // Relay's verification: node:test could not load the test because a project file declares `whisper` twice.
+    const failed = await h.orchestrator.runVerification(task.id);
+    const record = readVerification(h.runs.listByTask(task.id).at(-1)!);
+    expect(record.success && record.data.failureKind).toBe('implementation');
+    expect(failed.lastError).toContain('a project file declares the same name twice');
+    expect(record.success && record.data.outputSummary).toContain("src/strings.js:3\nSyntaxError: Identifier 'whisper' has already been declared");
+    expect(record.success && record.data.outputSummary).not.toContain(worktree);
+
+    // The one next step is the repair, not a diagnostic re-run and not a dead end.
+    const guidance = guidanceFor(h, failed);
+    expect(guidance.action).toMatchObject({ key: 'run_implementation', label: 'Fix verification failures · Ornith', enabled: true });
+    expect('secondaryAction' in guidance).toBe(false);
+
+    // One repair run, handed the located error, over the SAME worktree: nothing reset, nothing committed.
+    const repaired = await h.orchestrator.sendToClaude(task.id);
+    expect(requests).toHaveLength(2);
+    const repair = requests[1]!;
+    expect(repair.worktreePath).toBe(worktree);
+    expect(repair.correctionFindings).toContain('a project file declares the same name twice');
+    expect(repair.correctionFindings).toContain("src/strings.js:3\nSyntaxError: Identifier 'whisper' has already been declared");
+    expect(repair.correctionFindings).not.toContain(worktree);
+    expect(h.git.createdWorktrees).toHaveLength(worktreesBefore);
+    expect(h.git.commits).toEqual([]);
+    expect(repaired.worktreePath).toBe(worktree);
+    // A verification repair does not spend a review round (unchanged behaviour), and the review budget is untouched.
+    expect(repaired.currentRound).toBe(1);
+    expect(repaired.maxRounds).toBe(task.maxRounds);
+
+    // Relay verified the repair once, found a new confirmed failure, and stopped: nothing runs again by itself.
+    expect(verification.calls).toBe(2);
+    expect(repaired.status).toBe('READY_FOR_IMPLEMENTATION');
+    expect(repaired.lastError).toContain('a project module does not export a name that is imported from it');
+    expect(requests).toHaveLength(2);
+    expect(guidanceFor(h, repaired).action).toMatchObject({ key: 'run_implementation', label: 'Fix verification failures · Ornith' });
+  });
+
+  it('without a located, confirmed error the same failure stays a diagnostic re-run, never a repair', async () => {
+    const verification = nodeTestVerification([(root) => NODE_TEST_DUPLICATE_DECLARATION_SPEC(`${root}-elsewhere`)], () => '/unrelated');
+    const { harness: h, task } = await taskAfterOrnithRound({ ornith: fakeOrnith(async () => deadlineAfterEditsResult()), verification, projectOverrides });
+    const failed = await h.orchestrator.runVerification(task.id);
+    const record = readVerification(h.runs.listByTask(task.id).at(-1)!);
+    expect(record.success && record.data.failureKind).toBe('unknown');
+    expect(guidanceFor(h, failed).action).toMatchObject({ key: 'run_verification', label: 'Run verification to diagnose' });
   });
 });

@@ -57,6 +57,7 @@ import type { TaskSpecification } from '../../shared/schemas/codex';
 import type { AgentProgressEvent, ImplementationResult, OrnithHealthyLease, OrnithInferenceLeaseService } from '../ports';
 import type { ProcessRunner } from '../adapters/process/process-runner';
 import { OrnithWorktreeTools, type OrnithOperationBudget, type OrnithToolResult } from './ornith-worktree-tools';
+import { verificationWorktreeRoots } from './worktree-verification';
 
 /* -------------------------------------------------------------------------- */
 /* Request / result                                                           */
@@ -146,6 +147,57 @@ interface RollingResult {
   readonly action: OrnithActionKind;
   /** Bounded JSON text: either the tool's `forModel`, or a denial description. */
   readonly resultText: string;
+  /** The file a successful read_file showed the content of, so a later edit of it can retire that content. */
+  readonly readPath?: string;
+}
+
+/** How much of each applied oldText/newText a replace_text result repeats back to the model. */
+const APPLIED_REPLACEMENT_ECHO_CHARS = 600;
+
+/**
+ * Every request is stateless: the model never sees its own earlier replies, only these results. A
+ * replace_text result that said only "new sha256, N bytes" left it with no record of what it had just
+ * changed, beside an earlier read_file that still showed the file as it was — and the real 9B model then
+ * applied the same insertion again with the new hash (a duplicated function), or repeated a fix it had
+ * already made. So the result names the replacements that are now in the file, bounded; when even that
+ * does not fit the result budget, the plain result is kept, so its sha256 is never lost.
+ */
+function replaceResultForModel(
+  action: Extract<OrnithAction, { action: 'replace_text' }>,
+  forModel: unknown,
+  maxToolResultBytes: number
+): unknown {
+  if (forModel === null || typeof forModel !== 'object') return forModel;
+  const echo = (text: string): string => text.length <= APPLIED_REPLACEMENT_ECHO_CHARS
+    ? text
+    : `${text.slice(0, APPLIED_REPLACEMENT_ECHO_CHARS)}…[${text.length - APPLIED_REPLACEMENT_ECHO_CHARS} more characters]`;
+  const withApplied = {
+    ...forModel,
+    applied: action.replacements.map((replacement) => ({ oldText: echo(replacement.oldText), newText: echo(replacement.newText) })),
+    note: 'These replacements are now in the file. Do not send them again; read_file the file if you need its current content.'
+  };
+  return Buffer.byteLength(JSON.stringify(withApplied), 'utf8') <= maxToolResultBytes ? withApplied : forModel;
+}
+
+/**
+ * After a file changes, the content an earlier read_file showed for it is no longer the file. Left in the
+ * history it reads as current — and an edit computed from it re-applies what was already done — so it is
+ * replaced by a short notice that it is out of date. Only that file's earlier reads are touched.
+ */
+function retireStaleReads(rolling: RollingResult[], path: string, turn: number, action: OrnithActionKind): void {
+  rolling.forEach((entry, index) => {
+    if (entry.readPath !== path) return;
+    rolling[index] = {
+      turn: entry.turn,
+      action: entry.action,
+      resultText: JSON.stringify({
+        path,
+        outOfDate: true,
+        reason: `${path} was changed at turn ${turn} by ${action}, so the content this read returned is no longer the file ` +
+          'and was removed. read_file it again before you rely on its content or edit it again.'
+      })
+    };
+  });
 }
 
 const BOUND_TASK_WORKTREE_MARKER = '[bound task worktree]';
@@ -291,7 +343,11 @@ Rules:
 - All paths are repository-relative, use forward slashes, and must stay inside the worktree.
 - "replace_text" requires the file's CURRENT sha256 (given in the last read_file/create_file/
   replace_text result for that file) and fails with no write if oldText does not occur
-  exactly once.
+  exactly once. Its result lists the replacements it "applied": they are in the file now, so
+  never send them again.
+- After you create, replace text in, or delete a file, the content earlier read_file results
+  showed for it is out of date and is removed from PRIOR TOOL RESULTS. To edit that file again,
+  read_file it first and take oldText from that fresh content.
 - You have no git commit, push, merge, checkout, reset, or remote access of any kind —
   do not ask for one, it does not exist.
 - Call "run_verification" only when you believe the work is complete; Agent Relay itself
@@ -301,13 +357,22 @@ Rules:
   — do not repeat the identical request. ("list_files" truncation works differently: see the
   "nextCursor" rule below, not this one.)
 - Never repeat an identical list_files, read_file, search_text, git_status, or git_diff action after it succeeds.
-  Use the returned files, cursor, or status to choose a different next action.
+  Use the returned files, cursor, or status to choose a different next action. Reading a file again
+  after you changed it is not a repeat: its earlier content is out of date.
+- A "list_files" result lists only the PATHS of tracked and untracked (not ignored) files at or
+  under the prefix: no directories, types, sizes or symlink details. A listed path can still be
+  refused by "read_file" (a symlink, or not UTF-8 text).
 - A "list_files", "read_file", "search_text", "git_status", or "git_diff" action that fails with
   code "timeout" is recoverable a bounded number of times per run: choose a DIFFERENT, narrower
-  request (fewer "files", a shorter prefix, a smaller byte range) on your next turn — repeating
-  the identical request will be refused outright once, not retried.
-- A "search_text" or "read_file" that fails with code "limit_read_bytes_exceeded" gets exactly ONE
-  such recovery chance per run: on your next turn, either make the scoped edit now using context you
+  request on your next turn (list_files: a deeper prefix or smaller limit; read_file: a smaller
+  range; search_text: fewer "files" or a smaller limit; git_diff: fewer "paths"; git_status cannot
+  be narrowed, so continue without it). Repeating the identical request will be refused once.
+- Any failure these rules do not call recoverable ends the run at once: for example a "read_file"
+  or "git_diff" path that is not an existing repository file, a symlink, a file that is not UTF-8
+  text, or a Git error. Read only paths a "list_files" or "search_text" result gave you, existing
+  files the specification names, or files you created; never guess a path.
+- A "search_text", "read_file" or "git_diff" that fails with code "limit_read_bytes_exceeded" gets
+  exactly ONE such recovery chance per run: on your next turn, either make the scoped edit now using context you
   already have, or call "blocked" — repeating the identical request will be refused outright.
 - "search_text" reads the FULL content of every candidate file toward the same cumulative read
   budget as "read_file" (files over 64 KB and binary files are skipped, never searched: use
@@ -1214,8 +1279,8 @@ export class OrnithImplementationService {
               'then "finish".'
             : priorFailureCode !== null
             ? `The identical ${action.action} request (${describeActionParams(action)}) already failed ` +
-              `(${priorFailureCode}) and was not retried unchanged. Narrow "files", the query, offset, or limit ` +
-              'before retrying — repeating the exact same request will not succeed.'
+              `(${priorFailureCode}) and was not retried unchanged. ${narrowingAdvice(action)} — repeating the ` +
+              'exact same request will not succeed.'
             : `The identical ${action.action} request already succeeded and was not executed again. ` +
               'Use its prior result and choose a different action; narrow the query or page only if the result was truncated.'
         };
@@ -1356,6 +1421,7 @@ export class OrnithImplementationService {
           const classified = classifyVerificationExecution(execution, { budgetExpired, budgetMs });
           // What a failed command failed ON — the files, or the test runner itself — from the same bounded
           // output the summary is built from, so the model is not told to change files over a runner failure.
+          const worktreeRoots = await verificationWorktreeRoots(request.worktreePath);
           const failure = classified.outcome === 'passed'
             ? null
             : classifyVerificationFailure({
@@ -1363,7 +1429,8 @@ export class OrnithImplementationService {
                 exitCode: execution.exitCode,
                 durationMs: execution.durationMs,
                 outputLimitExceeded: execution.outputLimitExceeded === true,
-                output: execution.output
+                output: execution.output,
+                worktreeRoots
               });
           const attempt: OrnithVerificationAttempt = {
             sequence: nonterminalActionsUsed,
@@ -1372,7 +1439,7 @@ export class OrnithImplementationService {
             exitCode: execution.exitCode,
             durationMs: Math.max(0, Math.round(execution.durationMs)),
             reason: classified.reason === null ? null : classified.reason.slice(0, 400),
-            summary: summarizeVerificationOutput(execution.output),
+            summary: summarizeVerificationOutput(execution.output, undefined, { worktreeRoots }),
             code: null,
             fingerprint: shortFingerprint(fingerprint),
             ...(failure === null ? {} : { failureKind: failure.kind })
@@ -1558,8 +1625,8 @@ export class OrnithImplementationService {
               : isBudgetDenial
               ? `${toolResult.reason} (${describeActionParams(action)}) ${budgetRecoveryAdvice(action, tools.changedFileCount())}`
               : `${toolResult.reason} (${describeActionParams(action)}) ${remaining} read-only recovery ` +
-                `attempt${remaining === 1 ? '' : 's'} remain this run. Narrow "files", the query, offset, or limit ` +
-                'before retrying; repeating this exact request will be refused.'
+                `attempt${remaining === 1 ? '' : 's'} remain this run. ${narrowingAdvice(action)}; repeating ` +
+                'this exact request will be refused.'
           };
           rolling.push({ turn: turnsUsed, action: action.action, resultText: JSON.stringify(recoveryFeedback) });
           continue;
@@ -1634,8 +1701,12 @@ export class OrnithImplementationService {
         }
       });
 
-      const resultText = resultTextFor(action.action, toolResult.forModel, promptBudget.maxToolResultBytes);
-      rolling.push({ turn: turnsUsed, action: action.action, resultText });
+      const forModel = action.action === 'replace_text'
+        ? replaceResultForModel(action, toolResult.forModel, promptBudget.maxToolResultBytes)
+        : toolResult.forModel;
+      const resultText = resultTextFor(action.action, forModel, promptBudget.maxToolResultBytes);
+      if (toolResult.changedPath) retireStaleReads(rolling, toolResult.changedPath, turnsUsed, action.action);
+      rolling.push({ turn: turnsUsed, action: action.action, resultText, ...(action.action === 'read_file' ? { readPath: action.path } : {}) });
 
       // Deterministic, once per run: the moment discovery is nearly spent the model is told,
       // in Relay's own words rather than the prompt's standing text, that edits of files it
@@ -1724,6 +1795,28 @@ function describeActionParams(action: OrnithAction): string {
       return `paths=${action.paths ? JSON.stringify(action.paths) : '<whole manifest>'}`;
     default:
       return '(no parameters)';
+  }
+}
+
+/**
+ * How a refused read-only request can be made narrower, in the parameters THAT action has: a
+ * "files" list belongs to search_text alone, git_diff names "paths", and git_status has nothing to
+ * narrow at all, so its only way forward is another action.
+ */
+function narrowingAdvice(action: OrnithAction): string {
+  switch (action.action) {
+    case 'list_files':
+      return 'Use a deeper "prefix" or a smaller "limit" before retrying';
+    case 'read_file':
+      return 'Read a smaller range ("offset"/"limit") before retrying';
+    case 'search_text':
+      return 'Name fewer "files", use a more specific query or a smaller "limit" before retrying';
+    case 'git_diff':
+      return 'Name fewer "paths" before retrying';
+    case 'git_status':
+      return 'git_status has no parameters to narrow: continue with a different action instead';
+    default:
+      return 'Change the request before retrying';
   }
 }
 

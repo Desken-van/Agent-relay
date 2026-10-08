@@ -242,11 +242,18 @@ export interface LocalInferenceLifecyclePanelProps {
   readonly enabled: boolean;
   /** Whether the local-inference part of the Settings draft differs from what is saved. */
   readonly unsaved: boolean;
+  /**
+   * The *saved* local-inference settings. A new value — a profile added, edited, disabled or deleted and
+   * saved — makes the panel read the state and the profile list again, so a removed or disabled chosen
+   * profile is shown as such at once instead of after reopening the panel.
+   */
+  readonly savedLocalInference?: unknown;
 }
 
 export function LocalInferenceLifecyclePanel({
   enabled,
-  unsaved
+  unsaved,
+  savedLocalInference
 }: LocalInferenceLifecyclePanelProps): React.JSX.Element {
   const [state, setState] = useState<LocalInferenceState | null>(null);
   const [capabilities, setCapabilities] = useState<LocalInferenceCapabilities | null>(null);
@@ -284,8 +291,8 @@ export function LocalInferenceLifecyclePanel({
     return () => {
       cancelled = true;
     };
-    // Mount-only: opening the panel reads state (and the profile list) once and never again on its own.
-  }, []);
+    // On mount, and again only when the saved local-inference settings change: never on a timer.
+  }, [savedLocalInference]);
 
   const primary = projectPrimaryAction({ enabled, unsaved, state, capabilities, pending });
   const showStop =

@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { createHarness, type Harness } from '../helpers/harness';
 import { WorktreeVerification, type VerificationTarget } from '../../src/main/services/worktree-verification';
 import { ExecaProcessRunner } from '../../src/main/adapters/process/process-runner';
+import { LocalWorktreeDependencyPreparer } from '../../src/main/services/worktree-dependencies';
 
 let h: Harness;
 let target: VerificationTarget;
@@ -95,15 +96,35 @@ function installedElectron(modules = join(root, 'node_modules')) {
   writeFileSync(join(distribution, 'version'), '43.3.0');
   return distribution;
 }
+/** Dependencies prepared the way Agent Relay prepares them on this platform. */
+async function prepareDependencies(): Promise<void> {
+  await new LocalWorktreeDependencyPreparer(new ExecaProcessRunner())
+    .prepare({ repositoryPath: target.project.localPath, worktreePath: root });
+}
 it('prepares ignored Vite caches through the physical dependency directory before verification', async () => {
   const modules = join(target.project.localPath, 'node_modules');
   mkdirSync(join(modules, 'vite'), { recursive: true });
   writeFileSync(join(modules, 'vite', 'package.json'), '{}');
-  symlinkSync(modules, join(root, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+  await prepareDependencies();
   const result = await verifier.execute(target, new AbortController().signal, () => {});
   expect(result.exitCode).toBe(0);
-  expect(existsSync(join(modules, '.vite-temp'))).toBe(true);
-  expect(existsSync(join(modules, '.vite', 'vitest'))).toBe(true);
+  // Windows links node_modules itself (a junction), so the caches land in the registered checkout's
+  // directory. Elsewhere the worktree has its own physical node_modules, and its caches stay its own.
+  const physical = process.platform === 'win32' ? modules : join(root, 'node_modules');
+  expect(existsSync(join(physical, '.vite-temp'))).toBe(true);
+  expect(existsSync(join(physical, '.vite', 'vitest'))).toBe(true);
+  if (process.platform !== 'win32') expect(existsSync(join(modules, '.vite-temp'))).toBe(false);
+}, 30_000);
+it('prepared dependencies leave Git status clean and the verification snapshot unchanged, while an unsafe input is still refused', async () => {
+  mkdirSync(join(target.project.localPath, 'node_modules', 'left-pad'), { recursive: true });
+  writeFileSync(join(target.project.localPath, 'node_modules', 'left-pad', 'package.json'), '{}');
+  const before = await verifier.identity(target);
+  await prepareDependencies();
+  expect(git(root, 'status', '--short', '--untracked-files=all')).toBe('');
+  expect(await verifier.identity(target)).toBe(before);
+  // The snapshot still refuses a symlink that is a real, non-ignored verification input.
+  symlinkSync(join(target.project.localPath, 'input.txt'), join(root, 'linked-input.txt'));
+  await expect(verifier.identity(target)).rejects.toThrow(/unreadable or unsafe/);
 }, 30_000);
 it('fails before starting the long script when Electron has no executable', async () => {
   installedElectron();

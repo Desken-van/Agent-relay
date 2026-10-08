@@ -286,6 +286,8 @@ export function containsAbsoluteMachinePath(value: string): boolean {
 /** Replace machine-absolute path tokens in bounded, non-authoritative prose. */
 export function redactAbsoluteMachinePaths(value: string): string {
   return value
+    // A `file://` URL names a machine path too (Node prints module locations that way).
+    .replace(/\bfile:\/\/[^\s)\]}"'>,;]*/g, '[absolute-path-omitted]')
     .replace(/\\\\[^\\/\s]+[\\/][^\s)\]}"'>,;]*/g, '[absolute-path-omitted]')
     .replace(/[A-Za-z]:[\\/][^\s)\]}"'>,;]*/g, '[absolute-path-omitted]')
     .replace(/(^|[\s=:[({,"'])\/(?!\/)[^\s)\]}"'>,;]+/gm, '$1[absolute-path-omitted]');

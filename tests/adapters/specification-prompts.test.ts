@@ -129,6 +129,21 @@ describe('the implementer contract: Ornith is asked only for what its protocol e
     expect(prompt).toContain('so this implementer can carry it out with exactly these capabilities');
   });
 
+  it('tells the specifier, the reviser and the plan reviewer what Ornith’s reads return and that a failed read ends its run', () => {
+    for (const prompt of [generation('ornith'), revision('ornith'), implementerCapabilitiesSection('ornith', 'reviewer')]) {
+      const text = flat(prompt);
+      expect(text).toContain(
+        'list_files returns only the repository-relative paths of tracked and untracked (not ignored) files under a prefix: no directories, file types, sizes, permissions or symlink targets.'
+      );
+      expect(text).toContain('Never ask it to find out whether a path is a directory, a symlink or empty, or to list subdirectories.');
+      expect(text).toContain('A failed read_file, list_files, search_text, git_status or git_diff ends its run, except a timeout or a read-budget refusal');
+      expect(text).toContain('never tell it to try a path that may not exist, to retry a failed read, listing or Git action, or to handle such a failure and carry on.');
+    }
+    for (const prompt of [generation('claude'), revision('codex')]) {
+      expect(flat(prompt)).not.toContain('list_files returns only');
+    }
+  });
+
   it('never tells the specifier to require that the implementer invoke the UI verification or read its record', () => {
     for (const prompt of [generation('ornith'), revision('ornith'), generation('claude'), revision('codex')]) {
       const text = flat(prompt);

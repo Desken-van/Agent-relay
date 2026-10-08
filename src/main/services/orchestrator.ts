@@ -127,7 +127,7 @@ import {
   verificationNeedsImplementationRepair, verificationRerunRefusal, verificationReadinessFor, verificationRerunPolicy,
   type VerificationReadiness
 } from '../../shared/domain/verification';
-import type { VerificationExecutor } from './worktree-verification';
+import { verificationWorktreeRoots, type VerificationExecutor } from './worktree-verification';
 import type { WorktreeDependencyInstaller, WorktreeDependencyPreparer } from './worktree-dependencies';
 import type { ProtectedContinuationAction } from './continuation-service';
 import type { TaskOperationRegistry } from './task-operations';
@@ -491,6 +491,7 @@ export class Orchestrator {
       // tell — is decided from the locally held, bounded output BEFORE anything is stored, because it
       // selects the one next step the Run screen offers (`verification-failure.ts`): a runner failure is
       // re-run, a failure of the files is handed to the provider, and anything unclear fails closed.
+      const worktreeRoots = passed || task.worktreePath === null ? [] : await verificationWorktreeRoots(task.worktreePath);
       const failure = passed
         ? null
         : classifyVerificationFailure({
@@ -500,12 +501,15 @@ export class Orchestrator {
             identityChanged: after !== identity,
             outputLimitExceeded: result.outputLimitExceeded === true,
             outputLimitBytes: settings.maxStoredLogBytes,
-            output: `${result.stdout}\n${result.stderr}`
+            output: `${result.stdout}\n${result.stderr}`,
+            worktreeRoots
           });
       const reason = failure === null ? null : failure.reason;
       // Only the sanitized, bounded summary ever leaves this method: it is what the record keeps and what the
       // evidence fingerprint is taken from. The raw buffer is dropped here.
-      const outputSummary = failure === null ? null : summarizeVerificationOutput(`${result.stdout}\n${result.stderr}`);
+      const outputSummary = failure === null
+        ? null
+        : summarizeVerificationOutput(`${result.stdout}\n${result.stderr}`, undefined, { worktreeRoots });
       // (The bounded, sanitized tail of the output goes with the record, so the screen can say why.)
       // A generic, Relay-authored line — the classified outcome, exit code and duration, never the
       // command's own text — so the timeline shows that the run ended and how, without the raw

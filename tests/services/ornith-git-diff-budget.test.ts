@@ -205,7 +205,10 @@ describe('git_diff with only a few discovery bytes left', () => {
     expect(outcomeFor(run, 'git_diff')).toEqual([
       { sequence: 7, action: 'git_diff', ok: false, code: 'limit_read_bytes_exceeded' }
     ]);
-    expect(run.prompts.some((prompt) => prompt.includes(UNIQUE_MARKER))).toBe(false);
+    // Nothing of the diff reached the model. The model's own replacement is repeated back to it in the
+    // replace_text result ("applied"), bounded to its first characters — never the whole text, and never a diff.
+    expect(run.prompts.some((prompt) => prompt.includes('diff --git'))).toBe(false);
+    expect(run.prompts.some((prompt) => prompt.includes(large.slice(0, 2_000)))).toBe(false);
     expect(run.result.assessment.disposition, run.result.finalMessage).toBe('pass');
     expect(run.targetAfter).toContain(UNIQUE_MARKER);
   }, 600_000);

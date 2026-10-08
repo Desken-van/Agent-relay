@@ -14,6 +14,19 @@ import {
   VITEST_TEST_OWN_TIMEOUT_OUTPUT,
   VITEST_WORKER_TIMEOUT_OUTPUT
 } from '../helpers/verification-output-fixtures';
+import {
+  NODE_TEST_ASSERTION_SPEC,
+  NODE_TEST_DEPENDENCY_MISSING_EXPORT_SPEC,
+  NODE_TEST_DEPENDENCY_SYNTAX_ERROR_SPEC,
+  NODE_TEST_DUPLICATE_DECLARATION_DOT,
+  NODE_TEST_DUPLICATE_DECLARATION_SPEC,
+  NODE_TEST_DUPLICATE_DECLARATION_TAP,
+  NODE_TEST_MISSING_EXPORT_SPEC,
+  NODE_TEST_MISSING_EXPORT_TAP,
+  NODE_TEST_MISSING_PACKAGE_SPEC,
+  NODE_TEST_OTHER_SYNTAX_ERROR_SPEC
+} from '../helpers/node-test-output-fixtures';
+import { summarizeVerificationOutput } from '../../src/shared/domain/ornith-verification';
 
 const failed = (output: string, overrides: Partial<VerificationFailureInput> = {}): VerificationFailureInput => ({
   outcome: 'failed',
@@ -209,4 +222,122 @@ it('names an Electron preflight refusal before the command starts without leakin
   expect(result.kind).toBe('infrastructure');
   expect(result.reason).toContain('installed Electron runtime');
   expect(result.reason).toContain('Repair');
+});
+
+describe('node:test failures (Node v26 output captured from real runs)', () => {
+  const root = '/work/agent-relay/worktrees/t1-add-whisper';
+  const inWorktree = (output: string, overrides: Partial<VerificationFailureInput> = {}) =>
+    classifyVerificationFailure(failed(output, { worktreeRoots: [root], ...overrides }));
+
+  it.each([
+    ['a duplicate declaration (spec)', NODE_TEST_DUPLICATE_DECLARATION_SPEC, 'a project file declares the same name twice'],
+    ['a duplicate declaration (tap)', NODE_TEST_DUPLICATE_DECLARATION_TAP, 'a project file declares the same name twice'],
+    ['a missing export (spec)', NODE_TEST_MISSING_EXPORT_SPEC, 'a project module does not export a name that is imported from it'],
+    ['a missing export (tap)', NODE_TEST_MISSING_EXPORT_TAP, 'a project module does not export a name that is imported from it']
+  ])('reads %s located in the worktree as a failure of the current files', (_label, fixture, expected) => {
+    const classified = inWorktree(fixture(root));
+    expect(classified.kind).toBe('implementation');
+    expect(classified.reason).toBe(`npm run verify failed (exit 1): node:test could not load a test because ${expected}. The current files did not pass.`);
+    expect(classified.reason).not.toContain(root);
+    expect(classified.reason).not.toContain('whisper');
+  });
+
+  it('reads a node:test assertion as a failure of the current files', () => {
+    expect(inWorktree(NODE_TEST_ASSERTION_SPEC(root))).toMatchObject({ kind: 'implementation', reason: expect.stringContaining('a test assertion failed') });
+  });
+
+  it('accepts the resolved spelling of the worktree and a Windows file URL', () => {
+    expect(classifyVerificationFailure(failed(NODE_TEST_DUPLICATE_DECLARATION_SPEC('/real/wt'), { worktreeRoots: ['/link/wt', '/real/wt'] })).kind)
+      .toBe('implementation');
+    const windows = NODE_TEST_DUPLICATE_DECLARATION_SPEC('C:\\Users\\someone\\wt');
+    expect(windows).toContain('file:///C:/Users/someone/wt/src/strings.js:3');
+    expect(classifyVerificationFailure(failed(windows, { worktreeRoots: ['C:\\Users\\someone\\wt'] })).kind).toBe('implementation');
+  });
+
+  it.each([
+    ['the module error is located outside the worktree', NODE_TEST_DUPLICATE_DECLARATION_SPEC('/elsewhere/checkout')],
+    ['the dot reporter kept only "test failed"', NODE_TEST_DUPLICATE_DECLARATION_DOT(root)],
+    ['a package is not installed (the environment)', NODE_TEST_MISSING_PACKAGE_SPEC(root)],
+    ['the duplicate declaration is inside node_modules', NODE_TEST_DEPENDENCY_SYNTAX_ERROR_SPEC(root)],
+    ['the missing export is requested from a package', NODE_TEST_DEPENDENCY_MISSING_EXPORT_SPEC(root)],
+    ['another kind of SyntaxError (which might be this Node rejecting new syntax)', NODE_TEST_OTHER_SYNTAX_ERROR_SPEC(root)]
+  ])('stays unknown when %s', (_label, output) => {
+    expect(inWorktree(output)).toEqual({ kind: 'unknown', reason: 'npm run verify failed (exit 1), but the output does not show which check failed or why.' });
+  });
+
+  it('never reads a node:test module error as the files\' own without knowing the worktree', () => {
+    expect(classifyVerificationFailure(failed(NODE_TEST_DUPLICATE_DECLARATION_SPEC(root))).kind).toBe('unknown');
+    expect(classifyVerificationFailure(failed(NODE_TEST_DUPLICATE_DECLARATION_SPEC(root), { worktreeRoots: [] })).kind).toBe('unknown');
+    expect(classifyVerificationFailure(failed(NODE_TEST_DUPLICATE_DECLARATION_SPEC(root), { worktreeRoots: ['/'] })).kind).toBe('unknown');
+  });
+
+  it('stays unknown on insufficient output: the message without its location, or without node:test reporting a failure', () => {
+    const lines = NODE_TEST_DUPLICATE_DECLARATION_SPEC(root).split('\n');
+    expect(inWorktree(lines.filter((line) => !line.startsWith('file://')).join('\n')).kind).toBe('unknown');
+    expect(inWorktree(lines.filter((line) => !/^ℹ fail /.test(line)).join('\n')).kind).toBe('unknown');
+    expect(inWorktree("SyntaxError: Identifier 'whisper' has already been declared").kind).toBe('unknown');
+  });
+
+  it('stays unknown when a confirmed module error is mixed with an unconfirmed one or with an environment error', () => {
+    expect(inWorktree(`${NODE_TEST_DUPLICATE_DECLARATION_SPEC(root)}\n${NODE_TEST_DEPENDENCY_SYNTAX_ERROR_SPEC(root)}`).kind).toBe('unknown');
+    expect(inWorktree(`${NODE_TEST_MISSING_EXPORT_SPEC(root)}\n${NODE_TEST_MISSING_PACKAGE_SPEC(root)}`).kind).toBe('unknown');
+    expect(inWorktree(`${NODE_TEST_MISSING_EXPORT_SPEC(root)}\n${NODE_TEST_OTHER_SYNTAX_ERROR_SPEC(root)}`).kind).toBe('unknown');
+  });
+
+  it('keeps a test-runner failure beside it as a mixed, unconfirmed result', () => {
+    const classified = inWorktree(`${NODE_TEST_DUPLICATE_DECLARATION_SPEC(root)}\nError: [vitest-pool]: Failed to start forks worker for test files a.test.ts.`);
+    expect(classified.kind).toBe('unknown');
+    expect(classified.reason).toContain('checks failed and the test runner also failed');
+  });
+
+  it('keeps the safety order: cancellation, the output limit, changed files and a timeout outrank the evidence', () => {
+    const output = NODE_TEST_DUPLICATE_DECLARATION_SPEC(root);
+    expect(inWorktree(output, { outcome: 'cancelled', exitCode: null }).kind).toBe('cancelled');
+    expect(inWorktree(output, { outputLimitExceeded: true }).kind).toBe('output_limit');
+    expect(inWorktree(output, { identityChanged: true }).kind).toBe('infrastructure');
+    expect(inWorktree(output, { outcome: 'timed_out', exitCode: null }).kind).toBe('unknown');
+    expect(inWorktree(output, { exitCode: null }).kind).toBe('infrastructure');
+  });
+
+  it('summarizes the module error with its project-relative location and no machine path', () => {
+    for (const [fixture, location, message] of [
+      [NODE_TEST_DUPLICATE_DECLARATION_SPEC, 'src/strings.js:3', "SyntaxError: Identifier 'whisper' has already been declared"],
+      [NODE_TEST_MISSING_EXPORT_TAP, '# test/strings.test.js:3', "# SyntaxError: The requested module '../src/strings.js' does not provide an export named 'whisper'"]
+    ] as const) {
+      const summary = summarizeVerificationOutput(fixture(root), undefined, { worktreeRoots: [root] });
+      const lines = summary.split('\n');
+      expect(lines.indexOf(location)).toBeGreaterThanOrEqual(0);
+      expect(lines.indexOf(message)).toBe(lines.indexOf(location) + 1);
+      expect(summary).not.toContain(root);
+      expect(summary).not.toContain('file://');
+      // Re-bounding the stored summary (as the repair prompt does) keeps both lines.
+      expect(summarizeVerificationOutput(summary)).toContain(`${location}\n${message}`);
+    }
+    // The same on a Windows worktree and under a directory whose name Node percent-encodes in the URL.
+    for (const otherRoot of ['C:\\repo\\worktrees\\task', 'C:\\Users\\some one\\wt', '/work/some one/wt']) {
+      const summary = summarizeVerificationOutput(NODE_TEST_DUPLICATE_DECLARATION_SPEC(otherRoot), undefined, { worktreeRoots: [otherRoot] });
+      expect(summary, otherRoot).toContain("src/strings.js:3\nSyntaxError: Identifier 'whisper' has already been declared");
+      expect(summary).not.toContain('file://');
+      expect(summary).not.toMatch(/some one|some%20one|repo|Users/);
+    }
+    // Node percent-encodes "#", "?" and "%" in a module URL, which encodeURI does not reproduce: the URL is
+    // decoded and compared as the path it names (real `node --test` output under such a directory checked too).
+    for (const specialRoot of ['/work/hash#dir/wt', '/work/q?dir/wt', '/work/pct%41dir/wt', 'C:\\Users\\a#b c\\wt']) {
+      const output = NODE_TEST_DUPLICATE_DECLARATION_SPEC(specialRoot);
+      expect(output).toMatch(/%23|%3F|%25/);
+      expect(classifyVerificationFailure(failed(output, { worktreeRoots: [specialRoot] })).kind, specialRoot).toBe('implementation');
+      const summary = summarizeVerificationOutput(output, undefined, { worktreeRoots: [specialRoot] });
+      expect(summary, specialRoot).toContain("src/strings.js:3\nSyntaxError: Identifier 'whisper' has already been declared");
+      expect(summary).not.toMatch(/file:|hash|q\?dir|pct|Users|%2[35]|%3F/);
+    }
+    // A URL outside the worktree, however it is encoded, is still omitted, never shortened.
+    const outside = summarizeVerificationOutput(NODE_TEST_DUPLICATE_DECLARATION_SPEC('/work/hash#dir/other'), undefined, { worktreeRoots: ['/work/hash#dir/wt'] });
+    expect(outside).not.toContain('src/strings.js:3');
+    expect(outside).not.toMatch(/file:|hash/);
+    // Without the worktree, the location is a machine path and is omitted like any other.
+    const unrooted = summarizeVerificationOutput(NODE_TEST_DUPLICATE_DECLARATION_SPEC(root));
+    expect(unrooted).not.toContain(root);
+    expect(unrooted).not.toContain('file://');
+    expect(unrooted).toContain("SyntaxError: Identifier 'whisper' has already been declared");
+  });
 });

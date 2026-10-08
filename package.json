@@ -26,7 +26,9 @@
     "test:e2e:packaged": "npm run package:win && node scripts/test-packaged.mjs",
     "test:e2e:live-plan-review": "vitest run --config vitest.live.config.ts",
     "test:watch": "vitest",
-    "verify": "npm run lint && npm run typecheck && npm run test && npm run build && npm run test:e2e"
+    "verify": "npm run lint && npm run typecheck && npm run test && npm run build && npm run test:e2e",
+    "build:native": "node scripts/build-native.mjs",
+    "diagnose:linux-fs-guard-root-race": "node scripts/diagnostics/linux-fs-guard-root-race.mjs"
   },
   "dependencies": {
     "@openai/codex-sdk": "^0.147.0",

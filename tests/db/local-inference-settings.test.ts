@@ -298,3 +298,47 @@ describe('local-inference Settings persistence', () => {
     closeDatabase(db);
   });
 });
+
+describe('the chosen local-model profile in the settings table', () => {
+  it('round-trips, stays out of Settings, and a whole-Settings save does not touch it', () => {
+    const { file } = tempDatabase();
+    const db = openDatabase({ file });
+    try {
+      const repository = new SqliteSettingsRepository(db, defaults());
+      expect(repository.readLocalInferenceSelection()).toEqual({ kind: 'none' });
+      repository.writeLocalInferenceSelection('default');
+      expect(repository.readLocalInferenceSelection()).toEqual({ kind: 'saved', profileId: 'default' });
+      expect('localInferenceActiveProfileId' in repository.get()).toBe(false);
+
+      // What the Settings form does: write back its whole draft.
+      repository.update({ ...repository.get() });
+      expect(repository.readLocalInferenceSelection()).toEqual({ kind: 'saved', profileId: 'default' });
+    } finally {
+      closeDatabase(db);
+    }
+
+    // A new connection to the same file: what a restarted application reads.
+    const reopened = openDatabase({ file });
+    try {
+      expect(new SqliteSettingsRepository(reopened, defaults()).readLocalInferenceSelection())
+        .toEqual({ kind: 'saved', profileId: 'default' });
+    } finally {
+      closeDatabase(reopened);
+    }
+  });
+
+  it('reads a malformed stored choice as unreadable instead of trusting it', () => {
+    const { file } = tempDatabase();
+    const db = openDatabase({ file });
+    try {
+      const repository = new SqliteSettingsRepository(db, defaults());
+      for (const value of ['not json', JSON.stringify(42), JSON.stringify('../escape'), JSON.stringify('')]) {
+        db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+          .run('localInferenceActiveProfileId', value);
+        expect(repository.readLocalInferenceSelection(), value).toEqual({ kind: 'unreadable' });
+      }
+    } finally {
+      closeDatabase(db);
+    }
+  });
+});

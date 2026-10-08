@@ -332,6 +332,10 @@ export function buildApplication(options: BuildApplicationOptions): Application 
     ((config) => new LlamaCppLocalInference(localInferenceRunner, config));
   const localInference = new LocalInferenceService({
     settings,
+    selection: {
+      read: () => settings.readLocalInferenceSelection(),
+      write: (profileId) => settings.writeLocalInferenceSelection(profileId)
+    },
     createProvider: createLocalInferenceProvider,
     ids
   });

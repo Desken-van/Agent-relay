@@ -94,7 +94,8 @@ Every action button carries a **blast-radius marker**:
 | **Claude Code CLI** | implementation | `winget install --id Anthropic.ClaudeCode -e` |
 | **`llama-server` (local runtime)** | Ornith implementation only | Optional — configure under Settings → Local inference; see `docs/local-inference.md` |
 | **GitHub CLI (`gh`)** | publishing only | Optional — everything else works without it |
-| **Python + Visual Studio C++ Build Tools** | building from source on Windows | `npm install` uses `node-gyp` to build Agent Relay's Job Object launcher |
+| **Python + Visual Studio C++ Build Tools** | building from source on Windows | `npm install` uses `node-gyp` to build Agent Relay's Job Object launcher and Ornith filesystem guard |
+| **Python 3, `make` and a C++17 compiler (`g++` or `clang++`)** | building from source on Linux | `npm install` uses `node-gyp` to build the Ornith filesystem guard (`npm run build:native` rebuilds it) |
 
 Optional provider tools may be absent: the app stays usable and tells you what
 to install. A source checkout on Windows does have one native build step. It
@@ -103,6 +104,12 @@ the production bundle copies that executable beside the main-process bundle.
 The launcher contains managed local-inference runtimes in a Windows Job Object.
 If it is missing, local inference fails before starting a runtime rather than
 falling back to an uncontained process.
+
+Ornith's repository edits go through a native filesystem guard that Windows and
+Linux source checkouts build the same way (`build/Release/agent-relay-fs-guard`
+on Linux). Without it, or on any other platform, Ornith can still read the
+repository but every edit is refused with a reason naming the missing helper;
+there is no unguarded fallback.
 
 ---
 
@@ -152,8 +159,14 @@ put one. Each tool authenticates itself.
 
 ### Codex
 
-The Codex CLI is installed as a dependency of `@openai/codex-sdk`, so you do not
-need a separate install.
+Agent Relay runs one Codex for specifications, reviews, diagnostics and the model
+list, chosen in this order: the path set in **Settings → Codex path**; otherwise the
+Codex CLI installed on your PATH; otherwise the copy bundled with
+`@openai/codex-sdk`, so a separate install is optional. A configured path that does
+not exist is reported as an error, never replaced by another Codex. The bundled
+copy may be older than the Codex you use elsewhere, which matters because Codex
+builds share `~/.codex`. On Windows only a `codex.exe` on PATH counts; an npm
+`codex.cmd` shim is skipped.
 
 ```powershell
 npx codex login          # opens a browser; ChatGPT or API-key sign-in
@@ -433,7 +446,11 @@ For each task, on the first *Send to Claude*:
    implementation or verification. An existing worktree `node_modules` is kept;
    otherwise the registered checkout's installed dependencies are linked only
    when the package manifests match and Git proves `node_modules` is ignored.
-   This is local-only: Agent Relay never downloads packages implicitly.
+   On Windows `node_modules` itself is a junction. Elsewhere it is a real
+   directory holding one link per installed package, because Git does not apply
+   a `node_modules/` rule to a symlink; tool caches such as `.vite` stay local to
+   the worktree. This is local-only: Agent Relay never downloads packages
+   implicitly.
 
 Claude runs with its working directory set to that worktree and nowhere else.
 Your checkout is only ever read.

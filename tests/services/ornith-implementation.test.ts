@@ -477,7 +477,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       ...baseRequest(leaseService, new AbortController().signal),
       specification: {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(21_376)}`
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(20_172)}`
       }
     });
 
@@ -505,8 +505,9 @@ describe('OrnithImplementationService limits and cancellation', () => {
     // tests/adapters/ornith-worktree-tools.test.ts, where the budget is supplied
     // directly rather than derived from preflight.
     // chars values are recalibrated whenever ORNITH_PROTOCOL_INSTRUCTIONS' fixed
-    // byte length changes (most recently: the failed-verification evidence rule, +624 bytes; before that
-    // the run_verification budget/repeat rule and the scope-gate wording),
+    // byte length changes (most recently: the list_files result, per-action timeout narrowing and
+    // run-ending failure rules, +753 bytes; before that the failed-verification evidence rule, +624
+    // bytes, the run_verification budget/repeat rule and the scope-gate wording),
     // since that text is part of the same authoritative/fixed prompt budget this
     // filler trades off against. Recompute empirically (binary-search
     // `preflightOrnithPrompt` for the `chars` that yields each target budget)
@@ -628,14 +629,17 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(preflight.budget.maxToolResultBytes).toBe(384);
 
       // A single legal, existing path whose own JSON representation alone exceeds the
-      // 384-byte budget. `prefix` set to its exact name means the very first
+      // 384-byte budget. `prefix` set to its exact path means the very first
       // list_files call resolves to just this one entry, regardless of what else
       // exists in the manifest or how it sorts alphabetically. 130 multi-byte (3
       // UTF-8 bytes each) characters keep the actual filesystem path short (well
       // under Windows' ~260-character MAX_PATH) while still exceeding the byte
-      // budget once JSON-encoded: 130 real characters is a legal, if unusual, file
-      // name, not a path-length attack.
-      const oversizedName = '文'.repeat(130);
+      // budget once JSON-encoded. They are split over two path components because
+      // Linux limits ONE component to 255 bytes, and 130 such characters are 390:
+      // a legal, if unusual, path on every platform, not a path-length attack.
+      const oversizedName = `${'文'.repeat(65)}/${'文'.repeat(65)}`;
+      expect(Buffer.byteLength(JSON.stringify(oversizedName), 'utf8')).toBeGreaterThan(384);
+      mkdirSync(join(worktree, '文'.repeat(65)));
       writeFileSync(join(worktree, oversizedName), 'export {};\n', 'utf8');
 
       const leaseService: OrnithInferenceLeaseService = {
@@ -710,9 +714,13 @@ describe('OrnithImplementationService limits and cancellation', () => {
       };
       // Multi-byte (3 UTF-8 bytes each) names: short enough in UTF-16 code units to
       // stay well under Windows' MAX_PATH, long enough in UTF-8 bytes that every
-      // {path,line} match entry alone exceeds the 384-byte budget.
+      // {path,line} match entry alone exceeds the 384-byte budget. Split over two
+      // components so none exceeds Linux's 255-byte limit for one component.
+      mkdirSync(join(worktree, '文'.repeat(60)));
       for (let index = 0; index < 3; index += 1) {
-        writeFileSync(join(worktree, `${'文'.repeat(120)}${index}.txt`), 'needle appears here\n', 'utf8');
+        const path = `${'文'.repeat(60)}/${'文'.repeat(60)}${index}.txt`;
+        expect(Buffer.byteLength(JSON.stringify({ path, line: 1 }), 'utf8')).toBeGreaterThan(384);
+        writeFileSync(join(worktree, path), 'needle appears here\n', 'utf8');
       }
 
       let calls = 0;
@@ -1168,6 +1176,52 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(result.ornithAudit.outcomes[0]).toMatchObject({ action: 'search_text', ok: false, code: 'timeout' });
     });
 
+    it('tells the model how to narrow a timed-out request in that action’s own parameters', async () => {
+      (ORNITH_LIMITS as { searchTimeoutMs: number }).searchTimeoutMs = 1;
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          if (requests.length === 1) {
+            return completed(request, JSON.stringify({ version: 1, action: 'search_text', query: 'needle', caseSensitive: false, limit: 10 }));
+          }
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Pivoted away from the timed-out search.' }));
+        }
+      };
+
+      await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
+
+      const prompt = requests[1]!.messages.map((message) => message.content).join('\n');
+      const feedback = /[^\n]*read-only recovery attempt[^\n]*/.exec(prompt)?.[0] ?? '';
+      expect(feedback).toContain('Name fewer \\"files\\", use a more specific query or a smaller \\"limit\\" before retrying');
+      expect(feedback).not.toContain('offset');
+    });
+
+    it('states in the protocol what list_files returns, how each action narrows, and that other failures end the run', async () => {
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Done.' }));
+        }
+      };
+
+      await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
+
+      const prompt = requests[0]!.messages.map((message) => message.content).join('\n').replace(/\s+/g, ' ');
+      expect(prompt).toContain(
+        'A "list_files" result lists only the PATHS of tracked and untracked (not ignored) files at or under the prefix: no directories, types, sizes or symlink details.'
+      );
+      expect(prompt).toContain('git_diff: fewer "paths"; git_status cannot be narrowed, so continue without it');
+      expect(prompt).not.toContain('a shorter prefix');
+      expect(prompt).toContain('Any failure these rules do not call recoverable ends the run at once');
+      expect(prompt).toContain('A "search_text", "read_file" or "git_diff" that fails with code "limit_read_bytes_exceeded"');
+    });
+
     it('exhausts the read-only recovery budget and ends the run classified as configuration, not security', async () => {
       (ORNITH_LIMITS as { searchTimeoutMs: number }).searchTimeoutMs = 1;
       let calls = 0;
@@ -1461,7 +1515,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
           correctionFindings: null,
           round: 1,
           maxRounds: 3,
-          lease: lease({ contextLimitTokens: 16_384, maxOutputTokens: 1_024 })
+          lease: lease({ contextLimitTokens: 20_480, maxOutputTokens: 1_024 })
         });
         expect(checked.ok).toBe(true);
         if (!checked.ok) throw new Error('preflight unexpectedly refused');
@@ -1672,6 +1726,103 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(result.assessment.publishBlock).toBe('configuration');
       expect(result.assessment.reasonCodes).toContain('blocked');
       expect(result.ornithAudit.changedFiles).toBe(0);
+    });
+  });
+
+  describe('what the model is told after it changes a file (the duplicated-insertion failure)', () => {
+    // Live 9B trace this guards: read src/strings.js → replace_text (insert whisper) → the next stateless
+    // prompt still showed the ORIGINAL content from the first read and only "sha256, bytesWritten" for the
+    // edit, so the model applied the same insertion again with the new hash. Here the model is scripted;
+    // what is asserted is exactly what each prompt showed it.
+    const promptOf = (request: LocalInferenceRequest): string => request.messages.map((message) => message.content).join('\n');
+    const shaIn = (prompt: string, path: string): string =>
+      [...prompt.matchAll(new RegExp(`"path":"${path}"[^\\n]*?"sha256":"([0-9a-f]{64})"|"sha256":"([0-9a-f]{64})"[^\\n]*?"path":"${path}"`, 'g'))]
+        .map((match) => match[1] ?? match[2]).at(-1)!;
+
+    // The file is written by the test with known line endings, not checked out: a checkout follows the host's
+    // core.autocrlf (Windows CI turned "fixture\n" into "fixture\r\n" and the scripted LF oldText no longer
+    // matched). Both styles run; in each the model sends breaks in the file's own style, as the protocol says.
+    it.each([
+      ['lf', '\n'],
+      ['crlf', '\r\n']
+    ] as const)('retires the edited file\'s earlier content, names the applied replacement, and lets a fresh read drive the next edit (%s)', async (lineEnding, eol) => {
+      const path = 'notes.txt';
+      const original = `fixture${eol}`;
+      writeFileSync(join(worktree, path), original, 'utf8');
+      writeFileSync(join(worktree, 'other.txt'), 'other content\n', 'utf8');
+      const longText = `fixture${eol}export function whisper() {}${eol}${'/* padding */'.repeat(100)}`;
+      const escaped = (text: string): string => JSON.stringify(text).slice(1, -1);
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          const prompt = promptOf(request);
+          const reply = [
+            () => ({ version: 1, action: 'read_file', path, offset: 0, limit: 65_536 }),
+            () => ({ version: 1, action: 'read_file', path: 'other.txt', offset: 0, limit: 65_536 }),
+            () => ({ version: 1, action: 'replace_text', path, sha256: shaIn(prompt, path), replacements: [{ oldText: original, newText: longText }] }),
+            () => ({ version: 1, action: 'read_file', path, offset: 0, limit: 65_536 }),
+            () => ({ version: 1, action: 'replace_text', path, sha256: shaIn(prompt, path), replacements: [{ oldText: 'export function whisper() {}', newText: 'export function whisper(text) { return text; }' }] }),
+            () => ({ version: 1, action: 'finish', summary: 'Added whisper once.' })
+          ][requests.length - 1]!();
+          return completed(request, JSON.stringify(reply));
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
+
+      expect(result.assessment.disposition, result.finalMessage).toBe('pass');
+      // The first read really showed the file in this style.
+      expect(promptOf(requests[1]!)).toContain(`"lineEnding":"${lineEnding}"`);
+      expect(promptOf(requests[1]!)).toContain(`"content":"${escaped(original)}"`);
+      const afterFirstEdit = promptOf(requests[3]!);
+      // The first read of the file no longer shows its old content; it says it is out of date and why.
+      expect(afterFirstEdit).not.toContain(`"content":"${escaped(original)}"`);
+      expect(afterFirstEdit).toContain(`turn 1 [read_file]: {"path":"${path}","outOfDate":true`);
+      expect(afterFirstEdit).toContain(`${path} was changed at turn 3 by replace_text`);
+      // The other file's read is untouched.
+      expect(afterFirstEdit).toContain('"content":"other content\\n"');
+      // The edit's result names what it applied (bounded), beside the hash it always carried.
+      expect(afterFirstEdit).toContain(
+        `turn 3 [replace_text]: {"path":"${path}","sha256":"`
+      );
+      expect(afterFirstEdit).toContain(
+        `"lineEnding":"${lineEnding}","applied":[{"oldText":"${escaped(original)}","newText":"${escaped(`fixture${eol}export function whisper() {}${eol}`)}`
+      );
+      expect(afterFirstEdit).toMatch(/…\[\d+ more characters\]/);
+      expect(afterFirstEdit).toContain('These replacements are now in the file. Do not send them again');
+      expect(afterFirstEdit).not.toContain(escaped(longText));
+      // The fresh read after the edit is shown in full, and the second edit worked from it.
+      const afterReread = promptOf(requests[4]!);
+      expect(afterReread).toContain(`turn 4 [read_file]: {"path":"${path}","offset":0`);
+      expect(afterReread).toContain('export function whisper() {}');
+      const final = readFileSync(join(worktree, path), 'utf8');
+      expect(final.match(/export function whisper/g)).toHaveLength(1);
+      expect(final).toBe(`fixture${eol}export function whisper(text) { return text; }${eol}${'/* padding */'.repeat(100)}`);
+      // The file kept its own line endings: no lone LF crept into a CRLF file, and no CR into an LF one.
+      if (lineEnding === 'crlf') expect(final.replace(/\r\n/g, '')).not.toContain('\n');
+      else expect(final).not.toContain('\r');
+      // And once the file changes again, the read it was computed from is retired too.
+      expect(promptOf(requests[5]!)).toContain(`${path} was changed at turn 5 by replace_text`);
+    });
+
+    it('states the rule in the protocol: an edit\'s replacements are not sent again, and a changed file is read again first', async () => {
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'done' }));
+        }
+      };
+      await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
+      const prompt = promptOf(requests[0]!);
+      expect(prompt).toContain('Its result lists the replacements it "applied": they are in the file now');
+      expect(prompt).toContain('read_file it first and take oldText from that fresh content');
+      expect(prompt).toContain('Reading a file again\n  after you changed it is not a repeat');
     });
   });
 

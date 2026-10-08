@@ -63,6 +63,15 @@ It has exactly these actions and nothing else: ${ORNITH_ACTION_KINDS.join(', ')}
 - It edits files only through create_file, replace_text (exact text, with the file's current
   sha256 from its own read) and delete_file. There are no file handles: never instruct it to
   open, seek, append through a handle, flush or close a file, or to write raw bytes.
+- list_files returns only the repository-relative paths of tracked and untracked (not ignored)
+  files under a prefix: no directories, file types, sizes, permissions or symlink targets. Never
+  ask it to find out whether a path is a directory, a symlink or empty, or to list subdirectories.
+- A failed read_file, list_files, search_text, git_status or git_diff ends its run, except a
+  timeout or a read-budget refusal, which it may answer once or a few times with a different,
+  narrower request. A path that does not exist, a symlink, a file that is not UTF-8 text, or a Git
+  error therefore stops it: never tell it to try a path that may not exist, to retry a failed
+  read, listing or Git action, or to handle such a failure and carry on. Name an existing file only
+  after reading it yourself; otherwise tell it to find the file with list_files or search_text.
 - read_file validates UTF-8 and reports raw-byte sha256, totalBytes, whole-file lineEnding,
   utf8Bom and trailingLfBytes. Its content preserves CR/LF (a UTF-8 BOM is omitted from decoded
   content, so use utf8Bom). Compare the complete content, not a partial slice, for exact text.

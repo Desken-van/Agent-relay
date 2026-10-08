@@ -167,6 +167,40 @@ starts at `{ "kind": "stopped" }` (or the disabled `unavailable` DTO, when
 `enabled` is false) and performs no discovery, version probe, launch, health
 request, inference, retry, fallback, or automatic start.
 
+The profile chosen in the lifecycle panel is durable too: it is saved when it
+is chosen (in the settings table, under its own key outside the Settings form,
+so saving Settings never overwrites it) and restored at the next launch as the
+active profile — only the choice; the runtime still starts at `stopped` and
+nothing is launched. A saved choice that names a profile which no longer exists,
+is disabled for new tasks, or cannot be read is not restored: the state is
+`unavailable` with a reason saying which and what to do, until a profile is
+chosen. (A profile disabled for new tasks can still be chosen by hand, as
+before; only the automatic restore declines it.) A selected
+profile removed from Settings while the application runs is reported the same
+way. Switching profiles while the runtime is starting, healthy, inferring or
+stopping is still refused until it is stopped.
+
+### Quitting
+
+Quitting Agent Relay stops the runtime it started. The first quit request is
+held while the ordinary `stop()` runs against the retained provider — a
+starting runtime is cancelled, a healthy one stopped, an inferring one stopped
+after the Ornith run using it is told to unwind, a stopping one joined — and
+the application waits at most the active profile's `shutdownTimeoutMs` plus a
+5 s grace before quitting anyway (reporting an unconfirmed stop on stderr). A
+quit requested again meanwhile starts nothing new. Only the provider this
+application owns is stopped; no process is looked up by name. On POSIX,
+`SIGTERM`, `SIGINT` and `SIGHUP` sent to the application are handled as a quit
+in the same way; a second such signal exits immediately without waiting.
+
+An application that ends without a quit — `SIGKILL`, a crash, power loss —
+stops nothing. On Linux the runtime leads its own process group and keeps
+running (verified with `SIGKILL`). A new launch starts at `stopped` and does not
+know about it, so it has to be stopped by hand. On Windows the
+runtime additionally lives in the launcher's kill-on-close Job Object
+(described below), which is unchanged by this; Agent Relay has not re-verified
+that path on Windows as part of this change.
+
 ### Renderer Settings and lifecycle panel
 
 The Settings screen's "Local inference" card exposes every field above:

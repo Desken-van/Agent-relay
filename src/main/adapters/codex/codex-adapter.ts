@@ -20,8 +20,6 @@
  *    constrained on the way out and checked on the way in.
  */
 
-import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
 import { Codex, type ThreadEvent, type ThreadItem, type ThreadOptions } from '@openai/codex-sdk';
 import type { ToolDiagnostic } from '../../../shared/domain/diagnostics';
 import { AgentRelayError } from '../../../shared/domain/errors';
@@ -51,7 +49,7 @@ import type {
   CodexTriageRequest,
   TriageableFinding
 } from '../../ports';
-import { locateExecutable } from '../process/executable-locator';
+import { describeMissingCodex, resolveCodexExecutable, type CodexExecutableResolution } from './codex-executable';
 import type { ProcessRunner } from '../process/process-runner';
 import {
   buildReviewPrompt,
@@ -80,38 +78,13 @@ export interface CodexAdapterOptions {
   readonly configuredPath?: string | null;
 }
 
-/**
- * Platform packages that ship the Codex binary, mirroring the mapping inside
- * `@openai/codex`. The SDK resolves this itself when it spawns, but Agent Relay
- * resolves it too so that **diagnostics and execution agree**: without this,
- * Codex reports "missing" (it is not on PATH) while runs work perfectly, which
- * is the worst possible combination for a diagnostics screen.
- */
-const CODEX_PLATFORM_PACKAGES: Readonly<Record<string, { pkg: string; triple: string }>> = {
-  'linux-x64': { pkg: '@openai/codex-linux-x64', triple: 'x86_64-unknown-linux-musl' },
-  'linux-arm64': { pkg: '@openai/codex-linux-arm64', triple: 'aarch64-unknown-linux-musl' },
-  'darwin-x64': { pkg: '@openai/codex-darwin-x64', triple: 'x86_64-apple-darwin' },
-  'darwin-arm64': { pkg: '@openai/codex-darwin-arm64', triple: 'aarch64-apple-darwin' },
-  'win32-x64': { pkg: '@openai/codex-win32-x64', triple: 'x86_64-pc-windows-msvc' },
-  'win32-arm64': { pkg: '@openai/codex-win32-arm64', triple: 'aarch64-pc-windows-msvc' }
-};
+export { bundledCodexPaths } from './codex-executable';
 
-/** Absolute paths to the Codex binary that ships with the installed SDK. */
-export function bundledCodexPaths(): string[] {
-  const entry = CODEX_PLATFORM_PACKAGES[`${process.platform}-${process.arch}`];
-  if (!entry) return [];
-
-  const executable = process.platform === 'win32' ? 'codex.exe' : 'codex';
-
-  try {
-    const requireFrom = createRequire(import.meta.url);
-    const manifest = requireFrom.resolve(`${entry.pkg}/package.json`);
-    return [join(dirname(manifest), 'vendor', entry.triple, 'bin', executable)];
-  } catch {
-    // The platform package is optional; absence just means "not bundled".
-    return [];
-  }
-}
+const CODEX_SOURCE_LABELS = {
+  configured: 'path set in Settings',
+  installed: 'installed on PATH',
+  bundled: 'bundled with the SDK'
+} as const;
 
 /** The model-facing shape of an implementation turn's answer. Strict: every property is required. */
 export const IMPLEMENTATION_REPORT_SCHEMA: Record<string, unknown> = {
@@ -233,26 +206,25 @@ export class CodexSdkAdapter implements CodexAdapter {
     private readonly options: CodexAdapterOptions = {}
   ) {}
 
-  /** The executable this adapter will actually use, or null if none is found. */
-  private resolveExecutable(): string | null {
-    return (
-      locateExecutable('codex', {
-        configuredPath: this.options.configuredPath ?? null,
-        bundledPaths: bundledCodexPaths()
-      })?.path ?? null
-    );
+  /** The executable this adapter will actually use — the same answer diagnostics and the model catalogue get. */
+  private resolveExecutable(): CodexExecutableResolution {
+    return resolveCodexExecutable(this.options.configuredPath ?? null);
   }
 
   private createClient(): Codex {
     // Pin the SDK to the same binary diagnostics reports, so the two can never
-    // disagree. Falling back to the SDK's own resolution when nothing is found
-    // keeps this from being a regression on an unusual install.
-    const executable = this.resolveExecutable();
+    // disagree. Never left to the SDK's own resolution, which would quietly
+    // run its bundled copy in place of a configured or installed Codex.
+    const resolution = this.resolveExecutable();
+    if (resolution.kind !== 'found') {
+      const { detail, remediation } = describeMissingCodex(resolution);
+      throw new AgentRelayError('TOOL_MISSING', detail, { remediation });
+    }
 
     // The SDK inherits process.env deliberately: Codex owns its own credentials
     // (~/.codex/auth.json, or OPENAI_API_KEY) and passing a scrubbed environment
     // would break API-key authentication.
-    return new Codex(executable ? { codexPathOverride: executable } : {});
+    return new Codex({ codexPathOverride: resolution.path });
   }
 
   private threadOptions(model: string | null, overrides: Partial<ThreadOptions>): ThreadOptions {
@@ -642,22 +614,24 @@ export class CodexSdkAdapter implements CodexAdapter {
   async diagnose(): Promise<ToolDiagnostic> {
     const checkedAt = new Date().toISOString();
 
-    // Checks the configured path, then the binary bundled with the SDK, then
-    // PATH — the same resolution the adapter uses to run Codex.
-    const executable = this.resolveExecutable();
+    // The configured path, else the installed Codex on PATH, else the copy
+    // bundled with the SDK — the same resolution the adapter uses to run Codex.
+    const resolution = this.resolveExecutable();
 
-    if (!executable) {
+    if (resolution.kind !== 'found') {
+      const { detail, remediation } = describeMissingCodex(resolution);
       return {
         tool: 'codex',
         status: 'missing',
-        executablePath: null,
+        executablePath: resolution.kind === 'configured_missing' ? resolution.configuredPath : null,
         version: null,
-        detail: 'The Codex executable could not be found, including the copy bundled with the SDK.',
-        remediation:
-          'Reinstall dependencies (`npm install`), install the Codex CLI with `npm install -g @openai/codex`, or set an explicit path in Settings.',
+        detail,
+        remediation,
         checkedAt
       };
     }
+    const executable = resolution.path;
+    const origin = CODEX_SOURCE_LABELS[resolution.source];
 
     const version = await this.runner.run(executable, ['--version'], { timeoutMs: 30_000 });
     if (version.exitCode !== 0) {
@@ -683,8 +657,8 @@ export class CodexSdkAdapter implements CodexAdapter {
       executablePath: executable,
       version: version.stdout.trim() || null,
       detail: authenticated
-        ? `${version.stdout.trim()} — ${loginOutput.split(/\r?\n/)[0] ?? 'authenticated'}.`
-        : `${version.stdout.trim()} — not logged in.`,
+        ? `${version.stdout.trim()} (${origin}) — ${loginOutput.split(/\r?\n/)[0] ?? 'authenticated'}.`
+        : `${version.stdout.trim()} (${origin}) — not logged in.`,
       remediation: authenticated ? null : 'Run `codex login` in a terminal, then re-run diagnostics.',
       checkedAt
     };

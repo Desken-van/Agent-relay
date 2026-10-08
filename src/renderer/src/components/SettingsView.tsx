@@ -863,6 +863,7 @@ export function SettingsView(): React.JSX.Element {
             <LocalInferenceLifecyclePanel
               enabled={settings?.localInference.enabled ?? false}
               unsaved={localInferenceUnsaved}
+              savedLocalInference={settings?.localInference}
             />
 
             <Card title="Locations">

@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { LocalInferenceProvider, SettingsRepository } from '../../src/main/ports';
+import type {
+  LocalInferenceProvider,
+  LocalInferenceSavedSelection,
+  LocalInferenceSelectionStore,
+  SettingsRepository
+} from '../../src/main/ports';
 import {
   assembleLocalInferenceConfig,
   LOCAL_INFERENCE_APPLICATION_LIMITS,
@@ -1060,5 +1065,215 @@ describe('releasing the runtime around Relay verification', () => {
 
     await expect(releasing).resolves.toEqual({ kind: 'unavailable', reason: 'The release was cancelled.' });
     expect(service.state()).not.toMatchObject({ releasedForVerification: true });
+  });
+});
+
+describe('stopping the runtime because the application quits', () => {
+  it('has nothing to do when no runtime was ever started', async () => {
+    const provider = new StubProvider();
+    const service = selectedService({ settings: new MutableSettings(), createProvider: () => provider, ids: testIds() });
+    await expect(service.stopForQuit()).resolves.toEqual({ kind: 'not_running' });
+    expect(provider.stopCalls).toBe(0);
+  });
+
+  it('stops a healthy runtime it owns, once, however many times quitting asks', async () => {
+    const provider = new StubProvider();
+    const service = selectedService({ settings: new MutableSettings(), createProvider: () => provider, ids: testIds() });
+    await service.start();
+
+    const first = service.stopForQuit();
+    const second = service.stopForQuit();
+    expect(second).toBe(first);
+    await expect(first).resolves.toEqual({ kind: 'stopped' });
+    await expect(service.stopForQuit()).resolves.toEqual({ kind: 'stopped' });
+    expect(provider.stopCalls).toBe(1);
+    expect(service.state()).toEqual({ kind: 'stopped' });
+  });
+
+  it('stops a runtime that is still starting', async () => {
+    const provider = new StubProvider();
+    const service = selectedService({ settings: new MutableSettings(), createProvider: () => provider, ids: testIds() });
+    provider.startGate = new Promise<void>(() => undefined);
+    void service.start();
+    await Promise.resolve();
+    expect(service.state()).toMatchObject({ kind: 'starting' });
+
+    await expect(service.stopForQuit()).resolves.toEqual({ kind: 'stopped' });
+    expect(provider.stopCalls).toBe(1);
+  });
+
+  it('stops a runtime in the middle of an Ornith inference, telling that run to unwind first', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    const lease = await service.acquireOrnithLease('default', settings.defaultFingerprint());
+    let unwound = 0;
+    lease.onIndependentStop(() => { unwound += 1; });
+    provider.inferGate = new Promise<void>(() => undefined);
+    void service.inferForOrnith(lease, {
+      version: LOCAL_INFERENCE_CONTRACT_VERSION,
+      requestId: 'in-flight',
+      messages: [{ role: 'user', content: 'still thinking' }]
+    });
+    await Promise.resolve();
+
+    await expect(service.stopForQuit()).resolves.toEqual({ kind: 'stopped' });
+    expect(unwound).toBe(1);
+    expect(provider.stopCalls).toBe(1);
+  });
+
+  it('joins a stop already in flight instead of starting a second one', async () => {
+    const provider = new StubProvider();
+    const service = selectedService({ settings: new MutableSettings(), createProvider: () => provider, ids: testIds() });
+    await service.start();
+    let finishStop!: () => void;
+    provider.stopGate = new Promise<void>((resolve) => { finishStop = resolve; });
+    const operatorStop = service.stop();
+
+    const quitting = service.stopForQuit();
+    finishStop();
+    await expect(quitting).resolves.toEqual({ kind: 'stopped' });
+    await expect(operatorStop).resolves.toEqual({ kind: 'stopped' });
+    expect(provider.stopAttempts).toBe(1);
+  });
+
+  it('never waits past the profile\'s shutdown budget plus grace, and says the stop is unconfirmed', async () => {
+    vi.useFakeTimers();
+    try {
+      const settings = new MutableSettings();
+      const provider = new StubProvider();
+      const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+      await service.start();
+      provider.stopGate = new Promise<void>(() => undefined);
+
+      const quitting = service.stopForQuit();
+      const budget = settings.defaultProfile().shutdownTimeoutMs + 5_000;
+      await vi.advanceTimersByTimeAsync(budget - 1);
+      let settled = false;
+      void quitting.then(() => { settled = true; });
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(quitting).resolves.toEqual({
+        kind: 'unconfirmed',
+        reason: `The local runtime did not confirm it stopped within ${budget}ms.`
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports a stop that ends in anything but stopped as unconfirmed', async () => {
+    const provider = new StubProvider();
+    const service = selectedService({ settings: new MutableSettings(), createProvider: () => provider, ids: testIds() });
+    await service.start();
+    provider.stopResult = { kind: 'failed', reason: 'The runtime tree could not be confirmed stopped.' };
+    await expect(service.stopForQuit()).resolves.toEqual({
+      kind: 'unconfirmed',
+      reason: 'The runtime tree could not be confirmed stopped.'
+    });
+  });
+});
+
+describe('the chosen local-model profile across restarts', () => {
+  /** An in-memory stand-in for the settings-table key, shared by successive service instances. */
+  function memoryStore(initial: LocalInferenceSavedSelection = { kind: 'none' }): LocalInferenceSelectionStore & { writes: string[] } {
+    let saved = initial;
+    const writes: string[] = [];
+    return {
+      writes,
+      read: () => saved,
+      write: (profileId) => { writes.push(profileId); saved = { kind: 'saved', profileId }; }
+    };
+  }
+
+  it('saves the choice, and a new run restores it without constructing or starting anything', async () => {
+    const settings = new MutableSettings();
+    const selection = memoryStore();
+    const first = new LocalInferenceService({ settings, selection, createProvider: () => new StubProvider(), ids: testIds() });
+    first.selectActiveProfile('default');
+    expect(selection.writes).toEqual(['default']);
+
+    let constructed = 0;
+    const restarted = new LocalInferenceService({
+      settings,
+      selection,
+      createProvider: () => { constructed += 1; return new StubProvider(); },
+      ids: testIds()
+    });
+    expect(restarted.activeProfileId()).toBe('default');
+    expect(restarted.state()).toEqual({ kind: 'stopped' });
+    expect(restarted.listProfiles().find((profile) => profile.id === 'default')).toMatchObject({ activity: 'active' });
+    expect(constructed).toBe(0);
+  });
+
+  it('does not restore a profile that no longer exists, and says so', () => {
+    const settings = new MutableSettings();
+    const service = new LocalInferenceService({
+      settings,
+      selection: memoryStore({ kind: 'saved', profileId: 'removed-profile' }),
+      createProvider: () => new StubProvider(),
+      ids: testIds()
+    });
+    expect(service.activeProfileId()).toBeNull();
+    expect(service.state()).toEqual({
+      kind: 'unavailable',
+      reason: 'The previously selected local-model profile "removed-profile" no longer exists. Choose a profile in Settings → Local inference.'
+    });
+  });
+
+  it('does not restore a disabled profile, and says which one and what to do', () => {
+    const settings = new MutableSettings();
+    settings.patchDefaultProfile({ enabled: false });
+    const service = new LocalInferenceService({
+      settings,
+      selection: memoryStore({ kind: 'saved', profileId: 'default' }),
+      createProvider: () => new StubProvider(),
+      ids: testIds()
+    });
+    expect(service.activeProfileId()).toBeNull();
+    const state = service.state();
+    expect(state.kind).toBe('unavailable');
+    expect('reason' in state && state.reason).toMatch(/is disabled for new tasks, so it was not restored\. Select it again/);
+    // Declining the restore does not forbid the choice: selecting it by hand still works, as before.
+    service.selectActiveProfile('default');
+    expect(service.activeProfileId()).toBe('default');
+  });
+
+  it('reports a stored choice it cannot read, and choosing a profile clears that report', () => {
+    const settings = new MutableSettings();
+    const selection = memoryStore({ kind: 'unreadable' });
+    const service = new LocalInferenceService({ settings, selection, createProvider: () => new StubProvider(), ids: testIds() });
+    expect(service.state()).toEqual({
+      kind: 'unavailable',
+      reason: 'The saved local-model profile choice could not be read. Choose a profile in Settings → Local inference.'
+    });
+    service.selectActiveProfile('default');
+    expect(service.state()).toEqual({ kind: 'stopped' });
+  });
+
+  it('still refuses a switch while the runtime is active, and saves nothing for it', async () => {
+    const settings = new MutableSettings();
+    const selection = memoryStore();
+    const service = new LocalInferenceService({ settings, selection, createProvider: () => new StubProvider(), ids: testIds() });
+    service.selectActiveProfile('default');
+    await service.start();
+    expect(() => service.selectActiveProfile('default')).toThrow();
+    expect(selection.writes).toEqual(['default']);
+  });
+
+  it('a selected profile removed from Settings is reported as gone, not as an internal error on start', async () => {
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    settings.update({ localInference: { ...settings.get().localInference, profiles: [], defaultProfileId: null } });
+    const expected = {
+      kind: 'unavailable',
+      reason: 'The selected local-model profile "default" no longer exists. Choose a profile in Settings → Local inference.'
+    };
+    expect(service.state()).toEqual(expected);
+    await expect(service.start()).resolves.toEqual(expected);
+    expect(provider.launches).toBe(0);
   });
 });

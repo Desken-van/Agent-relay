@@ -488,6 +488,8 @@ export type LocalInferenceSettings = z.infer<typeof localInferenceSettingsSchema
 
 /** A safe display id: letters, digits, dot, underscore, hyphen, starting alphanumeric — see `safeIdSchema`. */
 const profileIdSchema = safeIdSchema(LOCAL_INFERENCE_LIMITS.profileIdMax, 'profile id');
+/** The same rule, for a profile id read back from storage outside the profile list. */
+export const localInferenceProfileIdSchema = profileIdSchema;
 
 /** What the operator calls a profile. Prose shown in menus, never parsed, never an argv token. */
 const profileDisplayNameSchema = z

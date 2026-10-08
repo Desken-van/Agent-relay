@@ -20,9 +20,8 @@ import type {
   CodexModelCatalogResult,
   CodexModelOption
 } from '../../ports';
-import { locateExecutable } from '../process/executable-locator';
 import type { InteractiveProcessRunner } from '../process/process-runner';
-import { bundledCodexPaths } from './codex-adapter';
+import { describeMissingCodex, resolveCodexExecutable } from './codex-executable';
 
 export interface CodexModelCatalogOptions {
   /**
@@ -97,25 +96,18 @@ export class CodexAppServerModelCatalog implements CodexModelCatalog {
     private readonly options: CodexModelCatalogOptions = {}
   ) {}
 
-  /** Re-resolved on every call, so a Settings change takes effect immediately. */
-  private resolveExecutable(): string | null {
-    return (
-      locateExecutable('codex', {
-        configuredPath: this.options.getConfiguredPath?.() ?? null,
-        bundledPaths: bundledCodexPaths()
-      })?.path ?? null
-    );
-  }
-
   async list(options: { refresh?: boolean } = {}): Promise<CodexModelCatalogResult> {
-    const executable = this.resolveExecutable();
-    if (!executable) {
+    // Re-resolved on every call, so a Settings change takes effect immediately.
+    // The same resolution execution and diagnostics use, so the models offered are the ones that Codex knows.
+    const resolution = resolveCodexExecutable(this.options.getConfiguredPath?.() ?? null);
+    if (resolution.kind !== 'found') {
       return {
         available: false,
         models: [],
-        detail: 'The Codex executable could not be found, so its model list is unavailable.'
+        detail: `${describeMissingCodex(resolution).detail} Its model list is unavailable.`
       };
     }
+    const executable = resolution.path;
 
     // Keyed on the resolved path: pointing Settings at a different Codex is a
     // different catalogue, and serving the old one would be a lie. A path

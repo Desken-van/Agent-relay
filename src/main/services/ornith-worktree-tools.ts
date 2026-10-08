@@ -33,12 +33,12 @@ import { containsSecretShape } from '../../shared/util/redact';
 import { locateExecutable } from '../adapters/process/executable-locator';
 import type { ProcessResult, ProcessRunner } from '../adapters/process/process-runner';
 import {
-  ExecaWindowsFsGuard,
-  type WindowsFsFileIdentity,
-  type WindowsFsGuard,
-  type WindowsFsGuardErrorCode,
-  type WindowsFsRootIdentity
-} from '../adapters/process/windows-fs-guard';
+  ExecaFsGuard,
+  type FsFileIdentity,
+  type FsGuard,
+  type FsGuardErrorCode,
+  type FsRootIdentity
+} from '../adapters/process/fs-guard';
 import { assertSafeWorktreePath, isInsideDirectory, isSamePath } from './path-safety';
 
 /**
@@ -48,7 +48,7 @@ import { assertSafeWorktreePath, isInsideDirectory, isSamePath } from './path-sa
  * `hash_mismatch`, `hard_linked`) or the platform primitive is unavailable
  * (`unavailable`) — never a reason to retry with a weaker path.
  */
-function mapGuardDenial(code: WindowsFsGuardErrorCode): OrnithDenialCode {
+function mapGuardDenial(code: FsGuardErrorCode): OrnithDenialCode {
   switch (code) {
     case 'reparse_ancestor':
       return 'path_symlink';
@@ -172,7 +172,7 @@ export interface OrnithWorktreeToolsOptions {
     readonly beforeIdentityRecheck?: () => void | Promise<void>;
   };
   /** Overridden only by tests that need to force the guard "unavailable" path. */
-  readonly fsGuard?: WindowsFsGuard;
+  readonly fsGuard?: FsGuard;
 }
 
 function timeoutSignal(ms: number, parent?: AbortSignal): { signal: AbortSignal; dispose: () => void } {
@@ -270,8 +270,8 @@ export class OrnithWorktreeTools {
   private readonly canonicalRoot: string;
   private readonly rootDevice: bigint | number;
   private readonly rootInode: bigint | number;
-  private readonly fsGuard: WindowsFsGuard;
-  private nativeRootIdentity: WindowsFsRootIdentity | null = null;
+  private readonly fsGuard: FsGuard;
+  private nativeRootIdentity: FsRootIdentity | null = null;
   /** Manifest-confirmed subset of `scopedFilePathCandidates`; computed only by `resolveAuthoritativeScope()`. */
   private authoritativeScope: readonly string[] | null = null;
   /**
@@ -285,7 +285,7 @@ export class OrnithWorktreeTools {
   private authoritativeScopeDecided = false;
 
   constructor(private readonly deps: OrnithWorktreeToolsOptions) {
-    this.fsGuard = deps.fsGuard ?? new ExecaWindowsFsGuard(deps.runner);
+    this.fsGuard = deps.fsGuard ?? new ExecaFsGuard(deps.runner);
     assertSafeWorktreePath({
       worktreePath: deps.worktreePath,
       worktreesRoot: deps.worktreesRoot,
@@ -381,17 +381,17 @@ export class OrnithWorktreeTools {
   }
 
   /**
-   * Bind the native FILE_ID_INFO identity to the synchronous Node stat
-   * snapshot captured by the constructor. A helper launched after a whole-root
-   * pathname replacement therefore cannot silently bless the replacement as
-   * the task worktree: its legacy volume/file index must first correlate with
-   * the original Node snapshot, and every later mutation receives the full
-   * 128-bit native identity.
+   * Bind the native root identity (Windows FILE_ID_INFO; Linux device, inode
+   * and inode birth time) to the synchronous Node stat snapshot captured by
+   * the constructor. A helper launched after a whole-root pathname
+   * replacement therefore cannot silently bless the replacement as the task
+   * worktree: its stat device/inode must first correlate with the original
+   * Node snapshot, and every later mutation receives the full native identity.
    */
   private async bindNativeRootIdentity(
     signal: AbortSignal
   ): Promise<
-    | { readonly ok: true; readonly identity: WindowsFsRootIdentity }
+    | { readonly ok: true; readonly identity: FsRootIdentity }
     | { readonly ok: false; readonly code: OrnithDenialCode; readonly reason: string }
   > {
     if (this.nativeRootIdentity !== null) {
@@ -411,15 +411,15 @@ export class OrnithWorktreeTools {
       };
     }
 
-    let sameLegacyIdentity = false;
+    let sameStatIdentity = false;
     try {
-      sameLegacyIdentity =
-        BigInt(result.identity.legacyVolumeSerial) === BigInt(this.rootDevice) &&
-        BigInt(result.identity.legacyFileIndex) === BigInt(this.rootInode);
+      sameStatIdentity =
+        BigInt(result.identity.statDev) === BigInt(this.rootDevice) &&
+        BigInt(result.identity.statIno) === BigInt(this.rootInode);
     } catch {
-      sameLegacyIdentity = false;
+      sameStatIdentity = false;
     }
-    if (!sameLegacyIdentity) {
+    if (!sameStatIdentity) {
       return {
         ok: false,
         code: 'checkout_identity_changed',
@@ -442,10 +442,10 @@ export class OrnithWorktreeTools {
     if (!result.ok) return false;
     const actual = result.identity;
     const expected = this.nativeRootIdentity;
-    return actual.volumeSerial === expected.volumeSerial &&
+    return actual.volumeId === expected.volumeId &&
       actual.fileId === expected.fileId &&
-      actual.legacyVolumeSerial === expected.legacyVolumeSerial &&
-      actual.legacyFileIndex === expected.legacyFileIndex;
+      actual.statDev === expected.statDev &&
+      actual.statIno === expected.statIno;
   }
 
   changedFileCount(): number {
@@ -1475,15 +1475,15 @@ export class OrnithWorktreeTools {
       }
       const handle = await open(resolved.absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
       let raw: Buffer;
-      let targetIdentity: WindowsFsFileIdentity;
+      let targetIdentity: FsFileIdentity;
       try {
         const openedStats = await handle.stat({ bigint: true });
         if (openedStats.dev !== beforeStats.dev || openedStats.ino !== beforeStats.ino || openedStats.nlink > 1) {
           return denied('path_not_regular_file', 'The file identity changed or is hard-linked.');
         }
         targetIdentity = {
-          volumeSerial: openedStats.dev.toString(),
-          fileIndex: openedStats.ino.toString()
+          dev: openedStats.dev.toString(),
+          ino: openedStats.ino.toString()
         };
         // Bounded for every pool: never buffers more than one byte past the size that was
         // checked above. On the validation pool the bytes are charged as each chunk arrives.
@@ -1641,15 +1641,15 @@ export class OrnithWorktreeTools {
       }
       const handle = await open(resolved.absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
       let raw: Buffer;
-      let targetIdentity: WindowsFsFileIdentity;
+      let targetIdentity: FsFileIdentity;
       try {
         const openedStats = await handle.stat({ bigint: true });
         if (openedStats.dev !== beforeStats.dev || openedStats.ino !== beforeStats.ino || openedStats.nlink > 1) {
           return denied('path_not_regular_file', 'The file identity changed or is hard-linked.');
         }
         targetIdentity = {
-          volumeSerial: openedStats.dev.toString(),
-          fileIndex: openedStats.ino.toString()
+          dev: openedStats.dev.toString(),
+          ino: openedStats.ino.toString()
         };
         raw = await readAtMost(handle, targetSize, bounded, this.validationCharge(onValidationBudget));
         if (raw.byteLength > targetSize) {

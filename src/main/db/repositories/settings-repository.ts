@@ -4,8 +4,9 @@ import {
   type VerificationConfigProblem
 } from '../../../shared/domain/claude-tool-rules';
 import { AgentRelayError } from '../../../shared/domain/errors';
+import { localInferenceProfileIdSchema } from '../../../shared/domain/local-inference';
 import { settingsSchema, type Settings } from '../../../shared/domain/models';
-import type { SettingsRepository } from '../../ports';
+import type { LocalInferenceSavedSelection, SettingsRepository } from '../../ports';
 import type { Db } from '../database';
 import { assertExternalPlanReviewSettings } from '../../services/plan-review-configuration';
 
@@ -18,6 +19,9 @@ import { assertExternalPlanReviewSettings } from '../../services/plan-review-con
  * GitHub is owned by those tools; Agent Relay only records *where* their
  * executables are.
  */
+/** The settings-table key that holds the chosen local-model profile; deliberately not a `settingsSchema` field. */
+const LOCAL_INFERENCE_SELECTION_KEY = 'localInferenceActiveProfileId';
+
 export class SqliteSettingsRepository implements SettingsRepository {
   private localInferenceWriteRevision = 0;
 
@@ -28,6 +32,33 @@ export class SqliteSettingsRepository implements SettingsRepository {
 
   localInferenceRevision(): number {
     return this.localInferenceWriteRevision;
+  }
+
+  /**
+   * The local-model profile the operator last chose, kept in the same table as Settings but under a key
+   * outside `settingsSchema`: it is lifecycle state chosen in the lifecycle panel, so neither `get()` nor a
+   * Settings save (which writes the form's whole draft) can read or overwrite it.
+   */
+  readLocalInferenceSelection(): LocalInferenceSavedSelection {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(LOCAL_INFERENCE_SELECTION_KEY) as
+      | { value: string }
+      | undefined;
+    if (row === undefined) return { kind: 'none' };
+    try {
+      const parsed = localInferenceProfileIdSchema.safeParse(JSON.parse(row.value));
+      return parsed.success ? { kind: 'saved', profileId: parsed.data } : { kind: 'unreadable' };
+    } catch {
+      return { kind: 'unreadable' };
+    }
+  }
+
+  writeLocalInferenceSelection(profileId: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+      )
+      .run(LOCAL_INFERENCE_SELECTION_KEY, JSON.stringify(profileId));
   }
 
   get(): Settings {

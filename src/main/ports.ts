@@ -1665,7 +1665,36 @@ export interface LocalInferenceLifecycleService {
    * explicit `stop()` first, never an implicit restart of whatever was running.
    */
   selectActiveProfile(profileId: string): void;
+  /**
+   * Stop the runtime this application owns because the application is quitting: the same operator stop,
+   * waited on for at most the profile's shutdown budget plus a short grace, never longer. Repeated calls
+   * join the first one. Never touches a process this application did not start.
+   */
+  stopForQuit(): Promise<LocalInferenceQuitOutcome>;
 }
+
+/** The local-model profile selection saved by an earlier run, as read back. */
+export type LocalInferenceSavedSelection =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'saved'; readonly profileId: string }
+  /** Something is stored, but it is not a valid profile id. */
+  | { readonly kind: 'unreadable' };
+
+/**
+ * Where the operator's chosen local-model profile survives a restart. Only the choice is kept: never a
+ * runtime state, so restoring it starts nothing.
+ */
+export interface LocalInferenceSelectionStore {
+  read(): LocalInferenceSavedSelection;
+  write(profileId: string): void;
+}
+
+/** What quitting did to the application's own local runtime. */
+export type LocalInferenceQuitOutcome =
+  | { readonly kind: 'not_running' }
+  | { readonly kind: 'stopped' }
+  /** The stop did not confirm within its ceiling, or failed; the runtime may still be alive. */
+  | { readonly kind: 'unconfirmed'; readonly reason: string };
 
 /**
  * The application-wide right to run one Ornith turn sequence against the

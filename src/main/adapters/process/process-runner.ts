@@ -15,7 +15,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execa, type Options, type ResultPromise } from 'execa';
 import { AgentRelayError } from '../../../shared/domain/errors';
@@ -361,6 +361,37 @@ function assertSpawnable(file: string, args: readonly string[]): void {
   }
 }
 
+/** Where this module runs from: the source tree in development, `out/main` in a build. */
+const OWN_MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * `npm run` and `npx` put `node_modules/.bin` of the directory they run in, and of every ancestor of it,
+ * at the front of PATH. When Agent Relay itself is started that way (`npm run dev`, `npm start`, a test
+ * runner), those are Agent Relay's OWN development binaries — its bundled Codex CLI among them — not the
+ * tools the user installed. A child that resolves a command through PATH (an external MCP server's own
+ * provider CLIs, for one) must find the user's tools, so these entries are not inherited. Only
+ * `<dir>/node_modules/.bin` where `<dir>` contains this module is dropped; a worktree's or any other
+ * project's `node_modules/.bin`, `preferLocal`, and a PATH a caller passes explicitly are unaffected.
+ */
+export function withoutOwnNodeBinaries(
+  env: NodeJS.ProcessEnv,
+  moduleDirectory: string = OWN_MODULE_DIRECTORY
+): NodeJS.ProcessEnv {
+  const key = Object.keys(env).find((name) => name.toUpperCase() === 'PATH');
+  const value = key === undefined ? undefined : env[key];
+  if (key === undefined || value === undefined || value.length === 0) return env;
+  const kept = value.split(delimiter).filter((entry) => {
+    if (entry.length === 0) return true;
+    const absolute = resolve(entry);
+    if (basename(absolute) !== '.bin' || basename(dirname(absolute)) !== 'node_modules') return true;
+    const owner = dirname(dirname(absolute));
+    const fromOwner = relative(owner, moduleDirectory);
+    const ownsThisModule = fromOwner === '' || (!fromOwner.startsWith('..') && !isAbsolute(fromOwner));
+    return !ownsThisModule;
+  });
+  return { ...env, [key]: kept.join(delimiter) };
+}
+
 /**
  * The security posture, in one place.
  *
@@ -370,7 +401,7 @@ function assertSpawnable(file: string, args: readonly string[]): void {
  */
 function childEnvironment(options: ProcessRunOptions): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    ...scrubEnvironment(process.env, options.passthroughEnvNames ?? []),
+    ...withoutOwnNodeBinaries(scrubEnvironment(process.env, options.passthroughEnvNames ?? [])),
     ...(options.env ?? {})
   };
   // Removed, not blanked: a key set to an empty string is still "set" to every tool that reads it.
