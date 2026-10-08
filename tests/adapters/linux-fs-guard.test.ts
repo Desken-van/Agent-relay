@@ -369,43 +369,7 @@ describe.runIf(process.platform === 'linux')('Linux native filesystem-mutation g
     });
   });
 
-  describe('the portable path (no O_TMPFILE, RENAME_EXCHANGE or RENAME_NOREPLACE)', () => {
-    const portable = { AGENT_RELAY_FS_GUARD_PORTABLE_ONLY: '1' };
-
-    it('creates, replaces and deletes with the same refusals and no leftovers', async () => {
-      const identity = await identify(guard);
-      const ids = [identity.volumeId, identity.fileId];
-
-      expect(await raw(['create', root, ...ids, 'new.txt'], 'created\n', portable)).toEqual({ exitCode: 0, line: 'OK' });
-      expect(readFileSync(join(root, 'new.txt'), 'utf8')).toBe('created\n');
-      expect(await raw(['create', root, ...ids, 'new.txt'], 'again\n', portable)).toEqual({ exitCode: 1, line: 'ERR:ALREADY_EXISTS' });
-      expect(readFileSync(join(root, 'new.txt'), 'utf8')).toBe('created\n');
-
-      chmodSync(join(root, 'new.txt'), 0o700);
-      const { dev, ino } = fileIdentity(join(root, 'new.txt'));
-      expect(await raw(['replace', root, ...ids, dev, ino, 'new.txt', sha('stale')], 'x', portable))
-        .toEqual({ exitCode: 1, line: 'ERR:HASH_MISMATCH' });
-      expect(await raw(['replace', root, ...ids, dev, ino, 'new.txt', sha('created\n')], 'replaced\n', portable))
-        .toEqual({ exitCode: 0, line: 'OK' });
-      expect(readFileSync(join(root, 'new.txt'), 'utf8')).toBe('replaced\n');
-      expect(statSync(join(root, 'new.txt')).mode & 0o777).toBe(0o700);
-
-      const replaced = fileIdentity(join(root, 'new.txt'));
-      expect(await raw(['delete', root, ...ids, replaced.dev, replaced.ino, 'new.txt', sha('stale')], undefined, portable))
-        .toEqual({ exitCode: 1, line: 'ERR:HASH_MISMATCH' });
-      expect(existsSync(join(root, 'new.txt'))).toBe(true);
-      expect(await raw(['delete', root, ...ids, replaced.dev, replaced.ino, 'new.txt', sha('replaced\n')], undefined, portable))
-        .toEqual({ exitCode: 0, line: 'OK' });
-      expect(readdirSync(root)).toEqual([]);
-
-      symlinkSync(outside, join(root, 'link'), 'dir');
-      expect(await raw(['create', root, ...ids, 'link/evil.txt'], 'x', portable)).toEqual({ exitCode: 1, line: 'ERR:REPARSE_ANCESTOR' });
-      expect(readdirSync(outside)).toEqual(['secret.txt']);
-      expectNoStagingLeftovers(root);
-    });
-  });
-
-  describe('races injected at the commit itself (LD_PRELOAD shims)', () => {
+  describe('races and missing primitives injected at the commit (LD_PRELOAD shims, a separate attacking process)', () => {
     let shims: string;
 
     beforeAll(() => {
@@ -421,23 +385,87 @@ describe.runIf(process.platform === 'linux')('Linux native filesystem-mutation g
         '  return real(fd);',
         '}'
       ].join('\n'));
-      // Another process renaming its own file over the staging name just before the exchange.
-      writeFileSync(join(shims, 'swap.c'), [
+      // Never acts itself: the helper confines itself, so an attack must come from ANOTHER process. This only
+      // pauses the helper once, just before the system call named by PAUSE_ON (one byte out on fd 3, then waits
+      // for one byte on fd 4), and simulates missing primitives: UNSUPPORTED_RENAME (no renameat2 flags),
+      // NO_TMPFILE (no O_TMPFILE) and NO_LANDLOCK (a kernel without Landlock).
+      writeFileSync(join(shims, 'pause.c'), [
         '#define _GNU_SOURCE',
-        '#include <dlfcn.h>', '#include <fcntl.h>', '#include <stdio.h>', '#include <stdlib.h>',
+        '#include <dlfcn.h>', '#include <errno.h>', '#include <fcntl.h>', '#include <stdarg.h>', '#include <stdlib.h>',
+        '#include <string.h>', '#include <sys/syscall.h>', '#include <unistd.h>',
+        'static void pauseBefore(const char* call) {',
+        '  static int done; const char* on = getenv("PAUSE_ON");',
+        '  if (done || !on || strcmp(on, call) != 0) return;',
+        '  done = 1; char b = 1; if (write(3, &b, 1) != 1 || read(4, &b, 1) != 1) _exit(99);',
+        '}',
+        'int linkat(int od, const char* o, int nd, const char* n, int f) {',
+        '  static int (*real)(int, const char*, int, const char*, int); if (!real) real = dlsym(RTLD_NEXT, "linkat");',
+        '  pauseBefore("linkat"); return real(od, o, nd, n, f);',
+        '}',
         'int renameat2(int od, const char* o, int nd, const char* n, unsigned flags) {',
-        '  static int (*real)(int, const char*, int, const char*, unsigned); static int done;',
-        '  if (!real) real = dlsym(RTLD_NEXT, "renameat2");',
-        '  if (!done && (flags & RENAME_EXCHANGE) && getenv("SWAP_IN")) { done = 1; renameat(AT_FDCWD, getenv("SWAP_IN"), od, o); }',
+        '  static int (*real)(int, const char*, int, const char*, unsigned); if (!real) real = dlsym(RTLD_NEXT, "renameat2");',
+        '  pauseBefore("renameat2");',
+        '  if (flags != 0 && getenv("UNSUPPORTED_RENAME")) { errno = EOPNOTSUPP; return -1; }',
         '  return real(od, o, nd, n, flags);',
+        '}',
+        'int mkdirat(int d, const char* n, mode_t m) {',
+        '  static int (*real)(int, const char*, mode_t); if (!real) real = dlsym(RTLD_NEXT, "mkdirat");',
+        '  pauseBefore("mkdirat"); return real(d, n, m);',
+        '}',
+        'int openat(int d, const char* n, int flags, ...) {',
+        '  static int (*real)(int, const char*, int, ...); if (!real) real = dlsym(RTLD_NEXT, "openat");',
+        '  va_list ap; va_start(ap, flags); mode_t m = va_arg(ap, mode_t); va_end(ap);',
+        '  if ((flags & O_TMPFILE) == O_TMPFILE && getenv("NO_TMPFILE")) { errno = EOPNOTSUPP; return -1; }',
+        '  return real(d, n, flags, m);',
+        '}',
+        'long syscall(long number, ...) {',
+        '  static long (*real)(long, ...); if (!real) real = dlsym(RTLD_NEXT, "syscall");',
+        '  va_list ap; va_start(ap, number); long a[6]; for (int i = 0; i < 6; ++i) a[i] = va_arg(ap, long); va_end(ap);',
+        '  if (number == SYS_landlock_create_ruleset && getenv("NO_LANDLOCK")) { errno = ENOSYS; return -1; }',
+        '  return real(number, a[0], a[1], a[2], a[3], a[4], a[5]);',
         '}'
       ].join('\n'));
-      for (const name of ['slow', 'swap']) {
+      for (const name of ['slow', 'pause']) {
         execFileSync('cc', ['-shared', '-fPIC', '-O2', '-o', join(shims, `${name}.so`), join(shims, `${name}.c`), '-ldl']);
       }
     });
 
     afterAll(() => rmSync(shims, { recursive: true, force: true }));
+
+    /**
+     * Run the helper under the pause shim. When it pauses before `call`, `attack` runs in THIS process
+     * (outside the helper's confinement), then the helper resumes. `paused` proves the race really happened.
+     */
+    async function raced(
+      args: readonly string[],
+      input: string | undefined,
+      env: Record<string, string>,
+      call: string | null,
+      attack: () => void
+    ): Promise<{ exitCode: number | null; line: string; paused: boolean }> {
+      const child = spawn(HELPER, args, {
+        stdio: ['pipe', 'pipe', 'ignore', 'pipe', 'pipe'],
+        env: { ...process.env, LD_PRELOAD: join(shims, 'pause.so'), ...(call === null ? {} : { PAUSE_ON: call }), ...env }
+      });
+      let stdout = '';
+      let paused = false;
+      child.stdout!.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
+      const signal = child.stdio[3] as NodeJS.ReadableStream;
+      const resume = child.stdio[4] as NodeJS.WritableStream;
+      signal.on('data', () => {
+        paused = true;
+        attack();
+        resume.write('g');
+      });
+      const exited = new Promise<number | null>((done) => child.on('close', (code) => done(code)));
+      child.stdin!.end(input ?? '');
+      const exitCode = await exited;
+      return { exitCode, line: stdout.trim(), paused };
+    }
+
+    function stagingNames(directory: string): string[] {
+      return readdirSync(directory).filter((name) => name.startsWith('.ornith-tmp-'));
+    }
 
     it('a termination that arrives while content is staged abandons the change before the commit', async () => {
       const identity = await identify(guard);
@@ -465,18 +493,153 @@ describe.runIf(process.platform === 'linux')('Linux native filesystem-mutation g
       expectNoStagingLeftovers(root);
     });
 
-    it('replace refuses, and restores the original, when a different file is renamed over the staging name before the exchange', async () => {
+    it('replace refuses, and keeps the original in place, when another process renames its file over the staging name before the exchange', async () => {
       const identity = await identify(guard);
       writeFileSync(join(root, 'file.txt'), 'original\n');
       writeFileSync(join(base, 'intruder.txt'), 'INTRUDER\n');
       const { dev, ino } = fileIdentity(join(root, 'file.txt'));
-      const result = await raw(
+      const result = await raced(
         ['replace', root, identity.volumeId, identity.fileId, dev, ino, 'file.txt', sha('original\n')],
-        'replacement\n',
-        { LD_PRELOAD: join(shims, 'swap.so'), SWAP_IN: join(base, 'intruder.txt') }
+        'replacement\n', {}, 'renameat2',
+        () => renameSync(join(base, 'intruder.txt'), join(root, stagingNames(root)[0]!))
       );
-      expect(result).toEqual({ exitCode: 1, line: 'ERR:HASH_MISMATCH' });
+      expect(result).toEqual({ exitCode: 1, line: 'ERR:HASH_MISMATCH', paused: true });
       expect(readFileSync(join(root, 'file.txt'), 'utf8')).toBe('original\n');
+      // The intruder's own file is neither lost nor deleted by the helper: it was never the helper's to remove.
+      const leftover = stagingNames(root);
+      expect(leftover).toHaveLength(1);
+      expect(readFileSync(join(root, leftover[0]!), 'utf8')).toBe('INTRUDER\n');
+    });
+
+    it('without RENAME_EXCHANGE, replace refuses before changing anything, even when the staging name is swapped', async () => {
+      const identity = await identify(guard);
+      writeFileSync(join(root, 'file.txt'), 'original\n');
+      writeFileSync(join(base, 'intruder.txt'), 'INTRUDER\n');
+      const { dev, ino } = fileIdentity(join(root, 'file.txt'));
+      const args = ['replace', root, identity.volumeId, identity.fileId, dev, ino, 'file.txt', sha('original\n')];
+
+      // Untouched by anyone else: refused, unchanged, nothing left behind.
+      expect(await raced(args, 'replacement\n', { UNSUPPORTED_RENAME: '1' }, null, () => undefined))
+        .toEqual({ exitCode: 1, line: 'ERR:UNSUPPORTED', paused: false });
+      expect(readdirSync(root)).toEqual(['file.txt']);
+      expect(readFileSync(join(root, 'file.txt'), 'utf8')).toBe('original\n');
+
+      // The audited case: another process renames its file over the staging name, and only then does the
+      // exchange turn out to be unsupported. The original stays in place with its content; nothing is lost.
+      const result = await raced(args, 'replacement\n', { UNSUPPORTED_RENAME: '1' }, 'renameat2',
+        () => renameSync(join(base, 'intruder.txt'), join(root, stagingNames(root)[0]!)));
+      expect(result).toEqual({ exitCode: 1, line: 'ERR:UNSUPPORTED', paused: true });
+      expect(readFileSync(join(root, 'file.txt'), 'utf8')).toBe('original\n');
+      expect(fileIdentity(join(root, 'file.txt'))).toEqual({ dev, ino });
+      expect(stagingNames(root).map((name) => readFileSync(join(root, name), 'utf8'))).toEqual(['INTRUDER\n']);
+    });
+
+    it('without RENAME_NOREPLACE, delete refuses before changing anything', async () => {
+      const identity = await identify(guard);
+      writeFileSync(join(root, 'file.txt'), 'keep\n');
+      const { dev, ino } = fileIdentity(join(root, 'file.txt'));
+      expect(await raced(['delete', root, identity.volumeId, identity.fileId, dev, ino, 'file.txt', sha('keep\n')],
+        undefined, { UNSUPPORTED_RENAME: '1' }, null, () => undefined))
+        .toEqual({ exitCode: 1, line: 'ERR:UNSUPPORTED', paused: false });
+      expect(readdirSync(root)).toEqual(['file.txt']);
+      expect(readFileSync(join(root, 'file.txt'), 'utf8')).toBe('keep\n');
+    });
+
+    it('without Landlock, no mutation runs at all', async () => {
+      const identity = await identify(guard);
+      writeFileSync(join(root, 'file.txt'), 'keep\n');
+      const { dev, ino } = fileIdentity(join(root, 'file.txt'));
+      const ids = [root, identity.volumeId, identity.fileId];
+      for (const [args, input] of [
+        [['create', ...ids, 'new.txt'], 'x'],
+        [['mkdirp', ...ids, 'a/b'], undefined],
+        [['replace', ...ids, dev, ino, 'file.txt', sha('keep\n')], 'changed'],
+        [['delete', ...ids, dev, ino, 'file.txt', sha('keep\n')], undefined]
+      ] as const) {
+        expect(await raced(args, input, { NO_LANDLOCK: '1' }, null, () => undefined), args[0])
+          .toEqual({ exitCode: 1, line: 'ERR:UNSUPPORTED', paused: false });
+      }
+      expect(readdirSync(root)).toEqual(['file.txt']);
+      expect(readFileSync(join(root, 'file.txt'), 'utf8')).toBe('keep\n');
+    });
+
+    it('without O_TMPFILE, a named staging file gives the same create, replace and delete, with no leftovers', async () => {
+      const identity = await identify(guard);
+      const ids = [root, identity.volumeId, identity.fileId];
+      const noTmpfile = { NO_TMPFILE: '1' };
+      expect(await raced(['create', ...ids, 'new.txt'], 'created\n', noTmpfile, null, () => undefined))
+        .toEqual({ exitCode: 0, line: 'OK', paused: false });
+      expect(await raced(['create', ...ids, 'new.txt'], 'again\n', noTmpfile, null, () => undefined))
+        .toEqual({ exitCode: 1, line: 'ERR:ALREADY_EXISTS', paused: false });
+      expect(readFileSync(join(root, 'new.txt'), 'utf8')).toBe('created\n');
+      chmodSync(join(root, 'new.txt'), 0o700);
+      const { dev, ino } = fileIdentity(join(root, 'new.txt'));
+      expect(await raced(['replace', ...ids, dev, ino, 'new.txt', sha('created\n')], 'replaced\n', noTmpfile, null, () => undefined))
+        .toEqual({ exitCode: 0, line: 'OK', paused: false });
+      expect(readFileSync(join(root, 'new.txt'), 'utf8')).toBe('replaced\n');
+      expect(statSync(join(root, 'new.txt')).mode & 0o777).toBe(0o700);
+      const replaced = fileIdentity(join(root, 'new.txt'));
+      expect(await raced(['delete', ...ids, replaced.dev, replaced.ino, 'new.txt', sha('replaced\n')], undefined, noTmpfile, null, () => undefined))
+        .toEqual({ exitCode: 0, line: 'OK', paused: false });
+      expect(readdirSync(root)).toEqual([]);
+    });
+
+    describe('a parent directory moved out of the worktree after the helper opened it', () => {
+      /** `root/sub/a.txt`; the attack moves `root/sub` to `outside/sub` while the helper is paused. */
+      function prepare(): void {
+        mkdirSync(join(root, 'sub'));
+        writeFileSync(join(root, 'sub', 'a.txt'), 'original\n');
+      }
+      const moveOut = (): void => renameSync(join(root, 'sub'), join(outside, 'sub'));
+
+      for (const [op, call] of [
+        ['create', 'linkat'],
+        ['mkdirp', 'mkdirat'],
+        ['replace', 'linkat'],
+        ['delete', 'renameat2']
+      ] as const) {
+        it(`${op} is refused by the kernel and changes nothing outside the worktree (moved before ${call})`, async () => {
+          prepare();
+          const identity = await identify(guard);
+          const { dev, ino } = fileIdentity(join(root, 'sub', 'a.txt'));
+          const ids = [root, identity.volumeId, identity.fileId];
+          const args = {
+            create: ['create', ...ids, 'sub/new.txt'],
+            mkdirp: ['mkdirp', ...ids, 'sub/deeper'],
+            replace: ['replace', ...ids, dev, ino, 'sub/a.txt', sha('original\n')],
+            delete: ['delete', ...ids, dev, ino, 'sub/a.txt', sha('original\n')]
+          }[op];
+          const result = await raced(args, 'changed\n', {}, call, moveOut);
+          expect(result).toEqual({ exitCode: 1, line: 'ERR:REPARSE_ANCESTOR', paused: true });
+          // Outside the worktree there is exactly what the attacker moved there, byte for byte.
+          expect(readdirSync(outside).sort()).toEqual(['secret.txt', 'sub']);
+          expect(readdirSync(join(outside, 'sub'))).toEqual(['a.txt']);
+          expect(readFileSync(join(outside, 'sub', 'a.txt'), 'utf8')).toBe('original\n');
+          expect(fileIdentity(join(outside, 'sub', 'a.txt'))).toEqual({ dev, ino });
+          expect(readFileSync(join(outside, 'secret.txt'), 'utf8')).toBe('outside\n');
+          expect(readdirSync(root)).toEqual([]);
+        });
+      }
+
+      it('replace moved out between naming its staged copy and the exchange: refused, original untouched, only the staged copy remains', async () => {
+        // The documented residual: the staging name was created while the directory was still inside, and
+        // the confined helper can no longer remove it once the directory is outside. It holds only the new
+        // content; the original keeps its inode, name and bytes.
+        prepare();
+        const identity = await identify(guard);
+        const { dev, ino } = fileIdentity(join(root, 'sub', 'a.txt'));
+        const result = await raced(
+          ['replace', root, identity.volumeId, identity.fileId, dev, ino, 'sub/a.txt', sha('original\n')],
+          'changed\n', {}, 'renameat2', moveOut
+        );
+        expect(result).toEqual({ exitCode: 1, line: 'ERR:REPARSE_ANCESTOR', paused: true });
+        expect(readFileSync(join(outside, 'sub', 'a.txt'), 'utf8')).toBe('original\n');
+        expect(fileIdentity(join(outside, 'sub', 'a.txt'))).toEqual({ dev, ino });
+        const staged = stagingNames(join(outside, 'sub'));
+        expect(staged).toHaveLength(1);
+        expect(readFileSync(join(outside, 'sub', staged[0]!), 'utf8')).toBe('changed\n');
+        expect(readdirSync(join(outside, 'sub')).sort()).toEqual([staged[0]!, 'a.txt'].sort());
+      });
     });
   });
 
@@ -546,18 +709,15 @@ describe('the guard on hosts without one', () => {
     expect(fsGuardExecutableName('darwin')).toBeNull();
   });
 
-  it('never passes the portable-path test switch on to the helper', async () => {
-    const seen: (readonly string[] | undefined)[] = [];
+  it('reports a helper that lacks a required primitive as unavailable, with a reason', async () => {
     const recording = {
-      run: async (_file: string, _args: readonly string[], options?: { omitEnvNames?: readonly string[] }) => {
-        seen.push(options?.omitEnvNames);
-        return { command: 'x', exitCode: 0, stdout: 'OK\n', stderr: '', timedOut: false, cancelled: false, durationMs: 1, failed: false };
-      }
+      run: async () => ({ command: 'x', exitCode: 1, stdout: 'ERR:UNSUPPORTED\n', stderr: '', timedOut: false, cancelled: false, durationMs: 1, failed: true })
     };
     const guard = new ExecaFsGuard(recording, { platform: 'linux', locate: () => '/fake/agent-relay-fs-guard' });
     const identity: FsRootIdentity = { volumeId: '0'.repeat(16), fileId: '0'.repeat(32), statDev: '0', statIno: '0' };
-    expect(await guard.mkdirp('/tmp/x', identity, 'a', never, TIMEOUT_MS)).toEqual({ ok: true });
-    expect(seen).toEqual([['AGENT_RELAY_FS_GUARD_PORTABLE_ONLY']]);
+    const result = await guard.createFile('/tmp/x', identity, 'a.txt', 'x', never, TIMEOUT_MS);
+    expect(result).toMatchObject({ ok: false, code: 'unavailable' });
+    expect(!result.ok && result.reason).toMatch(/lacks a primitive the mutation guard requires \(Landlock/);
   });
 
   it('reports a helper that exited normally with OK as success even when the timeout fired during its commit', async () => {

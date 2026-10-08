@@ -624,7 +624,18 @@ terminal failure for that attempt.
   content in an anonymous `O_TMPFILE`, replaces with
   `renameat2(RENAME_EXCHANGE)` and re-verifies what it swapped out (swapping
   back if it changed), and deletes by moving the target aside atomically
-  before re-verifying it. Each helper re-validates the relative path itself,
+  before re-verifying it. A descriptor keeps a directory's identity but not
+  its place, so after confirming the root the Linux helper confines itself
+  with Landlock to the hierarchy beneath that root directory: the kernel then
+  refuses every open, link, rename, mkdir and unlink whose directory is not
+  beneath the root at the instant of the call, including a directory the
+  helper opened and someone then moved out of the worktree. Without Landlock,
+  `RENAME_EXCHANGE`, `RENAME_NOREPLACE` or descriptor-based `linkat`, the
+  helper refuses (`unavailable`) before anything changes; there is no weaker
+  fallback. A directory moved out between the helper naming its staged copy
+  and the exchange keeps that staged copy (new content only; the original is
+  untouched), because the confined helper may no longer remove anything
+  there. Each helper re-validates the relative path itself,
   refuses a root whose native identity differs from the one bound before the
   first model-driven write (a recreated directory at the same path
   included), and re-checks the target's identity and SHA-256 itself. A

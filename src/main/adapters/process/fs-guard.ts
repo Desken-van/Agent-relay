@@ -128,6 +128,7 @@ const KNOWN_ERROR_CODES = new Set<string>([
   'NOT_A_FILE',
   'ROOT_INVALID',
   'INVALID_ARGUMENTS',
+  'UNSUPPORTED',
   'INTERNAL'
 ]);
 
@@ -142,6 +143,7 @@ function mapErrorCode(code: string): FsGuardErrorCode {
     case 'NOT_A_FILE': return 'not_a_file';
     case 'ROOT_INVALID': return 'root_invalid';
     case 'INVALID_ARGUMENTS': return 'invalid_arguments';
+    case 'UNSUPPORTED': return 'unavailable';
     default: return 'internal';
   }
 }
@@ -240,14 +242,15 @@ export class ExecaFsGuard implements FsGuard {
   > {
     const executable = this.resolvePath();
     if (executable === null) return unavailable(this.unavailableReason());
+    // Never start a mutation that is already cancelled: once running, the helper may legitimately
+    // finish it (and report OK) when the cancellation reaches it after the commit began.
+    if (signal.aborted) return { ok: false, code: 'cancelled', reason: 'The repository mutation was cancelled.' };
 
     const result = await this.runner.run(executable, args, {
       signal,
       timeoutMs,
       input,
-      maxOutputBytes: 4096,
-      // A test-only switch to the helper's portable path; never inherited by a real run.
-      omitEnvNames: ['AGENT_RELAY_FS_GUARD_PORTABLE_ONLY']
+      maxOutputBytes: 4096
     });
 
     const line = result.stdout.trim();
@@ -262,6 +265,14 @@ export class ExecaFsGuard implements FsGuard {
     if (result.exitCode === 0) return { ok: true, line };
 
     const match = /^ERR:([A-Z_]+)$/.exec(line);
+    if (match?.[1] === 'UNSUPPORTED') {
+      // Linux only: the kernel has no Landlock, or the worktree's filesystem lacks RENAME_EXCHANGE,
+      // RENAME_NOREPLACE or descriptor-based linkat. Refused before anything changed.
+      return unavailable(
+        'The worktree filesystem or kernel lacks a primitive the mutation guard requires (Landlock, ' +
+          'RENAME_EXCHANGE, RENAME_NOREPLACE or descriptor-based linkat); nothing was changed.'
+      );
+    }
     if (match?.[1] !== undefined && KNOWN_ERROR_CODES.has(match[1])) {
       return { ok: false, code: mapErrorCode(match[1]), reason: `The mutation guard refused the operation (${match[1]}).` };
     }

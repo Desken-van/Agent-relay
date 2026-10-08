@@ -15,6 +15,16 @@
  * the root's device and mount, so a bind mount or other mount point inside the
  * worktree is refused the way a junction is on Windows.
  *
+ * A descriptor keeps a directory's identity, not its place: a directory the
+ * helper opened can be moved out of the worktree before the commit. So right
+ * after the root is opened and its identity confirmed, every mutating
+ * operation confines this process with Landlock to the hierarchy beneath that
+ * root directory object. The kernel then evaluates each later access — every
+ * open, mkdirat, linkat, renameat2 and unlinkat — against where its directory
+ * is at the instant of that system call, and refuses (EACCES) any that is no
+ * longer beneath the root. A kernel without Landlock gets no mutation at all
+ * (`ERR:UNSUPPORTED`), never an unconfined one.
+ *
  * Protocol (identical argv and stdout to the Windows helper, so the
  * TypeScript side shares one parser):
  *
@@ -53,13 +63,13 @@
  *    moved, restores it if it was swapped in the meantime, and only then
  *    unlinks it.
  *
- * Filesystems without `O_TMPFILE`, `RENAME_EXCHANGE` or `RENAME_NOREPLACE`
- * (some network and FUSE filesystems) take a portable path: a named
- * `O_CREAT | O_EXCL | O_NOFOLLOW` staging file in the same directory, and a
- * verify-then-rename with the same small window the Windows helper has. The
- * environment variable `AGENT_RELAY_FS_GUARD_PORTABLE_ONLY=1` forces that
- * path so tests can prove it; it never disables a check, and the application
- * never passes it on to the helper.
+ * Without `O_TMPFILE` the content is staged in a named `O_CREAT | O_EXCL |
+ * O_NOFOLLOW` file instead; nothing else changes, because every commit links
+ * or exchanges the staged inode and then proves what landed. A filesystem or
+ * kernel without `RENAME_EXCHANGE`, `RENAME_NOREPLACE` or descriptor-based
+ * `linkat(AT_EMPTY_PATH)` (some network and FUSE filesystems) gets
+ * `ERR:UNSUPPORTED` before anything at the destination changes: there is no
+ * weaker fallback.
  *
  * Termination signals are blocked from the moment staging starts until the
  * process exits. A timeout or cancellation that arrives before the commit
@@ -74,7 +84,8 @@
  * never trusted alone.
  *
  * Exactly one line is printed to stdout: `OK` (or `OK:<identity>`) on
- * success, or `ERR:<CODE>` on a recognised, closed-vocabulary failure. Exit
+ * success, or `ERR:<CODE>` on a recognised, closed-vocabulary failure (the
+ * Windows vocabulary plus `UNSUPPORTED`). Exit
  * code 0 means `OK`; 1 means a recognised `ERR`; 2 means an
  * internal/unexpected failure. Diagnostics may go to stderr and are never
  * parsed.
@@ -85,9 +96,12 @@
 #endif
 
 #include <fcntl.h>
+#include <linux/landlock.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
@@ -118,6 +132,8 @@ enum class GuardError {
   kNotAFile,
   kRootInvalid,
   kInvalidArguments,
+  /** A kernel or filesystem primitive the guard requires is missing; nothing was changed. */
+  kUnsupported,
   kInternal
 };
 
@@ -132,6 +148,7 @@ const char* codeName(GuardError error) {
     case GuardError::kNotAFile: return "NOT_A_FILE";
     case GuardError::kRootInvalid: return "ROOT_INVALID";
     case GuardError::kInvalidArguments: return "INVALID_ARGUMENTS";
+    case GuardError::kUnsupported: return "UNSUPPORTED";
     default: return "INTERNAL";
   }
 }
@@ -169,11 +186,6 @@ struct Fd {
     value = -1;
   }
 };
-
-bool portableOnly() {
-  const char* value = std::getenv("AGENT_RELAY_FS_GUARD_PORTABLE_ONLY");
-  return value != nullptr && std::strcmp(value, "1") == 0;
-}
 
 /** errno values a kernel/filesystem uses to say "this flag is not supported here". */
 bool unsupported(int error) {
@@ -379,6 +391,89 @@ Root openRoot(const std::string& root, const RootIdentity* expected) {
   return result;
 }
 
+/**
+ * Confine this process, for the rest of its life, to the hierarchy beneath
+ * the already-opened, identity-checked root directory: from here on the kernel
+ * refuses every file access (open, create, link, rename, unlink, mkdir) whose
+ * directory is not beneath that root at the moment of the system call — a
+ * directory the helper already opened and that was then moved out of the
+ * worktree included. Only what the operations need is allowed beneath it.
+ */
+void confineBeneathRoot(const Root& root) {
+  const long abi = syscall(SYS_landlock_create_ruleset, nullptr, 0, LANDLOCK_CREATE_RULESET_VERSION);
+  if (abi < 1) {
+    diagnose("Landlock is unavailable; refusing to mutate without a kernel-enforced worktree boundary", errno);
+    fail(GuardError::kUnsupported);
+  }
+  uint64_t handled = LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE |
+      LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE |
+      LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_MAKE_REG |
+      LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
+      LANDLOCK_ACCESS_FS_MAKE_SYM;
+  uint64_t allowed = LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR |
+      LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_MAKE_REG;
+  if (abi >= 2) {
+    handled |= LANDLOCK_ACCESS_FS_REFER;
+    allowed |= LANDLOCK_ACCESS_FS_REFER;
+  }
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+  if (abi >= 3) {
+    handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    allowed |= LANDLOCK_ACCESS_FS_TRUNCATE;
+  }
+#endif
+#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
+  if (abi >= 5) handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+#endif
+  struct landlock_ruleset_attr rules {};
+  rules.handled_access_fs = handled;
+  const Fd ruleset(static_cast<int>(syscall(SYS_landlock_create_ruleset, &rules, sizeof(rules), 0)));
+  if (ruleset.value < 0) {
+    diagnose("creating the Landlock ruleset failed", errno);
+    fail(GuardError::kUnsupported);
+  }
+  struct landlock_path_beneath_attr beneath {};
+  beneath.allowed_access = allowed;
+  beneath.parent_fd = root.fd.value;
+  if (syscall(SYS_landlock_add_rule, ruleset.value, LANDLOCK_RULE_PATH_BENEATH, &beneath, 0) != 0 ||
+      prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+      syscall(SYS_landlock_restrict_self, ruleset.value, 0) != 0) {
+    diagnose("enforcing the Landlock worktree boundary failed", errno);
+    fail(GuardError::kUnsupported);
+  }
+}
+
+/**
+ * Why an access in `directory` was refused with EACCES/EPERM. Once confined, a
+ * refusal there almost always means the directory is no longer beneath the
+ * root. That is established structurally, by walking `..` through O_PATH
+ * descriptors from the very directory object (never by a pathname), only to
+ * report it accurately: the refusal itself was the kernel's.
+ */
+GuardError refusedIn(int directory, const FileInfo& root) {
+  Fd current(fcntl(directory, F_DUPFD_CLOEXEC, 0));
+  for (int depth = 0; current.value >= 0 && depth < 4096; ++depth) {
+    FileInfo info;
+    int error = 0;
+    if (!statAt(current.value, "", info, error)) break;
+    if (info.dev == root.dev && info.ino == root.ino) return GuardError::kInternal;
+    Fd up(openat(current.value, "..", O_PATH | O_DIRECTORY | O_CLOEXEC));
+    FileInfo upInfo;
+    if (up.value < 0 || !statAt(up.value, "", upInfo, error)) break;
+    if (upInfo.dev == info.dev && upInfo.ino == info.ino) break;  // reached a filesystem root
+    current = std::move(up);
+  }
+  diagnose("refused outside the worktree: the directory is no longer beneath the root", 0);
+  return GuardError::kReparseAncestor;
+}
+
+/** Map an errno from an access in `directory` that is not otherwise classified. */
+[[noreturn]] void failAccess(const char* what, int error, int directory, const FileInfo& root) {
+  if (error == EACCES || error == EPERM) fail(refusedIn(directory, root));
+  diagnose(what, error);
+  fail(GuardError::kInternal);
+}
+
 /** A symlink at `name` is an ancestor/target substitution; anything else that is not a directory is not. */
 GuardError classifyNonDirectory(int parent, const char* name) {
   FileInfo info;
@@ -416,13 +511,11 @@ Fd openOrCreateChildDirectory(int parent, const std::string& name, bool createIf
       // Mode 0777 is filtered by the process umask, exactly like Node's mkdir.
       if (mkdirat(parent, name.c_str(), 0777) == 0 || errno == EEXIST) continue;
       if (errno == ENOENT) fail(GuardError::kNotFound);
-      diagnose("mkdirat refused", errno);
-      fail(GuardError::kInternal);
+      failAccess("mkdirat refused", errno, parent, root);
     }
     if (error == ENOTDIR || error == ELOOP) fail(classifyNonDirectory(parent, name.c_str()));
     if (error == ENAMETOOLONG) fail(GuardError::kInvalidArguments);
-    diagnose("openat(directory) refused", error);
-    fail(GuardError::kInternal);
+    failAccess("openat(directory) refused", error, parent, root);
   }
   // Something kept removing the directory between mkdirat and openat.
   fail(GuardError::kInternal);
@@ -467,8 +560,7 @@ OpenedTarget openExistingRegularFile(int parent, const std::string& name, const 
     if (error == ENOENT) fail(GuardError::kNotFound);
     if (error == ELOOP) fail(GuardError::kReparseAncestor);
     if (error == ENXIO || error == EISDIR) fail(GuardError::kNotAFile);
-    diagnose("openat(target) refused", error);
-    fail(GuardError::kInternal);
+    failAccess("openat(target) refused", error, parent, root);
   }
   OpenedTarget target{Fd(fd), FileInfo{}};
   target.info = infoOf(target.fd.value);
@@ -695,11 +787,12 @@ std::string randomTempName() {
 /**
  * New content, fully written and flushed, not yet visible at its destination.
  * An anonymous O_TMPFILE inode disappears on its own if this process dies; a
- * named staging file (portable path, or after `materialize`) is removed by the
+ * named staging file (no O_TMPFILE, or after `materialize`) is removed by the
  * destructor unless the commit consumed it.
  */
 struct StagedFile {
   int parent = -1;
+  FileInfo root;
   Fd fd;
   FileInfo info;
   std::string name;  // empty while anonymous
@@ -715,29 +808,24 @@ struct StagedFile {
   }
 };
 
-void stageContent(StagedFile& staged, int parent, const std::vector<unsigned char>& content) {
+void stageContent(StagedFile& staged, int parent, const FileInfo& root, const std::vector<unsigned char>& content) {
   staged.parent = parent;
-  if (!portableOnly()) {
-    // Mode 0666 is filtered by the process umask, exactly like Node's writeFile.
-    const int fd = openat(parent, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0666);
-    if (fd >= 0) {
-      staged.fd = Fd(fd);
-      writeAll(staged.fd.value, content);
-      staged.info = infoOf(staged.fd.value);
-      return;
-    }
-    if (!unsupported(errno) && errno != EISDIR) {
-      diagnose("O_TMPFILE staging refused", errno);
-      fail(GuardError::kInternal);
-    }
+  staged.root = root;
+  // Mode 0666 is filtered by the process umask, exactly like Node's writeFile.
+  const int anonymous = openat(parent, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0666);
+  if (anonymous >= 0) {
+    staged.fd = Fd(anonymous);
+    writeAll(staged.fd.value, content);
+    staged.info = infoOf(staged.fd.value);
+    return;
   }
+  if (!unsupported(errno) && errno != EISDIR) failAccess("O_TMPFILE staging refused", errno, parent, root);
   for (int attempt = 0; attempt < 8; ++attempt) {
     const std::string name = randomTempName();
     const int fd = openat(parent, name.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0666);
     if (fd < 0) {
       if (errno == EEXIST) continue;
-      diagnose("named staging refused", errno);
-      fail(GuardError::kInternal);
+      failAccess("named staging refused", errno, parent, root);
     }
     staged.fd = Fd(fd);
     staged.name = name;
@@ -749,23 +837,23 @@ void stageContent(StagedFile& staged, int parent, const std::vector<unsigned cha
 }
 
 /**
- * Give the staged inode, through its open descriptor, the name `destination`
- * in its directory, failing with EEXIST (never replacing) if the name is
- * taken. Returns errno, 0 on success.
+ * Give the staged inode, through its open descriptor (never through a staging
+ * name), the name `destination` in its directory. Returns false when the name
+ * is taken (a link never replaces); every other failure is reported.
  */
-int linkFromFd(const StagedFile& staged, const std::string& destination) {
-  if (linkat(staged.fd.value, "", staged.parent, destination.c_str(), AT_EMPTY_PATH) == 0) return 0;
-  const int direct = errno;
-  if (direct == EEXIST) return EEXIST;
-  // Older kernels reserve AT_EMPTY_PATH linking for CAP_DAC_READ_SEARCH; the
-  // /proc magic link names the very same open inode.
-  char path[64];
-  std::snprintf(path, sizeof(path), "/proc/self/fd/%d", staged.fd.value);
-  if (linkat(AT_FDCWD, path, staged.parent, destination.c_str(), AT_SYMLINK_FOLLOW) == 0) return 0;
-  const int fallback = errno;
-  // Without /proc the fallback's ENOENT says nothing about the destination.
-  if (fallback == ENOENT && access("/proc/self/fd", F_OK) != 0) return EPERM;
-  return fallback;
+bool linkFromFd(const StagedFile& staged, const std::string& destination) {
+  if (linkat(staged.fd.value, "", staged.parent, destination.c_str(), AT_EMPTY_PATH) == 0) return true;
+  const int error = errno;
+  if (error == EEXIST) return false;
+  if (error == ENOENT) {
+    // The directory itself was removed, or the kernel only lets a privileged
+    // process link a descriptor. Neither is worked around by a weaker link.
+    const FileInfo parent = infoOf(staged.parent);
+    if (parent.nlink == 0) fail(GuardError::kNotFound);
+    diagnose("this kernel refuses linkat(AT_EMPTY_PATH) to an unprivileged process", error);
+    fail(GuardError::kUnsupported);
+  }
+  failAccess("linking the staged file refused", error, staged.parent, staged.root);
 }
 
 /** Give an anonymous staged file a private random name so it can take part in a rename. */
@@ -773,14 +861,9 @@ void materialize(StagedFile& staged) {
   if (!staged.name.empty()) return;
   for (int attempt = 0; attempt < 8; ++attempt) {
     const std::string name = randomTempName();
-    const int error = linkFromFd(staged, name);
-    if (error == 0) {
+    if (linkFromFd(staged, name)) {
       staged.name = name;
       return;
-    }
-    if (error != EEXIST) {
-      diagnose("linking the staged file refused", error);
-      fail(GuardError::kInternal);
     }
   }
   fail(GuardError::kInternal);
@@ -836,9 +919,16 @@ void syncDirectory(int directory) {
 /* Operations                                                                  */
 /* -------------------------------------------------------------------------- */
 
+/** Open the root, confirm it is the bound worktree, and confine the process beneath it. */
+Root openConfinedRoot(const std::string& rootPath, const RootIdentity& expected) {
+  Root root = openRoot(rootPath, &expected);
+  confineBeneathRoot(root);
+  return root;
+}
+
 void doMkdirp(const std::string& rootPath, const RootIdentity& expected, const std::string& relDir) {
-  const Root root = openRoot(rootPath, &expected);
   const auto segments = splitAndValidate(relDir);
+  const Root root = openConfinedRoot(rootPath, expected);
   if (segments.empty()) return;
   walkDirectories(root, segments, true);
 }
@@ -852,27 +942,21 @@ void doCreate(
     const RootIdentity& expected,
     const std::string& relPath,
     const std::vector<unsigned char>& content) {
-  const Root root = openRoot(rootPath, &expected);
   const auto segments = splitAndValidate(relPath);
   if (segments.empty()) fail(GuardError::kInvalidArguments);
+  const Root root = openConfinedRoot(rootPath, expected);
   const Fd parent = walkDirectories(root, parentSegmentsOf(segments), false);
   const std::string& finalName = segments.back();
 
   deferTermination();
   StagedFile staged;
-  stageContent(staged, parent.value, content);
+  stageContent(staged, parent.value, root.info, content);
 
   abandonIfTerminationPending();
   // Linked from the open descriptor, never from the staging name, so what
   // appears at the destination is exactly the staged inode. A hard link never
   // replaces an existing name.
-  const int error = linkFromFd(staged, finalName);
-  if (error == EEXIST) fail(GuardError::kAlreadyExists);
-  if (error == ENOENT) fail(GuardError::kNotFound);
-  if (error != 0) {
-    diagnose("linking the created file refused", error);
-    fail(GuardError::kInternal);
-  }
+  if (!linkFromFd(staged, finalName)) fail(GuardError::kAlreadyExists);
   // The destructor drops a named staging file's extra name.
   syncDirectory(parent.value);
 }
@@ -885,9 +969,9 @@ void doReplace(
     const std::string& relPath,
     const std::string& expectedSha256,
     const std::vector<unsigned char>& content) {
-  const Root root = openRoot(rootPath, &expected);
   const auto segments = splitAndValidate(relPath);
   if (segments.empty()) fail(GuardError::kInvalidArguments);
+  const Root root = openConfinedRoot(rootPath, expected);
   const Fd parent = walkDirectories(root, parentSegmentsOf(segments), false);
   const std::string& finalName = segments.back();
 
@@ -898,7 +982,7 @@ void doReplace(
 
   deferTermination();
   StagedFile staged;
-  stageContent(staged, parent.value, content);
+  stageContent(staged, parent.value, root.info, content);
   // Keep the file's permission bits (an executable script stays executable).
   if (fchmod(staged.fd.value, target.info.mode & 0777) != 0) {
     diagnose("fchmod(staged) failed", errno);
@@ -907,91 +991,48 @@ void doReplace(
   materialize(staged);
   abandonIfTerminationPending();
 
-  if (!portableOnly()) {
-    if (renameat2(parent.value, staged.name.c_str(), parent.value, finalName.c_str(), RENAME_EXCHANGE) == 0) {
-      // The destination should now hold the staged file, and the staging
-      // name whatever was there at the instant of the exchange. Prove both:
-      // the staged inode is what is now visible, and what it displaced is the
-      // inode verified above, still with the verified content.
-      staged.committed = true;
-      if (!nameRefersTo(parent.value, finalName, staged.info) ||
-          !nameRefersTo(parent.value, staged.name, target.info) ||
-          !stillVerified(target.fd.value, targetDev, targetIno, expectedSha256)) {
-        if (renameat2(parent.value, staged.name.c_str(), parent.value, finalName.c_str(), RENAME_EXCHANGE) != 0) {
-          diagnose("restoring a replaced file after a failed re-verification refused", errno);
-          fail(GuardError::kInternal);
-        }
-        staged.committed = false;  // the staging name is ours again; the destructor removes it
-        fail(GuardError::kHashMismatch);
-      }
-      if (unlinkat(parent.value, staged.name.c_str(), 0) != 0) {
-        diagnose("removing the replaced file's staging name failed", errno);
-      } else if (infoOf(target.fd.value).nlink != 0) {
-        diagnose("the staging name no longer named the replaced file when it was removed", 0);
-      }
-      syncDirectory(parent.value);
-      return;
-    }
+  // The only commit: an atomic exchange, so the original is never unlinked
+  // before the replacement is proven. Without it nothing is changed.
+  if (renameat2(parent.value, staged.name.c_str(), parent.value, finalName.c_str(), RENAME_EXCHANGE) != 0) {
     const int error = errno;
     if (error == ENOENT) fail(GuardError::kNotFound);
-    if (!unsupported(error)) {
-      diagnose("renameat2(RENAME_EXCHANGE) refused", error);
+    if (unsupported(error)) {
+      diagnose("renameat2(RENAME_EXCHANGE) is unavailable on this filesystem; nothing was replaced", error);
+      fail(GuardError::kUnsupported);
+    }
+    failAccess("renameat2(RENAME_EXCHANGE) refused", error, parent.value, root.info);
+  }
+  // The destination should now hold the staged file, and the staging name
+  // whatever was there at the instant of the exchange. Prove both: the staged
+  // inode is what is now visible, and what it displaced is the inode verified
+  // above, still with the verified content.
+  staged.committed = true;
+  if (!nameRefersTo(parent.value, finalName, staged.info) ||
+      !nameRefersTo(parent.value, staged.name, target.info) ||
+      !stillVerified(target.fd.value, targetDev, targetIno, expectedSha256)) {
+    if (renameat2(parent.value, staged.name.c_str(), parent.value, finalName.c_str(), RENAME_EXCHANGE) != 0) {
+      diagnose("restoring a replaced file after a failed re-verification refused", errno);
       fail(GuardError::kInternal);
     }
-  }
-
-  // Portable path: the same verify-then-rename window the Windows helper has.
-  if (!nameRefersTo(parent.value, finalName, target.info) ||
-      !sameVerifiedFile(target.fd.value, targetDev, targetIno, expectedSha256)) {
+    staged.committed = false;  // the staging name is ours again; the destructor removes it
     fail(GuardError::kHashMismatch);
   }
-  if (renameat(parent.value, staged.name.c_str(), parent.value, finalName.c_str()) != 0) {
-    if (errno == ENOENT) fail(GuardError::kNotFound);
-    diagnose("renameat refused", errno);
-    fail(GuardError::kInternal);
-  }
-  staged.committed = true;
-  if (!nameRefersTo(parent.value, finalName, staged.info)) {
-    // The staging name was replaced before the rename: something other than
-    // the staged content now sits at the destination. Never report success.
-    diagnose("the destination does not hold the staged content after the rename", 0);
-    fail(GuardError::kInternal);
+  if (unlinkat(parent.value, staged.name.c_str(), 0) != 0) {
+    diagnose("removing the replaced file's staging name failed", errno);
+  } else if (infoOf(target.fd.value).nlink != 0) {
+    diagnose("the staging name no longer named the replaced file when it was removed", 0);
   }
   syncDirectory(parent.value);
 }
 
 /**
- * Move `from` to `to` in `parent` without ever replacing an existing `to`.
- * Returns errno, 0 on success. `expected` is the inode the caller means to
- * move; the portable path refuses to drop a name that no longer refers to it.
+ * Move `from` to `to` in `parent` with RENAME_NOREPLACE, never replacing an
+ * existing `to`. Returns errno, 0 on success; EOPNOTSUPP when the filesystem
+ * cannot do it at all, in which case nothing was moved.
  */
-int moveNoReplace(int parent, const std::string& from, const std::string& to, const FileInfo& expected) {
-  if (!portableOnly()) {
-    if (renameat2(parent, from.c_str(), parent, to.c_str(), RENAME_NOREPLACE) == 0) return 0;
-    if (!unsupported(errno)) return errno;
-  }
-  // A hard link refuses an existing name just as RENAME_NOREPLACE does.
-  if (linkat(parent, from.c_str(), parent, to.c_str(), 0) != 0) return errno;
-  if (!nameRefersTo(parent, to, expected) || !nameRefersTo(parent, from, expected)) {
-    // Something else was linked, or now sits at `from`: drop only the fresh
-    // name this call created, whatever it links to.
-    unlinkat(parent, to.c_str(), 0);
-    return ESTALE;
-  }
-  if (unlinkat(parent, from.c_str(), 0) != 0) {
-    const int error = errno;
-    unlinkat(parent, to.c_str(), 0);
-    return error;
-  }
-  return 0;
-}
-
-/** Put back whatever is at `from` under `to`, never replacing anything at `to`. Returns errno, 0 on success. */
-int restoreName(int parent, const std::string& from, const std::string& to) {
-  FileInfo current;
-  int error = 0;
-  if (!statAt(parent, from.c_str(), current, error)) return error;
-  return moveNoReplace(parent, from, to, current);
+int moveNoReplace(int parent, const std::string& from, const std::string& to) {
+  if (renameat2(parent, from.c_str(), parent, to.c_str(), RENAME_NOREPLACE) == 0) return 0;
+  return unsupported(errno) ? EOPNOTSUPP : errno;
 }
 
 void doDelete(
@@ -1001,9 +1042,9 @@ void doDelete(
     uint64_t targetIno,
     const std::string& relPath,
     const std::string& expectedSha256) {
-  const Root root = openRoot(rootPath, &expected);
   const auto segments = splitAndValidate(relPath);
   if (segments.empty()) fail(GuardError::kInvalidArguments);
+  const Root root = openConfinedRoot(rootPath, expected);
   const Fd parent = walkDirectories(root, parentSegmentsOf(segments), false);
   const std::string& finalName = segments.back();
 
@@ -1019,28 +1060,30 @@ void doDelete(
   for (int attempt = 0;; ++attempt) {
     if (attempt == 8) fail(GuardError::kInternal);
     quarantine = randomTempName();
-    const int error = moveNoReplace(parent.value, finalName, quarantine, target.info);
+    const int error = moveNoReplace(parent.value, finalName, quarantine);
     if (error == 0) break;
     if (error == EEXIST) continue;
     if (error == ENOENT) fail(GuardError::kNotFound);
-    if (error == ESTALE) fail(GuardError::kHashMismatch);
-    diagnose("moving the target aside refused", error);
-    fail(GuardError::kInternal);
+    if (error == EOPNOTSUPP) {
+      diagnose("renameat2(RENAME_NOREPLACE) is unavailable on this filesystem; nothing was deleted", error);
+      fail(GuardError::kUnsupported);
+    }
+    failAccess("moving the target aside refused", error, parent.value, root.info);
   }
 
   if (!nameRefersTo(parent.value, quarantine, target.info) ||
       !stillVerified(target.fd.value, targetDev, targetIno, expectedSha256)) {
-    const int error = restoreName(parent.value, quarantine, finalName);
+    const int error = moveNoReplace(parent.value, quarantine, finalName);
     if (error != 0) {
-      diagnose("restoring a file after a failed re-verification refused", error);
+      diagnose("restoring a file after a failed re-verification refused; it is kept under its quarantine name", error);
       fail(GuardError::kInternal);
     }
     fail(GuardError::kHashMismatch);
   }
   if (unlinkat(parent.value, quarantine.c_str(), 0) != 0) {
     diagnose("unlinkat refused", errno);
-    const int error = restoreName(parent.value, quarantine, finalName);
-    if (error != 0) diagnose("restoring a file after a failed delete refused", error);
+    const int error = moveNoReplace(parent.value, quarantine, finalName);
+    if (error != 0) diagnose("restoring a file after a failed delete refused; it is kept under its quarantine name", error);
     fail(GuardError::kInternal);
   }
   // The unlink was by name: prove it removed the verified inode's last name.
