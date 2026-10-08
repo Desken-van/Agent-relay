@@ -174,6 +174,11 @@ describe('Ornith verification repair Electron acceptance', () => {
     git(repoDir, ['init', '-b', 'main']);
     git(repoDir, ['config', 'user.name', 'Ornith Repair Fixture']);
     git(repoDir, ['config', 'user.email', 'fixture@example.invalid']);
+    // The scripted edits carry hashes of LF content, so this repository pins LF before anything is checked
+    // out: a host's core.autocrlf (the Windows default) would otherwise give the task worktree CRLF files
+    // whose hashes the script cannot know. Repository-local, so worktrees Agent Relay adds from it inherit it.
+    // CRLF handling is covered by the unit tests, which write their files with known line endings.
+    git(repoDir, ['config', 'core.autocrlf', 'false']);
     mkdirSync(join(repoDir, 'src'));
     mkdirSync(join(repoDir, 'test'));
     writeFileSync(join(repoDir, 'package.json'), `${JSON.stringify({ name: 'repair-fixture', version: '1.0.0', type: 'module', scripts: { verify: 'node --test' } }, null, 2)}\n`);
