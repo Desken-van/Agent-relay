@@ -1739,9 +1739,19 @@ describe('OrnithImplementationService limits and cancellation', () => {
       [...prompt.matchAll(new RegExp(`"path":"${path}"[^\\n]*?"sha256":"([0-9a-f]{64})"|"sha256":"([0-9a-f]{64})"[^\\n]*?"path":"${path}"`, 'g'))]
         .map((match) => match[1] ?? match[2]).at(-1)!;
 
-    it('retires the edited file\'s earlier content, names the applied replacement, and lets a fresh read drive the next edit', async () => {
+    // The file is written by the test with known line endings, not checked out: a checkout follows the host's
+    // core.autocrlf (Windows CI turned "fixture\n" into "fixture\r\n" and the scripted LF oldText no longer
+    // matched). Both styles run; in each the model sends breaks in the file's own style, as the protocol says.
+    it.each([
+      ['lf', '\n'],
+      ['crlf', '\r\n']
+    ] as const)('retires the edited file\'s earlier content, names the applied replacement, and lets a fresh read drive the next edit (%s)', async (lineEnding, eol) => {
+      const path = 'notes.txt';
+      const original = `fixture${eol}`;
+      writeFileSync(join(worktree, path), original, 'utf8');
       writeFileSync(join(worktree, 'other.txt'), 'other content\n', 'utf8');
-      const longText = `fixture\nexport function whisper() {}\n${'/* padding */'.repeat(100)}`;
+      const longText = `fixture${eol}export function whisper() {}${eol}${'/* padding */'.repeat(100)}`;
+      const escaped = (text: string): string => JSON.stringify(text).slice(1, -1);
       const requests: LocalInferenceRequest[] = [];
       const leaseService: OrnithInferenceLeaseService = {
         acquireOrnithLease: async () => lease(),
@@ -1750,11 +1760,11 @@ describe('OrnithImplementationService limits and cancellation', () => {
           requests.push(request);
           const prompt = promptOf(request);
           const reply = [
-            () => ({ version: 1, action: 'read_file', path: 'fixture.txt', offset: 0, limit: 65_536 }),
+            () => ({ version: 1, action: 'read_file', path, offset: 0, limit: 65_536 }),
             () => ({ version: 1, action: 'read_file', path: 'other.txt', offset: 0, limit: 65_536 }),
-            () => ({ version: 1, action: 'replace_text', path: 'fixture.txt', sha256: shaIn(prompt, 'fixture.txt'), replacements: [{ oldText: 'fixture\n', newText: longText }] }),
-            () => ({ version: 1, action: 'read_file', path: 'fixture.txt', offset: 0, limit: 65_536 }),
-            () => ({ version: 1, action: 'replace_text', path: 'fixture.txt', sha256: shaIn(prompt, 'fixture.txt'), replacements: [{ oldText: 'export function whisper() {}', newText: 'export function whisper(text) { return text; }' }] }),
+            () => ({ version: 1, action: 'replace_text', path, sha256: shaIn(prompt, path), replacements: [{ oldText: original, newText: longText }] }),
+            () => ({ version: 1, action: 'read_file', path, offset: 0, limit: 65_536 }),
+            () => ({ version: 1, action: 'replace_text', path, sha256: shaIn(prompt, path), replacements: [{ oldText: 'export function whisper() {}', newText: 'export function whisper(text) { return text; }' }] }),
             () => ({ version: 1, action: 'finish', summary: 'Added whisper once.' })
           ][requests.length - 1]!();
           return completed(request, JSON.stringify(reply));
@@ -1764,27 +1774,38 @@ describe('OrnithImplementationService limits and cancellation', () => {
       const result = await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
 
       expect(result.assessment.disposition, result.finalMessage).toBe('pass');
+      // The first read really showed the file in this style.
+      expect(promptOf(requests[1]!)).toContain(`"lineEnding":"${lineEnding}"`);
+      expect(promptOf(requests[1]!)).toContain(`"content":"${escaped(original)}"`);
       const afterFirstEdit = promptOf(requests[3]!);
-      // The first read of fixture.txt no longer shows its old content; it says it is out of date and why.
-      expect(afterFirstEdit).not.toContain('"content":"fixture\\n"');
-      expect(afterFirstEdit).toContain('turn 1 [read_file]: {"path":"fixture.txt","outOfDate":true');
-      expect(afterFirstEdit).toContain('fixture.txt was changed at turn 3 by replace_text');
+      // The first read of the file no longer shows its old content; it says it is out of date and why.
+      expect(afterFirstEdit).not.toContain(`"content":"${escaped(original)}"`);
+      expect(afterFirstEdit).toContain(`turn 1 [read_file]: {"path":"${path}","outOfDate":true`);
+      expect(afterFirstEdit).toContain(`${path} was changed at turn 3 by replace_text`);
       // The other file's read is untouched.
       expect(afterFirstEdit).toContain('"content":"other content\\n"');
       // The edit's result names what it applied (bounded), beside the hash it always carried.
-      expect(afterFirstEdit).toMatch(/turn 3 \[replace_text\]: \{"path":"fixture.txt","sha256":"[0-9a-f]{64}","bytesWritten":\d+,"lineEnding":"lf","applied":\[\{"oldText":"fixture\\n","newText":"fixture\\nexport function whisper\(\) \{\}/);
+      expect(afterFirstEdit).toContain(
+        `turn 3 [replace_text]: {"path":"${path}","sha256":"`
+      );
+      expect(afterFirstEdit).toContain(
+        `"lineEnding":"${lineEnding}","applied":[{"oldText":"${escaped(original)}","newText":"${escaped(`fixture${eol}export function whisper() {}${eol}`)}`
+      );
       expect(afterFirstEdit).toMatch(/…\[\d+ more characters\]/);
       expect(afterFirstEdit).toContain('These replacements are now in the file. Do not send them again');
-      expect(afterFirstEdit).not.toContain(longText);
+      expect(afterFirstEdit).not.toContain(escaped(longText));
       // The fresh read after the edit is shown in full, and the second edit worked from it.
       const afterReread = promptOf(requests[4]!);
-      expect(afterReread).toContain('turn 4 [read_file]: {"path":"fixture.txt","offset":0');
+      expect(afterReread).toContain(`turn 4 [read_file]: {"path":"${path}","offset":0`);
       expect(afterReread).toContain('export function whisper() {}');
-      const final = readFileSync(join(worktree, 'fixture.txt'), 'utf8');
+      const final = readFileSync(join(worktree, path), 'utf8');
       expect(final.match(/export function whisper/g)).toHaveLength(1);
-      expect(final).toContain('export function whisper(text) { return text; }');
+      expect(final).toBe(`fixture${eol}export function whisper(text) { return text; }${eol}${'/* padding */'.repeat(100)}`);
+      // The file kept its own line endings: no lone LF crept into a CRLF file, and no CR into an LF one.
+      if (lineEnding === 'crlf') expect(final.replace(/\r\n/g, '')).not.toContain('\n');
+      else expect(final).not.toContain('\r');
       // And once the file changes again, the read it was computed from is retired too.
-      expect(promptOf(requests[5]!)).toContain('fixture.txt was changed at turn 5 by replace_text');
+      expect(promptOf(requests[5]!)).toContain(`${path} was changed at turn 5 by replace_text`);
     });
 
     it('states the rule in the protocol: an edit\'s replacements are not sent again, and a changed file is read again first', async () => {
