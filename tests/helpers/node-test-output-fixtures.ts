@@ -3,13 +3,33 @@
  * captured from real runs in disposable repositories (`npm run verify > out 2>&1`, not a terminal). Each is
  * a function of the repository root, because Node prints absolute module locations and only a location
  * inside the worktree can be the files' own. Stack frames are kept as Node printed them.
+ *
+ * Locations are rebuilt the way Node prints them for the root given — a module location is
+ * `pathToFileURL(path).href` (`file:///C:/repo/src/a.js` on Windows, percent-encoded), a plain message
+ * names the path with its own separators — never by gluing "file://" to a path, which yields a URL Node
+ * would never print for a Windows path.
  */
+
+import { posix, win32 } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const isWindowsPath = (path: string): boolean => /^[A-Za-z]:[\\/]|^\\\\/.test(path);
+
+/** A path under `root`, spelled by `root`'s own platform. */
+export function nodePath(root: string, relative: string): string {
+  return isWindowsPath(root) ? win32.join(root, ...relative.split('/')) : posix.join(root, relative);
+}
+
+/** The `file:` URL Node prints for a module under `root`. */
+export function nodeFileUrl(root: string, relative: string): string {
+  return pathToFileURL(nodePath(root, relative), { windows: isWindowsPath(root) }).href;
+}
 
 /** A source file declares `whisper` twice (spec reporter). */
 export const NODE_TEST_DUPLICATE_DECLARATION_SPEC = (root: string): string => [
   "npm notice run verify",
   "npm notice run node --test --test-reporter=spec",
-  "file://" + root + "/src/strings.js:3",
+  `${nodeFileUrl(root, 'src/strings.js')}:3`,
   "export function whisper(s) { return s.toLowerCase() + \"...\"; }",
   "       ^",
   "",
@@ -48,7 +68,7 @@ export const NODE_TEST_DUPLICATE_DECLARATION_TAP = (root: string): string => [
   "npm notice run verify",
   "npm notice run node --test --test-reporter=tap",
   "TAP version 13",
-  "# file://" + root + "/src/strings.js:3",
+  `# ${nodeFileUrl(root, 'src/strings.js')}:3`,
   "# export function whisper(s) { return s.toLowerCase() + \"...\"; }",
   "#        ^",
   "# SyntaxError: Identifier 'whisper' has already been declared",
@@ -68,7 +88,7 @@ export const NODE_TEST_DUPLICATE_DECLARATION_TAP = (root: string): string => [
   "  ---",
   "  duration_ms: 46.588011",
   "  type: 'test'",
-  "  location: '" + root + "/test/strings.test.js:1:1'",
+  `  location: '${nodePath(root, 'test/strings.test.js')}:1:1'`,
   "  failureType: 'testCodeFailure'",
   "  exitCode: 1",
   "  signal: ~",
@@ -90,7 +110,7 @@ export const NODE_TEST_DUPLICATE_DECLARATION_TAP = (root: string): string => [
 export const NODE_TEST_MISSING_EXPORT_SPEC = (root: string): string => [
   "npm notice run verify",
   "npm notice run node --test --test-reporter=spec",
-  "file://" + root + "/test/strings.test.js:3",
+  `${nodeFileUrl(root, 'test/strings.test.js')}:3`,
   "import { shout, whisper } from '../src/strings.js';",
   "                ^^^^^^^",
   "SyntaxError: The requested module '../src/strings.js' does not provide an export named 'whisper'",
@@ -122,7 +142,7 @@ export const NODE_TEST_MISSING_EXPORT_TAP = (root: string): string => [
   "npm notice run verify",
   "npm notice run node --test --test-reporter=tap",
   "TAP version 13",
-  "# file://" + root + "/test/strings.test.js:3",
+  `# ${nodeFileUrl(root, 'test/strings.test.js')}:3`,
   "# import { shout, whisper } from '../src/strings.js';",
   "#                 ^^^^^^^",
   "# SyntaxError: The requested module '../src/strings.js' does not provide an export named 'whisper'",
@@ -136,7 +156,7 @@ export const NODE_TEST_MISSING_EXPORT_TAP = (root: string): string => [
   "  ---",
   "  duration_ms: 31.514341",
   "  type: 'test'",
-  "  location: '" + root + "/test/strings.test.js:1:1'",
+  `  location: '${nodePath(root, 'test/strings.test.js')}:1:1'`,
   "  failureType: 'testCodeFailure'",
   "  exitCode: 1",
   "  signal: ~",
@@ -177,7 +197,7 @@ export const NODE_TEST_ASSERTION_SPEC = (root: string): string => [
   "  ",
   "  'a' !== 'a...'",
   "  ",
-  "      at TestContext.<anonymous> (file://" + root + "/test/strings.test.js:5:32)",
+  `      at TestContext.<anonymous> (${nodeFileUrl(root, 'test/strings.test.js')}:5:32)`,
   "      at Test.runInAsyncScope (node:async_hooks:226:14)",
   "      at Test.run (node:internal/test_runner/test:1402:25)",
   "      at Test.processPendingSubtests (node:internal/test_runner/test:974:18)",
@@ -213,7 +233,7 @@ export const NODE_TEST_MISSING_PACKAGE_SPEC = (root: string): string => [
   "  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);",
   "        ^",
   "",
-  "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'left-pad-missing' imported from " + root + "/src/strings.js",
+  "Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'left-pad-missing' imported from " + nodePath(root, 'src/strings.js'),
   "    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:343:9)",
   "    at packageResolve (node:internal/modules/esm/resolve:751:25)",
   "    at moduleResolve (node:internal/modules/esm/resolve:840:18)",
@@ -249,7 +269,7 @@ export const NODE_TEST_MISSING_PACKAGE_SPEC = (root: string): string => [
 export const NODE_TEST_DEPENDENCY_SYNTAX_ERROR_SPEC = (root: string): string => [
   "npm notice run verify",
   "npm notice run node --test --test-reporter=spec",
-  "file://" + root + "/node_modules/helper/index.js:2",
+  `${nodeFileUrl(root, 'node_modules/helper/index.js')}:2`,
   "export const a = 2;",
   "             ^",
   "",
@@ -287,7 +307,7 @@ export const NODE_TEST_DEPENDENCY_SYNTAX_ERROR_SPEC = (root: string): string => 
 export const NODE_TEST_DEPENDENCY_MISSING_EXPORT_SPEC = (root: string): string => [
   "npm notice run verify",
   "npm notice run node --test --test-reporter=spec",
-  "file://" + root + "/src/strings.js:1",
+  `${nodeFileUrl(root, 'src/strings.js')}:1`,
   "import { b } from \"helper\";",
   "         ^",
   "SyntaxError: The requested module 'helper' does not provide an export named 'b'",
@@ -318,7 +338,7 @@ export const NODE_TEST_DEPENDENCY_MISSING_EXPORT_SPEC = (root: string): string =
 export const NODE_TEST_OTHER_SYNTAX_ERROR_SPEC = (root: string): string => [
   "npm notice run verify",
   "npm notice run node --test --test-reporter=spec",
-  "file://" + root + "/src/strings.js:2",
+  `${nodeFileUrl(root, 'src/strings.js')}:2`,
   "export function whisper(s) { return s.toLowerCase( + \"...\"; }",
   "                                                     ^^^^^",
   "",

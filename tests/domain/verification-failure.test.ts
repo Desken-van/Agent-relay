@@ -249,7 +249,8 @@ describe('node:test failures (Node v26 output captured from real runs)', () => {
   it('accepts the resolved spelling of the worktree and a Windows file URL', () => {
     expect(classifyVerificationFailure(failed(NODE_TEST_DUPLICATE_DECLARATION_SPEC('/real/wt'), { worktreeRoots: ['/link/wt', '/real/wt'] })).kind)
       .toBe('implementation');
-    const windows = NODE_TEST_DUPLICATE_DECLARATION_SPEC('/C:/Users/someone/wt');
+    const windows = NODE_TEST_DUPLICATE_DECLARATION_SPEC('C:\\Users\\someone\\wt');
+    expect(windows).toContain('file:///C:/Users/someone/wt/src/strings.js:3');
     expect(classifyVerificationFailure(failed(windows, { worktreeRoots: ['C:\\Users\\someone\\wt'] })).kind).toBe('implementation');
   });
 
@@ -311,6 +312,13 @@ describe('node:test failures (Node v26 output captured from real runs)', () => {
       expect(summary).not.toContain('file://');
       // Re-bounding the stored summary (as the repair prompt does) keeps both lines.
       expect(summarizeVerificationOutput(summary)).toContain(`${location}\n${message}`);
+    }
+    // The same on a Windows worktree and under a directory whose name Node percent-encodes in the URL.
+    for (const otherRoot of ['C:\\repo\\worktrees\\task', 'C:\\Users\\some one\\wt', '/work/some one/wt']) {
+      const summary = summarizeVerificationOutput(NODE_TEST_DUPLICATE_DECLARATION_SPEC(otherRoot), undefined, { worktreeRoots: [otherRoot] });
+      expect(summary, otherRoot).toContain("src/strings.js:3\nSyntaxError: Identifier 'whisper' has already been declared");
+      expect(summary).not.toContain('file://');
+      expect(summary).not.toMatch(/some one|some%20one|repo|Users/);
     }
     // Without the worktree, the location is a machine path and is omitted like any other.
     const unrooted = summarizeVerificationOutput(NODE_TEST_DUPLICATE_DECLARATION_SPEC(root));
