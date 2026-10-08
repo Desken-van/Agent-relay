@@ -113,6 +113,46 @@ once (fixed in the loop, 12 turns) and once ended on a non-recoverable read.
 These are six runs per model on small tasks: enough to see the speed, not to
 rank the two on harder work.
 
+## Harder tasks, three models, hidden tests
+
+Five tasks through the same production loop, two runs each, each judged
+afterwards by hidden tests the model never saw (every hidden suite passes a
+reference solution first). Besides Strata and Ornith 9B, Qwen3-Coder-30B-A3B
+(`unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF` at `b17cb02`, UD-Q4_K_XL, 17.7 GB,
+sha256 checked) ran on the same llama-server build as Ornith, with
+`--n-cpu-moe 28` (the experts of 28 of its 48 layers in RAM) and otherwise the
+Ornith profile's flags — an ordinary llama.cpp profile, no code needed.
+
+| Task | Ornith 9B | Qwen3-Coder-30B-A3B | Strata Coder IQ1_M |
+| --- | --- | --- | --- |
+| `whisper`: edit a function and its test | 1/2 runs passed; hidden 3/3, 3/3 | 2/2; 3/3, 3/3 | 2/2; 3/3, 3/3 |
+| `clamp`: create a module and its test | 0/2 (read a file not yet created); hidden 4/4, 4/4 | 2/2; 4/4, 4/4 | 2/2; 4/4, 4/4 |
+| `bugfix`: 1-based pages, rounding, validation | 2/2; 8/8, 8/8 | 2/2; 8/8, 8/8 | 2/2; 8/8, 8/8 |
+| `priority`: store + API + HTML view | 0/2 (repeated a read; finish refused); hidden 6/8, 5/8 | 0/2 (repeated a read; verification budget spent); hidden 8/8, 8/8 | 0/2 (finish refused); hidden 8/8, 8/8 |
+| `csv`: RFC 4180 quoting | 0/2; hidden 0/1, 2/8 | 1/2; hidden 4/8, 7/8 | 2/2; 8/8, 8/8 |
+| **Runs the loop accepted** | 3/10 | 7/10 | 8/10 |
+| **Runs whose code passed every hidden test** | 6/10 | 8/10 | 10/10 |
+
+| Per run (median of the runs above) | Ornith 9B | Qwen3-Coder-30B-A3B | Strata Coder IQ1_M |
+| --- | --- | --- | --- |
+| One turn | ~1–7 s | ~7.4 s | ~25–50 s |
+| Writing the answer | ~52 tokens/s | ~40 tokens/s (45 with `--n-cpu-moe 22`) | 3–8 tokens/s |
+| `bugfix` | 28 s | 62–85 s | 161–182 s |
+| `priority` | 66–73 s | 505–719 s (many repeated turns) | 372–428 s |
+| `csv` | 30–58 s | 166–182 s | 194–205 s |
+| Start until ready | ~7 s | 13.5 s | 20–25 s |
+| GPU memory | 5.8 GB | 9.6 GB (11.4 at `--n-cpu-moe 22`) | 11.7 GB |
+| Lowest available RAM | ~16 GB | 11.9 GB | ~3 GB |
+
+All four "finish refused" endings (two Strata, one Ornith on `priority`) were
+the same Agent Relay rule: a finish summary that mentions a path starting with
+a slash (here the route `/todos`) is refused as an absolute machine path, even
+though the code was complete. It applies to every model alike.
+
+Ten runs per model on five small-to-medium tasks: enough to see a clear order
+(Strata's code was right every time, Qwen3-Coder-30B-A3B close behind,
+Ornith 9B least often), not enough to measure the size of the gaps.
+
 ## The real UI cycle
 
 Disposable profile and repository, everything through the application's UI:
@@ -135,9 +175,12 @@ profile and once with a Strata profile.
 ## Conclusion
 
 Strata works behind Agent Relay as an owned runtime, its contracts can be held,
-and on these small tasks its choices were cleaner than Ornith 9B's. On this
-machine it is 8–15 times slower per task, takes nearly all of the GPU, most of
-the RAM and a constant ~1 GB/s of SSD reads, and its output format rests on a
-prompt rather than a grammar. Ornith stays the default; Strata is an explicit
-alternative for a machine with more RAM (its docs put the Coder at 32 GB, the
-full model at 48–64 GB), where it would not run in the low-RAM mode.
+and its code was the most often right of the three models measured. On this
+machine it is 8–15 times slower per task than Ornith 9B, takes nearly all of
+the GPU, most of the RAM and a constant ~1 GB/s of SSD reads, and its output
+format rests on a prompt rather than a grammar. Qwen3-Coder-30B-A3B on the
+existing llama.cpp runtime was nearly as accurate at 2–3 times Strata's speed,
+with half the RAM pressure and a grammar-enforced output format. Ornith stays
+the default; Strata is an explicit alternative, best on a machine with more RAM
+(its docs put the Coder at 32 GB, the full model at 48–64 GB), where it would
+not run in the low-RAM mode.
