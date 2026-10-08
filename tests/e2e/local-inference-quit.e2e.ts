@@ -3,9 +3,10 @@
  *
  * Launches the real built application on a disposable profile, starts the repository-owned fake
  * runtime through the real Settings UI until it is Healthy, then ends the application — by an ordinary
- * quit, and (POSIX) by SIGTERM — and proves the runtime process this run started is gone afterwards.
- * Only that process is looked at, by the port it was given; nothing else is touched. An application
- * killed outright (SIGKILL, a crash) gets no chance to stop anything; that is documented in
+ * quit, and (POSIX) by SIGTERM — and proves the runtime this run started is gone afterwards: the fake
+ * runtime process and the helper it spawned, by the PIDs the fixture itself records (`runtime.evidence()`),
+ * on every platform. Only those processes are looked at and, on cleanup, only they are stopped. An
+ * application killed outright (SIGKILL, a crash) gets no chance to stop anything; that is documented in
  * docs/local-inference.md, not asserted here.
  */
 
@@ -13,7 +14,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
-import { execFileSync } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { _electron as electron, type ElectronApplication, type Locator, type Page } from 'playwright-core';
 import { FakeLocalInferenceRuntime, freePort } from '../helpers/fake-local-inference';
 
@@ -109,16 +110,6 @@ async function expect_(read: () => Promise<string | null>, predicate: (text: str
   }
 }
 
-/** The fake runtime processes this run started: the fixture, on this run's own port. */
-function runtimeProcesses(port: number): number[] {
-  if (process.platform === 'win32') return [];
-  return execFileSync('ps', ['-eo', 'pid=,args='], { encoding: 'utf8' })
-    .split('\n')
-    .filter((line) => line.includes('fake-local-inference-runtime') && line.includes(String(port)))
-    .map((line) => Number(line.trim().split(/\s+/)[0]))
-    .filter((pid) => Number.isInteger(pid) && pid > 0);
-}
-
 function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -128,13 +119,37 @@ function isAlive(pid: number): boolean {
   }
 }
 
-async function waitForExit(app: ElectronApplication, timeoutMs: number): Promise<boolean> {
-  const child = app.process();
-  if (child.exitCode !== null || child.signalCode !== null) return true;
-  return Promise.race([
-    new Promise<boolean>((done) => child.once('exit', () => done(true))),
-    new Promise<boolean>((done) => setTimeout(() => done(false), timeoutMs))
-  ]);
+/**
+ * Whether the application process has exited, within `timeoutMs`. It takes the ChildProcess saved at
+ * launch: once the application is quitting, Playwright may already have torn down its own connection, and
+ * `ElectronApplication.process()` then throws (as it did on Windows CI). An exit that already happened
+ * counts; the listener is attached in the same tick as that check, so an exit cannot slip between them;
+ * the timer and the listener are both removed whichever way it ends.
+ */
+function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  const exited = (): boolean => child.exitCode !== null || child.signalCode !== null;
+  if (exited()) return Promise.resolve(true);
+  return new Promise<boolean>((resolve) => {
+    const onExit = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      child.off('exit', onExit);
+      resolve(exited());
+    }, timeoutMs);
+    child.once('exit', onExit);
+  });
+}
+
+/** Bounded: whether every one of these processes has gone within `timeoutMs`. */
+async function allGone(pids: readonly number[], timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!pids.some(isAlive)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 100));
+  }
 }
 
 describe('quitting the application stops the local runtime it owns', () => {
@@ -142,27 +157,38 @@ describe('quitting the application stops the local runtime it owns', () => {
   for (const ending of endings) {
     it(`by ${ending === 'quit' ? 'an ordinary quit' : 'SIGTERM to the application'}`, async () => {
       const profile = mkdtempSync(join(tmpdir(), 'agent-relay-quit-e2e-'));
-      const runtime = new FakeLocalInferenceRuntime().scenario({ health: 'ok' });
+      // The runtime spawns a helper of its own, so what is checked is the runtime's whole tree, not one process.
+      const runtime = new FakeLocalInferenceRuntime().scenario({ health: 'ok', spawnDescendant: true });
       const port = await freePort();
-      let app: ElectronApplication | null = null;
-      let started: number[] = [];
+      let applicationProcess: ChildProcess | null = null;
+      let owned: number[] = [];
       try {
         const launched = await launch(profile, runtime.path);
-        app = launched.app;
+        // Saved now, while the connection is certainly alive: everything after the quit uses this object.
+        applicationProcess = launched.app.process();
         await startLocalInference(launched.page, FAKE_LOCAL_INFERENCE_RUNTIME_PATH, port);
-        started = runtimeProcesses(port);
-        if (process.platform !== 'win32') expect(started.length).toBeGreaterThan(0);
+        const evidence = runtime.evidence();
+        owned = [evidence.pid, evidence.descendantPid].filter((pid): pid is number => typeof pid === 'number' && pid > 0);
+        // Both exist before the quit: the runtime this test configured and the helper it spawned.
+        expect(owned).toHaveLength(2);
+        expect(owned.filter(isAlive)).toEqual(owned);
+        expect(evidence.argv).toContain(String(port));
 
-        if (ending === 'quit') void app.evaluate(({ app: electronApp }) => { electronApp.quit(); }).catch(() => undefined);
-        else app.process().kill('SIGTERM');
+        if (ending === 'quit') void launched.app.evaluate(({ app: electronApp }) => { electronApp.quit(); }).catch(() => undefined);
+        else applicationProcess.kill('SIGTERM');
 
         // Bounded: the profile's shutdown budget plus grace, never an open-ended wait.
-        expect(await waitForExit(app, 90_000)).toBe(true);
-        expect(started.filter(isAlive)).toEqual([]);
+        expect(await waitForExit(applicationProcess, 90_000)).toBe(true);
+        // The application stops its runtime BEFORE it exits; this only leaves room for the operating system
+        // to finish reaping what was already terminated.
+        expect(await allGone(owned, 5_000)).toBe(true);
+        expect(owned.filter(isAlive)).toEqual([]);
       } finally {
-        for (const pid of started.filter(isAlive)) process.kill(pid, 'SIGKILL');
-        if (app !== null && !(await waitForExit(app, 1))) app.process().kill('SIGKILL');
+        // Only this test's own processes, and only those still running.
+        for (const pid of owned.filter(isAlive)) process.kill(pid, 'SIGKILL');
+        if (applicationProcess !== null && !(await waitForExit(applicationProcess, 1))) applicationProcess.kill('SIGKILL');
         rmSync(profile, { recursive: true, force: true });
+        await runtime.cleanup();
       }
     }, 180_000);
   }
