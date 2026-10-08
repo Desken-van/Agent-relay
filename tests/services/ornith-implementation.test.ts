@@ -477,7 +477,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
       ...baseRequest(leaseService, new AbortController().signal),
       specification: {
         ...specification,
-        implementationPrompt: `Implement the approved scope. ${'x'.repeat(20_623)}`
+        implementationPrompt: `Implement the approved scope. ${'x'.repeat(20_172)}`
       }
     });
 
@@ -1726,6 +1726,82 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(result.assessment.publishBlock).toBe('configuration');
       expect(result.assessment.reasonCodes).toContain('blocked');
       expect(result.ornithAudit.changedFiles).toBe(0);
+    });
+  });
+
+  describe('what the model is told after it changes a file (the duplicated-insertion failure)', () => {
+    // Live 9B trace this guards: read src/strings.js → replace_text (insert whisper) → the next stateless
+    // prompt still showed the ORIGINAL content from the first read and only "sha256, bytesWritten" for the
+    // edit, so the model applied the same insertion again with the new hash. Here the model is scripted;
+    // what is asserted is exactly what each prompt showed it.
+    const promptOf = (request: LocalInferenceRequest): string => request.messages.map((message) => message.content).join('\n');
+    const shaIn = (prompt: string, path: string): string =>
+      [...prompt.matchAll(new RegExp(`"path":"${path}"[^\\n]*?"sha256":"([0-9a-f]{64})"|"sha256":"([0-9a-f]{64})"[^\\n]*?"path":"${path}"`, 'g'))]
+        .map((match) => match[1] ?? match[2]).at(-1)!;
+
+    it('retires the edited file\'s earlier content, names the applied replacement, and lets a fresh read drive the next edit', async () => {
+      writeFileSync(join(worktree, 'other.txt'), 'other content\n', 'utf8');
+      const longText = `fixture\nexport function whisper() {}\n${'/* padding */'.repeat(100)}`;
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          const prompt = promptOf(request);
+          const reply = [
+            () => ({ version: 1, action: 'read_file', path: 'fixture.txt', offset: 0, limit: 65_536 }),
+            () => ({ version: 1, action: 'read_file', path: 'other.txt', offset: 0, limit: 65_536 }),
+            () => ({ version: 1, action: 'replace_text', path: 'fixture.txt', sha256: shaIn(prompt, 'fixture.txt'), replacements: [{ oldText: 'fixture\n', newText: longText }] }),
+            () => ({ version: 1, action: 'read_file', path: 'fixture.txt', offset: 0, limit: 65_536 }),
+            () => ({ version: 1, action: 'replace_text', path: 'fixture.txt', sha256: shaIn(prompt, 'fixture.txt'), replacements: [{ oldText: 'export function whisper() {}', newText: 'export function whisper(text) { return text; }' }] }),
+            () => ({ version: 1, action: 'finish', summary: 'Added whisper once.' })
+          ][requests.length - 1]!();
+          return completed(request, JSON.stringify(reply));
+        }
+      };
+
+      const result = await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
+
+      expect(result.assessment.disposition, result.finalMessage).toBe('pass');
+      const afterFirstEdit = promptOf(requests[3]!);
+      // The first read of fixture.txt no longer shows its old content; it says it is out of date and why.
+      expect(afterFirstEdit).not.toContain('"content":"fixture\\n"');
+      expect(afterFirstEdit).toContain('turn 1 [read_file]: {"path":"fixture.txt","outOfDate":true');
+      expect(afterFirstEdit).toContain('fixture.txt was changed at turn 3 by replace_text');
+      // The other file's read is untouched.
+      expect(afterFirstEdit).toContain('"content":"other content\\n"');
+      // The edit's result names what it applied (bounded), beside the hash it always carried.
+      expect(afterFirstEdit).toMatch(/turn 3 \[replace_text\]: \{"path":"fixture.txt","sha256":"[0-9a-f]{64}","bytesWritten":\d+,"lineEnding":"lf","applied":\[\{"oldText":"fixture\\n","newText":"fixture\\nexport function whisper\(\) \{\}/);
+      expect(afterFirstEdit).toMatch(/…\[\d+ more characters\]/);
+      expect(afterFirstEdit).toContain('These replacements are now in the file. Do not send them again');
+      expect(afterFirstEdit).not.toContain(longText);
+      // The fresh read after the edit is shown in full, and the second edit worked from it.
+      const afterReread = promptOf(requests[4]!);
+      expect(afterReread).toContain('turn 4 [read_file]: {"path":"fixture.txt","offset":0');
+      expect(afterReread).toContain('export function whisper() {}');
+      const final = readFileSync(join(worktree, 'fixture.txt'), 'utf8');
+      expect(final.match(/export function whisper/g)).toHaveLength(1);
+      expect(final).toContain('export function whisper(text) { return text; }');
+      // And once the file changes again, the read it was computed from is retired too.
+      expect(promptOf(requests[5]!)).toContain('fixture.txt was changed at turn 5 by replace_text');
+    });
+
+    it('states the rule in the protocol: an edit\'s replacements are not sent again, and a changed file is read again first', async () => {
+      const requests: LocalInferenceRequest[] = [];
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) => {
+          requests.push(request);
+          return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'done' }));
+        }
+      };
+      await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
+      const prompt = promptOf(requests[0]!);
+      expect(prompt).toContain('Its result lists the replacements it "applied": they are in the file now');
+      expect(prompt).toContain('read_file it first and take oldText from that fresh content');
+      expect(prompt).toContain('Reading a file again\n  after you changed it is not a repeat');
     });
   });
 

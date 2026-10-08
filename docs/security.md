@@ -614,6 +614,12 @@ terminal failure for that attempt.
   is applied — performs no write at all. Writes are staged to a sibling
   temporary file in the same directory and renamed into place, so a writer
   never observes a partially-written file.
+- Each Ornith request is stateless; the model sees only bounded tool results.
+  After a file changes, the content earlier `read_file` results showed for it
+  is replaced by an "out of date, read it again" notice, and a `replace_text`
+  result repeats the replacements it applied (each text bounded). This is
+  feedback, not a guard: matching stays exact and unique, nothing is matched
+  loosely and nothing is undone.
 - Every one of those checks is pathname-based, and so already stale by the
   time a write happens. The write itself is therefore performed by a small
   native helper (`src/main/adapters/process/fs-guard.ts`): on Windows

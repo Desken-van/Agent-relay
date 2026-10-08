@@ -147,6 +147,57 @@ interface RollingResult {
   readonly action: OrnithActionKind;
   /** Bounded JSON text: either the tool's `forModel`, or a denial description. */
   readonly resultText: string;
+  /** The file a successful read_file showed the content of, so a later edit of it can retire that content. */
+  readonly readPath?: string;
+}
+
+/** How much of each applied oldText/newText a replace_text result repeats back to the model. */
+const APPLIED_REPLACEMENT_ECHO_CHARS = 600;
+
+/**
+ * Every request is stateless: the model never sees its own earlier replies, only these results. A
+ * replace_text result that said only "new sha256, N bytes" left it with no record of what it had just
+ * changed, beside an earlier read_file that still showed the file as it was — and the real 9B model then
+ * applied the same insertion again with the new hash (a duplicated function), or repeated a fix it had
+ * already made. So the result names the replacements that are now in the file, bounded; when even that
+ * does not fit the result budget, the plain result is kept, so its sha256 is never lost.
+ */
+function replaceResultForModel(
+  action: Extract<OrnithAction, { action: 'replace_text' }>,
+  forModel: unknown,
+  maxToolResultBytes: number
+): unknown {
+  if (forModel === null || typeof forModel !== 'object') return forModel;
+  const echo = (text: string): string => text.length <= APPLIED_REPLACEMENT_ECHO_CHARS
+    ? text
+    : `${text.slice(0, APPLIED_REPLACEMENT_ECHO_CHARS)}…[${text.length - APPLIED_REPLACEMENT_ECHO_CHARS} more characters]`;
+  const withApplied = {
+    ...forModel,
+    applied: action.replacements.map((replacement) => ({ oldText: echo(replacement.oldText), newText: echo(replacement.newText) })),
+    note: 'These replacements are now in the file. Do not send them again; read_file the file if you need its current content.'
+  };
+  return Buffer.byteLength(JSON.stringify(withApplied), 'utf8') <= maxToolResultBytes ? withApplied : forModel;
+}
+
+/**
+ * After a file changes, the content an earlier read_file showed for it is no longer the file. Left in the
+ * history it reads as current — and an edit computed from it re-applies what was already done — so it is
+ * replaced by a short notice that it is out of date. Only that file's earlier reads are touched.
+ */
+function retireStaleReads(rolling: RollingResult[], path: string, turn: number, action: OrnithActionKind): void {
+  rolling.forEach((entry, index) => {
+    if (entry.readPath !== path) return;
+    rolling[index] = {
+      turn: entry.turn,
+      action: entry.action,
+      resultText: JSON.stringify({
+        path,
+        outOfDate: true,
+        reason: `${path} was changed at turn ${turn} by ${action}, so the content this read returned is no longer the file ` +
+          'and was removed. read_file it again before you rely on its content or edit it again.'
+      })
+    };
+  });
 }
 
 const BOUND_TASK_WORKTREE_MARKER = '[bound task worktree]';
@@ -292,7 +343,11 @@ Rules:
 - All paths are repository-relative, use forward slashes, and must stay inside the worktree.
 - "replace_text" requires the file's CURRENT sha256 (given in the last read_file/create_file/
   replace_text result for that file) and fails with no write if oldText does not occur
-  exactly once.
+  exactly once. Its result lists the replacements it "applied": they are in the file now, so
+  never send them again.
+- After you create, replace text in, or delete a file, the content earlier read_file results
+  showed for it is out of date and is removed from PRIOR TOOL RESULTS. To edit that file again,
+  read_file it first and take oldText from that fresh content.
 - You have no git commit, push, merge, checkout, reset, or remote access of any kind —
   do not ask for one, it does not exist.
 - Call "run_verification" only when you believe the work is complete; Agent Relay itself
@@ -302,7 +357,8 @@ Rules:
   — do not repeat the identical request. ("list_files" truncation works differently: see the
   "nextCursor" rule below, not this one.)
 - Never repeat an identical list_files, read_file, search_text, git_status, or git_diff action after it succeeds.
-  Use the returned files, cursor, or status to choose a different next action.
+  Use the returned files, cursor, or status to choose a different next action. Reading a file again
+  after you changed it is not a repeat: its earlier content is out of date.
 - A "list_files" result lists only the PATHS of tracked and untracked (not ignored) files at or
   under the prefix: no directories, types, sizes or symlink details. A listed path can still be
   refused by "read_file" (a symlink, or not UTF-8 text).
@@ -1645,8 +1701,12 @@ export class OrnithImplementationService {
         }
       });
 
-      const resultText = resultTextFor(action.action, toolResult.forModel, promptBudget.maxToolResultBytes);
-      rolling.push({ turn: turnsUsed, action: action.action, resultText });
+      const forModel = action.action === 'replace_text'
+        ? replaceResultForModel(action, toolResult.forModel, promptBudget.maxToolResultBytes)
+        : toolResult.forModel;
+      const resultText = resultTextFor(action.action, forModel, promptBudget.maxToolResultBytes);
+      if (toolResult.changedPath) retireStaleReads(rolling, toolResult.changedPath, turnsUsed, action.action);
+      rolling.push({ turn: turnsUsed, action: action.action, resultText, ...(action.action === 'read_file' ? { readPath: action.path } : {}) });
 
       // Deterministic, once per run: the moment discovery is nearly spent the model is told,
       // in Relay's own words rather than the prompt's standing text, that edits of files it
