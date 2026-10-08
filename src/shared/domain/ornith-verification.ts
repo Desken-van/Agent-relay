@@ -233,19 +233,36 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** A `file:` URL as it appears in output; the same stop characters the machine-path redaction uses. */
+const FILE_URL = /\bfile:\/\/[^\s)\]}"'>,;]*/g;
+
 /**
  * A path inside the worktree the command ran in becomes relative to it (`src/strings.js:3`), so the summary
- * still says which project file failed after every other machine path is redacted. Both the plain and the
- * `file://` spelling Node uses, with either separator.
+ * still says which project file failed after every other machine path is redacted. Plain paths with either
+ * separator, and `file:` URLs — those DECODED and compared as the path they name: Node percent-encodes
+ * what a directory name may contain (a space, "#", "?", "%"), and re-encoding the root to match would have
+ * to reproduce its exact rules.
  */
 function relativizeWorktreePaths(text: string, roots: readonly string[]): string {
-  let result = text;
-  for (const root of roots) {
-    const slashed = root.replace(/\\/g, '/').replace(/\/+$/, '');
-    if (slashed.length < 2) continue;
-    const url = `file://${/^[A-Za-z]:\//.test(slashed) ? '/' : ''}`;
-    const spellings = new Set([`${url}${encodeURI(slashed)}/`, `${url}${slashed}/`, `${slashed}/`, `${slashed.replace(/\//g, '\\')}\\`]);
-    for (const spelling of spellings) {
+  const slashedRoots = roots.map((root) => root.replace(/\\/g, '/').replace(/\/+$/, '')).filter((root) => root.length >= 2);
+  if (slashedRoots.length === 0) return text;
+  let result = text.replace(FILE_URL, (url) => {
+    let path: string;
+    try {
+      path = decodeURIComponent(url.slice('file://'.length));
+    } catch {
+      return url;
+    }
+    if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+    for (const root of slashedRoots) {
+      const prefix = `${root}/`;
+      const inside = /^[A-Za-z]:/.test(root) ? path.toLowerCase().startsWith(prefix.toLowerCase()) : path.startsWith(prefix);
+      if (inside) return path.slice(prefix.length);
+    }
+    return url;
+  });
+  for (const slashed of slashedRoots) {
+    for (const spelling of new Set([`${slashed}/`, `${slashed.replace(/\//g, '\\')}\\`])) {
       result = result.replace(new RegExp(escapeRegExp(spelling), /^[A-Za-z]:/.test(slashed) ? 'gi' : 'g'), '');
     }
   }

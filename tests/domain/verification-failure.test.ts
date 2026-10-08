@@ -320,6 +320,20 @@ describe('node:test failures (Node v26 output captured from real runs)', () => {
       expect(summary).not.toContain('file://');
       expect(summary).not.toMatch(/some one|some%20one|repo|Users/);
     }
+    // Node percent-encodes "#", "?" and "%" in a module URL, which encodeURI does not reproduce: the URL is
+    // decoded and compared as the path it names (real `node --test` output under such a directory checked too).
+    for (const specialRoot of ['/work/hash#dir/wt', '/work/q?dir/wt', '/work/pct%41dir/wt', 'C:\\Users\\a#b c\\wt']) {
+      const output = NODE_TEST_DUPLICATE_DECLARATION_SPEC(specialRoot);
+      expect(output).toMatch(/%23|%3F|%25/);
+      expect(classifyVerificationFailure(failed(output, { worktreeRoots: [specialRoot] })).kind, specialRoot).toBe('implementation');
+      const summary = summarizeVerificationOutput(output, undefined, { worktreeRoots: [specialRoot] });
+      expect(summary, specialRoot).toContain("src/strings.js:3\nSyntaxError: Identifier 'whisper' has already been declared");
+      expect(summary).not.toMatch(/file:|hash|q\?dir|pct|Users|%2[35]|%3F/);
+    }
+    // A URL outside the worktree, however it is encoded, is still omitted, never shortened.
+    const outside = summarizeVerificationOutput(NODE_TEST_DUPLICATE_DECLARATION_SPEC('/work/hash#dir/other'), undefined, { worktreeRoots: ['/work/hash#dir/wt'] });
+    expect(outside).not.toContain('src/strings.js:3');
+    expect(outside).not.toMatch(/file:|hash/);
     // Without the worktree, the location is a machine path and is omitted like any other.
     const unrooted = summarizeVerificationOutput(NODE_TEST_DUPLICATE_DECLARATION_SPEC(root));
     expect(unrooted).not.toContain(root);
