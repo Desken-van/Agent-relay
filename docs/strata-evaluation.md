@@ -80,7 +80,7 @@ Ornith-sized prompts (3.6–4.3 thousand tokens, the production loop's own):
 | One agent turn | 22–57 s | 0.7–7 s |
 | Start until ready | 20–25 s | ~7 s |
 | Stop | 3–8 s | < 1 s |
-| Prompt cache between turns | not reused (`cache_n: 0` on every turn) | — |
+| Prompt cache between turns | not reused (`cache_n: 0` on every turn); see [below](#with-free-ram-and-the-prompt-cache) | — |
 
 A short cold prompt (~850 tokens) read at 36–57 tokens/s.
 
@@ -93,7 +93,9 @@ A short cold prompt (~850 tokens) read at 36–57 tokens/s.
 | Reads from the SSD | ~1 GB/s while answering (295 GB in 291 s) | the model load only |
 
 The SSD reads are the low-RAM mode re-reading experts from the packed file. On
-this machine, using it pushes most other programs into (zram) swap.
+this machine, using it pushes most other programs into (zram) swap. These
+figures were taken with other desktop programs holding ~21 GB of RAM; with
+that RAM free, Strata is several times faster (next sections).
 
 ## The same small tasks, same loop
 
@@ -153,6 +155,51 @@ Ten runs per model on five small-to-medium tasks: enough to see a clear order
 (Strata's code was right every time, Qwen3-Coder-30B-A3B close behind,
 Ornith 9B least often), not enough to measure the size of the gaps.
 
+## With free RAM and the prompt cache
+
+The same five tasks, two runs each, measured again on 2026-10-09 in three
+conditions: as above (other programs holding ~21 GB of RAM), with those
+programs closed, and with them closed **and** Strata's prompt cache used.
+
+The cache: every Ornith turn is a fresh prompt that starts with the same
+specification, rule evidence and protocol, and Strata keeps no cache point
+inside the one user message a turn sends, so it read the whole prompt again on
+every turn. The adapter now marks where that repeated part ends
+(`strata_prefix`, see [local-inference.md](local-inference.md#a-strata-runtime));
+Strata pins a cache point there and later turns read only what follows. On
+these tasks the repeated part was 2,768 of a turn's ~2,900–3,600 tokens.
+(Strata's `strata_checkpoint: false` is not sent with it: the engine then
+ignores the pin, measured.)
+
+| | RAM held by other programs | RAM free | RAM free + prompt cache |
+| --- | --- | --- | --- |
+| One turn (median) | 25.2 s | 10.2 s | 9.0 s |
+| Prompt tokens read per turn (median) | 3,050, in 14.8 s | 3,586, in 8.5 s | 818, in 6.0 s |
+| Turns that reused a cached prefix | 0 of 20 measured | 0 of 71 | 66 of 71 (the misses: each task's first turn) |
+| Writing the answer (median) | 12 tokens/s | 33 tokens/s | 34 tokens/s |
+| `whisper` | 131–132 s | 66–67 s | 41–52 s |
+| `clamp` | 87–94 s | 45–54 s | 23–31 s |
+| `bugfix` | 161–182 s | 75 s | 59–61 s |
+| `priority` | 372–428 s | 160–162 s | 143–147 s |
+| `csv` | 194–205 s | 94–95 s | 72–81 s |
+| All five tasks, both runs | ~33 min | ~15 min | ~12 min |
+| Reads from the SSD | ~1 GB/s while answering | median 21 MB/s | median 1 MB/s |
+| Highest swap in use | 21–23 GB | 9.2 GB | 8.8 GB |
+| Lowest available RAM | ~3 GB | 2.8 GB | 2.3 GB |
+| Runs the loop accepted | 8/10 | 8/10 | 8/10 |
+| Runs whose code passed every hidden test | 10/10 | 10/10 | 10/10 |
+| Replies that were not one action | 0 | 0 | 0 |
+
+The answers did not change with speed: the same 10/10 hidden-test result, the
+same turn counts within one or two, no malformed reply. The two refused runs in
+each column are `priority` again, refused for `/todos` in the finish summary
+(above). Strata takes whatever RAM is free for its expert cache (up to 23.8 GB
+of its own here), so "lowest available RAM" stays low; what changed is that it
+no longer pushes the rest of the machine into swap or reads the SSD
+constantly. Measured against the first table, Strata on a machine with its RAM
+free is now 2–3 times slower per task than Ornith 9B, not 8–15 times, and
+faster than Qwen3-Coder-30B-A3B on `priority` and `csv`.
+
 ## The real UI cycle
 
 Disposable profile and repository, everything through the application's UI:
@@ -175,12 +222,14 @@ profile and once with a Strata profile.
 ## Conclusion
 
 Strata works behind Agent Relay as an owned runtime, its contracts can be held,
-and its code was the most often right of the three models measured. On this
-machine it is 8–15 times slower per task than Ornith 9B, takes nearly all of
-the GPU, most of the RAM and a constant ~1 GB/s of SSD reads, and its output
-format rests on a prompt rather than a grammar. Qwen3-Coder-30B-A3B on the
-existing llama.cpp runtime was nearly as accurate at 2–3 times Strata's speed,
-with half the RAM pressure and a grammar-enforced output format. Ornith stays
-the default; Strata is an explicit alternative, best on a machine with more RAM
-(its docs put the Coder at 32 GB, the full model at 48–64 GB), where it would
-not run in the low-RAM mode.
+and its code was the most often right of the three models measured (10/10 runs
+passed every hidden test, in each of the three conditions measured). Its speed
+depends mostly on free RAM: with other programs holding most of it, a task took
+8–15 times as long as with Ornith 9B; with that RAM free and the prompt cache
+used, 2–3 times. It still takes nearly all of the GPU and whatever RAM is free,
+and its output format rests on a prompt rather than a grammar (no reply broke
+it in the 215 turns of those three series). Qwen3-Coder-30B-A3B on the existing llama.cpp
+runtime remains the lighter alternative with a grammar-enforced format, slightly
+less often right. Ornith stays the default; Strata is an explicit alternative
+for when correctness matters more than time, run with the RAM-heavy programs
+closed.
