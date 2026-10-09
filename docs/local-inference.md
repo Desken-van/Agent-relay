@@ -139,7 +139,10 @@ Before anything is launched, the model config is read (bounded) and refused
 when it names another model, has less context than the profile, has no
 absolute engine path, or would turn the server into something Agent Relay does
 not run: MCP tools (`mcp_servers`, `mcpServers`, `mcp`), an `api_key`, a
-`host` other than 127.0.0.1, lazy loading or idle unloading. Its engine's
+`host` other than 127.0.0.1, lazy loading, idle unloading, or a `before_load`
+command (a string or a list: Strata's server runs it — a string through a
+shell — every time it loads the engine again, also after the engine died, so
+it would run a command outside Agent Relay's tools). Its engine's
 `--version` is the runtime version. A Strata server answers `/health` with
 `"status": "ok"` while its model is still loading, so a Strata runtime is
 Healthy only when `/health` also says `loaded: true`, reports this profile's

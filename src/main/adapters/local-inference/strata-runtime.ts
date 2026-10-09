@@ -11,8 +11,10 @@
  *    configured model name and at least the configured context. Lazy loading and idle unloading are refused
  *    outright: Agent Relay owns when the runtime runs.
  *  * Its model config can make it an agent host (`mcp_servers` / `mcpServers` / `mcp`: MCP tools offered to
- *    requests) or a network server (`host`, `api_key`). Agent Relay sends no tools and does every file change
- *    itself; such a config is refused, never adapted.
+ *    requests), a network server (`host`, `api_key`) or a command runner (`before_load`: a command its server
+ *    runs, through a shell when it is a string, every time it loads the engine again — after an idle unload
+ *    and after the engine died). Agent Relay sends no tools, does every file change itself and runs no
+ *    command outside its own tools; such a config is refused, never adapted.
  *  * Its `json_schema` response format is a prompt plus a check after generation that extracts the first
  *    JSON object from the text — prose, a fence or a second object are dropped silently. Agent Relay's own
  *    parser requires the whole completion to be exactly one action, so the adapter does not ask Strata for a
@@ -78,7 +80,8 @@ const REFUSED_CONFIG_KEYS: readonly { readonly key: string; readonly reason: str
   { key: 'mcp', reason: 'it offers MCP tools to the model' },
   { key: 'api_key', reason: 'it requires an API key' },
   { key: 'lazy_load', reason: 'it loads the model lazily' },
-  { key: 'idle_unload_s', reason: 'it unloads the model when idle' }
+  { key: 'idle_unload_s', reason: 'it unloads the model when idle' },
+  { key: 'before_load', reason: 'it runs a command before the model loads' }
 ];
 
 /** What the adapter uses from a Strata model config, after it was checked. */

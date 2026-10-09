@@ -7,7 +7,8 @@
  * before it counts as ready, and what the request carries.
  */
 
-import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -39,6 +40,13 @@ const ENGINE_VERSION = 'strata 0.1.41 (fake)';
 
 class ObservingRunner extends ExecaProcessRunner implements LocalInferenceProcessRunner {
   readonly starts: { file: string; args: readonly string[] }[] = [];
+  /** One-shot runs: the `--version` probe. */
+  readonly runs: { file: string; args: readonly string[] }[] = [];
+
+  override run(...call: Parameters<ExecaProcessRunner['run']>): ReturnType<ExecaProcessRunner['run']> {
+    this.runs.push({ file: call[0], args: [...call[1]] });
+    return super.run(...call);
+  }
 
   override launch(file: string, args: readonly string[], options?: ManagedProcessOptions): ManagedProcess {
     this.starts.push({ file, args: [...args] });
@@ -190,6 +198,38 @@ describe('a Strata runtime: its model config is checked before anything is launc
     // Never launched, never contacted.
     expect(built.runner.starts).toHaveLength(0);
     expect(built.runtime.ran()).toBe(false);
+  });
+
+  it.each([
+    ['a shell command string', 'echo audit-marker'],
+    ['a command and arguments', ['echo', 'audit-marker']]
+  ])('refuses a before_load hook given as %s, before any version probe or launch', async (_label, beforeLoad) => {
+    // Strata's server runs it before every engine load — after an idle unload, and after the engine died —
+    // a string through a shell. That is a command outside Agent Relay's tools, so the config is refused.
+    const built = await harness({ healthBodies: [ready()] }, { before_load: beforeLoad });
+    const capabilities = await built.provider.capabilities();
+    expect(capabilities.available).toBe(false);
+    const state = await built.provider.start();
+    expect(state.kind).toBe('failed');
+    const reason = 'reason' in state ? state.reason : '';
+    expect(reason).toContain('runs a command before the model loads ("before_load")');
+    for (const told of [reason, capabilities.unavailableReason ?? '']) {
+      expect(told).not.toContain('audit-marker');
+      expect(told).not.toContain('echo');
+      expect(told).not.toContain(built.runtime.path);
+    }
+    expect(built.runner.runs).toHaveLength(0);
+    expect(built.runner.starts).toHaveLength(0);
+    expect(built.runtime.ran()).toBe(false);
+  });
+
+  it('still starts an ordinary config: the engine probed once, the server launched', async () => {
+    const built = await harness({ healthBodies: [ready()] });
+    expect((await built.provider.start()).kind).toBe('healthy');
+    expect(built.runner.runs).toHaveLength(1);
+    expect(built.runner.runs[0]!.args.at(-1)).toBe('--version');
+    expect([built.runner.runs[0]!.file, ...built.runner.runs[0]!.args]).toContain(built.checkout.engine);
+    expect(built.runner.starts).toHaveLength(1);
   });
 
   it('never names a path or a value from the file in a refusal', async () => {
@@ -352,6 +392,28 @@ describe('the Strata pieces on their own', () => {
 
   it('refuses a missing or oversized model config', () => {
     expect(readStrataEngineConfig(config())).toMatchObject({ ok: false, reason: expect.stringContaining('not present') });
+  });
+
+  it('refuses any before_load that Strata would run, and only that', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'strata-config-'));
+    try {
+      const engineConfig = join(dir, 'strata-x.json');
+      const read = (extra: Record<string, unknown>) => {
+        writeFileSync(engineConfig, JSON.stringify({ exe: '/usr/bin/true', model_name: MODEL, args: ['--max-context', '32768'], ...extra }));
+        return readStrataEngineConfig(config({ strata: { serverScript: '/opt/strata/serve/server.py', engineConfig } }));
+      };
+      expect(read({})).toMatchObject({ ok: true });
+      for (const beforeLoad of ['echo audit-marker', ' ', ['echo', 'audit-marker'], [''], { cmd: 'x' }, 1, true]) {
+        const verdict = read({ before_load: beforeLoad });
+        expect(verdict).toEqual({ ok: false, reason: 'The Strata model config is refused: it runs a command before the model loads ("before_load").' });
+      }
+      // Strata reads it as `cfg.get("before_load") or None`: an empty value runs nothing.
+      for (const beforeLoad of [null, '', [], false, 0]) {
+        expect(read({ before_load: beforeLoad })).toMatchObject({ ok: true });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('keeps the profile shape rules: an interpreter by explicit path, a model name, no fixed arguments, Strata paths only for Strata', () => {
