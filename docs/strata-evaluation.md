@@ -54,13 +54,24 @@ engine and Agent Relay's exact `ORNITH_ACTION_JSON_SCHEMA`.
 | A valid Ornith action | 200, `finish_reason: stop` |
 | Reasoning | returned separately in `reasoning_content`, never in `content` |
 | Truncated output (`max_tokens` too small) | with a response format: 502 `structured_output_failed`; without: 200 with `finish_reason: length` |
-| Prompt beyond the context | 400 `invalid_request_error`, nothing truncated |
+| Prompt beyond the context | 400 `invalid_request_error`, nothing truncated (a config without `fit_max_tokens`, as Strata's setup writes it; see below) |
 | Not JSON | with a response format: 502 `structured_output_failed` |
 | Breaks the schema (`limit: 999`, unknown action, extra or missing field, wrong version, duplicate key) | 502 `structured_output_failed` **only with `jsonschema` installed**; without it, a schema-breaking object is returned as 200 |
 | Prose or a code fence around the JSON, two objects in one reply | with a response format: 200 with only the first object — the rest is dropped silently |
 | Cancellation (client closes the connection) | generation stops at once (`cancel=True` in its log); idle within ~1 s; the next request is served |
 | Client timeout | same as cancellation |
 | Stop (SIGTERM to the server) | server and engine gone in 3–8 s; GPU memory back to its idle 1 MiB |
+
+That 400 holds for the config measured, which has no `fit_max_tokens`. A config
+with `"fit_max_tokens": true` (accepted by Agent Relay: it runs nothing and
+touches no file) answers differently, read from Strata's code at the pinned
+revision (`serve/server.py`, not measured live): a prompt that leaves no room
+to answer is still a 400, but a prompt that fits while prompt plus
+`max_tokens` does not is answered with the output cap lowered to the room
+left, as a 200. The prompt is never truncated either way. Agent Relay then
+gets a shorter answer: one that stops with `finish_reason: length` before a
+complete action is refused as `limit_output_exceeded`, never run, and its
+message names the output limit although the cause was the context.
 
 Because a response format would hand Agent Relay's strict one-action parser a
 cleaned-up completion, the adapter sends none. Without one, the Coder model
