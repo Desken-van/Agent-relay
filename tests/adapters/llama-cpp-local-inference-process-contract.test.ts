@@ -17,7 +17,7 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   LlamaCppLocalInference,
   LocalInferenceProcessRunner
@@ -927,6 +927,24 @@ describe('local inference process contract: the configured address is not negoti
     expect(state.kind).not.toBe('healthy');
     expect(second.seen).toHaveLength(0);
     await provider.stop();
+  });
+
+  it('does not speak to the runtime through the global fetch, whose 300-second headers timeout cut long inferences short', async () => {
+    const first = await loopback((req, res) => {
+      if (req.url === '/health') return ok(res, { status: 'ok' });
+      return ok(res, COMPLETION);
+    });
+    servers.push(first);
+    const globalFetch = vi.spyOn(globalThis, 'fetch');
+    try {
+      const provider = providerOn(first.port, new AliveRunner());
+      expect((await provider.start()).kind).toBe('healthy');
+      expect((await provider.infer(request())).kind).toBe('completed');
+      expect(globalFetch).not.toHaveBeenCalled();
+      await provider.stop();
+    } finally {
+      globalFetch.mockRestore();
+    }
   });
 
   it('leaves an ordinary loopback runtime working exactly as before', async () => {

@@ -395,6 +395,14 @@ received the POST, since it had to in order to answer 3xx, so the outcome
 carries `dispatchOutcome: "unknown"` like every other post-dispatch ambiguity
 and the request is never repeated anywhere.
 
+Both requests go through Agent Relay's own loopback HTTP client
+(`loopback-fetch.ts`), not the global `fetch`: that client stops waiting for
+response headers after 300 seconds whatever the caller allows, and a
+non-streaming completion sends its headers only when generation ends, so every
+inference longer than five minutes used to fail as "did not complete" (seen
+with Strata on a machine short of RAM). The loopback client has no timeout of
+its own; the budgets below are the only ones.
+
 Startup, each health request, inference, and shutdown have independent finite
 budgets. During startup, each health probe uses the smaller of its own health
 budget and the remaining overall startup budget. Cancellation uses
