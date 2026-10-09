@@ -620,6 +620,19 @@ terminal failure for that attempt.
   result repeats the replacements it applied (each text bounded). This is
   feedback, not a guard: matching stays exact and unique, nothing is matched
   loosely and nothing is undone.
+- A `finish` summary is stored, shown and handed to the reviewer, so one that
+  names an absolute machine path ends the round as `disallowed_action` and is
+  not kept; credentials and control characters are refused by the action
+  schema before that. An API route is not a machine path: a slash-led token is
+  read as one only when its first segment is a well-known filesystem root
+  (`/home`, `/etc`, `/usr`, `/tmp`, `/Users`, `/Volumes`, …) or an entry this
+  machine's root actually holds, or is empty, `.`/`..` or carries a backslash;
+  `/todos` or `/api/v1/todos/{id}` passes. A drive path, a UNC path and a
+  `file:` URL always count; any other URL's scheme is not taken for a drive.
+  A route spelled like an entry at this machine's root cannot be told from
+  that entry and is refused, and if the root cannot be listed every slash-led
+  token counts as a path. The approved inputs and a runtime's failure text
+  keep the stricter check that counts every slash-led token.
 - Every one of those checks is pathname-based, and so already stale by the
   time a write happens. The write itself is therefore performed by a small
   native helper (`src/main/adapters/process/fs-guard.ts`): on Windows

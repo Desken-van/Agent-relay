@@ -1039,6 +1039,74 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(result.finalMessage).not.toContain('must never be persisted');
   });
 
+  it('accepts a `finish` summary that names API routes, and keeps it word for word', async () => {
+    const cases = [
+      'Added a priority to every todo: POST /todos validates it and GET /todos?sort=priority orders by it.',
+      'GET /api/v1/todos/{id} now returns the priority; the HTML view renders it as data-priority.',
+      'Routes changed: /todos, /todos/:id and /health. Tests cover all three.'
+    ];
+
+    for (const summary of cases) {
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) =>
+          completed(request, JSON.stringify({ version: 1, action: 'finish', summary }))
+      };
+
+      const result = await new OrnithImplementationService().implement(
+        baseRequest(leaseService, new AbortController().signal)
+      );
+
+      expect(result.assessment.disposition).toBe('pass');
+      expect(result.assessment.reasonCodes).toEqual([]);
+      expect(result.finalMessage).toBe(summary);
+    }
+  });
+
+  it('refuses a route that is also an entry at this machine\'s root, and every route when the root cannot be listed', async () => {
+    const summary = 'POST /todos validates the priority.';
+    for (const machineRootNames of [() => new Set(['todos']), () => null]) {
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) =>
+          completed(request, JSON.stringify({ version: 1, action: 'finish', summary }))
+      };
+
+      const result = await new OrnithImplementationService({ machineRootNames }).implement(
+        baseRequest(leaseService, new AbortController().signal)
+      );
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.reasonCodes).toContain('disallowed_action');
+      expect(result.finalMessage).not.toContain(summary);
+    }
+  });
+
+  it('still refuses a credential or a control character in a `finish` summary that also names a route', async () => {
+    const cases = [
+      { summary: 'POST /todos now sends token=ghp_abcdefghijklmnopqrstuvwxyz1234567890', leaked: 'ghp_abcdefghijklmnopqrstuvwxyz1234567890' },
+      { summary: 'GET /todos\u001b[31m returns the list', leaked: '\u001b[31m' }
+    ];
+    for (const { summary, leaked } of cases) {
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) =>
+          completed(request, JSON.stringify({ version: 1, action: 'finish', summary }))
+      };
+
+      const result = await new OrnithImplementationService().implement(
+        baseRequest(leaseService, new AbortController().signal)
+      );
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(JSON.stringify(result)).not.toContain(leaked);
+      expect(result.finalMessage).not.toContain(summary);
+    }
+  });
+
   it('rejects a `finish` summary containing an absolute machine path and never persists the offending text', async () => {
     const cases = [
       'Wrote output to C:\\Windows\\Temp\\out.txt as requested',
@@ -1046,7 +1114,10 @@ describe('OrnithImplementationService limits and cancellation', () => {
       'See \\\\fileserver\\share\\notes.txt for details',
       'config: /etc/agent-relay/secrets.env was NOT touched',
       '{"path":"C:\\\\Users\\\\op\\\\file.txt"} was the result',
-      'See \\\\?\\C:\\Users\\op\\file.txt for the extended-length form'
+      'See \\\\?\\C:\\Users\\op\\file.txt for the extended-length form',
+      'Logs went to /home/operator/.cache/out.txt',
+      'The fixture lives in /Users/op/Library/secret.txt',
+      'POST /todos now writes /var/lib/app/notes.txt'
     ];
 
     for (const summary of cases) {

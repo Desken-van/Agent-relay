@@ -283,6 +283,54 @@ export function containsAbsoluteMachinePath(value: string): boolean {
     /(^|[\s=:[({,"'])\/(?!\/)[^\s)\]}"'>,;]+/m.test(value);
 }
 
+/**
+ * Top-level directories of a machine's own filesystem on Linux (the FHS and common distribution roots) and
+ * macOS, lower-cased. A slash-led token that starts with one of them names a machine path on any computer,
+ * including one this machine's root does not have (a Windows host, a path from another system).
+ */
+const WELL_KNOWN_MACHINE_ROOTS: ReadonlySet<string> = new Set([
+  'bin', 'boot', 'dev', 'etc', 'gnu', 'home', 'lib', 'lib32', 'lib64', 'libx32', 'lost+found', 'media', 'mnt',
+  'nix', 'opt', 'proc', 'root', 'run', 'sbin', 'snap', 'srv', 'sys', 'tmp', 'usr', 'var',
+  'applications', 'cores', 'library', 'network', 'private', 'system', 'users', 'volumes'
+]);
+
+/** The same slash-led token `containsAbsoluteMachinePath` detects, captured. */
+const POSIX_ABSOLUTE_TOKEN = /(?:^|[\s=:[({,"'])\/(?!\/)([^\s)\]}"'>,;]+)/gm;
+
+/**
+ * True when prose a model wrote names an absolute machine path, telling an API route apart from a POSIX
+ * path. A drive path or a UNC path is always a machine path. A slash-led token is a machine path when its
+ * first segment is a well-known filesystem root (`/home/...`, `/etc/...`, `/Users/...`), names an entry this
+ * machine's root holds (`machineRootNames`, lower-cased: `/data/...` where `/data` exists), or cannot be read
+ * as a plain name (empty, `.`, `..`, a backslash in the token); so is any `file:` URL. Anything else —
+ * `/todos`, `/api/v1/todos/{id}`, `/health?full=1`, `http://localhost:3000/todos` — is a route.
+ *
+ * A route and a directory with the same name are the same text and cannot be told apart, so the machine
+ * wins: `/todos` is refused on a machine whose root has a `todos` entry. `machineRootNames: null` (the root
+ * could not be listed) makes every slash-led token a machine path, as `containsAbsoluteMachinePath` does.
+ */
+export function containsMachinePathBesideRoutes(
+  value: string,
+  machineRootNames: ReadonlySet<string> | null
+): boolean {
+  // A `file:` URL names a machine path. Any other URL's scheme is not a drive letter (`http:/` read as one,
+  // so a route given as a whole URL was refused), and its path follows a host, not the machine's root.
+  if (/\bfile:\//i.test(value)) return true;
+  const text = value.replace(/\b[A-Za-z][A-Za-z0-9+.-]+:\/\//g, ' ');
+  if (/[A-Za-z]:[\\/]/.test(text) || /\\\\[^\\/\s]+[\\/]/.test(text)) return true;
+  for (const match of text.matchAll(POSIX_ABSOLUTE_TOKEN)) {
+    if (machineRootNames === null) return true;
+    const token = match[1] ?? '';
+    if (token.includes('\\')) return true;
+    // The first segment, without a query, a fragment or the punctuation that ends a sentence.
+    const segment = (token.split(/[/?#]/)[0] ?? '').replace(/[.:!?*]+$/, '').toLowerCase();
+    // `.` and `..` strip to nothing here as well.
+    if (segment.length === 0) return true;
+    if (WELL_KNOWN_MACHINE_ROOTS.has(segment) || machineRootNames.has(segment)) return true;
+  }
+  return false;
+}
+
 /** Replace machine-absolute path tokens in bounded, non-authoritative prose. */
 export function redactAbsoluteMachinePaths(value: string): string {
   return value

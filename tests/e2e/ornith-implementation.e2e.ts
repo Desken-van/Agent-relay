@@ -174,7 +174,11 @@ function readRuns(profile: string, taskId: string): RunRow[] {
 }
 
 describe('Ornith Electron acceptance', () => {
-  it('routes an implementation round to Ornith through real IPC/UI, mutates only the worktree, and sanitizes the rendered result', async () => {
+  it.each([
+    ['a plain summary', 'Created ornith-e2e-output.txt via the bounded Ornith tool loop.'],
+    // API routes are not machine paths: the summary of a task that touched an HTTP API names them.
+    ['a summary naming API routes', 'Created ornith-e2e-output.txt; it documents POST /todos and GET /api/v1/todos/{id}.']
+  ])('routes an implementation round to Ornith through real IPC/UI, mutates only the worktree, and sanitizes the rendered result (%s)', async (_label, finishSummary) => {
     const profile = mkdtempSync(join(tmpdir(), 'agent-relay-ornith-e2e-'));
     const repoDir = mkdtempSync(join(tmpdir(), 'agent-relay-ornith-e2e-repo-'));
     const runtime = new FakeLocalInferenceRuntime().scenario({ health: 'ok' });
@@ -263,7 +267,6 @@ describe('Ornith Electron acceptance', () => {
         }
       }
 
-      const finishSummary = 'Created ornith-e2e-output.txt via the bounded Ornith tool loop.';
       const sequence = [
         JSON.stringify({ version: 1, action: 'list_files', prefix: '', limit: 20 }),
         JSON.stringify({ version: 1, action: 'read_file', path: 'README.md', offset: 0, limit: 4096 }),
@@ -279,7 +282,8 @@ describe('Ornith Electron acceptance', () => {
       runtime.scenario({ health: 'ok', completionTextSequence: sequence });
 
       const outcome = await invokeIpc<{ status: string }>(page, 'workflow:implement', { taskId: task.id });
-      expect(['READY_FOR_REVIEW', 'CHANGES_REQUESTED', 'FAILED']).toContain(outcome.status);
+      // The finish was accepted and Relay's own verification passed: the task waits for review.
+      expect(outcome.status).toBe('READY_FOR_REVIEW');
 
       /* ---------------------------------------------------------------- */
       /* Database evidence: the run persisted, sanitized, worktree-only.   */
@@ -289,6 +293,7 @@ describe('Ornith Electron acceptance', () => {
       expect(ornithRuns).toHaveLength(1);
       const ornithRun = ornithRuns[0]!;
       expect(ornithRun.run_type).toBe('implementation');
+      expect(ornithRun.status).toBe('succeeded');
       // This is the field the model's `finish` summary actually reaches
       // (see `ornith-implementation.ts`) — scoped precisely here, since the
       // *system*-authored `git`-agent row legitimately records the worktree's

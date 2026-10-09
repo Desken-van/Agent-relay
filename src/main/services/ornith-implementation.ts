@@ -22,9 +22,11 @@
  * pruned turn to turn.
  */
 
+import { readdirSync } from 'node:fs';
 import {
   ORNITH_LIMITS,
   containsAbsoluteMachinePath,
+  containsMachinePathBesideRoutes,
   parseOrnithCompletion,
   sanitizeScopedFilePaths,
   type OrnithAction,
@@ -855,7 +857,39 @@ function assessmentFor(input: {
 /* The loop                                                                    */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The lower-cased names this machine's filesystem root holds, plus the first segment of each bound POSIX root:
+ * what a slash-led token in a `finish` summary must not start with to read as an API route (see
+ * `containsMachinePathBesideRoutes`). `null` when the root cannot be listed, which makes every slash-led token
+ * a machine path again.
+ */
+function listMachineRootNames(boundRoots: readonly string[]): ReadonlySet<string> | null {
+  let entries: string[];
+  try {
+    entries = readdirSync('/');
+  } catch {
+    return null;
+  }
+  const names = new Set(entries.map((entry) => entry.toLowerCase()));
+  for (const root of boundRoots) {
+    const first = root.startsWith('/') ? root.split('/')[1] : undefined;
+    if (first !== undefined && first.length > 0) names.add(first.toLowerCase());
+  }
+  return names;
+}
+
+export interface OrnithImplementationServiceOptions {
+  /** Where the names at the filesystem root come from; the real root unless a test supplies its own. */
+  readonly machineRootNames?: (boundRoots: readonly string[]) => ReadonlySet<string> | null;
+}
+
 export class OrnithImplementationService {
+  private readonly machineRootNames: (boundRoots: readonly string[]) => ReadonlySet<string> | null;
+
+  constructor(options: OrnithImplementationServiceOptions = {}) {
+    this.machineRootNames = options.machineRootNames ?? listMachineRootNames;
+  }
+
   async implement(request: OrnithImplementationRequest): Promise<OrnithImplementationResult> {
     const holder: { tools: OrnithWorktreeTools | null } = { tools: null };
     const result = await this.runLoop(request, (created) => { holder.tools = created; });
@@ -1219,7 +1253,9 @@ export class OrnithImplementationService {
       }
 
       if (action.action === 'finish') {
-        if (containsAbsoluteMachinePath(action.summary)) {
+        // An API route the task touched (`/todos`) is not a machine path; a path on this or any machine is.
+        const boundRoots = [request.worktreePath, request.worktreesRoot, request.repositoryPath];
+        if (containsMachinePathBesideRoutes(action.summary, this.machineRootNames(boundRoots))) {
           return finish(
             'fail',
             'Ornith finished with a summary that referenced an absolute machine path, which was refused.',

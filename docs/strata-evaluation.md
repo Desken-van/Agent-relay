@@ -160,7 +160,9 @@ Ornith profile's flags — an ordinary llama.cpp profile, no code needed.
 All four "finish refused" endings (two Strata, one Ornith on `priority`) were
 the same Agent Relay rule: a finish summary that mentions a path starting with
 a slash (here the route `/todos`) is refused as an absolute machine path, even
-though the code was complete. It applies to every model alike.
+though the code was complete. It applies to every model alike. (Since fixed:
+a route is no longer taken for a machine path, see
+[security.md](security.md#5c-ornith-a-bounded-structured-only-implementation-provider).)
 
 Ten runs per model on five small-to-medium tasks: enough to see a clear order
 (Strata's code was right every time, Qwen3-Coder-30B-A3B close behind,

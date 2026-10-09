@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 import {
   classifyLineEnding,
   containsAbsoluteMachinePath,
+  containsMachinePathBesideRoutes,
   containsLiteralLineBreakEscape,
   isOrnithTerminalAction,
   isOrnithToolDenialEventData,
@@ -49,6 +50,62 @@ describe('absolute machine-path prose detection', () => {
   ])('continues to detect and redact %s', (value) => {
     expect(containsAbsoluteMachinePath(value)).toBe(true);
     expect(redactAbsoluteMachinePaths(value)).not.toBe(value);
+  });
+});
+
+describe('machine paths beside API routes', () => {
+  const thisMachine = new Set(['bin', 'data', 'home', 'todos-archive']);
+
+  it.each([
+    'POST /todos validates the priority.',
+    'GET /todos?sort=priority orders high, normal, low',
+    'GET /api/v1/todos/{id} returns one todo',
+    'Routes: /todos, /todos/:id and /health.',
+    'See (/todos) and "/api/v1/items".',
+    'Derive progress as floor(sum / count); keep the Zod domain/IPC schemas.',
+    'Calls http://localhost:3000/todos and //cdn.example.com/x.js'
+  ])('reads %s as routes, not machine paths', (value) => {
+    expect(containsMachinePathBesideRoutes(value, thisMachine)).toBe(false);
+  });
+
+  it.each([
+    'Wrote C:\\Windows\\Temp\\out.txt',
+    'path=C:/Users/op/x.txt',
+    'See \\\\server\\share\\notes.txt',
+    'See \\\\?\\C:\\Users\\op\\file.txt',
+    'config: /etc/agent-relay/secrets.env',
+    'Logs in /home/operator/.cache/out.log',
+    'Fixture at /Users/op/Library/x',
+    'Ran /usr/bin/true',
+    'Wrote /tmp',
+    'Read /var/lib/app/todos.json.',
+    'Mounted at /Volumes/Backup',
+    'Opened file:///srv/x/report.html',
+    'Opened file:///C:/Users/op/report.html',
+    'Calls http:///etc/passwd'
+  ])('reads %s as a machine path on any machine', (value) => {
+    expect(containsMachinePathBesideRoutes(value, new Set())).toBe(true);
+  });
+
+  it.each([
+    ['an entry at this machine\'s root', 'Copied to /data/export.csv'],
+    ['the same entry in another case', 'Copied to /DATA/export.csv'],
+    ['a route named like an entry at this machine\'s root', 'POST /todos-archive stores it'],
+    ['a backslash in the token', 'GET /todos\\..\\x'],
+    ['a dot segment', 'Wrote /./x'],
+    ['a parent segment', 'Wrote /../x'],
+    ['an empty first segment', 'GET /?all=1']
+  ])('refuses %s', (_label, value) => {
+    expect(containsMachinePathBesideRoutes(value, thisMachine)).toBe(true);
+  });
+
+  it('treats every slash-led token as a machine path when the root could not be listed', () => {
+    expect(containsMachinePathBesideRoutes('POST /todos validates it', null)).toBe(true);
+    expect(containsMachinePathBesideRoutes('Derive progress as floor(sum / count).', null)).toBe(false);
+  });
+
+  it('leaves the strict check every other caller uses unchanged', () => {
+    expect(containsAbsoluteMachinePath('POST /todos validates it')).toBe(true);
   });
 });
 
