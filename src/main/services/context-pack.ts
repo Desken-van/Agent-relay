@@ -4,8 +4,9 @@
  * the vocabulary.
  *
  * Building is deterministic: the same request over the same bytes gives the same pack, hash included. Sources are
- * read twice (before and after the pack is assembled) and a pack whose sources changed in between is refused, so
- * every fragment is from one state of the worktree. Nothing here is wired into a model loop yet (14C).
+ * read twice (before and after the pack is assembled) and a pack whose sources differ between the two reads is
+ * refused. That detects a change; it is not a snapshot or a lock (docs/context-pack.md, "What the two reads
+ * prove"). Nothing here is wired into a model loop yet (14C).
  */
 
 import { createHash } from 'node:crypto';
@@ -135,8 +136,19 @@ function describeSource(path: string, observed: ContextSourceObservation): { sou
   };
 }
 
+/**
+ * A selector's lines: all it asks for (`startLine`–`endLine`), and its core (`coreStart`–`coreEnd`) — the lines
+ * it is no use without: an anchor's own lines, otherwise its first line.
+ */
 type Resolved =
-  | { readonly ok: true; readonly startLine: number; readonly endLine: number; readonly anchorLine: number | null }
+  | {
+      readonly ok: true;
+      readonly startLine: number;
+      readonly endLine: number;
+      readonly coreStart: number;
+      readonly coreEnd: number;
+      readonly anchorLine: number | null;
+    }
   | { readonly ok: false; readonly reason: ContextOmissionReason };
 
 function lineOfIndex(text: string, index: number): number {
@@ -149,10 +161,17 @@ function resolveSelector(selector: ContextSelector, source: ReadableSource): Res
   if (source.lineCount === 0) return { ok: false, reason: 'empty_file' };
   switch (selector.kind) {
     case 'file':
-      return { ok: true, startLine: 1, endLine: source.lineCount, anchorLine: null };
+      return { ok: true, startLine: 1, endLine: source.lineCount, coreStart: 1, coreEnd: 1, anchorLine: null };
     case 'lines':
       if (selector.startLine > source.lineCount) return { ok: false, reason: 'line_out_of_range' };
-      return { ok: true, startLine: selector.startLine, endLine: Math.min(selector.endLine, source.lineCount), anchorLine: null };
+      return {
+        ok: true,
+        startLine: selector.startLine,
+        endLine: Math.min(selector.endLine, source.lineCount),
+        coreStart: selector.startLine,
+        coreEnd: selector.startLine,
+        anchorLine: null
+      };
     case 'anchor': {
       const first = source.text.indexOf(selector.anchor);
       if (first === -1) return { ok: false, reason: 'anchor_not_found' };
@@ -163,23 +182,78 @@ function resolveSelector(selector: ContextSelector, source: ReadableSource): Res
         ok: true,
         startLine: Math.max(1, anchorLine - selector.linesBefore),
         endLine: Math.min(source.lineCount, lastLine + selector.linesAfter),
+        coreStart: anchorLine,
+        coreEnd: lastLine,
         anchorLine
       };
     }
   }
 }
 
-interface Candidate {
-  readonly path: string;
-  priority: number;
-  startLine: number;
-  endLine: number;
-  readonly provenance: ContextProvenance[];
+/** The lines of one file the pack holds so far, and the size of the fragment a range would end up in. */
+class HeldLines {
+  private readonly held: Uint8Array;
+
+  constructor(private readonly source: ReadableSource) {
+    this.held = new Uint8Array(source.lineCount + 2);
+  }
+
+  has(line: number): boolean {
+    return this.held[line] === 1;
+  }
+
+  bytesOf(first: number, last: number): number {
+    return this.source.starts[last]! - this.source.starts[first - 1]!;
+  }
+
+  /** What holding `line` costs the budget: nothing when it is already held. */
+  cost(line: number): number {
+    return this.has(line) ? 0 : this.bytesOf(line, line);
+  }
+
+  /** The bytes of the fragment `first`–`last` would be part of: it, and every held line touching it. */
+  runBytes(first: number, last: number): number {
+    let low = first;
+    while (low > 1 && this.has(low - 1)) low -= 1;
+    let high = last;
+    while (high < this.source.lineCount && this.has(high + 1)) high += 1;
+    return this.bytesOf(low, high);
+  }
+
+  /** Whether `first`–`last` touches or overlaps a held line, and so joins an existing fragment. */
+  joinsHeld(first: number, last: number): boolean {
+    for (let line = Math.max(1, first - 1); line <= Math.min(this.source.lineCount, last + 1); line += 1) {
+      if (this.has(line)) return true;
+    }
+    return false;
+  }
+
+  hold(first: number, last: number): void {
+    for (let line = first; line <= last; line += 1) this.held[line] = 1;
+  }
+
+  /** The held lines as maximal runs: one fragment each. */
+  runs(): { readonly startLine: number; readonly endLine: number }[] {
+    const runs: { startLine: number; endLine: number }[] = [];
+    for (let line = 1; line <= this.source.lineCount; line += 1) {
+      if (!this.has(line)) continue;
+      const last = runs.at(-1);
+      if (last !== undefined && last.endLine === line - 1) last.endLine = line;
+      else runs.push({ startLine: line, endLine: line });
+    }
+    return runs;
+  }
 }
 
 /**
  * The pack a request yields over one observation. Pure apart from hashing: every rule that decides what goes in
- * — anchors, merging, the order the budget is spent in, where a fragment is cut — is here.
+ * — anchors, the order the budget is spent in, where a selector is cut, how fragments form — is here.
+ *
+ * The budget is spent selector by selector in the request's order, line by line: a selector first needs its core
+ * (an anchor's lines, otherwise its first line), then grows forward to its last line and back to its first. A
+ * line a more important selector already holds costs nothing, so shared lines are paid for once and a less
+ * important selector can never take lines a more important one needs. Fragments are formed afterwards, from the
+ * runs of held lines, so merging decides nothing about what is held.
  */
 export function assembleContextPack(request: ContextPackRequest, observation: ContextObservation): ContextPack {
   const sources = new Map<string, { source: ContextSource; readable: ReadableSource | null }>();
@@ -190,92 +264,101 @@ export function assembleContextPack(request: ContextPackRequest, observation: Co
   }
 
   const omissions: ContextOmission[] = [];
-  const byPath = new Map<string, Candidate[]>();
+  const held = new Map<string, HeldLines>();
+  const answered: { readonly path: string; readonly provenance: ContextProvenance }[] = [];
+  let fragmentCount = 0;
+  let remaining = request.maxContentBytes;
+  const cap = CONTEXT_PACK_LIMITS.maxFragmentBytes;
   request.selectors.forEach((selector, index) => {
+    const omit = (reason: ContextOmissionReason): void => {
+      omissions.push({ selector: index, path: selector.path, reason });
+    };
     const entry = sources.get(selector.path)!;
     if (entry.readable === null) {
-      const reason: ContextOmissionReason = entry.source.state === 'read' ? entry.source.content as 'not_text' | 'secret_shaped' : entry.source.state;
-      omissions.push({ selector: index, path: selector.path, reason });
+      omit(entry.source.state === 'read' ? entry.source.content as 'not_text' | 'secret_shaped' : entry.source.state);
       return;
     }
     const resolved = resolveSelector(selector, entry.readable);
     if (!resolved.ok) {
-      omissions.push({ selector: index, path: selector.path, reason: resolved.reason });
+      omit(resolved.reason);
       return;
     }
-    const provenance: ContextProvenance = {
-      selector: index,
-      reason: selector.reason,
-      ...(selector.label === undefined ? {} : { label: selector.label }),
-      startLine: resolved.startLine,
-      endLine: resolved.endLine,
-      anchorLine: resolved.anchorLine
-    };
-    const list = byPath.get(selector.path) ?? [];
-    list.push({ path: selector.path, priority: index, startLine: resolved.startLine, endLine: resolved.endLine, provenance: [provenance] });
-    byPath.set(selector.path, list);
+    let lines = held.get(selector.path);
+    if (lines === undefined) {
+      lines = new HeldLines(entry.readable);
+      held.set(selector.path, lines);
+    }
+
+    const { coreStart, coreEnd } = resolved;
+    let coreCost = 0;
+    for (let line = coreStart; line <= coreEnd; line += 1) coreCost += lines.cost(line);
+    if (lines.bytesOf(coreStart, coreEnd) > cap || lines.runBytes(coreStart, coreEnd) > cap) {
+      omit('fragment_too_large');
+      return;
+    }
+    if (coreCost > remaining) {
+      omit('budget_exhausted');
+      return;
+    }
+    if (!lines.joinsHeld(coreStart, coreEnd) && fragmentCount >= CONTEXT_PACK_LIMITS.maxFragments) {
+      omit('fragment_limit');
+      return;
+    }
+    remaining -= coreCost;
+    let first = coreStart;
+    let last = coreEnd;
+    for (let line = coreEnd + 1; line <= resolved.endLine; line += 1) {
+      const cost = lines.cost(line);
+      if (cost > remaining || lines.runBytes(first, line) > cap) break;
+      remaining -= cost;
+      last = line;
+    }
+    for (let line = coreStart - 1; line >= resolved.startLine; line -= 1) {
+      const cost = lines.cost(line);
+      if (cost > remaining || lines.runBytes(line, last) > cap) break;
+      remaining -= cost;
+      first = line;
+    }
+    lines.hold(first, last);
+    fragmentCount = [...held.values()].reduce((total, file) => total + file.runs().length, 0);
+    answered.push({
+      path: selector.path,
+      provenance: {
+        selector: index,
+        reason: selector.reason,
+        ...(selector.label === undefined ? {} : { label: selector.label }),
+        startLine: resolved.startLine,
+        endLine: resolved.endLine,
+        anchorLine: resolved.anchorLine,
+        includedStartLine: first,
+        includedEndLine: last
+      }
+    });
   });
 
-  // Overlapping or touching ranges of one file become one fragment, which keeps its earliest selector's priority.
-  const candidates: Candidate[] = [];
-  for (const list of byPath.values()) {
-    list.sort((left, right) => left.startLine - right.startLine || left.priority - right.priority);
-    let current: Candidate | undefined;
-    for (const next of list) {
-      if (current !== undefined && next.startLine <= current.endLine + 1) {
-        current.endLine = Math.max(current.endLine, next.endLine);
-        current.priority = Math.min(current.priority, next.priority);
-        current.provenance.push(...next.provenance);
-      } else {
-        current = { ...next, provenance: [...next.provenance] };
-        candidates.push(current);
-      }
-    }
-  }
-  candidates.sort((left, right) => left.priority - right.priority);
-
   const kept: Omit<ContextFragment, 'id'>[] = [];
-  let remaining = request.maxContentBytes;
-  for (const candidate of candidates) {
-    const provenance = [...candidate.provenance].sort((left, right) => left.selector - right.selector);
-    const omitAll = (reason: ContextOmissionReason): void => {
-      for (const item of provenance) omissions.push({ selector: item.selector, path: candidate.path, reason });
-    };
-    if (kept.length >= CONTEXT_PACK_LIMITS.maxFragments) {
-      omitAll('fragment_limit');
-      continue;
+  for (const path of [...held.keys()].sort()) {
+    const lines = held.get(path)!;
+    const source = sources.get(path)!.readable!;
+    for (const run of lines.runs()) {
+      const startByte = source.starts[run.startLine - 1]!;
+      const endByte = source.starts[run.endLine]!;
+      const bytes = source.raw.subarray(startByte, endByte);
+      kept.push({
+        path,
+        startLine: run.startLine,
+        endLine: run.endLine,
+        startByte,
+        endByte,
+        contentSha256: sha256(bytes),
+        // A slice of valid UTF-8 cut at line breaks is valid UTF-8.
+        content: decodeExactly(bytes)!,
+        provenance: answered
+          .filter((item) => item.path === path && item.provenance.includedStartLine >= run.startLine && item.provenance.includedEndLine <= run.endLine)
+          .map((item) => item.provenance)
+      });
     }
-    const source = sources.get(candidate.path)!.readable!;
-    const startByte = source.starts[candidate.startLine - 1]!;
-    const endOf = (line: number): number => source.starts[line]!;
-    const cap = Math.min(CONTEXT_PACK_LIMITS.maxFragmentBytes, remaining);
-    let endLine = candidate.endLine;
-    while (endLine >= candidate.startLine && endOf(endLine) - startByte > cap) endLine -= 1;
-    if (endLine < candidate.startLine) {
-      omitAll(endOf(candidate.startLine) - startByte > CONTEXT_PACK_LIMITS.maxFragmentBytes ? 'fragment_too_large' : 'budget_exhausted');
-      continue;
-    }
-    const included = provenance.filter((item) => item.startLine <= endLine);
-    for (const item of provenance) {
-      if (item.startLine > endLine) omissions.push({ selector: item.selector, path: candidate.path, reason: 'budget_exhausted' });
-    }
-    const bytes = source.raw.subarray(startByte, endOf(endLine));
-    remaining -= bytes.length;
-    kept.push({
-      path: candidate.path,
-      startLine: candidate.startLine,
-      endLine,
-      startByte,
-      endByte: endOf(endLine),
-      contentSha256: sha256(bytes),
-      // A slice of valid UTF-8 cut at line breaks is valid UTF-8.
-      content: decodeExactly(bytes)!,
-      provenance: included,
-      truncatedFromEndLine: endLine < candidate.endLine ? candidate.endLine : null
-    });
   }
-
-  kept.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : left.startLine - right.startLine));
   const fragments: ContextFragment[] = kept.map((fragment, index) => ({ id: `f${index + 1}`, ...fragment }));
   omissions.sort((left, right) => left.selector - right.selector || (left.reason < right.reason ? -1 : left.reason > right.reason ? 1 : 0));
   const unsigned = {
@@ -409,9 +492,29 @@ export function verifyContextPackIntegrity(value: unknown): { ok: true; pack: Co
     if (previous !== null && (previous.path > fragment.path || (previous.path === fragment.path && previous.endLine + 1 >= fragment.startLine))) {
       return fail(`${fragment.id} is out of order or overlaps the fragment before it.`);
     }
+    let reach = fragment.startLine - 1;
+    let previousSelector = -1;
     for (const item of fragment.provenance) {
       if (pack.request.selectors[item.selector]?.path !== fragment.path) return fail(`${fragment.id} answers a selector of another path.`);
+      if (item.selector <= previousSelector) return fail(`${fragment.id} does not list its selectors once each, in order.`);
+      previousSelector = item.selector;
+      if (
+        item.endLine < item.startLine || item.includedStartLine < item.startLine || item.includedEndLine > item.endLine ||
+        item.includedEndLine < item.includedStartLine || item.includedStartLine < fragment.startLine ||
+        item.includedEndLine > fragment.endLine ||
+        (item.anchorLine !== null && (item.anchorLine < item.includedStartLine || item.anchorLine > item.includedEndLine))
+      ) {
+        return fail(`${fragment.id} holds lines for selector ${item.selector} that it did not ask for.`);
+      }
       answered.set(item.selector, (answered.get(item.selector) ?? 0) + 1);
+    }
+    // Every line of a fragment is there because a selector it answers included it: no line is unexplained.
+    for (const item of [...fragment.provenance].sort((left, right) => left.includedStartLine - right.includedStartLine)) {
+      if (item.includedStartLine > reach + 1) break;
+      reach = Math.max(reach, item.includedEndLine);
+    }
+    if (reach !== fragment.endLine || fragment.provenance.every((item) => item.includedStartLine !== fragment.startLine)) {
+      return fail(`${fragment.id} holds lines no selector included.`);
     }
     contentBytes += bytes;
     previous = fragment;

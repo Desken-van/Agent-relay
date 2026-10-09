@@ -54,13 +54,14 @@ declaration of `handle` or the test of `src/api.js` and turning it into an `anch
 | `request` | The request, whole, so a stale pack can be rebuilt from it. |
 | `checkout` | `branch` and `headCommit` of the task worktree when it was read. |
 | `sources` | Every path the selectors name, sorted, as observed: `read` (with `sha256` of the whole file, `bytes`, `lineCount`, `lineEnding`, and `content`: `text`, `not_text` or `secret_shaped`), `absent` (not in the worktree's tracked/untracked-not-ignored file set), or `refused` (`symlink`, `not_regular_file`, `too_large`, `outside_worktree`, `unreadable`). |
-| `fragments` | `f1`, `f2`, … sorted by path then line. Each has its `path`, `startLine`/`endLine`, `startByte`/`endByte` in the file as read, `contentSha256` of exactly its bytes, the `content`, its `provenance` (every selector it answers, with the lines that selector asked for and, for an anchor, the line it was found on) and `truncatedFromEndLine` when the budget cut it. |
+| `fragments` | `f1`, `f2`, … sorted by path then line. Each has its `path`, `startLine`/`endLine`, `startByte`/`endByte` in the file as read, `contentSha256` of exactly its bytes, the `content`, and its `provenance`: every selector it answers, in request order, with the lines that selector asked for (`startLine`/`endLine`), the part of them this fragment holds for it (`includedStartLine`/`includedEndLine` — fewer when the budget or the fragment size ran out) and, for an anchor, the line it was found on. |
 | `omissions` | Every selector that has no content, with why: `absent`, `refused`, `not_text`, `secret_shaped`, `empty_file`, `line_out_of_range`, `anchor_not_found`, `anchor_ambiguous`, `budget_exhausted`, `fragment_too_large`, `fragment_limit`. |
 | `contentBytes` | Sum of fragment content, never over `maxContentBytes`. |
 | `renderedBytes` | Exact UTF-8 size of the rendered text (§5): what a prompt spends on the pack. |
 | `sha256` | Hash of the canonical pack (sorted keys) without `renderedBytes` and itself; content enters through each `contentSha256`. |
 
-Every selector is answered **exactly once**: by the provenance of one fragment or by one omission.
+Every selector is answered **exactly once**: by the provenance of one fragment or by one omission. Every line
+of a fragment is there because a selector it answers included it.
 
 ## 3. How a pack is built (deterministic)
 
@@ -75,14 +76,20 @@ The same request over the same bytes gives the same pack, hash included. In orde
    content, byte for byte. Text is decoded exactly: a UTF-8 BOM stays in the content as U+FEFF, whether it
    starts the file or starts a fragment inside it, so a fragment's content, its byte range, its
    `contentSha256` and the anchor search all describe the same bytes of the file.
-5. Merge overlapping or touching ranges of one file into one fragment, which keeps its earliest selector's
-   priority and names every selector it answers.
-6. Spend the budget in priority order. A fragment is at most 16 KiB and at most what remains; one that does
-   not fit is cut at the last whole line that does (`truncatedFromEndLine`), and a selector whose lines all
-   fall after the cut is `budget_exhausted`. A fragment whose first line alone is over 16 KiB is
-   `fragment_too_large`. At most 64 fragments.
-7. Read every source **again**. If anything differs from the first read — a byte, a file appearing or going,
-   the commit — the build is refused (`sources_changed`): no pack mixes two states of the worktree.
+5. Spend the budget **selector by selector, in request order, line by line**. A selector first needs its
+   core — an anchor's own lines, otherwise its first line — whole; then it takes its following lines up to its
+   last, then its preceding lines back to its first (an anchor's context before it), and stops at the first
+   line that does not fit. A line an earlier selector already holds costs nothing: shared lines are paid for
+   once, and a later selector never takes a line from an earlier one. A selector whose core does not fit what
+   remains is `budget_exhausted`; the budget it could not use stays for the selectors after it, so a smaller,
+   less important selector can still get in.
+6. A fragment is at most 16 KiB. A selector stops growing where its lines, joined with the held lines they
+   touch, would make one larger; one whose core alone, or joined that way, is over it is
+   `fragment_too_large`. At most 64 fragments (`fragment_limit`; with at most 64 selectors it cannot be reached).
+7. Only then are fragments formed: each run of consecutive held lines of a file is one fragment, answering the
+   selectors whose included lines it holds. Forming fragments decides nothing about which lines are held.
+8. Read every source **again** and compare (§6, "What the two reads prove"); a difference refuses the build
+   (`sources_changed`).
 
 ## 4. Where the bytes come from (and the platform guarantees)
 
@@ -119,14 +126,16 @@ says. "file sha256" is the whole file as it was read; once a file has changed, r
 BEGIN <nonce> f1 src/api.js lines 1-2 of 4 file sha256 <sha256 of the whole file>
 …content…
 END <nonce> f1
-(f2: lines 3-4 were left out for the budget)
+Asked for but left out for the size limits:
+- src/store.js: lines 2-4
 Not included:
 - src/secret.js: holds credential-shaped text
 ```
 
 The nonce is the first 16 hex digits of the pack hash, which covers every content byte, so repository
 content cannot contain its own closing marker. A fragment's last line without a line break is said so rather
-than silently given one.
+than silently given one. The lines included selectors asked for but that no fragment holds are listed per file,
+so a model knows what it was not shown.
 
 ## 6. Stale context and the refresh before a mutation
 
@@ -144,8 +153,29 @@ other process. An Ornith edit is additionally guarded by its `sha256`: a hash ta
 
 `verifyContextPackIntegrity` is separate: whether a pack read back from storage or another process is one this
 code could have built — schema, each fragment against its hash and byte range, sources against the request,
-each selector answered once, order, budget, pack hash, rendered size. A wrong hash anywhere fails it. It says
-nothing about the worktree; freshness does.
+each selector answered once, every provenance inside what its selector asked for (an anchor's line included),
+every fragment line explained by a provenance, order, budget, pack hash, rendered size. A wrong hash anywhere
+fails it. It says nothing about the worktree; freshness does.
+
+### What the two reads prove, and what they do not
+
+A build reads every source twice and a freshness check reads it again later. Each comparison **detects a
+difference between two observations**: a different hash, a file appearing or going, another commit or branch.
+It is not an atomic snapshot of the worktree and not a lock: Agent Relay does not stop an editor, a build or a
+Git command from changing files, and nothing here could.
+
+- A change that is undone between two reads (A → B → A, an ABA) is not seen, and a pack built across it holds
+  bytes that were all there at each read — the same bytes either way.
+- Each file is read whole in one pass with its inode and the root's identity held, but different files are read
+  one after another: two files are each as they were at their own read, which may not be one instant of the
+  worktree if something kept writing between them and stopped before the second read.
+- What a pack can therefore stand for is the condition it is built under: **the sources are not being changed
+  by anything else while the step that uses them runs** — a task worktree that only Agent Relay's own tools
+  write to. Under that condition the two reads agreeing means the pack is the worktree's state.
+- Where that condition can fail, the guards that follow do not depend on it: `refreshContextPack` before
+  every change compares again, and an Ornith edit carries the whole file's `sha256`, which the write checks
+  against the file's bytes at the moment it writes (the native guard re-verifies what it replaces), so a stale
+  pack can lead to a refused edit, never to an edit of bytes nobody read.
 
 ## 7. How it connects to both runtimes (14C)
 

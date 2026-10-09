@@ -118,8 +118,8 @@ describe('Context Pack building', () => {
     ]);
     const [api, store, test] = pack.fragments;
     expect(api).toMatchObject({
-      id: 'f1', path: 'src/api.js', startLine: 1, endLine: 2, startByte: 0, truncatedFromEndLine: null,
-      provenance: [{ selector: 0, reason: 'symbol', label: 'handle', startLine: 1, endLine: 2, anchorLine: 1 }]
+      id: 'f1', path: 'src/api.js', startLine: 1, endLine: 2, startByte: 0,
+      provenance: [{ selector: 0, reason: 'symbol', label: 'handle', startLine: 1, endLine: 2, anchorLine: 1, includedStartLine: 1, includedEndLine: 2 }]
     });
     expect(api!.content).toBe(API.split('\n').slice(0, 2).join('\n') + '\n');
     expect(api!.endByte).toBe(Buffer.byteLength(api!.content));
@@ -160,6 +160,7 @@ describe('Context Pack building', () => {
     expect(pack.fragments[0]).toMatchObject({ startLine: 1, endLine: 3, provenance: [{ selector: 0 }, { selector: 1 }] });
     // A range past the end is clamped to the file; it is not an omission.
     expect(pack.fragments[1]).toMatchObject({ startLine: 5, endLine: 5, provenance: [{ selector: 2, startLine: 5, endLine: 5 }] });
+    expectFaithful(pack);
   });
 
   it('records every part it could not include, and why', async () => {
@@ -218,15 +219,14 @@ describe('Context Pack limits', () => {
 
     // The anchor selector comes first, so it keeps its content; store.js is cut; the test file has no room.
     const [api, store] = pack.fragments;
-    expect(api!.truncatedFromEndLine).toBeNull();
-    expect(store).toMatchObject({ path: 'src/store.js', startLine: 1, truncatedFromEndLine: 4 });
-    expect(store!.endLine).toBeLessThan(4);
+    expect(api!.provenance).toMatchObject([{ selector: 0, startLine: 1, endLine: 2, includedStartLine: 1, includedEndLine: 2 }]);
+    expect(store).toMatchObject({ path: 'src/store.js', startLine: 1, endLine: 1, provenance: [{ selector: 1, startLine: 1, endLine: 4, includedEndLine: 1 }] });
     expect(STORE.startsWith(store!.content)).toBe(true);
     expect(store!.content.endsWith('\n')).toBe(true);
     expect(pack.omissions).toEqual([{ selector: 2, path: 'test/app.test.js', reason: 'budget_exhausted' }]);
     expect(pack.contentBytes).toBeLessThanOrEqual(pack.request.maxContentBytes);
-    expect(renderContextPack(pack)).toContain(`(f2: lines ${store!.endLine + 1}-4 were left out for the budget)`);
-    expect(verifyContextPackIntegrity(pack)).toMatchObject({ ok: true });
+    expect(renderContextPack(pack)).toContain('- src/store.js: lines 2-4');
+    expectFaithful(pack);
   });
 
   it('leaves out a part whose single line is longer than a fragment may be', async () => {
@@ -304,7 +304,11 @@ describe('Context Pack identity and freshness', () => {
       { ...pack, sources: pack.sources.map((source) => (source.state === 'read' ? { ...source, sha256: sha256('other') } : source)) },
       { ...pack, sha256: sha256('other') },
       { ...pack, renderedBytes: pack.renderedBytes + 1 },
-      { ...pack, omissions: [{ selector: 0, path: 'src/api.js', reason: 'absent' }] }
+      { ...pack, omissions: [{ selector: 0, path: 'src/api.js', reason: 'absent' }] },
+      // Provenance that claims lines its selector never asked for, or leaves fragment lines unexplained.
+      { ...pack, fragments: pack.fragments.map((item, index) => (index === 0 ? { ...item, provenance: item.provenance.map((p) => ({ ...p, includedEndLine: p.endLine + 1 })) } : item)) },
+      { ...pack, fragments: pack.fragments.map((item, index) => (index === 0 ? { ...item, provenance: item.provenance.map((p) => ({ ...p, includedEndLine: p.includedStartLine })) } : item)) },
+      { ...pack, fragments: pack.fragments.map((item, index) => (index === 0 ? { ...item, provenance: [...item.provenance, ...item.provenance] } : item)) }
     ];
 
     for (const value of tampered) expect(verifyContextPackIntegrity(value)).toMatchObject({ ok: false });
@@ -413,6 +417,10 @@ function expectFaithful(pack: ContextPack): void {
   }
 }
 
+function lines(...texts: string[]): string {
+  return texts.map((text) => `${text}\n`).join('');
+}
+
 describe('Context Pack bytes: a BOM or U+FEFF is content like any other', () => {
   it('keeps a leading BOM and a U+FEFF that starts a fragment, byte for byte, with LF and CRLF', async () => {
     writeFileSync(join(worktree, 'src', 'bom-lf.js'), '﻿export const x = 1;\nexport const y = 2;\n');
@@ -451,5 +459,147 @@ describe('Context Pack bytes: a BOM or U+FEFF is content like any other', () => 
     expect(pack.fragments).toHaveLength(1);
     expect(pack.fragments[0]).toMatchObject({ startLine: 2, endLine: 2, content: 'export function handle() {}\n', provenance: [{ selector: 0, anchorLine: 2 }] });
     expect(pack.omissions).toEqual([{ selector: 1, path: 'src/bom-secret.js', reason: 'secret_shaped' }]);
+  });
+});
+
+describe('Context Pack budget: spent in selector priority order', () => {
+  it('gives the budget to the more important selector even when a less important one touches it', async () => {
+    writeFileSync(join(worktree, 'src', 'a.ts'), 'a\nb\nc\n');
+    const selectors: ContextPackRequest['selectors'] = [
+      { kind: 'lines', path: 'src/a.ts', startLine: 3, endLine: 3, reason: 'symbol', label: 'important' },
+      { kind: 'lines', path: 'src/a.ts', startLine: 1, endLine: 2, reason: 'explicit' }
+    ];
+    const tight = await built({ version: 1, allowedPaths: ['src/a.ts'], selectors, maxContentBytes: 2 });
+
+    expectFaithful(tight);
+    expect(tight.fragments).toHaveLength(1);
+    expect(tight.fragments[0]).toMatchObject({ startLine: 3, endLine: 3, content: 'c\n', provenance: [{ selector: 0, label: 'important' }] });
+    expect(tight.omissions).toEqual([{ selector: 1, path: 'src/a.ts', reason: 'budget_exhausted' }]);
+
+    // With room for both, the touching ranges are one fragment and each line is paid for once.
+    const roomy = await built({ version: 1, allowedPaths: ['src/a.ts'], selectors, maxContentBytes: 6 });
+    expectFaithful(roomy);
+    expect(roomy.fragments).toHaveLength(1);
+    expect(roomy.fragments[0]).toMatchObject({ startLine: 1, endLine: 3, content: 'a\nb\nc\n' });
+    expect(roomy.fragments[0]!.provenance.map((item) => item.selector)).toEqual([0, 1]);
+    expect(roomy.contentBytes).toBe(6);
+  });
+
+  it('does not pay twice for lines two selectors share, and cuts the less important one where the budget ends', async () => {
+    writeFileSync(join(worktree, 'src', 'six.js'), lines('l1', 'l2', 'l3', 'l4', 'l5', 'l6'));
+    const pack = await built(request({
+      selectors: [
+        { kind: 'lines', path: 'src/six.js', startLine: 3, endLine: 5, reason: 'symbol' },
+        { kind: 'lines', path: 'src/six.js', startLine: 1, endLine: 6, reason: 'explicit' }
+      ],
+      // Lines 3-5 for the first selector, then lines 1-2 of the second: line 6 does not fit.
+      maxContentBytes: 15
+    }));
+
+    expectFaithful(pack);
+    expect(pack.fragments).toHaveLength(1);
+    expect(pack.fragments[0]).toMatchObject({ startLine: 1, endLine: 5, content: lines('l1', 'l2', 'l3', 'l4', 'l5') });
+    expect(pack.fragments[0]!.provenance).toMatchObject([
+      { selector: 0, startLine: 3, endLine: 5, includedStartLine: 3, includedEndLine: 5 },
+      { selector: 1, startLine: 1, endLine: 6, includedStartLine: 1, includedEndLine: 5 }
+    ]);
+    expect(pack.contentBytes).toBe(15);
+    expect(pack.omissions).toEqual([]);
+    expect(renderContextPack(pack)).toContain('Asked for but left out for the size limits:\n- src/six.js: line 6\n');
+  });
+
+  it('keeps an important anchor far into a file before a large, less important range of the same file', async () => {
+    const body = Array.from({ length: 100 }, (_, index) => (index === 89 ? 'export function important() {' : `const filler${index} = ${index};`));
+    writeFileSync(join(worktree, 'src', 'big.js'), lines(...body));
+    const pack = await built(request({
+      selectors: [
+        { kind: 'anchor', path: 'src/big.js', anchor: 'export function important(', linesBefore: 0, linesAfter: 1, reason: 'symbol', label: 'important' },
+        { kind: 'file', path: 'src/big.js', reason: 'scoped_file' }
+      ],
+      maxContentBytes: 120
+    }));
+
+    expectFaithful(pack);
+    const anchor = pack.fragments.find((fragment) => fragment.provenance.some((item) => item.selector === 0))!;
+    expect(anchor).toMatchObject({ startLine: 90, endLine: 91, content: lines(body[89]!, body[90]!) });
+    const file = pack.fragments.find((fragment) => fragment.provenance.some((item) => item.selector === 1))!;
+    expect(file.startLine).toBe(1);
+    expect(file.provenance[0]).toMatchObject({ selector: 1, startLine: 1, endLine: 100, includedStartLine: 1 });
+    expect(file.endLine).toBeLessThan(90);
+    expect(pack.contentBytes).toBeLessThanOrEqual(120);
+  });
+
+  it('spends the budget across files in priority order, not in path order', async () => {
+    writeFileSync(join(worktree, 'src', 'a-first.js'), lines('alpha one', 'alpha two', 'alpha three'));
+    writeFileSync(join(worktree, 'src', 'z-last.js'), lines('zulu'));
+    const pack = await built(request({
+      selectors: [
+        { kind: 'file', path: 'src/z-last.js', reason: 'symbol' },
+        { kind: 'file', path: 'src/a-first.js', reason: 'explicit' }
+      ],
+      maxContentBytes: 5 + 10
+    }));
+
+    expectFaithful(pack);
+    expect(pack.fragments.map((fragment) => [fragment.path, fragment.content])).toEqual([
+      ['src/a-first.js', 'alpha one\n'],
+      ['src/z-last.js', 'zulu\n']
+    ]);
+    expect(pack.fragments[0]!.provenance[0]).toMatchObject({ selector: 1, includedEndLine: 1, endLine: 3 });
+  });
+
+  it('never lets touching selectors grow one fragment past the fragment size', async () => {
+    const row = `${'x'.repeat(99)}\n`;
+    writeFileSync(join(worktree, 'src', 'rows.js'), row.repeat(200));
+    const pack = await built(request({
+      selectors: [
+        { kind: 'lines', path: 'src/rows.js', startLine: 1, endLine: 100, reason: 'explicit' },
+        { kind: 'lines', path: 'src/rows.js', startLine: 101, endLine: 200, reason: 'explicit' }
+      ],
+      maxContentBytes: CONTEXT_PACK_LIMITS.maxContentBytes
+    }));
+
+    expectFaithful(pack);
+    expect(pack.fragments).toHaveLength(1);
+    const fragment = pack.fragments[0]!;
+    expect(fragment.endByte - fragment.startByte).toBeLessThanOrEqual(CONTEXT_PACK_LIMITS.maxFragmentBytes);
+    expect(fragment.provenance).toMatchObject([
+      { selector: 0, includedStartLine: 1, includedEndLine: 100 },
+      { selector: 1, includedStartLine: 101, includedEndLine: Math.floor(CONTEXT_PACK_LIMITS.maxFragmentBytes / 100) }
+    ]);
+  });
+
+  it('counts multibyte UTF-8 by bytes and cuts only between lines', async () => {
+    const text = lines('ünï', '€€', '😀x');
+    writeFileSync(join(worktree, 'src', 'multi.js'), text);
+    const pack = await built(request({
+      selectors: [
+        { kind: 'lines', path: 'src/multi.js', startLine: 2, endLine: 2, reason: 'explicit' },
+        { kind: 'file', path: 'src/multi.js', reason: 'explicit' }
+      ],
+      // '€€\n' is 7 bytes and 'ünï\n' 6: both fit, '😀x\n' (6) does not.
+      maxContentBytes: 13
+    }));
+
+    expectFaithful(pack);
+    expect(pack.fragments).toHaveLength(1);
+    expect(pack.fragments[0]).toMatchObject({ startLine: 1, endLine: 2, content: lines('ünï', '€€') });
+    expect(pack.contentBytes).toBe(13);
+  });
+
+  it('leaves out a selector whose own line does not fit, while a less important one that fits still gets in', async () => {
+    writeFileSync(join(worktree, 'src', 'a.ts'), 'aa\nb\n');
+    const pack = await built(request({
+      selectors: [
+        { kind: 'lines', path: 'src/a.ts', startLine: 1, endLine: 1, reason: 'symbol' },
+        { kind: 'lines', path: 'src/a.ts', startLine: 2, endLine: 2, reason: 'explicit' }
+      ],
+      maxContentBytes: 2
+    }));
+
+    expectFaithful(pack);
+    // The first selector's line (3 bytes) does not fit; the second's (2 bytes) does, in its own right.
+    expect(pack.fragments).toMatchObject([{ startLine: 2, endLine: 2, content: 'b\n', provenance: [{ selector: 1 }] }]);
+    expect(pack.omissions).toEqual([{ selector: 0, path: 'src/a.ts', reason: 'budget_exhausted' }]);
   });
 });

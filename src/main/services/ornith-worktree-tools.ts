@@ -564,8 +564,9 @@ export class OrnithWorktreeTools {
    * following a link, its identity and the root's proven unchanged across the read. Read-only, and charged to no
    * run budget: the caller bounds it (`maxFileBytes` per file, `maxTotalBytes` in all).
    *
-   * The checkout is confirmed before the first read and after the last, with the same HEAD commit both times, so
-   * every byte returned belongs to one commit of this task's branch; otherwise this throws `WORKTREE_INVALID`.
+   * The checkout is confirmed before the first read and after the last, on this task's branch at the same HEAD
+   * commit both times; otherwise this throws `WORKTREE_INVALID`. Files are read one after another, each whole:
+   * this is not a snapshot of the working tree, and nothing stops another process writing to it meanwhile.
    * Cancellation throws `CANCELLED` and returns nothing partial.
    */
   async observeContextSources(

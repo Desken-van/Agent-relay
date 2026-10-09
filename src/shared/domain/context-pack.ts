@@ -222,7 +222,13 @@ export const contextProvenanceSchema = z
     startLine: z.number().int().min(1),
     endLine: z.number().int().min(1),
     /** Where the anchor was found (its first line), for an `anchor` selector. */
-    anchorLine: z.number().int().min(1).nullable()
+    anchorLine: z.number().int().min(1).nullable(),
+    /**
+     * The part of those lines this fragment holds for it: all of them, or fewer when the budget or the fragment
+     * size ran out. Always its core (an anchor's lines, otherwise its first line).
+     */
+    includedStartLine: z.number().int().min(1),
+    includedEndLine: z.number().int().min(1)
   })
   .strict();
 export type ContextProvenance = z.infer<typeof contextProvenanceSchema>;
@@ -241,9 +247,8 @@ export const contextFragmentSchema = z
     /** SHA-256 of exactly the content's bytes. */
     contentSha256: ornithSha256Schema,
     content: z.string().max(CONTEXT_PACK_LIMITS.maxFragmentBytes),
-    provenance: z.array(contextProvenanceSchema).min(1).max(CONTEXT_PACK_LIMITS.maxSelectors),
-    /** Set when the budget cut it short: the last line the selectors asked for. */
-    truncatedFromEndLine: z.number().int().min(1).nullable()
+    /** Every selector it answers, in request order; together their included lines are exactly its lines. */
+    provenance: z.array(contextProvenanceSchema).min(1).max(CONTEXT_PACK_LIMITS.maxSelectors)
   })
   .strict();
 export type ContextFragment = z.infer<typeof contextFragmentSchema>;
@@ -300,9 +305,31 @@ const OMISSION_TEXT: Record<ContextOmissionReason, string> = {
   anchor_not_found: 'the requested place was not found',
   anchor_ambiguous: 'the requested place occurs more than once',
   budget_exhausted: 'no room left in the context budget',
-  fragment_too_large: 'a single line is longer than a fragment may be',
+  fragment_too_large: 'its lines would make a fragment larger than a fragment may be',
   fragment_limit: 'too many fragments'
 };
+
+/** Per file, the lines included selectors asked for that no fragment holds, as `- path: lines 4-9, 12`. */
+function leftOutLines(pack: ContextPack): string[] {
+  const out: string[] = [];
+  for (const path of [...new Set(pack.fragments.map((fragment) => fragment.path))]) {
+    const fragments = pack.fragments.filter((fragment) => fragment.path === path);
+    const held = (line: number): boolean => fragments.some((fragment) => line >= fragment.startLine && line <= fragment.endLine);
+    const asked = new Set<number>();
+    for (const item of fragments.flatMap((fragment) => fragment.provenance)) {
+      for (let line = item.startLine; line <= item.endLine; line += 1) if (!held(line)) asked.add(line);
+    }
+    const missing = [...asked].sort((left, right) => left - right);
+    const ranges: string[] = [];
+    for (let index = 0; index < missing.length; index += 1) {
+      const from = missing[index]!;
+      while (index + 1 < missing.length && missing[index + 1] === missing[index]! + 1) index += 1;
+      ranges.push(from === missing[index] ? `${from}` : `${from}-${missing[index]}`);
+    }
+    if (ranges.length > 0) out.push(`- ${path}: ${ranges.length === 1 && !ranges[0]!.includes('-') ? 'line' : 'lines'} ${ranges.join(', ')}`);
+  }
+  return out;
+}
 
 /**
  * The text a prompt carries for a pack. Deterministic: the same pack renders to the same bytes. Repository
@@ -331,10 +358,9 @@ export function renderContextPack(pack: ContextPack): string {
     lines.push(fragment.content.endsWith('\n') ? fragment.content.slice(0, -1) : fragment.content);
     lines.push(`END ${nonce} ${fragment.id}`);
     if (!fragment.content.endsWith('\n')) lines.push(`(${fragment.id}: no line break at the end of line ${fragment.endLine})`);
-    if (fragment.truncatedFromEndLine !== null) {
-      lines.push(`(${fragment.id}: lines ${fragment.endLine + 1}-${fragment.truncatedFromEndLine} were left out for the budget)`);
-    }
   }
+  const cut = leftOutLines(pack);
+  if (cut.length > 0) lines.push('Asked for but left out for the size limits:', ...cut);
   const omitted = [...new Set(pack.omissions.map((omission) => `- ${omission.path}: ${OMISSION_TEXT[omission.reason]}`))];
   if (omitted.length > 0) lines.push('Not included:', ...omitted);
   return `${lines.join('\n')}\n`;
