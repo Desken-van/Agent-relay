@@ -761,6 +761,28 @@ describe('LocalInferenceService.runTestInference', () => {
     lease.release();
   });
 
+  it('reports why the runtime failed an inference instead of a configuration change that never happened', async () => {
+    // The provider ends a non-completed inference by taking its runtime down, so its state is no longer
+    // Healthy afterwards; the service used to report that as "changed during inference" and drop the reason.
+    const settings = new MutableSettings();
+    const provider = new StubProvider();
+    const service = selectedService({ settings, createProvider: () => provider, ids: testIds() });
+    await service.start();
+    const lease = await service.acquireOrnithLease('default', settings.defaultFingerprint());
+    const cases: LocalInferenceOutcome[] = [
+      { kind: 'failed', version: LOCAL_INFERENCE_CONTRACT_VERSION, requestId: 'r', reason: 'The inference request did not complete.', dispatchOutcome: 'unknown' },
+      { kind: 'timed_out', version: LOCAL_INFERENCE_CONTRACT_VERSION, requestId: 'r', reason: 'The inference request did not complete. It exceeded the 1800000ms inference timeout.', dispatchOutcome: 'unknown' }
+    ];
+    for (const outcome of cases) {
+      provider.current = { kind: 'healthy', runtimeInstanceId: 'runtime-1' };
+      provider.inferOutcome = outcome;
+      const pending = service.inferForOrnith(lease, { version: LOCAL_INFERENCE_CONTRACT_VERSION, requestId: 'r', messages: [{ role: 'user', content: 'x' }] });
+      provider.current = { kind: 'failed', reason: outcome.kind === 'completed' ? '' : outcome.reason } as LocalInferenceState;
+      expect(await pending).toEqual(outcome);
+    }
+    lease.release();
+  });
+
   it('constructs no provider and returns a bounded structured failure when disabled and unbound', async () => {
     const settings = new MutableSettings();
     settings.update({ localInference: { ...settings.get().localInference, enabled: false } });

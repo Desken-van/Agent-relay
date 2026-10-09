@@ -712,6 +712,10 @@ export class LocalInferenceService
     // request and calls this again, subject to the same lease and identity
     // checks every time.
     const outcome = await provider.infer(request, signal);
+    // A non-completed inference carries no completion to discard, and the provider takes its runtime down
+    // after one — so the checks below would always fire and replace the provider's reason (a timeout, a
+    // dropped connection) with a configuration change that never happened.
+    if (outcome.kind !== 'completed') return outcome;
     const afterProfile = this.activeProfile();
     const afterFingerprint = afterProfile === null ? null : localInferenceProfileFingerprint(afterProfile);
     const afterConfig = afterProfile === null ? null : assembleLocalInferenceConfig(afterProfile);
