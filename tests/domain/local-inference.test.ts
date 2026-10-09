@@ -801,6 +801,20 @@ describe('local inference request', () => {
       localInferenceRequestSchema.safeParse(request({ structuredOutput: 'arbitrary_schema' })).success
     ).toBe(false);
   });
+
+  it('accepts a stable prefix only inside the request messages', () => {
+    const messages = [{ role: 'user', content: 'abcd' }];
+    const valid = (stablePrefix: unknown): boolean =>
+      localInferenceRequestSchema.safeParse(request({ messages, stablePrefix })).success;
+    expect(valid({ message: 0, chars: 4 })).toBe(true);
+    expect(valid({ message: 0, chars: 1 })).toBe(true);
+    expect(valid({ message: 0, chars: 5 })).toBe(false);
+    expect(valid({ message: 1, chars: 1 })).toBe(false);
+    expect(valid({ message: 0, chars: 0 })).toBe(false);
+    expect(valid({ message: -1, chars: 1 })).toBe(false);
+    expect(valid({ message: 0, chars: 1.5 })).toBe(false);
+    expect(valid({ message: 0, chars: 1, tokens: 3 })).toBe(false);
+  });
 });
 
 describe('local inference prompt', () => {

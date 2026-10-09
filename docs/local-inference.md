@@ -157,6 +157,14 @@ it the Coder model answered a real Ornith prompt with a sentence of prose on
 every attempt; with it, with exactly one action on every turn. Every file
 change is still Agent Relay's own tool; Strata never receives tools.
 
+Every Ornith turn is a fresh prompt that starts with the same specification,
+rule evidence and protocol; only the tool results and budget after them
+change. llama.cpp reuses such a common start by itself. Strata keeps no cache
+point inside the one user message a turn sends, so it read the whole prompt
+again on every turn. A Strata request therefore marks where that repeated part
+ends (`strata_prefix`); Strata pins a cache point there, and later turns of the
+round read only what follows it. The text sent is the same either way.
+
 Everywhere a profile is offered, a Strata profile carries "· Strata" after its
 name, and its runs are recorded with the provider id `local-strata` and the
 profile's model id — a Strata model is never presented as llama.cpp's. "Ornith"

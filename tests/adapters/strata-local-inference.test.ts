@@ -20,6 +20,7 @@ import {
   judgeStrataHealth,
   readStrataEngineConfig,
   STRATA_ORNITH_FORMAT_MESSAGE,
+  strataPrefixFields,
   strataRuntimeArgv
 } from '../../src/main/adapters/local-inference/strata-runtime';
 import { parseLocalInferenceConfig, type LocalInferenceConfig } from '../../src/shared/domain/local-inference';
@@ -229,6 +230,33 @@ describe('a Strata runtime: inference', () => {
     expect(body.messages).toEqual([{ role: 'user', content: 'Say something short.' }]);
   });
 
+  it('marks the request\'s stable prefix for Strata\'s cache, shifted past the format message, the text unchanged', async () => {
+    const built = await harness({ healthBodies: [ready()], completionText: '{"version":1,"action":"git_status"}' });
+    await built.provider.start();
+    const content = 'SPECIFICATION AND PROTOCOL\n\nturn 1 [git_status]: clean';
+    await built.provider.infer(fakeInferenceRequest({
+      structuredOutput: 'ornith_action_v1',
+      messages: [{ role: 'user', content }],
+      stablePrefix: { message: 0, chars: 28 }
+    }));
+    const body = JSON.parse(built.runtime.completionRequests()[0]!.body) as Record<string, unknown>;
+    // Message 0 of the request is message 1 on the wire, behind the format message.
+    expect(body.strata_prefix).toEqual({ message: 1, chars: 28 });
+    // Not "strata_checkpoint": false, with which the engine ignores the pin.
+    expect(body).not.toHaveProperty('strata_checkpoint');
+    expect(body.messages).toEqual([STRATA_ORNITH_FORMAT_MESSAGE, { role: 'user', content }]);
+    expect(body).not.toHaveProperty('stablePrefix');
+  });
+
+  it('sends no cache fields without a stable prefix', async () => {
+    const built = await harness({ healthBodies: [ready()], completionText: '{"version":1,"action":"git_status"}' });
+    await built.provider.start();
+    await built.provider.infer(fakeInferenceRequest({ structuredOutput: 'ornith_action_v1' }));
+    const body = JSON.parse(built.runtime.completionRequests()[0]!.body) as Record<string, unknown>;
+    expect(body).not.toHaveProperty('strata_prefix');
+    expect(body).not.toHaveProperty('strata_checkpoint');
+  });
+
   it('counts the format message toward the prompt byte limit', async () => {
     const built = await harness({ healthBodies: [ready()] }, {}, { maxPromptBytes: 300 });
     await built.provider.start();
@@ -290,6 +318,19 @@ describe('the Strata pieces on their own', () => {
     maxPromptBytes: 64_000, maxRequestBytes: 128_000, maxResponseBytes: 256_000, maxCompletionBytes: 32_000, maxProcessOutputBytes: 16_000,
     startupTimeoutMs: 20_000, healthTimeoutMs: 5_000, inferenceTimeoutMs: 20_000, shutdownTimeoutMs: 10_000,
     ...overrides
+  });
+
+  it('maps a stable prefix to Strata\'s fields: message index past what the adapter put in front, length in code points', () => {
+    const wire = [STRATA_ORNITH_FORMAT_MESSAGE, { role: 'user' as const, content: 'ab\u{1F600}cd' }];
+    // 'ab' plus one emoji: four UTF-16 code units, three characters to Strata.
+    expect(strataPrefixFields({ message: 0, chars: 4 }, wire, 1)).toEqual({
+      strata_prefix: { message: 1, chars: 3 }
+    });
+    expect(strataPrefixFields({ message: 1, chars: 2 }, wire, 0)).toEqual({
+      strata_prefix: { message: 1, chars: 2 }
+    });
+    expect(strataPrefixFields(undefined, wire, 1)).toEqual({});
+    expect(strataPrefixFields({ message: 1, chars: 2 }, wire, 1)).toEqual({});
   });
 
   it('builds the server argv from the profile alone', () => {

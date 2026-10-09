@@ -65,7 +65,13 @@ import {
   unsafeProviderProse
 } from '../../../shared/util/provider-text';
 import type { LocalInferenceProvider } from '../../ports';
-import { judgeStrataHealth, readStrataEngineConfig, STRATA_ORNITH_FORMAT_MESSAGE, strataRuntimeArgv } from './strata-runtime';
+import {
+  judgeStrataHealth,
+  readStrataEngineConfig,
+  STRATA_ORNITH_FORMAT_MESSAGE,
+  strataPrefixFields,
+  strataRuntimeArgv
+} from './strata-runtime';
 import {
   launchFor,
   locateExecutable,
@@ -1064,6 +1070,12 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
       this.config.adapterKind === 'strata' && parsed.structuredOutput === 'ornith_action_v1'
         ? [STRATA_ORNITH_FORMAT_MESSAGE, ...parsed.messages]
         : parsed.messages;
+    // The stable-prefix hint reaches Strata only, as its `strata_prefix` (see `strataPrefixFields`); a
+    // llama.cpp server reuses a common prompt start by itself and gets nothing extra.
+    const cacheFields =
+      this.config.adapterKind === 'strata'
+        ? strataPrefixFields(parsed.stablePrefix, wireMessages, wireMessages.length - parsed.messages.length)
+        : {};
     const promptBytes = wireMessages.reduce(
       (total, message) => total + Buffer.byteLength(message.content, 'utf8'),
       0
@@ -1118,7 +1130,8 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
               }
             }
           }
-        : {})
+        : {}),
+      ...cacheFields
     });
 
     const requestBytes = Buffer.byteLength(bodyText, 'utf8');

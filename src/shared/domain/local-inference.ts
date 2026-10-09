@@ -970,9 +970,36 @@ export const localInferenceRequestSchema = z
       'The request output token cap'
     ).optional(),
     chatTemplateParameters: chatTemplateParametersSchema.optional(),
-    structuredOutput: localInferenceStructuredOutputSchema.optional()
+    structuredOutput: localInferenceStructuredOutputSchema.optional(),
+    /**
+     * A caching hint, never content: every message before `message`, and the first `chars` characters
+     * (UTF-16 code units) of `message`, are the same on every request of one run. A runtime that can keep
+     * a marked prefix cached may keep this one; any other ignores it. The text sent is the same either way.
+     */
+    stablePrefix: z
+      .object({
+        message: z
+          .number()
+          .int('The stable prefix message must be a whole number.')
+          .min(0, 'The stable prefix message may not be negative.')
+          .max(LOCAL_INFERENCE_LIMITS.messagesMax - 1, 'The stable prefix message is out of range.'),
+        chars: boundedInt(LOCAL_INFERENCE_LIMITS.messageContentMax, 'The stable prefix length')
+      })
+      .strict()
+      .optional()
   })
-  .strict();
+  .strict()
+  .superRefine((request, ctx) => {
+    if (request.stablePrefix === undefined) return;
+    const message = request.messages[request.stablePrefix.message];
+    if (message === undefined || request.stablePrefix.chars > message.content.length) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['stablePrefix'],
+        message: 'The stable prefix must lie within the request messages.'
+      });
+    }
+  });
 
 export type LocalInferenceRequest = z.infer<typeof localInferenceRequestSchema>;
 

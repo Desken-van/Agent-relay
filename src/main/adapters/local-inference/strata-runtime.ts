@@ -25,7 +25,12 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
-import { LOCAL_INFERENCE_HOST, type LocalInferenceConfig, type LocalInferenceMessage } from '../../../shared/domain/local-inference';
+import {
+  LOCAL_INFERENCE_HOST,
+  type LocalInferenceConfig,
+  type LocalInferenceMessage,
+  type LocalInferenceRequest
+} from '../../../shared/domain/local-inference';
 
 /**
  * The system message an Ornith request to a Strata model starts with: the output format, in fixed words,
@@ -37,6 +42,31 @@ export const STRATA_ORNITH_FORMAT_MESSAGE: LocalInferenceMessage = Object.freeze
     'OUTPUT FORMAT REQUIREMENT: Reply with exactly one JSON object: one Ornith action from the protocol below. ' +
     'No Markdown, code fences, commentary or any text before or after the JSON object.'
 });
+
+/**
+ * A request's stable-prefix hint as Strata's `strata_prefix`: the engine pins a checkpoint where the prefix ends.
+ *
+ * Strata keeps checkpoints at the start of an assistant turn, at the end of a long system prompt and every 16K
+ * tokens — none inside the one user message an Ornith turn sends, so without a mark every turn read its whole
+ * prompt again (`cache_n: 0` on every turn measured, STRATA-1), most of a turn's time. Marked, a later turn
+ * reads only what follows the repeated specification and protocol. The text sent is unchanged. (Not with
+ * `strata_checkpoint: false`, although no Ornith turn is ever continued: the engine then ignores the pin.)
+ *
+ * `wireMessages` are the messages as sent, `offset` how many of them the adapter put in front of the request's
+ * own. Strata counts characters in code points; the hint counts UTF-16 code units.
+ */
+export function strataPrefixFields(
+  stablePrefix: LocalInferenceRequest['stablePrefix'],
+  wireMessages: readonly LocalInferenceMessage[],
+  offset: number
+): { strata_prefix: { message: number; chars: number } } | Record<string, never> {
+  if (stablePrefix === undefined) return {};
+  const message = stablePrefix.message + offset;
+  const content = wireMessages[message]?.content;
+  if (content === undefined) return {};
+  const chars = Array.from(content.slice(0, stablePrefix.chars)).length;
+  return chars > 0 ? { strata_prefix: { message, chars } } : {};
+}
 
 /** A model config is a few hundred bytes; anything this large is not one. */
 const STRATA_CONFIG_MAX_BYTES = 64 * 1024;

@@ -519,6 +519,15 @@ describe('local inference request', () => {
     });
   });
 
+  it('sends a stable-prefix hint nowhere: llama.cpp reuses a common prompt start by itself', async () => {
+    const { provider, calls } = await started(() => json(completion()), { maxRequestBytes: 50_000 });
+    await provider.infer(request({ structuredOutput: 'ornith_action_v1', stablePrefix: { message: 0, chars: 3 } }));
+
+    const body = JSON.parse(String(posts(calls)[0]?.init.body)) as Record<string, unknown>;
+    expect(Object.keys(body).filter((key) => key.startsWith('strata') || key === 'stablePrefix')).toEqual([]);
+    expect(body.messages).toEqual([{ role: 'user', content: 'hello' }]);
+  });
+
   it('maps the closed Ornith profile to a strict runtime-owned JSON schema', async () => {
     const { provider, calls } = await started(() => json(completion()), { maxRequestBytes: 50_000 });
     await provider.infer(request({ structuredOutput: 'ornith_action_v1' }));
