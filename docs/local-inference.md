@@ -146,7 +146,9 @@ it would run a command outside Agent Relay's tools). Its engine's
 `--version` is the runtime version. A Strata server answers `/health` with
 `"status": "ok"` while its model is still loading, so a Strata runtime is
 Healthy only when `/health` also says `loaded: true`, reports this profile's
-model and at least its context, and is a Strata service.
+model and at least its context, and says exactly `"service": "strata"` —
+which Strata's server includes in every `/health` answer, so a body without it
+(absent, null, another value) is refused as another program on the port.
 
 Strata's `json_schema` response format is a prompt plus a check after
 generation that extracts the first JSON object from the text, silently dropping

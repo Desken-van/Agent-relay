@@ -189,12 +189,16 @@ export type StrataHealthVerdict =
   /** Answered, but as something else than this profile's runtime. Not retryable. */
   | { readonly kind: 'malformed'; readonly reason: string };
 
-/** What a Strata `/health` body must say before the runtime counts as ready. */
+/**
+ * What a Strata `/health` body must say before the runtime counts as ready. Identity first: Strata's server
+ * answers every `/health` with `"service": "strata"` (loading, unloaded or ready), so a body without exactly
+ * that is another program on the port, never this runtime still starting.
+ */
 export function judgeStrataHealth(record: Record<string, unknown>, config: LocalInferenceConfig): StrataHealthVerdict {
-  if (record.status !== 'ok') return { kind: 'not_ready', reason: 'The runtime is not reporting status "ok".' };
-  if (record.service !== undefined && record.service !== 'strata') {
+  if (record.service !== 'strata') {
     return { kind: 'malformed', reason: 'The runtime on the configured port is not a Strata server.' };
   }
+  if (record.status !== 'ok') return { kind: 'not_ready', reason: 'The runtime is not reporting status "ok".' };
   if (record.loaded !== true) return { kind: 'not_ready', reason: 'The Strata server is up, but its model is not loaded.' };
   if (config.model.source.kind !== 'runtime_id' || record.model !== config.model.source.runtimeModelId) {
     return { kind: 'malformed', reason: 'The Strata server reports a different model than this profile.' };

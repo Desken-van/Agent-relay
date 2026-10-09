@@ -163,7 +163,11 @@ describe('a Strata runtime: launch and identity', () => {
   it.each([
     ['another model', ready({ model: 'some-other-model' }), 'different model'],
     ['less context than the profile needs', ready({ max_context: 2048 }), 'less context'],
-    ['another service on the port', ready({ service: 'llama.cpp' }), 'not a Strata server']
+    ['another service on the port', ready({ service: 'llama.cpp' }), 'not a Strata server'],
+    ['no service at all', ready({ service: undefined }), 'not a Strata server'],
+    ['a null service', ready({ service: null }), 'not a Strata server'],
+    ['a service that is not a string', ready({ service: ['strata'] }), 'not a Strata server'],
+    ['a service named differently', ready({ service: 'Strata' }), 'not a Strata server']
   ])('refuses at once a server that reports %s, without polling it out', async (_label, body, reason) => {
     const built = await harness({ healthBodies: [body] }, {}, { startupTimeoutMs: 15_000 });
     const startedAt = Date.now();
@@ -383,11 +387,23 @@ describe('the Strata pieces on their own', () => {
     const base = { status: 'ok', loaded: true, model: MODEL, max_context: 32768, service: 'strata' };
     expect(judgeStrataHealth(base, config())).toEqual({ kind: 'ok' });
     expect(judgeStrataHealth({ ...base, loaded: false }, config()).kind).toBe('not_ready');
-    expect(judgeStrataHealth({ status: 'ok' }, config()).kind).toBe('not_ready');
+    expect(judgeStrataHealth({ status: 'ok', service: 'strata' }, config()).kind).toBe('not_ready');
     expect(judgeStrataHealth({ ...base, status: 'loading' }, config()).kind).toBe('not_ready');
     expect(judgeStrataHealth({ ...base, model: 'x' }, config()).kind).toBe('malformed');
     expect(judgeStrataHealth({ ...base, max_context: 4096 }, config()).kind).toBe('malformed');
     expect(judgeStrataHealth({ ...base, service: 'llama.cpp' }, config()).kind).toBe('malformed');
+  });
+
+  it('requires exactly service "strata": absent, null, another type or another name is not this runtime', () => {
+    const { service: _service, ...unnamed } = { status: 'ok', loaded: true, model: MODEL, max_context: 32768, service: 'strata' };
+    const identity = { kind: 'malformed', reason: 'The runtime on the configured port is not a Strata server.' };
+    expect(judgeStrataHealth(unnamed, config())).toEqual(identity);
+    for (const service of [null, 1, true, ['strata'], { name: 'strata' }, '', 'Strata', 'strata ', 'llama.cpp']) {
+      expect(judgeStrataHealth({ ...unnamed, service }, config())).toEqual(identity);
+    }
+    // Identity is judged before readiness, so a body without it never reads as "still loading".
+    expect(judgeStrataHealth({ status: 'ok', loaded: false }, config())).toEqual(identity);
+    expect(judgeStrataHealth({ ...unnamed, service: 'strata' }, config())).toEqual({ kind: 'ok' });
   });
 
   it('refuses a missing or oversized model config', () => {
