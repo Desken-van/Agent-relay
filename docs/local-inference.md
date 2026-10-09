@@ -572,9 +572,11 @@ has the no-publish acceptance path using a real Ornith/llama.cpp model.
   renderer, opening Settings, or checking state never dispatches an inference
   request on its own.
 - There is no streaming, tool calling, embeddings, multimodal input, completion
-  cache, Context Pack, repository indexing/RAG, patching, retries, fallback
-  models, or workflow wiring. A non-completed test inference is never retried
-  automatically.
+  cache, repository indexing/RAG, patching, retries, fallback models, or
+  workflow wiring. A non-completed test inference is never retried
+  automatically. A Context Pack can be built and checked
+  ([context-pack.md](context-pack.md), 14A), but no runtime receives one yet
+  (14C).
 - There is no model-specific tokenizer in the trusted host process. Ornith
   instead uses a deliberately conservative byte-to-token upper bound, so some
   prompts that a particular tokenizer could fit may require a larger configured

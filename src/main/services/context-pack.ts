@@ -1,0 +1,448 @@
+/**
+ * Context Pack (14A): build a pack from one task worktree, prove a pack is intact, and tell whether it still
+ * describes the worktree. See docs/context-pack.md for the contract and `src/shared/domain/context-pack.ts` for
+ * the vocabulary.
+ *
+ * Building is deterministic: the same request over the same bytes gives the same pack, hash included. Sources are
+ * read twice (before and after the pack is assembled) and a pack whose sources changed in between is refused, so
+ * every fragment is from one state of the worktree. Nothing here is wired into a model loop yet (14C).
+ */
+
+import { createHash } from 'node:crypto';
+import { AgentRelayError } from '../../shared/domain/errors';
+import {
+  CONTEXT_PACK_LIMITS,
+  CONTEXT_PACK_VERSION,
+  contextPackRequestSchema,
+  contextPackSchema,
+  isContextPathAllowed,
+  renderContextPack,
+  type ContextFragment,
+  type ContextObservation,
+  type ContextOmission,
+  type ContextOmissionReason,
+  type ContextPack,
+  type ContextPackRequest,
+  type ContextProvenance,
+  type ContextSelector,
+  type ContextSource,
+  type ContextSourceObservation
+} from '../../shared/domain/context-pack';
+import { classifyLineEnding } from '../../shared/domain/ornith';
+import { containsSecretShape } from '../../shared/util/redact';
+import { OrnithWorktreeTools, type OrnithWorktreeToolsOptions } from './ornith-worktree-tools';
+
+/** Reads the requested paths of one worktree in one bounded pass. */
+export interface ContextSourceReader {
+  observe(paths: readonly string[], signal: AbortSignal): Promise<ContextObservation>;
+}
+
+/** The task worktree, read through the same safety checks as an Ornith `read_file`. */
+export class WorktreeContextSourceReader implements ContextSourceReader {
+  constructor(private readonly options: OrnithWorktreeToolsOptions) {}
+
+  observe(paths: readonly string[], signal: AbortSignal): Promise<ContextObservation> {
+    // A fresh instance each pass: its file manifest is the worktree's now, not as an earlier pass found it.
+    return new OrnithWorktreeTools(this.options).observeContextSources(
+      paths,
+      { maxFileBytes: CONTEXT_PACK_LIMITS.maxSourceFileBytes, maxTotalBytes: CONTEXT_PACK_LIMITS.maxReadBytes },
+      signal
+    );
+  }
+}
+
+export type ContextPackRefusal =
+  /** The request does not satisfy its schema. */
+  | 'invalid_request'
+  /** A selector names a path outside the request's read scope. */
+  | 'path_not_allowed'
+  /** The worktree is not this task's checkout, or it moved to another commit while it was read. */
+  | 'worktree_invalid'
+  /** The requested sources add up to more than one pass may read. */
+  | 'read_limit_exceeded'
+  /** A source changed between the two reads of one build. */
+  | 'sources_changed';
+
+export type ContextPackBuildResult =
+  | { readonly ok: true; readonly pack: ContextPack }
+  | { readonly ok: false; readonly code: ContextPackRefusal; readonly message: string; readonly path?: string };
+
+export type ContextStaleReason =
+  | { readonly kind: 'checkout_changed' }
+  | { readonly kind: 'worktree_invalid' }
+  | { readonly kind: 'source_changed' | 'source_removed' | 'source_appeared'; readonly path: string };
+
+export type ContextPackFreshness =
+  | { readonly fresh: true }
+  | { readonly fresh: false; readonly stale: readonly ContextStaleReason[] };
+
+const sha256 = (bytes: Uint8Array | string): string => createHash('sha256').update(bytes).digest('hex');
+const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
+
+/** JSON with every object's keys sorted and `undefined` dropped: one text per value, however it was built. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** Byte offset where each line starts, plus the file's end: line n (1-based) is [starts[n-1], starts[n]). */
+function lineStarts(raw: Uint8Array): number[] {
+  const starts = [0];
+  for (let index = 0; index < raw.length; index += 1) {
+    if (raw[index] === 0x0a && index + 1 < raw.length) starts.push(index + 1);
+  }
+  starts.push(raw.length);
+  return starts;
+}
+
+interface ReadableSource {
+  readonly raw: Uint8Array;
+  readonly text: string;
+  readonly starts: readonly number[];
+  readonly lineCount: number;
+}
+
+function describeSource(path: string, observed: ContextSourceObservation): { source: ContextSource; readable: ReadableSource | null } {
+  if (observed.state === 'absent') return { source: { path, state: 'absent' }, readable: null };
+  if (observed.state === 'refused') return { source: { path, state: 'refused', reason: observed.reason }, readable: null };
+  const raw = observed.raw;
+  const starts = lineStarts(raw);
+  const lineCount = raw.length === 0 ? 0 : starts.length - 1;
+  let text: string | null = null;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+  } catch {
+    text = null;
+  }
+  const content = text === null ? 'not_text' : containsSecretShape(text) ? 'secret_shaped' : 'text';
+  return {
+    source: { path, state: 'read', sha256: sha256(raw), bytes: raw.length, lineCount, lineEnding: classifyLineEnding(raw), content },
+    readable: content === 'text' && text !== null ? { raw, text, starts, lineCount } : null
+  };
+}
+
+type Resolved =
+  | { readonly ok: true; readonly startLine: number; readonly endLine: number; readonly anchorLine: number | null }
+  | { readonly ok: false; readonly reason: ContextOmissionReason };
+
+function lineOfIndex(text: string, index: number): number {
+  let line = 1;
+  for (let at = text.indexOf('\n'); at !== -1 && at < index; at = text.indexOf('\n', at + 1)) line += 1;
+  return line;
+}
+
+function resolveSelector(selector: ContextSelector, source: ReadableSource): Resolved {
+  if (source.lineCount === 0) return { ok: false, reason: 'empty_file' };
+  switch (selector.kind) {
+    case 'file':
+      return { ok: true, startLine: 1, endLine: source.lineCount, anchorLine: null };
+    case 'lines':
+      if (selector.startLine > source.lineCount) return { ok: false, reason: 'line_out_of_range' };
+      return { ok: true, startLine: selector.startLine, endLine: Math.min(selector.endLine, source.lineCount), anchorLine: null };
+    case 'anchor': {
+      const first = source.text.indexOf(selector.anchor);
+      if (first === -1) return { ok: false, reason: 'anchor_not_found' };
+      if (source.text.indexOf(selector.anchor, first + 1) !== -1) return { ok: false, reason: 'anchor_ambiguous' };
+      const anchorLine = lineOfIndex(source.text, first);
+      const lastLine = lineOfIndex(source.text, first + selector.anchor.length - 1);
+      return {
+        ok: true,
+        startLine: Math.max(1, anchorLine - selector.linesBefore),
+        endLine: Math.min(source.lineCount, lastLine + selector.linesAfter),
+        anchorLine
+      };
+    }
+  }
+}
+
+interface Candidate {
+  readonly path: string;
+  priority: number;
+  startLine: number;
+  endLine: number;
+  readonly provenance: ContextProvenance[];
+}
+
+/**
+ * The pack a request yields over one observation. Pure apart from hashing: every rule that decides what goes in
+ * — anchors, merging, the order the budget is spent in, where a fragment is cut — is here.
+ */
+export function assembleContextPack(request: ContextPackRequest, observation: ContextObservation): ContextPack {
+  const sources = new Map<string, { source: ContextSource; readable: ReadableSource | null }>();
+  for (const path of [...new Set(request.selectors.map((selector) => selector.path))].sort()) {
+    const observed = observation.sources.get(path);
+    if (observed === undefined) throw new AgentRelayError('INTERNAL', 'A requested context source was not observed.');
+    sources.set(path, describeSource(path, observed));
+  }
+
+  const omissions: ContextOmission[] = [];
+  const byPath = new Map<string, Candidate[]>();
+  request.selectors.forEach((selector, index) => {
+    const entry = sources.get(selector.path)!;
+    if (entry.readable === null) {
+      const reason: ContextOmissionReason = entry.source.state === 'read' ? entry.source.content as 'not_text' | 'secret_shaped' : entry.source.state;
+      omissions.push({ selector: index, path: selector.path, reason });
+      return;
+    }
+    const resolved = resolveSelector(selector, entry.readable);
+    if (!resolved.ok) {
+      omissions.push({ selector: index, path: selector.path, reason: resolved.reason });
+      return;
+    }
+    const provenance: ContextProvenance = {
+      selector: index,
+      reason: selector.reason,
+      ...(selector.label === undefined ? {} : { label: selector.label }),
+      startLine: resolved.startLine,
+      endLine: resolved.endLine,
+      anchorLine: resolved.anchorLine
+    };
+    const list = byPath.get(selector.path) ?? [];
+    list.push({ path: selector.path, priority: index, startLine: resolved.startLine, endLine: resolved.endLine, provenance: [provenance] });
+    byPath.set(selector.path, list);
+  });
+
+  // Overlapping or touching ranges of one file become one fragment, which keeps its earliest selector's priority.
+  const candidates: Candidate[] = [];
+  for (const list of byPath.values()) {
+    list.sort((left, right) => left.startLine - right.startLine || left.priority - right.priority);
+    let current: Candidate | undefined;
+    for (const next of list) {
+      if (current !== undefined && next.startLine <= current.endLine + 1) {
+        current.endLine = Math.max(current.endLine, next.endLine);
+        current.priority = Math.min(current.priority, next.priority);
+        current.provenance.push(...next.provenance);
+      } else {
+        current = { ...next, provenance: [...next.provenance] };
+        candidates.push(current);
+      }
+    }
+  }
+  candidates.sort((left, right) => left.priority - right.priority);
+
+  const kept: Omit<ContextFragment, 'id'>[] = [];
+  let remaining = request.maxContentBytes;
+  for (const candidate of candidates) {
+    const provenance = [...candidate.provenance].sort((left, right) => left.selector - right.selector);
+    const omitAll = (reason: ContextOmissionReason): void => {
+      for (const item of provenance) omissions.push({ selector: item.selector, path: candidate.path, reason });
+    };
+    if (kept.length >= CONTEXT_PACK_LIMITS.maxFragments) {
+      omitAll('fragment_limit');
+      continue;
+    }
+    const source = sources.get(candidate.path)!.readable!;
+    const startByte = source.starts[candidate.startLine - 1]!;
+    const endOf = (line: number): number => source.starts[line]!;
+    const cap = Math.min(CONTEXT_PACK_LIMITS.maxFragmentBytes, remaining);
+    let endLine = candidate.endLine;
+    while (endLine >= candidate.startLine && endOf(endLine) - startByte > cap) endLine -= 1;
+    if (endLine < candidate.startLine) {
+      omitAll(endOf(candidate.startLine) - startByte > CONTEXT_PACK_LIMITS.maxFragmentBytes ? 'fragment_too_large' : 'budget_exhausted');
+      continue;
+    }
+    const included = provenance.filter((item) => item.startLine <= endLine);
+    for (const item of provenance) {
+      if (item.startLine > endLine) omissions.push({ selector: item.selector, path: candidate.path, reason: 'budget_exhausted' });
+    }
+    const bytes = source.raw.subarray(startByte, endOf(endLine));
+    remaining -= bytes.length;
+    kept.push({
+      path: candidate.path,
+      startLine: candidate.startLine,
+      endLine,
+      startByte,
+      endByte: endOf(endLine),
+      contentSha256: sha256(bytes),
+      content: new TextDecoder('utf-8', { fatal: true }).decode(bytes),
+      provenance: included,
+      truncatedFromEndLine: endLine < candidate.endLine ? candidate.endLine : null
+    });
+  }
+
+  kept.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : left.startLine - right.startLine));
+  const fragments: ContextFragment[] = kept.map((fragment, index) => ({ id: `f${index + 1}`, ...fragment }));
+  omissions.sort((left, right) => left.selector - right.selector || (left.reason < right.reason ? -1 : left.reason > right.reason ? 1 : 0));
+  const unsigned = {
+    version: CONTEXT_PACK_VERSION,
+    request,
+    checkout: observation.checkout,
+    sources: [...sources.values()].map((entry) => entry.source),
+    fragments,
+    omissions,
+    contentBytes: fragments.reduce((total, fragment) => total + utf8Bytes(fragment.content), 0)
+  };
+  const pack: ContextPack = { ...unsigned, renderedBytes: 0, sha256: packHash(unsigned) };
+  return { ...pack, renderedBytes: utf8Bytes(renderContextPack(pack)) };
+}
+
+/** The pack's hash: everything but `renderedBytes` and the hash itself, each fragment's content by its own hash. */
+function packHash(pack: Omit<ContextPack, 'renderedBytes' | 'sha256'>): string {
+  return sha256(canonicalJson({ ...pack, fragments: pack.fragments.map(({ content: _content, ...rest }) => rest) }));
+}
+
+/** What changed between a pack and a later observation of the same worktree; empty when nothing did. */
+export function staleSources(pack: ContextPack, observation: ContextObservation): ContextStaleReason[] {
+  const stale: ContextStaleReason[] = [];
+  if (observation.checkout.branch !== pack.checkout.branch || observation.checkout.headCommit !== pack.checkout.headCommit) {
+    stale.push({ kind: 'checkout_changed' });
+  }
+  for (const source of pack.sources) {
+    const now = observation.sources.get(source.path);
+    if (now === undefined) {
+      stale.push({ kind: 'source_changed', path: source.path });
+      continue;
+    }
+    if (source.state === 'read') {
+      if (now.state === 'absent') stale.push({ kind: 'source_removed', path: source.path });
+      else if (now.state === 'refused' || sha256(now.raw) !== source.sha256) stale.push({ kind: 'source_changed', path: source.path });
+    } else if (source.state === 'absent') {
+      if (now.state !== 'absent') stale.push({ kind: 'source_appeared', path: source.path });
+    } else if (now.state !== 'refused' || now.reason !== source.reason) {
+      stale.push({ kind: now.state === 'absent' ? 'source_removed' : 'source_changed', path: source.path });
+    }
+  }
+  return stale;
+}
+
+async function observe(
+  reader: ContextSourceReader,
+  paths: readonly string[],
+  signal: AbortSignal
+): Promise<{ ok: true; observation: ContextObservation } | { ok: false; code: ContextPackRefusal; message: string }> {
+  if (signal.aborted) throw new AgentRelayError('CANCELLED', 'Reading the context was cancelled.');
+  try {
+    return { ok: true, observation: await reader.observe(paths, signal) };
+  } catch (error) {
+    if (!(error instanceof AgentRelayError)) throw error;
+    if (error.code === 'WORKTREE_INVALID' || error.code === 'GIT_FAILED') {
+      return { ok: false, code: 'worktree_invalid', message: error.message };
+    }
+    if (error.code === 'VALIDATION_FAILED') return { ok: false, code: 'read_limit_exceeded', message: error.message };
+    throw error;
+  }
+}
+
+/**
+ * Build a pack for `input` from the worktree `reader` reads. A refusal says why and builds nothing; cancellation
+ * and a timeout throw (`CANCELLED`, `TIMEOUT`) and leave nothing behind.
+ */
+export async function buildContextPack(
+  input: unknown,
+  reader: ContextSourceReader,
+  signal: AbortSignal
+): Promise<ContextPackBuildResult> {
+  const parsed = contextPackRequestSchema.safeParse(input);
+  if (!parsed.success) {
+    const where = [...new Set(parsed.error.issues.map((issue) => issue.path.join('.') || '(request)'))].slice(0, 5);
+    return { ok: false, code: 'invalid_request', message: `The context request is not valid at: ${where.join(', ')}.` };
+  }
+  const request = parsed.data;
+  const outside = request.selectors.find((selector) => !isContextPathAllowed(selector.path, request.allowedPaths));
+  if (outside !== undefined) {
+    return { ok: false, code: 'path_not_allowed', message: 'A selector names a path outside the allowed paths.', path: outside.path };
+  }
+  const paths = [...new Set(request.selectors.map((selector) => selector.path))];
+  const first = await observe(reader, paths, signal);
+  if (!first.ok) return first;
+  const pack = assembleContextPack(request, first.observation);
+  const second = await observe(reader, paths, signal);
+  if (!second.ok) return second;
+  const changed = staleSources(pack, second.observation);
+  if (changed.length > 0) {
+    const named = changed.find((reason) => 'path' in reason);
+    return {
+      ok: false,
+      code: 'sources_changed',
+      message: 'The worktree changed while the context was read. Retry when editing has stopped.',
+      ...(named !== undefined && 'path' in named ? { path: named.path } : {})
+    };
+  }
+  return { ok: true, pack };
+}
+
+/**
+ * Whether `value` is a pack this module could have built: its schema, every fragment against its own hash and
+ * byte range, the sources and omissions against the request, the order, the budget, the pack hash and the
+ * rendered size. Says nothing about whether the worktree still matches — that is {@link checkContextPackFreshness}.
+ */
+export function verifyContextPackIntegrity(value: unknown): { ok: true; pack: ContextPack } | { ok: false; problem: string } {
+  const parsed = contextPackSchema.safeParse(value);
+  if (!parsed.success) return { ok: false, problem: 'The pack does not match its schema.' };
+  const pack = parsed.data;
+  const fail = (problem: string): { ok: false; problem: string } => ({ ok: false, problem });
+
+  const paths = [...new Set(pack.request.selectors.map((selector) => selector.path))].sort();
+  if (canonicalJson(pack.sources.map((source) => source.path)) !== canonicalJson(paths)) {
+    return fail('The sources are not exactly the requested paths, in order.');
+  }
+  const sources = new Map(pack.sources.map((source) => [source.path, source]));
+  const answered = new Map<number, number>();
+  let contentBytes = 0;
+  let previous: ContextFragment | null = null;
+  for (const [index, fragment] of pack.fragments.entries()) {
+    if (fragment.id !== `f${index + 1}`) return fail('Fragment ids are not f1, f2, … in order.');
+    const source = sources.get(fragment.path);
+    if (source?.state !== 'read' || source.content !== 'text') return fail(`${fragment.id} names a source with no readable text.`);
+    if (fragment.endLine < fragment.startLine || fragment.endLine > source.lineCount) return fail(`${fragment.id} has impossible lines.`);
+    const bytes = utf8Bytes(fragment.content);
+    if (fragment.endByte - fragment.startByte !== bytes || fragment.endByte > source.bytes || bytes === 0) {
+      return fail(`${fragment.id} does not match its byte range.`);
+    }
+    if (bytes > CONTEXT_PACK_LIMITS.maxFragmentBytes) return fail(`${fragment.id} is larger than a fragment may be.`);
+    if (sha256(fragment.content) !== fragment.contentSha256) return fail(`${fragment.id} does not match its hash.`);
+    if (previous !== null && (previous.path > fragment.path || (previous.path === fragment.path && previous.endLine + 1 >= fragment.startLine))) {
+      return fail(`${fragment.id} is out of order or overlaps the fragment before it.`);
+    }
+    for (const item of fragment.provenance) {
+      if (pack.request.selectors[item.selector]?.path !== fragment.path) return fail(`${fragment.id} answers a selector of another path.`);
+      answered.set(item.selector, (answered.get(item.selector) ?? 0) + 1);
+    }
+    contentBytes += bytes;
+    previous = fragment;
+  }
+  for (const omission of pack.omissions) {
+    if (pack.request.selectors[omission.selector]?.path !== omission.path) return fail('An omission names a selector of another path.');
+    answered.set(omission.selector, (answered.get(omission.selector) ?? 0) + 1);
+  }
+  for (let index = 0; index < pack.request.selectors.length; index += 1) {
+    if (answered.get(index) !== 1) return fail(`Selector ${index} is not answered exactly once.`);
+  }
+  if (contentBytes !== pack.contentBytes || contentBytes > pack.request.maxContentBytes) return fail('The content does not fit its budget.');
+  const { renderedBytes: _renderedBytes, sha256: recorded, ...unsigned } = pack;
+  if (packHash(unsigned) !== recorded) return fail('The pack does not match its hash.');
+  if (utf8Bytes(renderContextPack(pack)) !== pack.renderedBytes) return fail('The rendered size is not the recorded one.');
+  return { ok: true, pack };
+}
+
+/** Whether the worktree still holds exactly what `pack` was built from: the same commit and every source the same. */
+export async function checkContextPackFreshness(
+  pack: ContextPack,
+  reader: ContextSourceReader,
+  signal: AbortSignal
+): Promise<ContextPackFreshness> {
+  const observed = await observe(reader, pack.sources.map((source) => source.path), signal);
+  if (!observed.ok) return { fresh: false, stale: [{ kind: 'worktree_invalid' }] };
+  const stale = staleSources(pack, observed.observation);
+  return stale.length === 0 ? { fresh: true } : { fresh: false, stale };
+}
+
+/**
+ * The pack to act on now: `pack` itself while it is fresh, otherwise one rebuilt from its own request. A caller
+ * that is about to change the worktree on the strength of a pack calls this first (docs/context-pack.md).
+ */
+export async function refreshContextPack(
+  pack: ContextPack,
+  reader: ContextSourceReader,
+  signal: AbortSignal
+): Promise<(ContextPackBuildResult & { readonly rebuilt: boolean })> {
+  const freshness = await checkContextPackFreshness(pack, reader, signal);
+  if (freshness.fresh) return { ok: true, pack, rebuilt: false };
+  return { ...(await buildContextPack(pack.request, reader, signal)), rebuilt: true };
+}

@@ -1949,6 +1949,16 @@ cannot trigger SQLite's implicit cascading delete through any of them; the
 migration proves this with `PRAGMA foreign_key_check` before it returns, and
 throws — rolling the whole migration back — if that check is not empty.
 
+### Context Pack (14A)
+
+A Context Pack is a bounded set of repository fragments read from one task
+worktree, bound to its commit and to the hash of every file it read, with the
+origin of every fragment and the reason for everything left out
+([context-pack.md](context-pack.md)). `src/main/services/context-pack.ts`
+builds one deterministically through `OrnithWorktreeTools`' read path,
+verifies a stored one and tells whether it is still fresh; a caller refreshes
+it before any change to the worktree. It is not yet given to Ornith (14C).
+
 ---
 
 ## 7. Renderer
