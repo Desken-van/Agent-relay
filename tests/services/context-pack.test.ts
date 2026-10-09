@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -394,5 +394,62 @@ describe('Context Pack cancellation', () => {
     });
     await expect(buildContextPack(request(), tools, during.signal)).rejects.toMatchObject({ code: 'CANCELLED' });
     await expect(checkContextPackFreshness(await built(), tools, during.signal)).rejects.toMatchObject({ code: 'CANCELLED' });
+  });
+});
+
+/**
+ * What every successfully built pack must be: intact by its own checks, every selector answered exactly once, and
+ * every fragment exactly the bytes of the file it names, at the range it names, under the hash it names.
+ */
+function expectFaithful(pack: ContextPack): void {
+  expect(verifyContextPackIntegrity(pack)).toEqual({ ok: true, pack });
+  const answers = [...pack.fragments.flatMap((fragment) => fragment.provenance.map((item) => item.selector)), ...pack.omissions.map((item) => item.selector)];
+  expect(answers.sort((left, right) => left - right)).toEqual(pack.request.selectors.map((_, index) => index));
+  for (const fragment of pack.fragments) {
+    const raw = readFileSync(join(worktree, ...fragment.path.split('/')));
+    const slice = raw.subarray(fragment.startByte, fragment.endByte);
+    expect(Buffer.from(fragment.content, 'utf8').equals(slice)).toBe(true);
+    expect(fragment.contentSha256).toBe(createHash('sha256').update(slice).digest('hex'));
+  }
+}
+
+describe('Context Pack bytes: a BOM or U+FEFF is content like any other', () => {
+  it('keeps a leading BOM and a U+FEFF that starts a fragment, byte for byte, with LF and CRLF', async () => {
+    writeFileSync(join(worktree, 'src', 'bom-lf.js'), '﻿export const x = 1;\nexport const y = 2;\n');
+    writeFileSync(join(worktree, 'src', 'bom-crlf.js'), '﻿export const x=1;\r\nexport const z=3;\r\n');
+    writeFileSync(join(worktree, 'src', 'inner.js'), 'first\n﻿second\nthird\n');
+    const pack = await built(request({
+      selectors: [
+        { kind: 'file', path: 'src/bom-lf.js', reason: 'explicit' },
+        { kind: 'lines', path: 'src/bom-crlf.js', startLine: 1, endLine: 1, reason: 'explicit' },
+        { kind: 'anchor', path: 'src/bom-crlf.js', anchor: 'export const z', linesBefore: 0, linesAfter: 0, reason: 'symbol', label: 'z' },
+        { kind: 'lines', path: 'src/inner.js', startLine: 2, endLine: 2, reason: 'explicit' },
+        { kind: 'anchor', path: 'src/inner.js', anchor: 'third', linesBefore: 0, linesAfter: 0, reason: 'explicit' }
+      ]
+    }));
+
+    expectFaithful(pack);
+    expect(pack.omissions).toEqual([]);
+    const byPath = new Map(pack.fragments.map((fragment) => [fragment.path, fragment]));
+    expect(byPath.get('src/bom-lf.js')).toMatchObject({ startByte: 0, content: '﻿export const x = 1;\nexport const y = 2;\n' });
+    expect(byPath.get('src/bom-crlf.js')).toMatchObject({ startByte: 0, startLine: 1, endLine: 2, content: '﻿export const x=1;\r\nexport const z=3;\r\n' });
+    expect(byPath.get('src/inner.js')).toMatchObject({ startLine: 2, endLine: 3, startByte: 6, content: '﻿second\nthird\n' });
+    expect(pack.sources.find((source) => source.path === 'src/bom-crlf.js')).toMatchObject({ lineEnding: 'crlf', lineCount: 2 });
+  });
+
+  it('finds an anchor in a BOM file at the line it is on, and still leaves out a credential behind a BOM', async () => {
+    writeFileSync(join(worktree, 'src', 'bom-anchor.js'), '﻿// header\nexport function handle() {}\n');
+    writeFileSync(join(worktree, 'src', 'bom-secret.js'), '﻿const key = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";\n');
+    const pack = await built(request({
+      selectors: [
+        { kind: 'anchor', path: 'src/bom-anchor.js', anchor: 'export function handle(', linesBefore: 0, linesAfter: 0, reason: 'symbol' },
+        { kind: 'file', path: 'src/bom-secret.js', reason: 'explicit' }
+      ]
+    }));
+
+    expectFaithful(pack);
+    expect(pack.fragments).toHaveLength(1);
+    expect(pack.fragments[0]).toMatchObject({ startLine: 2, endLine: 2, content: 'export function handle() {}\n', provenance: [{ selector: 0, anchorLine: 2 }] });
+    expect(pack.omissions).toEqual([{ selector: 1, path: 'src/bom-secret.js', reason: 'secret_shaped' }]);
   });
 });

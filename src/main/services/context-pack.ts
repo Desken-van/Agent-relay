@@ -77,6 +77,19 @@ export type ContextPackFreshness =
   | { readonly fresh: false; readonly stale: readonly ContextStaleReason[] };
 
 const sha256 = (bytes: Uint8Array | string): string => createHash('sha256').update(bytes).digest('hex');
+
+/**
+ * The text of exactly these bytes, or null when they are not UTF-8. A BOM is kept as U+FEFF, wherever it is —
+ * a file's first bytes or the first bytes of a fragment inside it — so the text encodes back to the same bytes:
+ * anchors, content, offsets and hashes all describe one sequence. (`TextDecoder` drops a leading BOM by default.)
+ */
+function decodeExactly(bytes: Uint8Array): string | null {
+  try {
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
 const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
 
 /** JSON with every object's keys sorted and `undefined` dropped: one text per value, however it was built. */
@@ -114,12 +127,7 @@ function describeSource(path: string, observed: ContextSourceObservation): { sou
   const raw = observed.raw;
   const starts = lineStarts(raw);
   const lineCount = raw.length === 0 ? 0 : starts.length - 1;
-  let text: string | null = null;
-  try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(raw);
-  } catch {
-    text = null;
-  }
+  const text = decodeExactly(raw);
   const content = text === null ? 'not_text' : containsSecretShape(text) ? 'secret_shaped' : 'text';
   return {
     source: { path, state: 'read', sha256: sha256(raw), bytes: raw.length, lineCount, lineEnding: classifyLineEnding(raw), content },
@@ -260,7 +268,8 @@ export function assembleContextPack(request: ContextPackRequest, observation: Co
       startByte,
       endByte: endOf(endLine),
       contentSha256: sha256(bytes),
-      content: new TextDecoder('utf-8', { fatal: true }).decode(bytes),
+      // A slice of valid UTF-8 cut at line breaks is valid UTF-8.
+      content: decodeExactly(bytes)!,
       provenance: included,
       truncatedFromEndLine: endLine < candidate.endLine ? candidate.endLine : null
     });

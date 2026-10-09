@@ -72,7 +72,9 @@ The same request over the same bytes gives the same pack, hash included. In orde
 3. A source that is not UTF-8 (`not_text`) or holds credential-shaped text anywhere (`secret_shaped` —
    the check `read_file` applies) gives no fragment at all; its hash is still recorded.
 4. Resolve each selector to lines. Lines end at `\n`; a last line without one counts; CRLF stays in the
-   content, byte for byte.
+   content, byte for byte. Text is decoded exactly: a UTF-8 BOM stays in the content as U+FEFF, whether it
+   starts the file or starts a fragment inside it, so a fragment's content, its byte range, its
+   `contentSha256` and the anchor search all describe the same bytes of the file.
 5. Merge overlapping or touching ranges of one file into one fragment, which keeps its earliest selector's
    priority and names every selector it answers.
 6. Spend the budget in priority order. A fragment is at most 16 KiB and at most what remains; one that does
