@@ -108,6 +108,9 @@ const STARTUP_POLL_MS = 50;
  */
 const REJECTED_BODY_DRAIN_BYTES = 4096;
 
+/** How long a request that broke off waits for the runtime's exit to be reaped (see {@link withRuntimeExit}). */
+const RUNTIME_EXIT_GRACE_MS = 250;
+
 type TerminalKind = 'failed' | 'cancelled' | 'timed_out';
 type TerminalEvents = Readonly<Record<TerminalKind, LocalInferenceEvent>>;
 
@@ -1183,6 +1186,7 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
           generation,
           parsed.requestId,
           deadline,
+          managed,
           'The inference request did not complete.'
         );
       }
@@ -1215,6 +1219,7 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
           generation,
           parsed.requestId,
           deadline,
+          managed,
           'The inference response was cut short.'
         );
       }
@@ -1291,6 +1296,7 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
     generation: number,
     requestId: string,
     deadline: Deadline,
+    managed: ManagedProcess,
     reason: string
   ): Promise<LocalInferenceOutcome> {
     const kind: TerminalKind = deadline.timedOut
@@ -1302,7 +1308,7 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
       ? `${reason} It exceeded the ${this.config.inferenceTimeoutMs}ms inference timeout.`
       : deadline.cancelled
         ? `${reason} It was cancelled.`
-        : reason;
+        : await withRuntimeExit(managed, reason);
     return this.concludeFailure(generation, requestId, kind, 'unknown', detail);
   }
 
@@ -1610,6 +1616,26 @@ function failure(
     reason: safe,
     dispatchOutcome
   };
+}
+
+/**
+ * A request that broke off without a timeout or a cancellation, with the runtime's own exit when that is why.
+ *
+ * A runtime that dies mid-request (an out-of-memory kill, a crash, a signal from outside) drops the connection,
+ * and the request alone cannot tell that from a network fault. The provider holds the exit, so it says it. The
+ * socket can close a moment before the exit is reaped, hence the short wait; a runtime still running after it
+ * keeps the plain reason (and is taken down by the caller as before).
+ */
+async function withRuntimeExit(managed: ManagedProcess, reason: string): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const exit = await Promise.race([
+    managed.exited,
+    new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), RUNTIME_EXIT_GRACE_MS);
+    })
+  ]);
+  clearTimeout(timer);
+  return exit === null ? reason : `${reason} ${exitReason(exit)}`;
 }
 
 /** A bounded description of how the process ended. Never its output. */

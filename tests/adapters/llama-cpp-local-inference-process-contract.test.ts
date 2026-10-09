@@ -509,6 +509,8 @@ describe('local inference process contract: inference', () => {
     expect(outcome.kind).not.toBe('completed');
     if (outcome.kind === 'completed') return;
     expect(outcome.dispatchOutcome).toBe('unknown');
+    // Said as what it was — the runtime's own exit, over a real socket and a real reap — not as a bare dropped request.
+    expect(outcome.reason).toBe('The inference request did not complete. The runtime process exited with code 9.');
     await expectTreeGone(built);
   });
 
