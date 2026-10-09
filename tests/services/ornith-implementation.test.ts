@@ -431,6 +431,74 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(calls).toBe(0);
   });
 
+  it('hands approved inputs that name API routes to the model word for word', async () => {
+    // A real Codex specification of an API task: before this, every slash-led token here counted as a
+    // machine path and the round was refused before its first inference.
+    const routes = 'POST /todos accepts body.priority; GET /todos?sort=priority; GET /api/v1/todos/{id}; ' +
+      'http://localhost:3000/todos stays a URL.';
+    const prompts: string[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        prompts.push(request.messages.map((message) => message.content).join('\n'));
+        return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'Done.' }));
+      }
+    };
+    const safe = baseRequest(leaseService, new AbortController().signal);
+    const inputs = [
+      { ...safe, specification: { ...specification, summary: routes, acceptanceCriteria: [`GET /todos returns 200. ${routes}`] } },
+      { ...safe, acceptedPlanReviewAddenda: routes },
+      { ...safe, ruleEvidence: routes },
+      { ...safe, correctionFindings: routes }
+    ];
+
+    for (const request of inputs) {
+      const result = await new OrnithImplementationService({ machineRootNames: () => new Set(['data', 'team data']) })
+        .implement(request);
+      expect(result.assessment.disposition).toBe('pass');
+    }
+    expect(prompts).toHaveLength(inputs.length);
+    for (const prompt of prompts) expect(prompt).toContain(routes);
+  });
+
+  it('still refuses approved inputs that name a known machine root, beside routes or not', async () => {
+    let calls = 0;
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        calls += 1;
+        return completed(request, JSON.stringify({ version: 1, action: 'finish', summary: 'not reached' }));
+      }
+    };
+    const safe = baseRequest(leaseService, new AbortController().signal);
+    const unsafe = [
+      { ...safe, specification: { ...specification, summary: 'POST /todos, then copy /Team Data/private/report.txt' } },
+      { ...safe, specification: { ...specification, constraints: ['GET /todos reads /data/fixtures.json'] } },
+      { ...safe, acceptedPlanReviewAddenda: 'GET /todos; logs in /home/operator/app.log' },
+      { ...safe, ruleEvidence: 'Routes live under /todos; see file:///srv/rules.md' },
+      { ...safe, correctionFindings: 'GET /todos failed at C:\\work\\app\\src\\api.js:3' },
+      { ...safe, specification: { ...specification, implementationPrompt: 'GET /todos: read /./etc/hosts' } }
+    ];
+
+    for (const request of unsafe) {
+      const result = await new OrnithImplementationService({ machineRootNames: () => new Set(['data', 'team data']) })
+        .implement(request);
+      expect(result.assessment.reasonCodes).toContain('disallowed_action');
+      expect(JSON.stringify(result)).not.toContain('report.txt');
+      expect(JSON.stringify(result)).not.toContain('fixtures.json');
+    }
+    // A route spelled like an entry at this machine's root, and any slash-led token when the root cannot be
+    // listed, still count as machine paths.
+    const route = { ...safe, specification: { ...specification, summary: 'POST /todos accepts a priority.' } };
+    expect((await new OrnithImplementationService({ machineRootNames: () => new Set(['todos']) }).implement(route))
+      .assessment.reasonCodes).toContain('disallowed_action');
+    expect((await new OrnithImplementationService({ machineRootNames: () => null }).implement(route))
+      .assessment.reasonCodes).toContain('disallowed_action');
+    expect(calls).toBe(0);
+  });
+
   it('replaces only the already-bound project and worktree roots while preserving ordinary slash prose', async () => {
     const requests: LocalInferenceRequest[] = [];
     const leaseService: OrnithInferenceLeaseService = {
