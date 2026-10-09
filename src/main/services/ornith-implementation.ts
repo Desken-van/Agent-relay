@@ -863,7 +863,7 @@ function assessmentFor(input: {
  * `containsMachinePathBesideRoutes`). `null` when the root cannot be listed, which makes every slash-led token
  * a machine path again.
  */
-function listMachineRootNames(boundRoots: readonly string[]): ReadonlySet<string> | null {
+export function listMachineRootNames(boundRoots: readonly string[]): ReadonlySet<string> | null {
   let entries: string[];
   try {
     entries = readdirSync('/');

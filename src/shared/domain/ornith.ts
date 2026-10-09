@@ -294,20 +294,52 @@ const WELL_KNOWN_MACHINE_ROOTS: ReadonlySet<string> = new Set([
   'applications', 'cores', 'library', 'network', 'private', 'system', 'users', 'volumes'
 ]);
 
-/** The same slash-led token `containsAbsoluteMachinePath` detects, captured. */
-const POSIX_ABSOLUTE_TOKEN = /(?:^|[\s=:[({,"'])\/(?!\/)([^\s)\]}"'>,;]+)/gm;
+/**
+ * What may stand right before a `/` that therefore does not start at the machine's root: a letter or digit (a
+ * URL's host, `src/data`), `.`, `~`, `_`, `-` (`../data`, `~/data`) or another separator.
+ */
+const CONTINUES_BEFORE_SLASH = /[\p{L}\p{N}_.~/\\-]/u;
+
+/** What, right after a root's name, makes it part of a longer name: `/data` is not `/database` or `/data_2`. */
+const CONTINUES_NAME = /[\p{L}\p{N}_-]/u;
+
+/** A slash-led token, for the checks that do not depend on a name: its first segment and any backslash. */
+const SLASH_LED_TOKEN = /(?<![\p{L}\p{N}_.~/\\-])\/(?!\/)([^\s)\]}"'>,;]+)/gmu;
 
 /**
- * True when prose a model wrote names an absolute machine path, telling an API route apart from a POSIX
- * path. A drive path or a UNC path is always a machine path. A slash-led token is a machine path when its
- * first segment is a well-known filesystem root (`/home/...`, `/etc/...`, `/Users/...`), names an entry this
- * machine's root holds (`machineRootNames`, lower-cased: `/data/...` where `/data` exists), or cannot be read
- * as a plain name (empty, `.`, `..`, a backslash in the token); so is any `file:` URL. Anything else —
- * `/todos`, `/api/v1/todos/{id}`, `/health?full=1`, `http://localhost:3000/todos` — is a route.
+ * True when `text` (lower-cased) names the root entry `name` (lower-cased) as a path: `/name` that does not
+ * continue something before it and is not the start of a longer name. The name is matched whole, as the
+ * machine spells it — a space, `#`, `?`, a comma or a parenthesis in it is part of it, not the end of a token.
+ */
+function namesRootEntry(text: string, name: string): boolean {
+  const needle = `/${name}`;
+  for (let at = text.indexOf(needle); at >= 0; at = text.indexOf(needle, at + 1)) {
+    const before = at === 0 ? '' : (text[at - 1] ?? '');
+    const after = text[at + needle.length] ?? '';
+    if (before !== '' && CONTINUES_BEFORE_SLASH.test(before)) continue;
+    if (after !== '' && CONTINUES_NAME.test(after)) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * True when prose a model wrote names an absolute machine path that Agent Relay can recognise, so that an API
+ * route it mentions is not refused as one.
  *
- * A route and a directory with the same name are the same text and cannot be told apart, so the machine
- * wins: `/todos` is refused on a machine whose root has a `todos` entry. `machineRootNames: null` (the root
- * could not be listed) makes every slash-led token a machine path, as `containsAbsoluteMachinePath` does.
+ * Always a machine path: a drive path, a UNC path, a `file:` URL. A slash-led name is one when it is a
+ * well-known filesystem root (`/home/...`, `/etc/...`, `/Users/...`) or an entry this machine's root holds
+ * (`machineRootNames`, lower-cased) — each matched whole, as spelled, so `/Team Data/...` or `/archive#2026/...`
+ * is found for a root of that name, while `/database` is not taken for a root `/data`. What follows a matched
+ * name decides nothing: `/data.json` or `/data?x=1` beside a root `/data` is refused, since the two cannot be
+ * told apart. A slash-led token that cannot be read as a plain name (empty, `.`, `..`, a backslash) is one too.
+ *
+ * What is left — `/todos`, `/api/v1/todos/{id}`, `/health?full=1`, `http://localhost:3000/todos` — is accepted.
+ * That is not proof it is a route: a path from another machine under a root neither list knows (`/backups/...`
+ * written elsewhere) passes as well. The check knows the roots any machine has and the ones this machine has.
+ *
+ * A route spelled like an entry at this machine's root is refused (`/todos` where the root has `todos`).
+ * `machineRootNames: null` (the root could not be listed) makes every slash-led token a machine path.
  */
 export function containsMachinePathBesideRoutes(
   value: string,
@@ -318,15 +350,18 @@ export function containsMachinePathBesideRoutes(
   if (/\bfile:\//i.test(value)) return true;
   const text = value.replace(/\b[A-Za-z][A-Za-z0-9+.-]+:\/\//g, ' ');
   if (/[A-Za-z]:[\\/]/.test(text) || /\\\\[^\\/\s]+[\\/]/.test(text)) return true;
-  for (const match of text.matchAll(POSIX_ABSOLUTE_TOKEN)) {
+  for (const match of text.matchAll(SLASH_LED_TOKEN)) {
     if (machineRootNames === null) return true;
     const token = match[1] ?? '';
     if (token.includes('\\')) return true;
-    // The first segment, without a query, a fragment or the punctuation that ends a sentence.
-    const segment = (token.split(/[/?#]/)[0] ?? '').replace(/[.:!?*]+$/, '').toLowerCase();
-    // `.` and `..` strip to nothing here as well.
-    if (segment.length === 0) return true;
-    if (WELL_KNOWN_MACHINE_ROOTS.has(segment) || machineRootNames.has(segment)) return true;
+    // `.`, `..` and an empty first segment (`/?all=1`) strip to nothing.
+    if ((token.split(/[/?#]/)[0] ?? '').replace(/[.:!?*]+$/, '').length === 0) return true;
+  }
+  if (machineRootNames === null) return false;
+  // One Unicode form on both sides: a root listed in decomposed form (as macOS stores names) is still found.
+  const lowered = text.normalize('NFC').toLowerCase();
+  for (const name of [...WELL_KNOWN_MACHINE_ROOTS, ...machineRootNames]) {
+    if (name.length > 0 && namesRootEntry(lowered, name.normalize('NFC').toLowerCase())) return true;
   }
   return false;
 }

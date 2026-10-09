@@ -99,6 +99,40 @@ describe('machine paths beside API routes', () => {
     expect(containsMachinePathBesideRoutes(value, thisMachine)).toBe(true);
   });
 
+  it.each([
+    ['a space', 'team data', 'Wrote /Team Data/private/report.txt'],
+    ['a hash', 'archive#2026', 'Wrote /archive#2026/private/report.txt'],
+    ['a question mark', 'archive?2026', 'Wrote /archive?2026/private/report.txt'],
+    ['a comma', 'backup,old', 'Wrote /backup,old/private/report.txt'],
+    ['a closing parenthesis', 'x)y', 'Wrote /x)y/private/report.txt'],
+    ['a quote', "it's", "Wrote /it's/private/report.txt"],
+    ['a semicolon and a brace', 'a;b}', 'Wrote /a;b}/private/report.txt'],
+    ['a name at the end of the text', 'team data', 'Wrote /Team Data'],
+    ['a name in backticks', 'data', 'Wrote `/data/private/report.txt`'],
+    ['a name in angle brackets', 'data', 'See </data/private/report.txt>'],
+    ['a decomposed accent, written composed', 'donne\u0301es', 'Wrote /Donn\u00e9es/private/report.txt']
+  ])('matches a root name holding %s whole, as the machine names it', (_label, name, value) => {
+    expect(containsMachinePathBesideRoutes(value, new Set([name]))).toBe(true);
+  });
+
+  it.each([
+    ['a longer name', 'Opened /database/schema.sql'],
+    ['a name with a suffix', 'Opened /data-backup and /data_2'],
+    ['a relative path', 'Edited src/data/x.js and ../data/y.js'],
+    ['a URL path', 'Calls https://example.com/data/x and http://data/x']
+  ])('does not take %s for the root /data', (_label, value) => {
+    expect(containsMachinePathBesideRoutes(value, new Set(['data']))).toBe(false);
+  });
+
+  it.each([
+    'Wrote /data.',
+    'Wrote /data.json',
+    'Wrote /data?x=1',
+    'Wrote /data#top'
+  ])('refuses %s: the root /data and what follows cannot be told apart from another name', (value) => {
+    expect(containsMachinePathBesideRoutes(value, new Set(['data']))).toBe(true);
+  });
+
   it('treats every slash-led token as a machine path when the root could not be listed', () => {
     expect(containsMachinePathBesideRoutes('POST /todos validates it', null)).toBe(true);
     expect(containsMachinePathBesideRoutes('Derive progress as floor(sum / count).', null)).toBe(false);

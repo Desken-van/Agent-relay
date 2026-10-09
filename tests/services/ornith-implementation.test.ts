@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } fr
 import { ExecaProcessRunner, type ProcessResult, type ProcessRunner } from '../../src/main/adapters/process/process-runner';
 import { locateExecutable } from '../../src/main/adapters/process/executable-locator';
 import {
+  listMachineRootNames,
   normalizeOrnithPromptInput,
   OrnithImplementationService,
   preflightOrnithPrompt
@@ -19,7 +20,7 @@ import {
   type LocalInferenceOutcome,
   type LocalInferenceRequest
 } from '../../src/shared/domain/local-inference';
-import { containsAbsoluteMachinePath, ORNITH_LIMITS } from '../../src/shared/domain/ornith';
+import { containsAbsoluteMachinePath, containsMachinePathBesideRoutes, ORNITH_LIMITS } from '../../src/shared/domain/ornith';
 import type { TaskSpecification } from '../../src/shared/schemas/codex';
 import { passedExecution } from '../helpers/ornith-verification';
 
@@ -1082,6 +1083,56 @@ describe('OrnithImplementationService limits and cancellation', () => {
       expect(result.assessment.reasonCodes).toContain('disallowed_action');
       expect(result.finalMessage).not.toContain(summary);
     }
+  });
+
+  it('refuses a path under a root whose name holds a space, # or ?, and never keeps the summary', async () => {
+    const cases = [
+      { root: 'team data', summary: 'Wrote /Team Data/private/report.txt' },
+      { root: 'archive#2026', summary: 'Wrote /archive#2026/private/report.txt' },
+      { root: 'archive?2026', summary: 'Wrote /archive?2026/private/report.txt' },
+      { root: 'backup,old', summary: 'Wrote /backup,old/private/report.txt' }
+    ];
+    for (const { root, summary } of cases) {
+      const leaseService: OrnithInferenceLeaseService = {
+        acquireOrnithLease: async () => lease(),
+        recheckOrnithLease: async () => true,
+        inferForOrnith: async (_lease, request) =>
+          completed(request, JSON.stringify({ version: 1, action: 'finish', summary }))
+      };
+
+      const result = await new OrnithImplementationService({ machineRootNames: () => new Set([root]) }).implement(
+        baseRequest(leaseService, new AbortController().signal)
+      );
+
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.reasonCodes).toContain('disallowed_action');
+      expect(JSON.stringify(result)).not.toContain('private/report.txt');
+    }
+  });
+
+  it('adds each bound root\'s first segment whole, a space or # in it included, to the names at the root', () => {
+    const names = listMachineRootNames(['/Team Data/worktrees/task', '/archive#2026/repo', 'C:\\Users\\op\\repo']);
+    expect(names).not.toBeNull();
+    expect(names!.has('team data')).toBe(true);
+    expect(names!.has('archive#2026')).toBe(true);
+    expect(containsMachinePathBesideRoutes('Wrote /Team Data/worktrees/task/out.txt', names)).toBe(true);
+  });
+
+  it('still keeps route summaries word for word beside such roots', async () => {
+    const summary = 'POST /todos and GET /todos?sort=priority; GET /api/v1/todos/{id} via http://localhost:3000/todos.';
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) =>
+        completed(request, JSON.stringify({ version: 1, action: 'finish', summary }))
+    };
+
+    const result = await new OrnithImplementationService({
+      machineRootNames: () => new Set(['team data', 'archive#2026', 'archive?2026', 'data'])
+    }).implement(baseRequest(leaseService, new AbortController().signal));
+
+    expect(result.assessment.disposition).toBe('pass');
+    expect(result.finalMessage).toBe(summary);
   });
 
   it('still refuses a credential or a control character in a `finish` summary that also names a route', async () => {
