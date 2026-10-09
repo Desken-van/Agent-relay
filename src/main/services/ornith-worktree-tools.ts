@@ -29,6 +29,7 @@ import {
   type OrnithAction,
   type OrnithDenialCode
 } from '../../shared/domain/ornith';
+import type { ContextObservation, ContextSourceObservation, ContextSourceRefusal } from '../../shared/domain/context-pack';
 import { containsSecretShape } from '../../shared/util/redact';
 import { locateExecutable } from '../adapters/process/executable-locator';
 import type { ProcessResult, ProcessRunner } from '../adapters/process/process-runner';
@@ -238,6 +239,22 @@ async function readAtMost(
     total += bytesRead;
   }
   return Buffer.concat(chunks, total);
+}
+
+/** Why a Context Pack source was not read, from the denial its safety check gave. */
+function contextRefusalFor(code: OrnithDenialCode): ContextSourceRefusal {
+  switch (code) {
+    case 'limit_read_bytes_exceeded':
+      return 'too_large';
+    case 'path_symlink':
+      return 'symlink';
+    case 'path_not_regular_file':
+      return 'not_regular_file';
+    case 'path_outside_worktree':
+      return 'outside_worktree';
+    default:
+      return 'unreadable';
+  }
 }
 
 /** True when any path segment resolves to `.git`, checked again here defensively. */
@@ -536,6 +553,89 @@ export class OrnithWorktreeTools {
       return hash.digest('hex');
     } catch {
       return null;
+    } finally {
+      dispose();
+    }
+  }
+
+  /**
+   * Context Pack sources (docs/context-pack.md): the exact bytes of each requested path, read the way `read_file`
+   * and `search_text` read — only a manifest file, every ancestor and the file itself checked, opened without
+   * following a link, its identity and the root's proven unchanged across the read. Read-only, and charged to no
+   * run budget: the caller bounds it (`maxFileBytes` per file, `maxTotalBytes` in all).
+   *
+   * The checkout is confirmed before the first read and after the last, on this task's branch at the same HEAD
+   * commit both times; otherwise this throws `WORKTREE_INVALID`. Files are read one after another, each whole:
+   * this is not a snapshot of the working tree, and nothing stops another process writing to it meanwhile.
+   * Cancellation throws `CANCELLED` and returns nothing partial.
+   */
+  async observeContextSources(
+    paths: readonly string[],
+    limits: { readonly maxFileBytes: number; readonly maxTotalBytes: number },
+    signal?: AbortSignal
+  ): Promise<ContextObservation> {
+    const { signal: bounded, dispose } = timeoutSignal(ORNITH_LIMITS.gitTimeoutMs, signal);
+    const stopIfAborted = (): void => {
+      if (signal?.aborted) throw new AgentRelayError('CANCELLED', 'Reading the context was cancelled.');
+      if (bounded.aborted) throw new AgentRelayError('TIMEOUT', 'Reading the context timed out.');
+    };
+    const head = async (): Promise<string> => {
+      if (!(await this.assertCheckoutIdentity(bounded))) {
+        stopIfAborted();
+        throw new AgentRelayError('WORKTREE_INVALID', 'The task worktree no longer matches its checkout identity.');
+      }
+      const commit = (await this.git(['rev-parse', '--verify', 'HEAD'], bounded))?.trim() ?? null;
+      if (commit === null || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit)) {
+        throw new AgentRelayError('WORKTREE_INVALID', 'The task worktree has no readable HEAD commit.');
+      }
+      return commit;
+    };
+    try {
+      const before = await head();
+      await this.ensureManifest(bounded);
+      const sources = new Map<string, ContextSourceObservation>();
+      let totalBytes = 0;
+      for (const path of [...new Set(paths)].sort()) {
+        stopIfAborted();
+        if (!this.knownFiles.has(path) || touchesDotGit(path)) {
+          sources.set(path, { state: 'absent' });
+          continue;
+        }
+        const resolved = await this.resolvePathOnly(path, { mustExist: true, forWrite: false });
+        if (!resolved.ok) {
+          sources.set(path, resolved.code === 'file_not_found'
+            ? { state: 'absent' }
+            : { state: 'refused', reason: contextRefusalFor(resolved.code) });
+          continue;
+        }
+        let read: Awaited<ReturnType<OrnithWorktreeTools['readRegularFileSafely']>>;
+        try {
+          read = await this.readRegularFileSafely(resolved.absolutePath, limits.maxFileBytes, bounded);
+        } catch (error) {
+          stopIfAborted();
+          sources.set(path, (error as NodeJS.ErrnoException).code === 'ENOENT'
+            ? { state: 'absent' }
+            : { state: 'refused', reason: 'unreadable' });
+          continue;
+        }
+        if (!read.ok) {
+          if (read.code === 'checkout_identity_changed') {
+            throw new AgentRelayError('WORKTREE_INVALID', 'The task worktree root changed while the context was read.');
+          }
+          sources.set(path, { state: 'refused', reason: contextRefusalFor(read.code) });
+          continue;
+        }
+        totalBytes += read.raw.byteLength;
+        if (totalBytes > limits.maxTotalBytes) {
+          throw new AgentRelayError('VALIDATION_FAILED', `The requested context reads more than ${limits.maxTotalBytes} bytes.`);
+        }
+        sources.set(path, { state: 'read', raw: read.raw });
+      }
+      stopIfAborted();
+      if ((await head()) !== before) {
+        throw new AgentRelayError('WORKTREE_INVALID', 'The task worktree moved to another commit while the context was read.');
+      }
+      return { checkout: { branch: this.deps.branchName, headCommit: before }, sources };
     } finally {
       dispose();
     }

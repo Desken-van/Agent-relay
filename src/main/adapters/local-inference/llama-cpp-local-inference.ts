@@ -65,6 +65,7 @@ import {
   unsafeProviderProse
 } from '../../../shared/util/provider-text';
 import type { LocalInferenceProvider } from '../../ports';
+import { loopbackFetch } from './loopback-fetch';
 import {
   judgeStrataHealth,
   readStrataEngineConfig,
@@ -90,7 +91,7 @@ export type LocalInferenceProcessRunner = ProcessRunner & ManagedProcessRunner;
 export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
 export interface LlamaCppLocalInferenceOptions {
-  /** Injected in tests. Production uses the global `fetch`. */
+  /** Injected in tests. Production uses {@link loopbackFetch}. */
   readonly fetch?: FetchLike;
   readonly now?: () => number;
 }
@@ -528,7 +529,8 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
     options: LlamaCppLocalInferenceOptions = {}
   ) {
     this.config = parseLocalInferenceConfig(config);
-    this.fetchImpl = options.fetch ?? ((url, init) => globalThis.fetch(url, init));
+    // Not the global fetch: its 300-second headers timeout would cut every longer inference short (loopback-fetch.ts).
+    this.fetchImpl = options.fetch ?? loopbackFetch;
     this.now = options.now ?? ((): number => Date.now());
     this.runtimeArgv = Object.freeze(
       this.config.adapterKind === 'strata' ? strataRuntimeArgv(this.config) : buildRuntimeArgv(this.config)

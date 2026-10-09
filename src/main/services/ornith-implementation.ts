@@ -859,9 +859,9 @@ function assessmentFor(input: {
 
 /**
  * The lower-cased names this machine's filesystem root holds, plus the first segment of each bound POSIX root:
- * what a slash-led token in a `finish` summary must not start with to read as an API route (see
- * `containsMachinePathBesideRoutes`). `null` when the root cannot be listed, which makes every slash-led token
- * a machine path again.
+ * what a slash-led token in a `finish` summary or an approved input must not start with to read as an API route
+ * (see `containsMachinePathBesideRoutes`). `null` when the root cannot be listed, which makes every slash-led
+ * token a machine path again.
  */
 export function listMachineRootNames(boundRoots: readonly string[]): ReadonlySet<string> | null {
   let entries: string[];
@@ -994,15 +994,18 @@ export class OrnithImplementationService {
 
     // These sources are authoritative. The only transport substitution is an
     // exact, already-verified project/worktree root, represented by one stable
-    // logical marker. Unknown host paths and credentials still cause refusal
-    // before the first inference rather than being silently rewritten.
+    // logical marker. Credentials and the machine paths Agent Relay recognises
+    // still cause refusal before the first inference rather than being silently
+    // rewritten; an API route the task is about (`POST /todos`) is not one — the
+    // same policy as a `finish` summary.
     const promptSources = [
       renderSpecification(promptInput.specification),
       promptInput.acceptedPlanReviewAddenda,
       promptInput.ruleEvidence,
       promptInput.correctionFindings
     ].filter((value): value is string => value !== null);
-    if (promptSources.some((value) => containsSecretShape(value) || containsAbsoluteMachinePath(value))) {
+    const machineRootNames = this.machineRootNames([request.worktreePath, request.worktreesRoot, request.repositoryPath]);
+    if (promptSources.some((value) => containsSecretShape(value) || containsMachinePathBesideRoutes(value, machineRootNames))) {
       return finish(
         'fail',
         'The approved Ornith inputs contain credential-shaped text or an absolute machine path.',

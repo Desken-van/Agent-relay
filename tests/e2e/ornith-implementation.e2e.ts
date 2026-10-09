@@ -175,10 +175,12 @@ function readRuns(profile: string, taskId: string): RunRow[] {
 
 describe('Ornith Electron acceptance', () => {
   it.each([
-    ['a plain summary', 'Created ornith-e2e-output.txt via the bounded Ornith tool loop.'],
-    // API routes are not machine paths: the summary of a task that touched an HTTP API names them.
-    ['a summary naming API routes', 'Created ornith-e2e-output.txt; it documents POST /todos and GET /api/v1/todos/{id}.']
-  ])('routes an implementation round to Ornith through real IPC/UI, mutates only the worktree, and sanitizes the rendered result (%s)', async (_label, finishSummary) => {
+    ['a plain summary', 'Created ornith-e2e-output.txt via the bounded Ornith tool loop.', ''],
+    // API routes are not machine paths: the specification of a task that touches an HTTP API names them, and
+    // so does its summary. The specification reaches the model word for word.
+    ['a summary naming API routes', 'Created ornith-e2e-output.txt; it documents POST /todos and GET /api/v1/todos/{id}.',
+      ' It documents POST /todos and GET /todos?sort=priority.']
+  ])('routes an implementation round to Ornith through real IPC/UI, mutates only the worktree, and sanitizes the rendered result (%s)', async (_label, finishSummary, specificationRoutes) => {
     const profile = mkdtempSync(join(tmpdir(), 'agent-relay-ornith-e2e-'));
     const repoDir = mkdtempSync(join(tmpdir(), 'agent-relay-ornith-e2e-repo-'));
     const runtime = new FakeLocalInferenceRuntime().scenario({ health: 'ok' });
@@ -241,7 +243,7 @@ describe('Ornith Electron acceptance', () => {
       /* ---------------------------------------------------------------- */
       const specification = {
         title: taskTitle,
-        summary: 'Create a small confirmation file to prove the bounded Ornith tool loop works end to end.',
+        summary: `Create a small confirmation file to prove the bounded Ornith tool loop works end to end.${specificationRoutes}`,
         assumptions: [],
         acceptanceCriteria: ['A new file exists with the expected content.'],
         constraints: [],
@@ -284,6 +286,7 @@ describe('Ornith Electron acceptance', () => {
       const outcome = await invokeIpc<{ status: string }>(page, 'workflow:implement', { taskId: task.id });
       // The finish was accepted and Relay's own verification passed: the task waits for review.
       expect(outcome.status).toBe('READY_FOR_REVIEW');
+      if (specificationRoutes !== '') expect(runtime.completionRequests()[0]!.body).toContain(specificationRoutes.trim());
 
       /* ---------------------------------------------------------------- */
       /* Database evidence: the run persisted, sanitized, worktree-only.   */

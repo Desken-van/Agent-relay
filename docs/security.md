@@ -638,7 +638,13 @@ terminal failure for that attempt.
   it is a route: the check knows the roots every machine has and the ones
   this machine has, so a path from another machine under a root neither list
   holds passes as well. A route spelled like an entry at this machine's root
-  is refused. The approved inputs and a runtime's failure text keep the
+  is refused. The approved inputs — the specification, accepted plan-review
+  addenda, rule evidence and the previous attempt's evidence — are checked the
+  same way before the first inference (the roots listed when the round starts),
+  so a specification of an API task (`POST /todos`, `GET /todos?sort=priority`)
+  reaches the model word for word, while one that names a path under a known
+  root, a drive, a UNC share or a `file:` URL still ends the round as
+  `disallowed_action` with nothing sent. A runtime's failure text keeps the
   stricter check that counts every slash-led token.
 - Every one of those checks is pathname-based, and so already stale by the
   time a write happens. The write itself is therefore performed by a small
