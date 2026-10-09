@@ -32,6 +32,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { _electron as electron, type ElectronApplication, type Locator, type Page } from 'playwright-core';
 import { execFileSync } from 'node:child_process';
 import { FakeLocalInferenceRuntime, freePort } from '../helpers/fake-local-inference';
+import { defaultProfileDiffers, saveSettingsThroughUi } from '../helpers/settings-save';
 
 const require = createRequire(import.meta.url);
 const electronExecutable = require('electron') as string;
@@ -98,7 +99,6 @@ async function startLocalInference(page: Page, runtimePath: string, port: number
   await page.getByRole('button', { name: 'Settings' }).click();
   const settingsCard = card(page, /^Local inference$/);
   await settingsCard.waitFor();
-  const saveButton = page.getByRole('button', { name: 'Save settings' });
 
   await settingsCard.getByLabel(/^Enable local inference/).check();
   // Distinct from the feature-wide toggle above: this profile must also be individually enabled for
@@ -123,8 +123,9 @@ async function startLocalInference(page: Page, runtimePath: string, port: number
   // and this fixture is not a minimal-window test.
   await settingsCard.getByLabel('Context size (tokens)').fill('16384');
   await settingsCard.getByLabel('Default max output tokens').fill('1024');
-  await saveButton.click();
-  await page.getByText('Settings saved').waitFor();
+  await saveSettingsThroughUi(page, defaultProfileDiffers({
+    adapterKind: 'llama_cpp', modelId: 'fake-model', port, contextLimitTokens: 16384, maxOutputTokens: 1024, profileEnabled: true
+  }));
 
   const lifecycle = card(page, 'Local inference lifecycle');
   await lifecycle.waitFor();

@@ -803,6 +803,45 @@ describe('local inference response', () => {
     if (outcome.kind === 'completed') return;
     expect(outcome.dispatchOutcome).toBe('unknown');
   });
+
+  /**
+   * The live failure: a memory guard terminated a Strata runtime in the middle of an Ornith turn, and the run
+   * said only "The inference request did not complete." — the same words as a dropped connection — although
+   * the provider held the process's exit. The socket can close a moment before the exit is reaped, so both
+   * orders are covered.
+   */
+  const SIGTERM_EXIT: ManagedProcessExit = { exitCode: null, signal: 'SIGTERM', spawnFailed: false, errorCode: null };
+  for (const order of ['exit before the connection drops', 'connection drops before the exit'] as const) {
+    it(`names the runtime's own exit when it ends during the request (${order})`, async () => {
+      const observed: { runner: StubRunner | null } = { runner: null };
+      const built = harness(async (url) => {
+        if (url.endsWith('/health')) return json({ status: 'ok' });
+        const child = observed.runner?.processes[0];
+        if (order === 'exit before the connection drops') child?.end(SIGTERM_EXIT);
+        else setTimeout(() => child?.end(SIGTERM_EXIT), 20);
+        throw new TypeError('fetch failed');
+      });
+      observed.runner = built.runner;
+      expect((await built.provider.start()).kind).toBe('healthy');
+
+      const outcome = await built.provider.infer(request());
+      expect(outcome.kind).toBe('failed');
+      if (outcome.kind === 'completed') return;
+      expect(outcome.dispatchOutcome).toBe('unknown');
+      expect(outcome.reason).toBe('The inference request did not complete. The runtime process was terminated by SIGTERM.');
+      expect(built.provider.state()).toMatchObject({ kind: 'failed', reason: outcome.reason });
+    });
+  }
+
+  it('keeps the plain reason when the runtime is still running after the connection drops', async () => {
+    const { provider } = await started(() => {
+      throw new TypeError('connection reset');
+    });
+    const outcome = await provider.infer(request());
+    expect(outcome.kind).toBe('failed');
+    if (outcome.kind === 'completed') return;
+    expect(outcome.reason).toBe('The inference request did not complete.');
+  });
 });
 
 /* -------------------------------------------------------------------------- */

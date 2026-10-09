@@ -27,6 +27,7 @@ import { createRequire } from 'node:module';
 import { DatabaseSync } from 'node:sqlite';
 import { _electron as electron, type ElectronApplication, type Locator, type Page } from 'playwright-core';
 import { FakeLocalInferenceRuntime, freePort } from '../helpers/fake-local-inference';
+import { defaultProfileDiffers, saveSettingsThroughUi } from '../helpers/settings-save';
 
 const require = createRequire(import.meta.url);
 const electronExecutable = require('electron') as string;
@@ -230,8 +231,9 @@ describe('Local inference Electron acceptance', () => {
       await settingsCard.getByLabel(/^Inference timeout \(ms\)/).fill('1500');
 
       expect(await saveButton.isDisabled()).toBe(false);
-      await saveButton.click();
-      await page.getByText('Settings saved').waitFor();
+      await saveSettingsThroughUi(page, defaultProfileDiffers({
+        adapterKind: 'llama_cpp', modelId: 'fake-model', port, maxOutputTokens: 111, inferenceTimeoutMs: 1500
+      }));
 
       const lifecycle = card(page, 'Local inference lifecycle');
       await lifecycle.waitFor();

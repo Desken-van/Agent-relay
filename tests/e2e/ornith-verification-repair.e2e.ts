@@ -32,6 +32,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { execFileSync } from 'node:child_process';
 import { _electron as electron, type ElectronApplication, type Locator, type Page } from 'playwright-core';
 import { FakeLocalInferenceRuntime, freePort } from '../helpers/fake-local-inference';
+import { defaultProfileDiffers, saveSettingsThroughUi } from '../helpers/settings-save';
 
 const require = createRequire(import.meta.url);
 const electronExecutable = require('electron') as string;
@@ -183,8 +184,9 @@ async function startLocalInference(page: Page, port: number, kind: RuntimeKind, 
   for (const [field, value] of fields) if ((await field.inputValue()) !== value) await fillHeld(field, value);
   const save = page.getByRole('button', { name: 'Save settings' });
   await expect_(async () => String(await save.isEnabled()), (enabled) => enabled === 'true');
-  await save.click();
-  await page.getByText('Settings saved').waitFor();
+  await saveSettingsThroughUi(page, defaultProfileDiffers({
+    adapterKind: kind, modelId: 'fake-model', port, contextLimitTokens: 16384, maxOutputTokens: 1024, profileEnabled: true
+  }));
   const lifecycle = card(page, 'Local inference lifecycle');
   // The runtime is named for what it is wherever the profile is offered.
   if (kind === 'strata') await expect_(async () => lifecycle.textContent(), (text) => (text ?? '').includes('Local model · Strata'));

@@ -5,7 +5,9 @@ import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import type { Settings } from '../../src/shared/domain/models';
 import { defaultLocalInferenceSettings } from '../../src/shared/domain/local-inference';
 import { SettingsView } from '../../src/renderer/src/components/SettingsView';
-import { installBridge, ok, renderApp, type Bridge } from './harness';
+import { Toasts } from '../../src/renderer/src/components/Toasts';
+import { useStore } from '../../src/renderer/src/state/store';
+import { deferred, installBridge, ok, renderApp, type Bridge } from './harness';
 
 let bridge: Bridge;
 let settings: Settings;
@@ -369,5 +371,70 @@ describe('a Strata runtime in the profile editor', () => {
     const saved = (bridge.callsTo('settings:update')[0]?.input as Settings).localInference.profiles[0]!;
     expect(saved.adapterKind).toBe('llama_cpp');
     expect(saved).not.toHaveProperty('strata');
+  });
+});
+
+/**
+ * The Windows CI failure behind this: Save wrote the settings at once, but "Settings saved" waited for the forced
+ * tool diagnostics that follow it (codex, claude, git and gh are each probed, with timeouts of up to 30 s), so on a
+ * cold first launch the confirmation came after the e2e's 15 s wait although the profile had long been stored.
+ * A completed write is confirmed when it completes; the refreshes that follow it are not part of it.
+ */
+describe('saving settings', () => {
+  it('confirms a completed write without waiting for the tool diagnostics that follow it', async () => {
+    const diagnostics = deferred<unknown>();
+    bridge.set('diagnostics:run', () => diagnostics.promise);
+    renderApp(<><SettingsView /><Toasts /></>);
+    fireEvent.click(await screen.findByLabelText(/^Release the local runtime while Agent Relay verifies/));
+    fireEvent.click(screen.getByRole('button', { name: /^Save settings$/ }));
+
+    expect(await screen.findByText('Settings saved')).toBeTruthy();
+    expect(bridge.callsTo('settings:update')).toHaveLength(1);
+    // The diagnostics are still refreshed for the saved paths — after the confirmation, not before it.
+    expect(bridge.callsTo('diagnostics:run').some((call) => (call.input as { force?: boolean }).force === true)).toBe(true);
+    diagnostics.resolve({ ok: false, error: { code: 'INTERNAL', message: 'not used' } });
+  });
+
+  it('leaves no operation busy once the write is confirmed, while the diagnostics are still running', async () => {
+    // A busy operation blocks every workflow action on the Run screen (its primary action included): a save that
+    // stayed busy for its follow-up probes kept "Run implementation" disabled, with no reason given, until they ended.
+    const diagnostics = deferred<unknown>();
+    bridge.set('diagnostics:run', () => diagnostics.promise);
+    function BusyProbe(): React.JSX.Element {
+      const { busy } = useStore();
+      return <output aria-label="busy operations">{Object.keys(busy).filter((key) => busy[key]).join(',') || 'none'}</output>;
+    }
+    renderApp(<><SettingsView /><Toasts /><BusyProbe /></>);
+    fireEvent.click(await screen.findByLabelText(/^Release the local runtime while Agent Relay verifies/));
+    fireEvent.click(screen.getByRole('button', { name: /^Save settings$/ }));
+
+    await screen.findByText('Settings saved');
+    await waitFor(() => expect(screen.getByLabelText('busy operations').textContent).toBe('none'));
+    expect(bridge.callsTo('diagnostics:run').some((call) => (call.input as { force?: boolean }).force === true)).toBe(true);
+    diagnostics.resolve({ ok: false, error: { code: 'INTERNAL', message: 'not used' } });
+  });
+
+  it('confirms a write that changed the Codex path without waiting for the Codex catalogue', async () => {
+    const catalogue = deferred<unknown>();
+    bridge.set('diagnostics:run', () => ({ ok: false, error: { code: 'INTERNAL', message: 'not used' } }));
+    bridge.set('codex:listModels', () => catalogue.promise);
+    renderApp(<><SettingsView /><Toasts /></>);
+    await screen.findByLabelText(/^Enable local inference/);
+    fireEvent.change(screen.getByLabelText(/^Codex path/), { target: { value: 'C:\\tools\\codex.exe' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Save settings$/ }));
+
+    expect(await screen.findByText('Settings saved')).toBeTruthy();
+    await waitFor(() => expect(bridge.callsTo('codex:listModels').length).toBeGreaterThan(0));
+    catalogue.resolve(ok<'codex:listModels'>({ available: false, models: [], detail: 'not used' }));
+  });
+
+  it('still reports a refused write as a failure and never as saved', async () => {
+    bridge.set('settings:update', () => ({ ok: false, error: { code: 'VALIDATION_FAILED', message: 'Port is in use.' } }));
+    renderApp(<><SettingsView /><Toasts /></>);
+    fireEvent.click(await screen.findByLabelText(/^Release the local runtime while Agent Relay verifies/));
+    fireEvent.click(screen.getByRole('button', { name: /^Save settings$/ }));
+
+    expect(await screen.findByText('Could not save settings')).toBeTruthy();
+    expect(screen.queryByText('Settings saved')).toBeNull();
   });
 });

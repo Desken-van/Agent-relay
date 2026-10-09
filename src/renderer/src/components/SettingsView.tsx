@@ -1323,13 +1323,19 @@ export function SettingsView(): React.JSX.Element {
                     await expect('settings:update', draft);
                     clearEdits();
                     await refreshSettings();
-                    await refreshDiagnostics(true);
+                    // Confirmed once the write is stored and read back. The tool
+                    // refreshes below probe codex, claude, git and gh (each with a
+                    // timeout of up to 30 s) and are not part of the save: they are
+                    // started, not awaited, because an operation still in progress
+                    // here would block every workflow action on the Run screen until
+                    // the slowest probe answered. Neither of them throws.
+                    notify({ tone: 'success', title: 'Settings saved' });
+
+                    void refreshDiagnostics(true);
 
                     // A different Codex binary is a different catalogue. Fetch
                     // it now rather than making the user press Refresh models.
-                    if (codexPathChanged) await refreshCodexModels(true);
-
-                    notify({ tone: 'success', title: 'Settings saved' });
+                    if (codexPathChanged) void refreshCodexModels(true);
                   })
                 }
               >
