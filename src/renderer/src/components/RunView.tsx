@@ -6,7 +6,7 @@ import {
   type ReviewProvider
 } from '@shared/domain/execution-providers';
 import { latestClaudeRoundResult } from '@shared/domain/claude-assessment';
-import type { LocalInferenceProfileSummary, LocalInferenceStateKind } from '@shared/domain/local-inference';
+import { localRuntimeTag, type LocalInferenceProfileSummary, type LocalInferenceStateKind } from '@shared/domain/local-inference';
 import type { GitChangeSet } from '@shared/domain/git';
 import { APPROVAL_ACTIONS, type ApprovalAction, type Run, type Task } from '@shared/domain/models';
 import {
@@ -239,7 +239,7 @@ export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: 
       <span className="provider-controls__summary">
         {providerLabel(task.implementationProvider)}
         {task.implementationProvider === 'ornith'
-          ? ` (${boundProfile?.displayName ?? task.ornithModelProfileId ?? 'no profile bound'})`
+          ? ` (${boundProfile !== null ? `${boundProfile.displayName}${localRuntimeTag(boundProfile.runtime)}` : task.ornithModelProfileId ?? 'no profile bound'})`
           : ''}{' '}
         implements · {providerLabel(task.reviewProvider)} reviews
       </span>
@@ -284,6 +284,7 @@ export function ProviderControls({ task, busy, onChanged }: { task: Task; busy: 
               {profiles.map((profile) => (
                 <option key={profile.id} value={profile.id} disabled={!profile.enabled}>
                   {profile.displayName}
+                  {localRuntimeTag(profile.runtime)}
                   {profile.isDefault ? ' (default)' : ''}
                   {profile.enabled ? '' : ' — disabled'}
                 </option>

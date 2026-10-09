@@ -24,6 +24,7 @@ import { call } from '../lib/api';
 import {
   isLocalInferenceActive,
   localInferencePromptSchema,
+  localRuntimeTag,
   type LocalInferenceCapabilities,
   type LocalInferenceFinishReason,
   type LocalInferenceProfileSummary,
@@ -556,6 +557,7 @@ export function LocalInferenceLifecyclePanel({
               {profiles.map((profile) => (
                 <option key={profile.id} value={profile.id}>
                   {profile.displayName}
+                  {localRuntimeTag(profile.runtime)}
                   {profile.isDefault ? ' (default)' : ''}
                   {profile.enabled ? '' : ' (disabled for new tasks)'}
                 </option>

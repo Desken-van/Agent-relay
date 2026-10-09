@@ -26,6 +26,7 @@ import {
   type LocalInferenceRequest,
   type LocalInferenceState
 } from '../../shared/domain/local-inference';
+import { dirname } from 'node:path';
 import { AgentRelayError } from '../../shared/domain/errors';
 import type {
   IdGenerator,
@@ -42,6 +43,13 @@ import type {
 import { localInferenceProfileFingerprint } from './local-inference-profile-fingerprint';
 
 export const LOCAL_INFERENCE_PROVIDER_ID = 'local-llama-cpp';
+/** A Strata runtime's provider identity: never reported as llama.cpp's, in a lease, a response or a record. */
+export const STRATA_LOCAL_INFERENCE_PROVIDER_ID = 'local-strata';
+
+/** The provider identity a profile's runtime reports. */
+export function localInferenceProviderIdFor(profile: Pick<LocalInferenceProfile, 'adapterKind'>): string {
+  return profile.adapterKind === 'strata' ? STRATA_LOCAL_INFERENCE_PROVIDER_ID : LOCAL_INFERENCE_PROVIDER_ID;
+}
 
 /** Bounded and safe; never a path, never provider-side detail. */
 const LOCAL_INFERENCE_DISABLED_REASON = 'Local inference is disabled in Settings.';
@@ -90,7 +98,15 @@ export const LOCAL_INFERENCE_APPLICATION_LIMITS = {
 export function assembleLocalInferenceConfig(profile: LocalInferenceProfile): LocalInferenceConfig {
   return parseLocalInferenceConfig({
     version: LOCAL_INFERENCE_CONTRACT_VERSION,
-    providerId: LOCAL_INFERENCE_PROVIDER_ID,
+    providerId: localInferenceProviderIdFor(profile),
+    adapterKind: profile.adapterKind,
+    ...(profile.strata === undefined
+      ? {}
+      : {
+          strata: profile.strata,
+          // Where Strata's own start script stands: the checkout that holds serve/server.py.
+          workingDirectory: dirname(dirname(profile.strata.serverScript))
+        }),
     executable: profile.executable,
     model: profile.model,
     fixedArguments: profile.fixedArguments,
@@ -751,7 +767,7 @@ export class LocalInferenceService
     return {
       protocol: LOCAL_INFERENCE_PROTOCOL,
       contractVersion: LOCAL_INFERENCE_CONTRACT_VERSION,
-      providerId: LOCAL_INFERENCE_PROVIDER_ID,
+      providerId: profile === null ? LOCAL_INFERENCE_PROVIDER_ID : localInferenceProviderIdFor(profile),
       modelId: profile?.model.id ?? 'none',
       available: false,
       unavailableReason: reason,

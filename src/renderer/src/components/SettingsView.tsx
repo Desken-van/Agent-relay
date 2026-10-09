@@ -292,6 +292,24 @@ export function SettingsView(): React.JSX.Element {
     }
   };
 
+  /** The same profile as a Strata runtime: explicit interpreter, the runtime's own model name, no fixed arguments. */
+  const asStrataProfile = (profile: LocalInferenceProfile): LocalInferenceProfile => ({
+    ...profile,
+    adapterKind: 'strata',
+    executable: { kind: 'explicit_path', path: profile.executable.kind === 'explicit_path' ? profile.executable.path : '' },
+    model: {
+      id: profile.model.id,
+      source: { kind: 'runtime_id', runtimeModelId: profile.model.source.kind === 'runtime_id' ? profile.model.source.runtimeModelId : '' }
+    },
+    fixedArguments: [],
+    strata: profile.strata ?? { serverScript: '', engineConfig: '' }
+  });
+  /** The same profile as a llama.cpp runtime: the Strata paths go. */
+  const asLlamaCppProfile = (profile: LocalInferenceProfile): LocalInferenceProfile => {
+    const { strata: _strata, ...rest } = profile;
+    return { ...rest, adapterKind: 'llama_cpp' };
+  };
+
   const setEditingProfile = (next: LocalInferenceProfile): void => {
     if (!draft || editingIndex < 0) return;
     const profiles = draft.localInference.profiles.slice();
@@ -573,6 +591,7 @@ export function SettingsView(): React.JSX.Element {
                           }}
                         >
                           {profile.displayName}{' '}
+                          {profile.adapterKind === 'strata' ? <span className="faint">· Strata </span> : null}
                           <span className="mono faint">({profile.id})</span>
                         </button>
                         <button type="button" className="btn btn--sm btn--ghost" onClick={() => deleteProfile(profile.id)}>
@@ -598,6 +617,65 @@ export function SettingsView(): React.JSX.Element {
                       />
                     </Field>
 
+                    <Field
+                      label="Runtime"
+                      hint="llama.cpp: a llama-server Agent Relay launches with the arguments below. Strata: a Strata server started from the files its own setup wrote; Agent Relay still owns the process and does every file change itself."
+                    >
+                      <select
+                        className="input"
+                        aria-label="Runtime"
+                        value={editingProfile.adapterKind}
+                        onChange={(event) => {
+                          setFixedArgumentsText(null);
+                          setEditingProfile(event.target.value === 'strata' ? asStrataProfile(editingProfile) : asLlamaCppProfile(editingProfile));
+                        }}
+                      >
+                        <option value="llama_cpp">llama.cpp (llama-server)</option>
+                        <option value="strata">Strata</option>
+                      </select>
+                    </Field>
+                    {editingProfile.adapterKind === 'strata' ? (
+                      <>
+                        <Field label="Strata Python interpreter" hint="The python of Strata's own .venv, as an absolute path. Never looked up on PATH.">
+                          <input
+                            className="input input--mono"
+                            value={editingProfile.executable.kind === 'explicit_path' ? editingProfile.executable.path : ''}
+                            onChange={(event) =>
+                              setEditingProfile({ ...editingProfile, executable: { kind: 'explicit_path', path: event.target.value } })
+                            }
+                          />
+                        </Field>
+                        <Field label="Strata server script" hint="serve/server.py of the Strata checkout, as an absolute path.">
+                          <input
+                            className="input input--mono"
+                            value={editingProfile.strata?.serverScript ?? ''}
+                            onChange={(event) =>
+                              setEditingProfile({
+                                ...editingProfile,
+                                strata: { serverScript: event.target.value, engineConfig: editingProfile.strata?.engineConfig ?? '' }
+                              })
+                            }
+                          />
+                        </Field>
+                        <Field
+                          label="Strata model config"
+                          hint="The strata-<model>.json its setup wrote. Checked before every start: it must name this profile's model and enough context, and must not add MCP tools, an API key, another host, lazy loading or idle unloading."
+                        >
+                          <input
+                            className="input input--mono"
+                            value={editingProfile.strata?.engineConfig ?? ''}
+                            onChange={(event) =>
+                              setEditingProfile({
+                                ...editingProfile,
+                                strata: { serverScript: editingProfile.strata?.serverScript ?? '', engineConfig: event.target.value }
+                              })
+                            }
+                          />
+                        </Field>
+                      </>
+                    ) : null}
+
+                    {editingProfile.adapterKind === 'llama_cpp' ? <>
                     <Field label="Executable" hint="Discover llama-server on PATH, or name an absolute path explicitly.">
                       <select
                         className="input"
@@ -631,6 +709,8 @@ export function SettingsView(): React.JSX.Element {
                       </Field>
                     ) : null}
 
+                    </> : null}
+
                     <Field label="Model id" hint="The stable identity used in --alias and in every request/response. Never a path.">
                       <input
                         className="input input--mono"
@@ -643,6 +723,22 @@ export function SettingsView(): React.JSX.Element {
                         }
                       />
                     </Field>
+                    {editingProfile.adapterKind === 'strata' ? (
+                      <Field label="Strata model name" hint="The model_name of the Strata model config — what its /health reports. The runtime counts as ready only when it reports this model, loaded.">
+                        <input
+                          className="input input--mono"
+                          value={editingProfile.model.source.kind === 'runtime_id' ? editingProfile.model.source.runtimeModelId : ''}
+                          onChange={(event) =>
+                            setEditingProfile({
+                              ...editingProfile,
+                              model: { ...editingProfile.model, source: { kind: 'runtime_id', runtimeModelId: event.target.value } }
+                            })
+                          }
+                        />
+                      </Field>
+                    ) : null}
+
+                    {editingProfile.adapterKind === 'llama_cpp' ? <>
                     <Field label="Model source" hint="Where the runtime finds the weights.">
                       <select
                         className="input"
@@ -719,6 +815,7 @@ export function SettingsView(): React.JSX.Element {
                         }}
                       />
                     </Field>
+                    </> : null}
 
                     <Field label="Port" hint="Loopback only (127.0.0.1); the host is never configurable.">
                       <input

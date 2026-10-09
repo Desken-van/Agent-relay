@@ -368,6 +368,40 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(readFileSync(join(worktree, 'fixture.txt'), 'utf8')).toContain('ornith');
   }, 60_000);
 
+  it('marks the same stable prefix on every turn, ending before the history and budget that change', async () => {
+    const actions = [
+      { version: 1, action: 'list_files', prefix: '', limit: 20 },
+      { version: 1, action: 'read_file', path: 'fixture.txt', offset: 0, limit: 4096 },
+      { version: 1, action: 'finish', summary: 'Read the fixture.' }
+    ];
+    const requests: LocalInferenceRequest[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(),
+      recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        requests.push(request);
+        return completed(request, JSON.stringify(actions[requests.length - 1]!));
+      }
+    };
+
+    await new OrnithImplementationService().implement(
+      baseRequest(leaseService, new AbortController().signal, VERIFYING_LOOP_DEADLINE_MS)
+    );
+
+    expect(requests).toHaveLength(3);
+    const prefixes = requests.map((request) => {
+      expect(request.stablePrefix?.message).toBe(0);
+      return request.messages[0]!.content.slice(0, request.stablePrefix!.chars);
+    });
+    expect(new Set(prefixes).size).toBe(1);
+    const prefix = prefixes[0]!;
+    expect(prefix.endsWith('\n\n')).toBe(true);
+    expect(prefix).not.toContain('=== REMAINING BUDGET ===');
+    expect(prefix).not.toContain('=== PRIOR TOOL RESULTS');
+    // What follows the prefix is what changes: the later turns carry the earlier results there.
+    expect(requests[2]!.messages[0]!.content.slice(prefix.length)).toContain('=== PRIOR TOOL RESULTS');
+  }, 60_000);
+
   it('refuses unsafe prompt sources before the first inference', async () => {
     let calls = 0;
     const leaseService: OrnithInferenceLeaseService = {

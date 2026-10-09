@@ -634,13 +634,27 @@ Round ${request.round} of at most ${request.maxRounds}.`;
     : full;
 }
 
+const PROMPT_MESSAGE_CHUNK = 190_000;
+
 function toMessages(promptText: string): LocalInferenceMessage[] {
-  const CHUNK = 190_000;
   const messages: LocalInferenceMessage[] = [];
-  for (let offset = 0; offset < promptText.length; offset += CHUNK) {
-    messages.push({ role: 'user', content: promptText.slice(offset, offset + CHUNK) });
+  for (let offset = 0; offset < promptText.length; offset += PROMPT_MESSAGE_CHUNK) {
+    messages.push({ role: 'user', content: promptText.slice(offset, offset + PROMPT_MESSAGE_CHUNK) });
   }
   return messages.length > 0 ? messages : [{ role: 'user', content: promptText }];
+}
+
+/**
+ * Where the part every turn of a round repeats ends in `toMessages(promptText)`: the authoritative content
+ * and its separator come first on every turn, and only the history and budget after them change. A runtime
+ * that can keep a marked prefix cached then reads just that tail on later turns. `undefined` when the prompt
+ * does not start with it (it always does; the hint is then simply not sent).
+ */
+function stablePrefixOf(promptText: string, authoritative: string): LocalInferenceRequest['stablePrefix'] {
+  const stable = `${authoritative}\n\n`;
+  if (!promptText.startsWith(stable) || stable.length >= promptText.length) return undefined;
+  const message = Math.floor((stable.length - 1) / PROMPT_MESSAGE_CHUNK);
+  return { message, chars: stable.length - message * PROMPT_MESSAGE_CHUNK };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1085,12 +1099,14 @@ export class OrnithImplementationService {
       }
 
       const requestId = `ornith-${Date.now().toString(36)}-${turnsUsed}`;
+      const stablePrefix = stablePrefixOf(promptText, authoritativePromptText(promptInput));
       const inferRequest: LocalInferenceRequest = {
         version: LOCAL_INFERENCE_CONTRACT_VERSION,
         requestId,
         messages: toMessages(promptText),
         maxOutputTokens: promptBudget.maxOutputTokens,
-        structuredOutput: 'ornith_action_v1'
+        structuredOutput: 'ornith_action_v1',
+        ...(stablePrefix === undefined ? {} : { stablePrefix })
       };
 
       turnsUsed += 1;

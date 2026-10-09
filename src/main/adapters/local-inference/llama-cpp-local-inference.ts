@@ -66,6 +66,13 @@ import {
 } from '../../../shared/util/provider-text';
 import type { LocalInferenceProvider } from '../../ports';
 import {
+  judgeStrataHealth,
+  readStrataEngineConfig,
+  STRATA_ORNITH_FORMAT_MESSAGE,
+  strataPrefixFields,
+  strataRuntimeArgv
+} from './strata-runtime';
+import {
   launchFor,
   locateExecutable,
   type LocatedExecutable
@@ -523,7 +530,9 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
     this.config = parseLocalInferenceConfig(config);
     this.fetchImpl = options.fetch ?? ((url, init) => globalThis.fetch(url, init));
     this.now = options.now ?? ((): number => Date.now());
-    this.runtimeArgv = Object.freeze(buildRuntimeArgv(this.config));
+    this.runtimeArgv = Object.freeze(
+      this.config.adapterKind === 'strata' ? strataRuntimeArgv(this.config) : buildRuntimeArgv(this.config)
+    );
   }
 
   /** The argv this provider would launch. Exposed for diagnostics and tests. */
@@ -553,7 +562,12 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
       return this.describe(false, resolved.reason, null);
     }
 
-    const probe = await this.probeVersion(resolved.located, this.config.healthTimeoutMs, [signal]);
+    const target = this.versionTarget(resolved.located);
+    if (target.kind !== 'found') {
+      this.probedRuntimeVersion = null;
+      return this.describe(false, target.reason, resolved.located.source);
+    }
+    const probe = await this.probeVersion(target.located, this.config.healthTimeoutMs, [signal]);
     this.probedRuntimeVersion = probe.kind === 'ok' ? probe.version : null;
     return this.describe(true, null, resolved.located.source);
   }
@@ -619,8 +633,27 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
     return { kind: 'found', located };
   }
 
+  /**
+   * The file whose `--version` identifies this runtime. For llama.cpp, the executable itself. For Strata, the
+   * executable is its Python interpreter, which identifies nothing: the engine its model config names does —
+   * and that config is checked first (model, context, no MCP tools, no network listening, no lazy or idle
+   * unloading), so a refused config stops here, before anything is launched.
+   */
+  private versionTarget(located: LocatedExecutable): ExecutableResolution {
+    if (this.config.adapterKind !== 'strata') return { kind: 'found', located };
+    const read = readStrataEngineConfig(this.config);
+    if (!read.ok) return { kind: 'unusable', reason: read.reason };
+    const engine = locateExecutable('strata', { configuredPath: read.config.engine });
+    if (engine === null) return { kind: 'unusable', reason: 'The Strata engine named by its model config is not present.' };
+    if (isShellDependentExecutable(engine.path)) {
+      return { kind: 'unusable', reason: 'The Strata engine named by its model config is a command shim or script, and Agent Relay never launches one.' };
+    }
+    return { kind: 'found', located: engine };
+  }
+
   /** Never names the path that was tried: state and capabilities are retained. */
   private missingExecutableReason(): string {
+    if (this.config.adapterKind === 'strata') return 'The configured Strata Python interpreter is not present.';
     return this.config.executable.kind === 'explicit_path'
       ? 'The configured local inference executable is not present.'
       : `${LLAMA_SERVER_COMMAND} was not found.`;
@@ -718,8 +751,12 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
     // executable is not enough: before supervising it as a compatible runtime,
     // require one bounded, safe version identity from that exact file.
     const deadline = this.now() + this.config.startupTimeoutMs;
+    const target = this.versionTarget(located);
+    if (target.kind !== 'found') {
+      return this.settle(generation, 'failed', START_EVENTS, target.reason);
+    }
     const versionProbe = await this.probeVersion(
-      located,
+      target.located,
       Math.max(1, deadline - this.now()),
       [signal, operation.signal]
     );
@@ -988,6 +1025,8 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
           reason: 'The runtime health endpoint returned a body that is not a JSON object.'
         };
       }
+      // A Strata server says "ok" before its model is usable; it has a stricter answer to give.
+      if (this.config.adapterKind === 'strata') return judgeStrataHealth(record, this.config);
       if (record.status === 'ok') return { kind: 'ok' };
 
       // `{"status":"loading model"}` is what llama.cpp says while it warms up.
@@ -1025,7 +1064,19 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
       );
     }
 
-    const promptBytes = parsed.messages.reduce(
+    // A Strata model is told the one-action format in a system message of its own (see `strata-runtime.ts`);
+    // it is part of the prompt, so it counts toward the same limit.
+    const wireMessages =
+      this.config.adapterKind === 'strata' && parsed.structuredOutput === 'ornith_action_v1'
+        ? [STRATA_ORNITH_FORMAT_MESSAGE, ...parsed.messages]
+        : parsed.messages;
+    // The stable-prefix hint reaches Strata only, as its `strata_prefix` (see `strataPrefixFields`); a
+    // llama.cpp server reuses a common prompt start by itself and gets nothing extra.
+    const cacheFields =
+      this.config.adapterKind === 'strata'
+        ? strataPrefixFields(parsed.stablePrefix, wireMessages, wireMessages.length - parsed.messages.length)
+        : {};
+    const promptBytes = wireMessages.reduce(
       (total, message) => total + Buffer.byteLength(message.content, 'utf8'),
       0
     );
@@ -1054,7 +1105,7 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
         : undefined);
     const bodyText = JSON.stringify({
       model: this.config.model.id,
-      messages: parsed.messages.map((message) => ({
+      messages: wireMessages.map((message) => ({
         role: message.role,
         content: message.content
       })),
@@ -1066,7 +1117,9 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
       ...(effectiveChatTemplateParameters === undefined
         ? {}
         : { chat_template_kwargs: effectiveChatTemplateParameters }),
-      ...(parsed.structuredOutput === 'ornith_action_v1'
+      // Not for Strata: its json_schema mode extracts the first JSON object from the text and drops the rest,
+      // which would hand Agent Relay's one-action parser a cleaned-up completion. See `strata-runtime.ts`.
+      ...(parsed.structuredOutput === 'ornith_action_v1' && this.config.adapterKind !== 'strata'
         ? {
             response_format: {
               type: 'json_schema',
@@ -1077,7 +1130,8 @@ export class LlamaCppLocalInference implements LocalInferenceProvider {
               }
             }
           }
-        : {})
+        : {}),
+      ...cacheFields
     });
 
     const requestBytes = Buffer.byteLength(bodyText, 'utf8');

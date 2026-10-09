@@ -112,6 +112,69 @@ thing for the locator to return; `launchFor` rewrites only JavaScript entry
 points, so nothing downstream would have caught it. A configured shim fails
 configuration validation; a discovered one produces `unavailable`.
 
+### A Strata runtime
+
+A profile's **Runtime** is either llama.cpp (above) or
+[Strata](https://github.com/Niko1221/Strata): its Python HTTP server plus its
+engine, run from the files Strata's own setup wrote. Agent Relay does not
+install Strata; point a profile at an existing install:
+
+| Field | Value |
+| --- | --- |
+| Strata Python interpreter | the `python` of Strata's own `.venv` (an explicit path; never PATH) |
+| Strata server script | `serve/server.py` of the Strata checkout |
+| Strata model config | the `strata-<model>.json` its setup wrote |
+| Strata model name | that config's `model_name` (what its `/health` reports) |
+| Context size | at most the config's `--max-context` |
+
+Agent Relay launches `<python> <serve/server.py> --engine strata --config
+<config> --host 127.0.0.1 --port <port>` from the checkout's directory, with no
+shell, and supervises it — server and engine — as one process tree, exactly as
+it does llama-server: started by Agent Relay, stopped by Agent Relay (Stop, a
+profile switch, the release before verification, and quitting), never left
+behind on an ordinary quit. A Strata server Agent Relay did not start is not
+supported: there is no "attach to an external server" mode.
+
+Before anything is launched, the model config is read (bounded) and refused
+when it names another model, has less context than the profile, has no
+absolute engine path, or would turn the server into something Agent Relay does
+not run: MCP tools (`mcp_servers`, `mcpServers`, `mcp`), an `api_key`, a
+`host` other than 127.0.0.1, lazy loading, idle unloading, or a `before_load`
+command (a string or a list: Strata's server runs it — a string through a
+shell — every time it loads the engine again, also after the engine died, so
+it would run a command outside Agent Relay's tools). Its engine's
+`--version` is the runtime version. A Strata server answers `/health` with
+`"status": "ok"` while its model is still loading, so a Strata runtime is
+Healthy only when `/health` also says `loaded: true`, reports this profile's
+model and at least its context, and says exactly `"service": "strata"` —
+which Strata's server includes in every `/health` answer, so a body without it
+(absent, null, another value) is refused as another program on the port.
+
+Strata's `json_schema` response format is a prompt plus a check after
+generation that extracts the first JSON object from the text, silently dropping
+prose, a code fence or a second object. Agent Relay's Ornith parser requires the
+whole completion to be exactly one action, so a Strata request carries no
+response format: the raw text reaches that parser unchanged, and an answer that
+is not exactly one valid action is malformed output, as with llama.cpp. What it
+does carry is one fixed system message stating that format ("exactly one JSON
+object ... no text before or after"), counted toward the prompt limit: without
+it the Coder model answered a real Ornith prompt with a sentence of prose on
+every attempt; with it, with exactly one action on every turn. Every file
+change is still Agent Relay's own tool; Strata never receives tools.
+
+Every Ornith turn is a fresh prompt that starts with the same specification,
+rule evidence and protocol; only the tool results and budget after them
+change. llama.cpp reuses such a common start by itself. Strata keeps no cache
+point inside the one user message a turn sends, so it read the whole prompt
+again on every turn. A Strata request therefore marks where that repeated part
+ends (`strata_prefix`); Strata pins a cache point there, and later turns of the
+round read only what follows it. The text sent is the same either way.
+
+Everywhere a profile is offered, a Strata profile carries "· Strata" after its
+name, and its runs are recorded with the provider id `local-strata` and the
+profile's model id — a Strata model is never presented as llama.cpp's. "Ornith"
+in Agent Relay names the local agent protocol both runtimes are driven by.
+
 ## Capability, health, and inference evidence
 
 These are deliberately separate claims:
