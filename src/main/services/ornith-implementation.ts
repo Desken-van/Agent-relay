@@ -1202,6 +1202,17 @@ export class OrnithImplementationService {
 
       const parsed = parseOrnithCompletion(response.completion);
       if (!parsed.ok) {
+        request.onProgress({
+          type: 'progress',
+          text: `Ornith output rejected: ${parsed.reason}`,
+          data: {
+            kind: 'ornith_completion_rejected', turn: turnsUsed, code: parsed.code,
+            failureKind: parsed.failureKind, invalidJsonShape: parsed.invalidJsonShape, syntaxReason: parsed.syntaxReason, schemaFields: parsed.schemaFields ?? [],
+            completionBytes: Buffer.byteLength(response.completion, 'utf8'),
+            finishReason: response.finishReason.kind,
+            promptTokens: response.promptTokens, completionTokens: response.completionTokens
+          }
+        });
         if (response.finishReason.kind === 'length') {
           return finish(
             'fail',
@@ -1211,7 +1222,7 @@ export class OrnithImplementationService {
             ['limit_output_exceeded']
           );
         }
-        return finish('fail', 'Ornith returned output that could not be accepted.', 'configuration', [parsed.code]);
+        return finish('fail', `Ornith returned output that could not be accepted. ${parsed.reason}`, 'configuration', [parsed.code]);
       }
       const action = parsed.action;
 

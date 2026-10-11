@@ -910,6 +910,26 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(result.ornithAudit.readBytes).toBe(Buffer.byteLength('repeat me'));
   });
 
+  it.each([
+    ['', 'empty'],
+    ['private rejected output /home/private', 'invalid_json'],
+    [JSON.stringify({ action: 'read_file', path: '/home/private', secret: 'hidden' }), 'schema']
+  ])('retains safe parser diagnostics (%s) on refusal', async (completion, failureKind) => {
+    const events: AgentProgressEvent[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(), recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => completed(request, completion)
+    };
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal), onProgress: (event) => events.push(event)
+    });
+    expect(result.assessment.reasonCodes).toContain('malformed_output');
+    const diagnostic = events.find((event) => event.data?.kind === 'ornith_completion_rejected');
+    expect(diagnostic?.data).toMatchObject({ failureKind, finishReason: 'stop', completionBytes: Buffer.byteLength(completion) });
+    expect(JSON.stringify(diagnostic)).not.toContain('/home/private');
+    expect(JSON.stringify(result)).not.toContain('/home/private');
+  });
+
   it('does not retry malformed output or execute a following action', async () => {
     let calls = 0;
     const leaseService: OrnithInferenceLeaseService = {
