@@ -471,3 +471,17 @@ it.each(['native', 'yaml', 'forward'] as const)('retains Windows TAP assertion l
     expect(text).not.toContain('C:');
   }
 });
+
+
+it.each(['native', 'yaml'] as const)('omits Windows assertion paths escaping the bound root with %s separators', (spelling) => {
+  const root = String.raw`C:\Users\private\bound-tree`;
+  const native = `${root}\\old\\..\\..\\secret.test.js:8:1`;
+  const path = spelling === 'yaml' ? native.replace(/\\/g, '\\\\') : native;
+  const raw = [`  location: '${path}'`, "  name: 'AssertionError'",
+    ...Array.from({ length: 20 }, () => 'frame')].join('\n');
+  const summary = summarizeVerificationOutput(raw, 1500, { worktreeRoots: [root] });
+  expect(summary).toContain('AssertionError');
+  expect(summary).not.toContain('private');
+  expect(summary).not.toContain('secret.test.js');
+  expect(summary).not.toContain('../');
+});

@@ -280,7 +280,11 @@ function relativizeWorktreePaths(text: string, roots: readonly string[]): string
     for (const spelling of new Set([`${slashed}/`, native, ...(windows ? [native.replace(/\\/g, '\\\\')] : [])])) {
       if (windows) {
         const path = new RegExp(`${escapeRegExp(spelling)}[^\\s)\\]}"'>,;]*`, 'gi');
-        result = result.replace(path, (match) => match.slice(spelling.length).replace(/\\+/g, '/'));
+        result = result.replace(path, (match) => {
+          const relative = match.slice(spelling.length).replace(/\\+/g, '/');
+          if (relative.split('/').some((segment) => segment === '.' || segment === '..')) return '[absolute-path-omitted]';
+          return relative;
+        });
       } else {
         result = result.replace(new RegExp(escapeRegExp(spelling), 'g'), '');
       }

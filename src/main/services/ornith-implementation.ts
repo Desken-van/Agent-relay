@@ -1239,7 +1239,7 @@ export class OrnithImplementationService {
         }
         // Schema refusals (including unsafe paths/prose), oversized and truncated replies stay terminal.
         // The strict parser has accepted NO action here, so no rejected mutation can be executed twice.
-        if (parsed.failureKind === 'invalid_json' && !formatCorrectionUsed) {
+        if (parsed.failureKind === 'invalid_json' && !formatCorrectionUsed && turnsUsed < ORNITH_LIMITS.maxModelTurns) {
           formatCorrectionUsed = true;
           request.onProgress({ type: 'progress', text: 'Ornith will make one format-correction attempt within the remaining turn and time budgets.' });
           continue;

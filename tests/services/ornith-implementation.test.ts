@@ -1067,6 +1067,27 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(() => readFileSync(join(worktree, 'bad.txt'), 'utf8')).toThrow();
   });
 
+  it('does not promise a format correction when the malformed reply uses the final turn', async () => {
+    writeFileSync(join(worktree, 'turns.txt'), 'x'.repeat(ORNITH_LIMITS.maxModelTurns));
+    let calls = 0;
+    const events: AgentProgressEvent[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(), recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        calls += 1;
+        return completed(request, calls === ORNITH_LIMITS.maxModelTurns ? 'not-json' :
+          JSON.stringify({ version: 1, action: 'read_file', path: 'turns.txt', offset: calls - 1, limit: 1 }));
+      }
+    };
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal, VERIFYING_LOOP_DEADLINE_MS),
+      onProgress: (event) => events.push(event)
+    });
+    expect(calls).toBe(ORNITH_LIMITS.maxModelTurns);
+    expect(result.assessment.reasonCodes).toContain('malformed_output');
+    expect(events.some((event) => event.text?.includes('will make one format-correction'))).toBe(false);
+  });
+
   it('reports an output-token truncation distinctly from arbitrary malformed output', async () => {
     let calls = 0;
     const leaseService: OrnithInferenceLeaseService = {
