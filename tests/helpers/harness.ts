@@ -257,7 +257,7 @@ export function createHarness(
       return projects.create({
         id: ids.next(),
         name: 'Demo',
-        localPath: 'C:\\repo',
+        localPath: join(tempRoot, 'repo'),
         projectType: 'existing',
         defaultBranch: 'main',
         githubOwner: 'Desken-van',

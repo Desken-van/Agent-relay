@@ -160,7 +160,7 @@ describe('implementation stage', () => {
 
     const { task } = await runToReview(harness);
 
-    expect(prepared).toEqual(['C:\\repo -> ' + task.worktreePath]);
+    expect(prepared).toEqual([harness.projects.findById(task.projectId)!.localPath + ' -> ' + task.worktreePath]);
     expect(harness.claude.calls).toHaveLength(1);
   });
 

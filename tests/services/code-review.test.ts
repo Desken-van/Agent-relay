@@ -8,7 +8,7 @@
  */
 
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { SqliteCodeReviewRepository } from '../../src/main/db/repositories/code-review-repository';
 import { CodeReviewClaims, CodeReviewService } from '../../src/main/services/code-review';
@@ -1141,7 +1141,7 @@ describe('code-review decisions', () => {
   it('refuses a finding that belongs to another task', async () => {
     const { value, finding: target } = await decided();
     const other = value.harness.createTask(
-      value.harness.createProject({ id: 'p2', localPath: 'C:\\another-repo' }).id,
+      value.harness.createProject({ id: 'p2', localPath: resolve('another-repo') }).id,
       { status: 'READY_FOR_IMPLEMENTATION' }
     );
 
@@ -1806,7 +1806,7 @@ describe('a contradictory read-back, from the transport to the durable round', (
   const mcpConfig: ExternalMcpServerConfig = {
     id: 'coai-code-review',
     enabled: true,
-    executablePath: 'C:/tools/coai-mcp.exe',
+    executablePath: resolve('tools', 'coai-mcp.exe'),
     args: ['--stdio'],
     allowedTools: COAI_CODE_REVIEW_TOOLS,
     timeoutMs: 30_000,
@@ -2332,7 +2332,7 @@ describe('a reviewer that goes away between reserving and dispatching', () => {
       ...defaultSettings({ dataDir: 'C:/user-data', documentsDir: 'C:/documents' }),
       externalCodeReviewEnabled: true,
       localInferenceReleaseBeforeVerification: true,
-      coaiMcpExecutablePath: 'C:/tools/coai-mcp.exe',
+      coaiMcpExecutablePath: resolve('tools', 'coai-mcp.exe'),
       coaiMcpArguments: ['--stdio']
     };
   }

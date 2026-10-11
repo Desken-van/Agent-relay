@@ -7,6 +7,7 @@
  * `CodeReviewService` writes anything durable.
  */
 
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   COAI_ADDRESSABLE_PROFILE,
@@ -62,7 +63,7 @@ function settings(overrides: Partial<Settings> = {}): Settings {
     ...defaultSettings({ dataDir: 'C:/user-data', documentsDir: 'C:/documents' }),
     externalCodeReviewEnabled: true,
     localInferenceReleaseBeforeVerification: true,
-    coaiMcpExecutablePath: 'C:\\tools\\coai-mcp.exe',
+    coaiMcpExecutablePath: resolve('tools', 'coai-mcp.exe'),
     coaiMcpArguments: ['--stdio'],
     ...overrides
   };
@@ -121,7 +122,7 @@ describe('the trusted code-review configuration', () => {
     // Code review needs only the round lifecycle — none of the nine plan
     // tools are required for it to be considered available.
     expect(config.allowedTools).not.toEqual(COAI_PLAN_PROFILE);
-    expect(config.executablePath).toBe('C:\\tools\\coai-mcp.exe');
+    expect(config.executablePath).toBe(resolve('tools', 'coai-mcp.exe'));
     expect(config.args).toEqual(['--stdio']);
   });
 
@@ -318,7 +319,7 @@ describe('the two gates describe one server', () => {
       externalPlanReviewEnabled: true,
       externalCodeReviewEnabled: true,
       localInferenceReleaseBeforeVerification: true,
-      coaiMcpWorkingDirectory: 'C:/work',
+      coaiMcpWorkingDirectory: resolve('work'),
       processTimeoutMs: 90 * 60_000
     });
 
@@ -343,7 +344,7 @@ describe('the two gates describe one server', () => {
       expect(config.timeoutMs).toBe(COAI_MCP_TIMEOUT_MAX_MS);
       expect(config.executablePath).toBe(value.coaiMcpExecutablePath);
       expect(config.args).toEqual(value.coaiMcpArguments);
-      expect(config.cwd).toBe('C:/work');
+      expect(config.cwd).toBe(resolve('work'));
     }
   });
 

@@ -116,7 +116,7 @@ describe('verification-only workflow', () => {
 
     await h.orchestrator.runVerification(task.id);
 
-    expect(calls).toEqual(['C:\\repo -> ' + task.worktreePath, 'identity', 'execute', 'identity']);
+    expect(calls).toEqual([h.projects.findById(task.projectId)!.localPath + ' -> ' + task.worktreePath, 'identity', 'execute', 'identity']);
   });
   it.each(['exit', 'timeout', 'cancelled', 'changed'] as const)('does not open review after %s', async kind => {
     const task = await prepared();

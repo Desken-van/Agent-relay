@@ -11,7 +11,7 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const handlers = vi.hoisted(() => ({ invoke: null as null | ((event: unknown, payload: unknown) => Promise<unknown>) }));
@@ -42,7 +42,7 @@ const CONFIG: ExternalMcpServerConfig = {
   id: 'coai',
   enabled: true,
   // Never launched: nothing below reaches the provider.
-  executablePath: 'C:\\tools\\never-started.exe',
+  executablePath: resolve('tools', 'never-started.exe'),
   args: [],
   allowedTools: ['open', 'status', 'review_plan', 'resolve'],
   timeoutMs: 30_000,
@@ -256,7 +256,7 @@ describe('a gate an earlier build left stuck, through the IPC boundary', () => {
     const { app, task } = world();
     // External plan review is enabled, and pointed at an executable that does not exist: any attempt to
     // reach the provider would fail loudly, so a chained review cannot go unnoticed.
-    app.settings.update({ externalPlanReviewEnabled: true, coaiMcpExecutablePath: 'C:\\tools\\never-started.exe' });
+    app.settings.update({ externalPlanReviewEnabled: true, coaiMcpExecutablePath: resolve('tools', 'never-started.exe') });
 
     const result = await ipc('planReview:retryFreshSession', { taskId: task.id });
 

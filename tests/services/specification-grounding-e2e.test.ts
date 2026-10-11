@@ -12,7 +12,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, renameSync, symlinkSync, rmdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, renameSync, symlinkSync, rmdirSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CliGitAdapter } from '../../src/main/adapters/git/git-adapter';
@@ -324,7 +324,9 @@ describe('a target that changed after the specification is detected, surfaced an
       expect(value.seen).toHaveLength(1);
       expect(readFileSync(join(value.repo, FILE), 'utf8')).toBe(DIRTY);
     } finally {
-      rmdirSync(docs); // remove the junction itself, never recursively traverse its target
+      // Remove only the redirect itself; POSIX directory symlinks require unlink.
+      if (process.platform === 'win32') rmdirSync(docs);
+      else unlinkSync(docs);
       renameSync(preserved, docs);
     }
   });
