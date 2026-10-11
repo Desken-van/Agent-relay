@@ -77,6 +77,16 @@ describe('the Ornith instruction contract refuses', () => {
     ['Seek to the end of docs/manual-test.md.', 'file_operation'],
     ['Write raw bytes for the BOM.', 'file_operation'],
     ['Make scripts/check.sh executable.', 'file_operation'],
+    ['Make src/executable-locator.ts executable.', 'file_operation'],
+    ['Set the file executable.', 'file_operation'],
+    ['Change the script to executable.', 'file_operation'],
+    ['Keep scripts/check.sh executable.', 'file_operation'],
+    ['Keep the file executable.', 'file_operation'],
+    ['Keep it executable.', 'file_operation'],
+    ['Read the executable permissions.', 'file_operation'],
+    ['Set executable bits on src/executable-locator.ts.', 'file_operation'],
+    ['Keep executable bits set on the script.', 'file_operation'],
+    ['Chmod src/executable-locator.ts.', 'file_operation'],
     ['Create a symlink from docs/latest.md to docs/manual-test.md.', 'file_operation'],
     // Network.
     ['Install the lodash package.', 'network'],
@@ -140,6 +150,11 @@ describe('the Ornith instruction contract allows', () => {
   it.each([
     // What Ornith can do, by its actions or in plain words for them.
     'Read docs/manual-test.md, then append the section after the last heading.',
+    'Read tests/adapters/adapters.test.ts and src/main/adapters/process/executable-locator.ts.',
+    'Read tests/adapters/codex-executable.test.ts and src/main/adapters/codex/codex-executable.ts.',
+    'Read `src/executable.ts`.',
+    'Keep Windows behavior tests executable on both hosts.',
+    'Keep the tests executable on all platforms.',
     'Use run_verification once the edit is complete.',
     'Run the verification with run_verification before you finish.',
     'Check git status and git diff before finishing.',
