@@ -1,3 +1,4 @@
+import { ORNITH_ACTION_JSON_SCHEMA } from '../../src/shared/domain/ornith';
 /**
  * The local-inference adapter running a Strata runtime, against a fake Strata checkout built from the
  * repository's fake runtime: its `serve/server.py` is the fake server (run by Node standing in for Strata's
@@ -262,6 +263,7 @@ describe('a Strata runtime: inference', () => {
     expect(body).toMatchObject({ stream: false, n: 1, model: MODEL, chat_template_kwargs: { enable_thinking: false } });
     // The output format is stated in a fixed system message of its own, ahead of the request's messages.
     expect(body.messages[0]).toEqual(STRATA_ORNITH_FORMAT_MESSAGE);
+    expect(JSON.parse(body.messages[0]!.content.split('JSON Schema:\n')[1]!)).toEqual(ORNITH_ACTION_JSON_SCHEMA);
     expect(body.messages.slice(1)).toEqual([{ role: 'user', content: 'Say something short.' }]);
   });
 
@@ -302,9 +304,10 @@ describe('a Strata runtime: inference', () => {
   });
 
   it('counts the format message toward the prompt byte limit', async () => {
-    const built = await harness({ healthBodies: [ready()] }, {}, { maxPromptBytes: 300 });
+    const maxPromptBytes = Buffer.byteLength(STRATA_ORNITH_FORMAT_MESSAGE.content) + 100;
+    const built = await harness({ healthBodies: [ready()] }, {}, { maxPromptBytes });
     await built.provider.start();
-    const content = 'x'.repeat(300 - Buffer.byteLength(STRATA_ORNITH_FORMAT_MESSAGE.content) + 1);
+    const content = 'x'.repeat(101);
     const outcome = await built.provider.infer(fakeInferenceRequest({ structuredOutput: 'ornith_action_v1', messages: [{ role: 'user', content }] }));
     expect(outcome).toMatchObject({ kind: 'failed', dispatchOutcome: 'not_dispatched' });
     expect(built.runtime.completionRequests()).toHaveLength(0);

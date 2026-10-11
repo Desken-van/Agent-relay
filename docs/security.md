@@ -588,7 +588,11 @@ completion, matching a strict Zod discriminated union
 command, an executable, an argv array, an environment variable, a URL, or a
 Git ref/revision/option. Parsing is intolerant by design: the whole trimmed
 completion is handed to `JSON.parse` once, with no Markdown-fence stripping,
-no substring recovery. A syntactically invalid JSON reply may consume exactly
+no substring recovery. Strata receives the canonical action JSON schema in a fixed
+system message, counted toward the existing prompt/request limits. Its server-side
+`response_format` stays absent because that mode extracts a JSON substring; the
+schema message is guidance, not constrained decoding or a replacement for parsing.
+A syntactically invalid JSON reply may consume exactly
 one format-correction turn per implementation loop: fixed feedback asks for a
 new action using the existing tool results. The reminder stays for subsequent
 turns without granting another retry; the rejected text is never replayed

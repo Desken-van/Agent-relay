@@ -21,10 +21,12 @@
  *    response format: the model's raw text reaches that parser unchanged. What that format adds that does
  *    matter is a system message stating the output format: without one, the Coder model answered a real
  *    Ornith prompt with a sentence of prose instead of an action on every attempt (STRATA-1 control run,
- *    five of five); with the short one below and no response format, it answered with exactly one action on
- *    every turn. So that message is sent, and the strict check stays Agent Relay's.
+ *    five of five). A short reminder helped the initial implementation but not a preserved repair. The
+ *    system message therefore includes the canonical action schema and field instructions, while the
+ *    strict whole-response check stays Agent Relay's. This is prompting, not constrained decoding.
  */
 
+import { ORNITH_ACTION_JSON_SCHEMA } from '../../../shared/domain/ornith';
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import {
@@ -41,8 +43,11 @@ import {
 export const STRATA_ORNITH_FORMAT_MESSAGE: LocalInferenceMessage = Object.freeze({
   role: 'system',
   content:
-    'OUTPUT FORMAT REQUIREMENT: Reply with exactly one JSON object: one Ornith action from the protocol below. ' +
-    'No Markdown, code fences, commentary or any text before or after the JSON object.'
+    'OUTPUT FORMAT REQUIREMENT: Return exactly one JSON object matching the JSON Schema below. ' +
+    'No Markdown, headings, code fences, commentary, or text outside the JSON. ' +
+    'Use every required field, correct types, and only allowed fields. ' +
+    'Put all requested writing inside the appropriate JSON string fields.\nJSON Schema:\n' +
+    JSON.stringify(ORNITH_ACTION_JSON_SCHEMA)
 });
 
 /**
