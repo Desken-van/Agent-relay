@@ -588,9 +588,15 @@ completion, matching a strict Zod discriminated union
 command, an executable, an argv array, an environment variable, a URL, or a
 Git ref/revision/option. Parsing is intolerant by design: the whole trimmed
 completion is handed to `JSON.parse` once, with no Markdown-fence stripping,
-no substring recovery, and no retry-on-malformed-output. Prose, trailing
-content, an unknown action, an extra property, or an over-limit value is a
-terminal failure for that attempt.
+no substring recovery. A syntactically invalid JSON reply may consume exactly
+one format-correction turn per implementation loop: fixed feedback asks for a
+new action using the existing tool results; the rejected text is never replayed
+or dispatched. The correction uses the same turn, prompt, output and deadline
+budgets and checkout/lease checks. Empty, oversized, token-truncated or
+schema-invalid replies (including unknown actions, extra properties and unsafe
+paths) remain terminal. Repeated invalid JSON also ends the loop. Diagnostics
+contain fixed parse categories, bounded protocol field names and numeric
+response metrics, never rejected text or parser error messages.
 
 **Every repository operation is Agent Relay-owned,** in
 `src/main/services/ornith-worktree-tools.ts`:

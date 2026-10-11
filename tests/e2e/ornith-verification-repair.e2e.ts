@@ -352,6 +352,7 @@ describe.each(['llama_cpp', 'strata'] as const)('Ornith verification repair Elec
         ...healthFor(kind),
         completionTextSequence: [
           JSON.stringify({ version: 1, action: 'read_file', path: 'src/strings.js', offset: 0, limit: 4096 }),
+          'I will remove the duplicate declaration before verifying.',
           JSON.stringify({ version: 1, action: 'replace_text', path: 'src/strings.js', sha256: sha256(duplicated), replacements: [{ oldText: `${WHISPER}${WHISPER}`, newText: WHISPER }] }),
           JSON.stringify({ version: 1, action: 'finish', summary: 'Removed the duplicated whisper declaration.' })
         ]
@@ -366,7 +367,9 @@ describe.each(['llama_cpp', 'strata'] as const)('Ornith verification repair Elec
       expect(repairPrompt).toContain('src/strings.js:');
       expect(repairPrompt).not.toContain(worktree);
       expect(repairPrompt).not.toContain(repoDir);
-      expect(runtime.completionRequests()).toHaveLength(3);
+      expect(runtime.completionRequests()).toHaveLength(4);
+      expect(runtime.completionRequests()[2]!.body).toContain('FORMAT CORRECTION:');
+      expect(runtime.completionRequests()[2]!.body).not.toContain('I will remove the duplicate declaration before verifying.');
 
       const repaired = await readTask();
       expect(repaired.status).toBe('READY_FOR_REVIEW');

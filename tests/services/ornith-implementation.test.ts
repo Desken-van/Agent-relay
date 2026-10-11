@@ -930,21 +930,137 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(JSON.stringify(result)).not.toContain('/home/private');
   });
 
-  it('does not retry malformed output or execute a following action', async () => {
+  it('repairs the escaping assertion through a format correction and real node:test verification', async () => {
+    mkdirSync(join(worktree, 'src'));
+    mkdirSync(join(worktree, 'test'));
+    const view = "export const renderedTitle = '&amp;&quot;';\n";
+    const wrong = "assert.equal(renderedTitle, '&amp;\"');";
+    const right = "assert.equal(renderedTitle, '&amp;&quot;');";
+    const test = "import assert from 'node:assert/strict';\nimport { test } from 'node:test';\n" +
+      "import { renderedTitle } from '../src/view.mjs';\n" +
+      "test('rendering with priorities and escaping', () => { " + wrong + " });\n";
+    writeFileSync(join(worktree, 'src/view.mjs'), view);
+    writeFileSync(join(worktree, 'test/view.test.mjs'), test);
+    const verify = vi.fn(async (signal: AbortSignal) => {
+      const execution = await runner.run(process.execPath, ['--test', 'test/view.test.mjs'], { cwd: worktree, timeoutMs: 10_000, signal });
+      return { ...execution, output: execution.stdout + execution.stderr };
+    });
+    expect((await verify(new AbortController().signal)).exitCode).toBe(1);
+    verify.mockClear();
+    const rejected = 'I should change the test expectation rather than weaken escaping.';
+    const actions = [
+      JSON.stringify({ version: 1, action: 'read_file', path: 'src/view.mjs', offset: 0, limit: 4096 }),
+      rejected,
+      JSON.stringify({ version: 1, action: 'read_file', path: 'test/view.test.mjs', offset: 0, limit: 4096 }),
+      JSON.stringify({ version: 1, action: 'replace_text', path: 'test/view.test.mjs', sha256: createHash('sha256').update(test).digest('hex'), replacements: [{ oldText: wrong, newText: right }] }),
+      JSON.stringify({ version: 1, action: 'run_verification' }),
+      JSON.stringify({ version: 1, action: 'finish', summary: 'Corrected the expected escaped quote.' })
+    ];
+    const prompts: string[] = [];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(), recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        prompts.push(request.messages.map((message) => message.content).join('\n'));
+        return completed(request, actions[prompts.length - 1]!);
+      }
+    };
+    const result = await new OrnithImplementationService().implement({
+      ...baseRequest(leaseService, new AbortController().signal, VERIFYING_LOOP_DEADLINE_MS),
+      runType: 'correction', runVerification: verify,
+      correctionFindings: 'rendering with priorities and escaping failed in test/view.test.mjs. Expected a literal quote but received &quot;.',
+      specification: { ...specification, scopedFilePaths: ['src/view.mjs', 'test/view.test.mjs'] }
+    });
+    expect(result.assessment.disposition).toBe('pass');
+    expect(result.ornithAudit).toMatchObject({ turns: 6, actions: 4, changedFiles: 1, verifications: 1 });
+    expect(result.ornithAudit.verificationAttempts[0]?.outcome).toBe('passed');
+    expect(verify).toHaveBeenCalledTimes(1);
+    expect(prompts[2]).toContain('FORMAT CORRECTION:');
+    expect(prompts[2]).toContain('rendering with priorities and escaping failed');
+    expect(prompts[2]).toContain(view.replaceAll('\n', '\\n'));
+    expect(prompts.join('\n')).not.toContain(rejected);
+    expect(readFileSync(join(worktree, 'src/view.mjs'), 'utf8')).toBe(view);
+    expect(readFileSync(join(worktree, 'test/view.test.mjs'), 'utf8')).toBe(test.replace(wrong, right));
+  });
+
+  it('never executes a fenced rejected mutation or replays an earlier applied mutation', async () => {
+    const prompts: string[] = [];
+    const rejected = '```json\n' + JSON.stringify({ version: 1, action: 'create_file', path: 'rejected.txt', content: 'never' }) + '\n```';
+    const actions = [JSON.stringify({ version: 1, action: 'create_file', path: 'applied.txt', content: 'once\n' }), rejected,
+      JSON.stringify({ version: 1, action: 'finish', summary: 'Done.' })];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(), recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => {
+        prompts.push(request.messages.map((message) => message.content).join('\n'));
+        return completed(request, actions[prompts.length - 1]!);
+      }
+    };
+    const result = await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
+    expect(result.assessment.disposition).toBe('pass');
+    expect(result.ornithAudit.actions).toBe(1);
+    expect(readFileSync(join(worktree, 'applied.txt'), 'utf8')).toBe('once\n');
+    expect(() => readFileSync(join(worktree, 'rejected.txt'))).toThrow();
+    expect(prompts[2]).toContain('already applied changes remain applied');
+    expect(prompts[2]).toContain('applied.txt');
+    expect(prompts[2]).not.toContain('rejected.txt');
+  });
+
+  it('uses one correction for the whole loop, even after an intervening valid action', async () => {
+    let calls = 0;
+    const actions = ['not-json', JSON.stringify({ version: 1, action: 'create_file', path: 'once.txt', content: 'once' }), 'not-json'];
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(), recheckOrnithLease: async () => true,
+      inferForOrnith: async (_lease, request) => completed(request, actions[calls++] ?? JSON.stringify({ version: 1, action: 'finish', summary: 'Not reached.' }))
+    };
+    const verify = vi.fn(async () => passedExecution());
+    const result = await new OrnithImplementationService().implement({ ...baseRequest(leaseService, new AbortController().signal), runVerification: verify });
+    expect(calls).toBe(3);
+    expect(result.assessment.disposition).toBe('fail');
+    expect(result.assessment.reasonCodes).toContain('malformed_output');
+    expect(result.ornithAudit.actions).toBe(1);
+    expect(verify).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancel', 'lease', 'checkout'] as const)('rechecks %s during format correction before any mutation', async (failure) => {
+    const controller = new AbortController();
+    let calls = 0;
+    const leaseService: OrnithInferenceLeaseService = {
+      acquireOrnithLease: async () => lease(), recheckOrnithLease: async () => failure !== 'lease',
+      inferForOrnith: async (_lease, request) => {
+        calls += 1;
+        if (calls === 1) {
+          if (failure === 'checkout') await git(worktree, ['checkout', '-b', 'different']);
+          return completed(request, 'not-json');
+        }
+        if (failure === 'cancel') controller.abort();
+        return completed(request, JSON.stringify({ version: 1, action: 'create_file', path: 'bad.txt', content: 'bad' }));
+      }
+    };
+    const pending = new OrnithImplementationService().implement(baseRequest(leaseService, controller.signal));
+    if (failure === 'cancel') await expect(pending).rejects.toMatchObject({ code: 'CANCELLED' });
+    else {
+      const result = await pending;
+      expect(result.assessment.disposition).toBe('fail');
+      expect(result.assessment.reasonCodes).toContain(failure === 'checkout' ? 'checkout_identity_changed' : 'runtime_unhealthy');
+    }
+    expect(calls).toBe(failure === 'checkout' ? 1 : 2);
+    expect(() => readFileSync(join(worktree, 'bad.txt'))).toThrow();
+  });
+
+  it('stops after one format-correction attempt without dispatching malformed text', async () => {
     let calls = 0;
     const leaseService: OrnithInferenceLeaseService = {
       acquireOrnithLease: async () => lease(),
       recheckOrnithLease: async () => true,
       inferForOrnith: async (_lease, request) => {
         calls += 1;
-        return completed(request, calls === 1 ? 'not-json' : JSON.stringify({ version: 1, action: 'create_file', path: 'bad.txt', content: 'bad' }));
+        return completed(request, calls <= 2 ? 'not-json' : JSON.stringify({ version: 1, action: 'create_file', path: 'bad.txt', content: 'bad' }));
       }
     };
 
     const result = await new OrnithImplementationService().implement(baseRequest(leaseService, new AbortController().signal));
 
     expect(result.assessment.reasonCodes).toContain('malformed_output');
-    expect(calls).toBe(1);
+    expect(calls).toBe(2);
     expect(() => readFileSync(join(worktree, 'bad.txt'), 'utf8')).toThrow();
   });
 
