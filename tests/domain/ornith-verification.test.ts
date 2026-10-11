@@ -454,3 +454,20 @@ describe('node:test assertion locations for repair', () => {
     expect(summary).not.toContain('private.test.js');
   });
 });
+
+
+it.each(['native', 'yaml', 'forward'] as const)('retains Windows TAP assertion locations with %s separators', (spelling) => {
+  const root = String.raw`C:\Users\private\bound-tree`;
+  const native = `${root}\\test\\strings.test.js:8:1`;
+  const path = spelling === 'yaml' ? native.replace(/\\/g, '\\\\') : spelling === 'forward' ? native.replace(/\\/g, '/') : native;
+  const raw = ["not ok 2 - whisper", `  location: '${path}'`,
+    "  error: 'wrong whisper'", "  name: 'AssertionError'",
+    ...Array.from({ length: 20 }, () => '  at frame'), '# fail 1'].join('\n');
+  const summary = summarizeVerificationOutput(raw, 1500, { worktreeRoots: [root] });
+  for (const text of [summary, summarizeVerificationOutput(summary)]) {
+    expect(text).toContain('test/strings.test.js:8:1');
+    expect(text).toContain('AssertionError');
+    expect(text).not.toContain('private');
+    expect(text).not.toContain('C:');
+  }
+});

@@ -273,8 +273,17 @@ function relativizeWorktreePaths(text: string, roots: readonly string[]): string
     return url;
   });
   for (const slashed of slashedRoots) {
-    for (const spelling of new Set([`${slashed}/`, `${slashed.replace(/\//g, '\\')}\\`])) {
-      result = result.replace(new RegExp(escapeRegExp(spelling), /^[A-Za-z]:/.test(slashed) ? 'gi' : 'g'), '');
+    const windows = /^[A-Za-z]:/.test(slashed);
+    const native = `${slashed.replace(/\//g, '\\')}\\`;
+    // TAP quotes Windows locations as YAML and doubles each separator. Match only a
+    // supplied worktree root, then normalize its relative suffix for the POSIX tool protocol.
+    for (const spelling of new Set([`${slashed}/`, native, ...(windows ? [native.replace(/\\/g, '\\\\')] : [])])) {
+      if (windows) {
+        const path = new RegExp(`${escapeRegExp(spelling)}[^\\s)\\]}"'>,;]*`, 'gi');
+        result = result.replace(path, (match) => match.slice(spelling.length).replace(/\\+/g, '/'));
+      } else {
+        result = result.replace(new RegExp(escapeRegExp(spelling), 'g'), '');
+      }
     }
   }
   return result;
