@@ -408,3 +408,49 @@ it('retains the assertion and worker cause after six long failed-test titles, ah
   expect(summary).toContain('Timeout waiting for worker to respond');
   expect(summary.length).toBeLessThanOrEqual(1_500);
 });
+
+
+describe('node:test assertion locations for repair', () => {
+  it.each(['tap', 'spec'] as const)('retains the bound failing file in %s, including after a second summary', (reporter) => {
+    const root = '/home/private/bound-tree';
+    const location = reporter === 'tap'
+      ? `  location: '${root}/test/app.test.js:128:1'`
+      : `test at ${root}/test/app.test.js:128:1`;
+    const raw = [
+      ...Array.from({ length: 16 }, (_, i) => `ok ${i + 1} - successful test ${i}`),
+      'not ok 17 - rendering with priorities and escaping', location,
+      '  duration_ms: 1', "  failureType: 'testCodeFailure'", '  error: |-',
+      '    Expected values to be strictly equal', '    + actual - expected',
+      '    + &amp;&quot;', '    - &amp;"', "  name: 'AssertionError'",
+      '  stack: |-', `    at ${root}/test/app.test.js:131:10`,
+      '    at /elsewhere/private/dependency.js:10:2',
+      ...Array.from({ length: 20 }, () => '  at dependency-frame'),
+      '# tests 17', '# pass 16', '# fail 1'
+    ].join('\n');
+    const summary = summarizeVerificationOutput(raw, 1500, { worktreeRoots: [root] });
+    for (const text of [summary, summarizeVerificationOutput(summary)]) {
+      expect(text).toContain('test/app.test.js:128:1');
+      expect(text).toContain('AssertionError');
+      expect(text).not.toContain(root);
+      expect(text).not.toContain('/elsewhere/private');
+      expect(text.length).toBeLessThanOrEqual(1500);
+    }
+    expect(summarizeVerificationOutput(raw, 120, { worktreeRoots: [root] }).length).toBeLessThanOrEqual(120);
+  });
+
+  it('does not attach a prior test location across a node:test case boundary', () => {
+    const raw = ["  location: 'test/earlier.test.js:10:1'", 'ok 1 - earlier test',
+      'not ok 2 - failure without a location', 'AssertionError: mismatch',
+      ...Array.from({ length: 20 }, () => 'frame'), '# fail 1'].join('\n');
+    expect(summarizeVerificationOutput(raw)).not.toContain('earlier.test.js');
+  });
+
+  it('does not preserve an unknown absolute assertion location', () => {
+    const raw = ["  location: '/home/other/private.test.js:10:1'", "  name: 'AssertionError'",
+      ...Array.from({ length: 20 }, () => 'frame')].join('\n');
+    const summary = summarizeVerificationOutput(raw, 1500, { worktreeRoots: ['/home/known/tree'] });
+    expect(summary).toContain('AssertionError');
+    expect(summary).not.toContain('/home/other');
+    expect(summary).not.toContain('private.test.js');
+  });
+});

@@ -214,7 +214,8 @@ function verificationRecords(profile: string, taskId: string): VerificationRecor
   }
 }
 
-describe.each(['llama_cpp', 'strata'] as const)('Ornith verification repair Electron acceptance (%s runtime)', (kind) => {
+describe.each([{ kind: 'llama_cpp', defect: 'syntax' }, { kind: 'strata', defect: 'syntax' },
+  { kind: 'llama_cpp', defect: 'assertion' }, { kind: 'strata', defect: 'assertion' }] as const)('Ornith verification repair Electron acceptance ($kind/$defect)', ({ kind, defect }) => {
   it('turns a node:test failure of Ornith\'s edit into one repair round over the same worktree, then review', async () => {
     const profile = mkdtempSync(join(tmpdir(), 'agent-relay-ornith-repair-e2e-'));
     const repoDir = mkdtempSync(join(tmpdir(), 'agent-relay-ornith-repair-e2e-repo-'));
@@ -244,7 +245,10 @@ describe.each(['llama_cpp', 'strata'] as const)('Ornith verification repair Elec
     // Round 1 inserts whisper twice (the live mistake); the repair round removes the second copy. Relay
     // releases the local runtime before its verification, so the repair round starts a NEW runtime process,
     // whose scripted answers start from the first again: each round gets its own sequence.
-    const duplicated = `${SHOUT}${WHISPER}${WHISPER}`;
+    const duplicated = defect === 'syntax' ? `${SHOUT}${WHISPER}${WHISPER}`
+      : `${SHOUT}${WHISPER.replace('toLowerCase', 'toUpperCase')}`;
+    const failureMessage = defect === 'syntax' ? "SyntaxError: Identifier 'whisper' has already been declared" : 'AssertionError';
+    const failureLocation = defect === 'syntax' ? 'src/strings.js:' : 'test/strings.test.js:';
     runtime.scenario({
       ...healthFor(kind),
       completionTextSequence: [
@@ -334,13 +338,13 @@ describe.each(['llama_cpp', 'strata'] as const)('Ornith verification repair Elec
       await untilAvailable(/Fix verification failures · Ornith/, 90_000);
       const afterFirst = await readTask();
       expect(afterFirst.status).toBe('READY_FOR_IMPLEMENTATION');
-      expect(afterFirst.lastError).toContain('a project file declares the same name twice');
+      expect(afterFirst.lastError).toContain(defect === 'syntax' ? 'a project file declares the same name twice' : 'a test assertion failed');
       const worktree = afterFirst.worktreePath!;
-      expect(readFileSync(join(worktree, 'src', 'strings.js'), 'utf8').match(/export function whisper/g)).toHaveLength(2);
+      expect(readFileSync(join(worktree, 'src', 'strings.js'), 'utf8').match(/export function whisper/g)).toHaveLength(defect === 'syntax' ? 2 : 1);
       const failed = verificationRecords(profile, task.id).at(-1)!;
       expect(failed).toMatchObject({ passed: false, failureKind: 'implementation' });
-      expect(failed.outputSummary).toContain("src/strings.js:");
-      expect(failed.outputSummary).toContain("SyntaxError: Identifier 'whisper' has already been declared");
+      expect(failed.outputSummary).toContain(failureLocation);
+      expect(failed.outputSummary).toContain(failureMessage);
       expect(failed.outputSummary).not.toContain(worktree);
       // Pressable for the right reason: the runtime is the one Relay released for its own verification.
       expect(JSON.parse(await primaryState())).toMatchObject({ enabled: true, disabledReason: null, runtime: { kind: 'stopped', releasedForVerification: true } });
@@ -353,7 +357,7 @@ describe.each(['llama_cpp', 'strata'] as const)('Ornith verification repair Elec
         completionTextSequence: [
           JSON.stringify({ version: 1, action: 'read_file', path: 'src/strings.js', offset: 0, limit: 4096 }),
           'I will remove the duplicate declaration before verifying.',
-          JSON.stringify({ version: 1, action: 'replace_text', path: 'src/strings.js', sha256: sha256(duplicated), replacements: [{ oldText: `${WHISPER}${WHISPER}`, newText: WHISPER }] }),
+          JSON.stringify({ version: 1, action: 'replace_text', path: 'src/strings.js', sha256: sha256(duplicated), replacements: [{ oldText: duplicated, newText: `${SHOUT}${WHISPER}` }] }),
           JSON.stringify({ version: 1, action: 'finish', summary: 'Removed the duplicated whisper declaration.' })
         ]
       });
@@ -362,9 +366,9 @@ describe.each(['llama_cpp', 'strata'] as const)('Ornith verification repair Elec
       expect(runtime.evidence().pid).not.toBe(firstRuntimePid);
       const repairPrompt = runtime.completionRequests()[0]!.body;
       expect(repairPrompt).toContain('EVIDENCE FROM THE PREVIOUS ATTEMPT');
-      expect(repairPrompt).toContain('a project file declares the same name twice');
-      expect(repairPrompt).toContain("SyntaxError: Identifier 'whisper' has already been declared");
-      expect(repairPrompt).toContain('src/strings.js:');
+      expect(repairPrompt).toContain(defect === 'syntax' ? 'a project file declares the same name twice' : 'a test assertion failed');
+      expect(repairPrompt).toContain(failureMessage);
+      expect(repairPrompt).toContain(failureLocation);
       expect(repairPrompt).not.toContain(worktree);
       expect(repairPrompt).not.toContain(repoDir);
       expect(runtime.completionRequests()).toHaveLength(4);
