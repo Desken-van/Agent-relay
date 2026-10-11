@@ -83,6 +83,8 @@ describe('the Ornith instruction contract refuses', () => {
     ['Keep scripts/check.sh executable.', 'file_operation'],
     ['Keep the file executable.', 'file_operation'],
     ['Keep it executable.', 'file_operation'],
+    ['Keep `check.sh` executable.', 'file_operation'],
+    ['Keep "check.sh" executable.', 'file_operation'],
     ['Read the executable permissions.', 'file_operation'],
     ['Set executable bits on src/executable-locator.ts.', 'file_operation'],
     ['Keep executable bits set on the script.', 'file_operation'],

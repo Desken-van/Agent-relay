@@ -207,7 +207,7 @@ const FILE_MECHANISM =
 /** The adjective alone is not a mechanism: source filenames and runnable tests use it too. */
 const EXECUTABLE_MODE = /\bexecutable\b(?![-/\\]|\.\w)/i;
 /** "Keep" changes no mode by itself; require a file target, rather than behavior tests on hosts. */
-const KEPT_EXECUTABLE_FILE = /\b(?:files?|scripts?|programs?|binaries|it|them)\b[^;\n]*\bexecutable\b(?![-/\\]|\.\w)|\S+(?:[/\\]\S+|\.\w+)\s+executable\b(?![-/\\]|\.\w)/i;
+const KEPT_EXECUTABLE_FILE = /\b(?:files?|scripts?|programs?|binaries|it|them)\b[^;\n]*\bexecutable\b(?![-/\\]|\.\w)|\S+(?:[/\\]\S+|\.\w+)[`'"]?\s+executable\b(?![-/\\]|\.\w)/i;
 
 /* ------------------------------------------------------------------ */
 /* Rules: an operative verb, and the object that makes it impossible   */
