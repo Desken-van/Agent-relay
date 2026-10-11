@@ -491,6 +491,11 @@ function promptBudgetFor(lease: OrnithPromptPreflightInput['lease']): OrnithProm
   };
 }
 
+const ORNITH_REPAIR_INSTRUCTIONS = `If the evidence reports a failed verification, start by reading the failing file the evidence names,
+including a failing test, rather than re-reading every implementation file. Your own added tests can
+have incorrect expectations: when production already meets the acceptance criteria, fix the erroneous
+expectation in your own test instead of weakening correct production behavior.`;
+
 function authoritativePromptText(request: OrnithPromptPreflightInput): string {
   return [
     renderSpecification(request.specification),
@@ -498,7 +503,7 @@ function authoritativePromptText(request: OrnithPromptPreflightInput): string {
       ? `=== USER-ACCEPTED EXTERNAL PLAN-REVIEW ADDENDA ===\n${request.acceptedPlanReviewAddenda}`
       : null,
     request.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${request.ruleEvidence}` : null,
-    request.correctionFindings ? `=== EVIDENCE FROM THE PREVIOUS ATTEMPT ===\n${request.correctionFindings}` : null,
+    request.correctionFindings ? `=== REPAIR INSTRUCTION ===\n${ORNITH_REPAIR_INSTRUCTIONS}\n\n=== EVIDENCE FROM THE PREVIOUS ATTEMPT ===\n${request.correctionFindings}` : null,
     ORNITH_PROTOCOL_INSTRUCTIONS
   ]
     .filter((part): part is string => part !== null)

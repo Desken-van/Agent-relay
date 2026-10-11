@@ -977,6 +977,8 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(prompts[2]).toContain('FORMAT CORRECTION:');
     for (const prompt of prompts.slice(3)) expect(prompt).toContain('FORMAT CORRECTION:');
     expect(prompts[2]).toContain('rendering with priorities and escaping failed');
+    expect(prompts[0]).toContain('start by reading the failing file the evidence names');
+    expect(prompts[0]).toContain('expectation in your own test instead of weakening correct production behavior');
     expect(prompts[2]).toContain(view.replaceAll('\n', '\\n'));
     expect(prompts.join('\n')).not.toContain(rejected);
     expect(readFileSync(join(worktree, 'src/view.mjs'), 'utf8')).toBe(view);
