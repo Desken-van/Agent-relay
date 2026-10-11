@@ -76,6 +76,8 @@ describe('the Ornith instruction contract refuses', () => {
     ['Open a file handle, seek to the end and append the section.', 'file_operation'],
     ['Seek to the end of docs/manual-test.md.', 'file_operation'],
     ['Write raw bytes for the BOM.', 'file_operation'],
+    ['Write executable files to the release directory.', 'file_operation'],
+    ['Create executable binaries in dist.', 'file_operation'],
     ['Make scripts/check.sh executable.', 'file_operation'],
     ['Make src/executable-locator.ts executable.', 'file_operation'],
     ['Set the file executable.', 'file_operation'],

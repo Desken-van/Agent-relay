@@ -202,7 +202,7 @@ const TIED_RECORD = any(
 const BARE_RUN_ID = new RegExp(String.raw`\b${RUN_ID}\b`, 'i');
 
 const FILE_MECHANISM =
-  /\b(?:file\s+)?handles?\b|\bfile\s+descriptors?\b|\braw\s+bytes\b|\bbyte\s+stream\b|\bbinary\s+(?:data|content|bytes)\b|\b(?:file|unix|posix|execute|executable|write|read)\s+permissions?\b|\bmode\s+bits\b|\bexecutable\s+bits?\b|\bsymlinks?\b|\bsymbolic\s+links?\b|\bhard\s+links?\b|\bjunctions?\b|\bfile\s+locks?\b/i;
+  /\b(?:file\s+)?handles?\b|\bfile\s+descriptors?\b|\braw\s+bytes\b|\bbyte\s+stream\b|\bbinary\s+(?:data|content|bytes)\b|\b(?:file|unix|posix|execute|executable|write|read)\s+permissions?\b|\bmode\s+bits\b|\bexecutable\s+(?:bits?|files?|binaries|programs?)\b|\bsymlinks?\b|\bsymbolic\s+links?\b|\bhard\s+links?\b|\bjunctions?\b|\bfile\s+locks?\b/i;
 
 /** The adjective alone is not a mechanism: source filenames and runnable tests use it too. */
 const EXECUTABLE_MODE = /\bexecutable\b(?![-/\\]|\.\w)(?=$|[.!?;,]|\s+(?:on|for|by|with|using|and|before|after)\b)/i;
