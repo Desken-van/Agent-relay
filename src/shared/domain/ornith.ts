@@ -848,7 +848,15 @@ export function isOrnithToolDenialEventData(
 
 export type OrnithActionParseResult =
   | { readonly ok: true; readonly action: OrnithAction }
-  | { readonly ok: false; readonly code: OrnithDenialCode; readonly reason: string };
+  | {
+      readonly ok: false;
+      readonly code: OrnithDenialCode;
+      readonly reason: string;
+      readonly failureKind: 'empty' | 'oversized' | 'invalid_json' | 'schema';
+      readonly schemaFields?: readonly string[];
+      readonly invalidJsonShape?: 'markdown_fence' | 'object' | 'array' | 'text' | 'other';
+      readonly syntaxReason?: 'property_name' | 'property_value' | 'colon' | 'separator' | 'unterminated_string' | 'trailing_text' | 'other';
+    };
 
 /**
  * Parse one raw model completion into exactly one accepted action.
@@ -863,21 +871,34 @@ export type OrnithActionParseResult =
 export function parseOrnithCompletion(raw: string): OrnithActionParseResult {
   const trimmed = raw.trim();
   if (trimmed.length === 0) {
-    return { ok: false, code: 'malformed_output', reason: 'The completion was empty.' };
+    return { ok: false, code: 'malformed_output', reason: 'The completion was empty.', failureKind: 'empty' };
   }
   if (Buffer.byteLength(trimmed, 'utf8') > ORNITH_LIMITS.maxCompletionBytes) {
     return {
       ok: false,
       code: 'oversized_output',
-      reason: `The completion exceeded the ${ORNITH_LIMITS.maxCompletionBytes}-byte limit.`
+      reason: `The completion exceeded the ${ORNITH_LIMITS.maxCompletionBytes}-byte limit.`, failureKind: 'oversized'
     };
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(trimmed);
-  } catch {
-    return { ok: false, code: 'malformed_output', reason: 'The completion was not a single valid JSON document.' };
+  } catch (error) {
+    // Never expose JSON.parse's message: it may quote rejected text, paths or secrets.
+    const message = error instanceof SyntaxError ? error.message : '';
+    const syntaxReason = message.startsWith('Expected property name') || message.startsWith('Expected double-quoted property name') ? 'property_name'
+      : message.startsWith('Unexpected end') ? 'property_value'
+      : message.startsWith("Expected ':'") ? 'colon'
+      : message.startsWith("Expected ','") ? 'separator'
+      : message.startsWith('Unterminated string') ? 'unterminated_string'
+      : message.startsWith('Unexpected non-whitespace character after JSON') ? 'trailing_text' : 'other';
+    return {
+      ok: false, code: 'malformed_output', reason: 'The completion was not a single valid JSON document.',
+      failureKind: 'invalid_json', syntaxReason,
+      invalidJsonShape: trimmed.startsWith('```') ? 'markdown_fence' : trimmed.startsWith('{') ? 'object'
+        : trimmed.startsWith('[') ? 'array' : /^[A-Za-z]/.test(trimmed) ? 'text' : 'other'
+    };
   }
 
   const result = ornithActionSchema.safeParse(parsed);
@@ -885,7 +906,16 @@ export function parseOrnithCompletion(raw: string): OrnithActionParseResult {
     return {
       ok: false,
       code: 'malformed_output',
-      reason: 'The completion did not match the Ornith action schema.'
+      reason: 'The completion did not match the Ornith action schema.',
+      failureKind: 'schema',
+      // Only protocol field names, never issue messages, unknown keys or input values.
+      schemaFields: [...new Set(result.error.issues.map((issue) => {
+        const knownFields = new Set(['version', 'action', 'prefix', 'limit', 'cursor', 'path', 'offset',
+          'query', 'caseSensitive', 'files', 'content', 'sha256', 'replacements', 'oldText', 'newText',
+          'paths', 'summary', 'reason', 'allowLineEndingChange']);
+        return issue.path.slice(0, 4).map((part) => typeof part === 'number' ? '[]'
+          : typeof part === 'string' && knownFields.has(part) ? part : '?').join('.') || '(object)';
+      }))].slice(0, 12)
     };
   }
   return { ok: true, action: result.data };

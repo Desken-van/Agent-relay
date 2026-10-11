@@ -491,6 +491,11 @@ function promptBudgetFor(lease: OrnithPromptPreflightInput['lease']): OrnithProm
   };
 }
 
+const ORNITH_REPAIR_INSTRUCTIONS = `If the evidence reports a failed verification, start by reading the failing file the evidence names,
+including a failing test, rather than re-reading every implementation file. Your own added tests can
+have incorrect expectations: when production already meets the acceptance criteria, fix the erroneous
+expectation in your own test instead of weakening correct production behavior.`;
+
 function authoritativePromptText(request: OrnithPromptPreflightInput): string {
   return [
     renderSpecification(request.specification),
@@ -498,7 +503,7 @@ function authoritativePromptText(request: OrnithPromptPreflightInput): string {
       ? `=== USER-ACCEPTED EXTERNAL PLAN-REVIEW ADDENDA ===\n${request.acceptedPlanReviewAddenda}`
       : null,
     request.ruleEvidence ? `=== IMMUTABLE PROJECT RULE EVIDENCE ===\n${request.ruleEvidence}` : null,
-    request.correctionFindings ? `=== EVIDENCE FROM THE PREVIOUS ATTEMPT ===\n${request.correctionFindings}` : null,
+    request.correctionFindings ? `=== REPAIR INSTRUCTION ===\n${ORNITH_REPAIR_INSTRUCTIONS}\n\n=== EVIDENCE FROM THE PREVIOUS ATTEMPT ===\n${request.correctionFindings}` : null,
     ORNITH_PROTOCOL_INSTRUCTIONS
   ]
     .filter((part): part is string => part !== null)
@@ -564,7 +569,8 @@ function buildOrnithPromptText(
     validationBytes: number;
     changedFiles: number;
   },
-  promptBudget: OrnithPromptBudget
+  promptBudget: OrnithPromptBudget,
+  formatCorrectionRequired = false
 ): string | null {
   const authoritative = authoritativePromptText(request);
 
@@ -583,7 +589,14 @@ Changed files remaining: ${remaining.changedFiles}
 Maximum retained tool-result bytes: ${promptBudget.maxToolResultBytes}
 Round ${request.round} of at most ${request.maxRounds}.`;
 
-  const fixedTail = `${budget}\n\nReply with exactly one JSON action now.`;
+  // Fixed feedback only: rejected text is neither history nor a tool result, and never replayed.
+  const replyInstruction = formatCorrectionRequired
+    ? 'FORMAT CORRECTION: A reply in this run was rejected because it was not a single valid JSON document. ' +
+      'No action from that reply was executed. Every subsequent reply must be exactly one JSON action matching the protocol above. ' +
+      'Do not explain your reasoning or use Markdown. Use the prior tool results to choose your next action; ' +
+      'already applied changes remain applied and must not be repeated.'
+    : 'Reply with exactly one JSON action now.';
+  const fixedTail = `${budget}\n\n${replyInstruction}`;
   const fixedBytes = Buffer.byteLength(`${authoritative}\n\n${fixedTail}`, 'utf8');
   if (fixedBytes > promptBudget.maxPromptBytes) return null;
   const rollingByteBudget = Math.min(
@@ -624,7 +637,7 @@ Round ${request.round} of at most ${request.maxRounds}.`;
       .join('\n')}`;
   }
 
-  const full = [authoritative, history, budget, 'Reply with exactly one JSON action now.']
+  const full = [authoritative, history, budget, replyInstruction]
     .filter((part) => part.length > 0)
     .join('\n\n');
 
@@ -632,7 +645,7 @@ Round ${request.round} of at most ${request.maxRounds}.`;
     ? // The rolling section alone pushed it over; drop history entirely and
       // retry with just the authoritative content and budget, which was
       // already proven to fit above.
-      [authoritative, budget, 'Reply with exactly one JSON action now.'].join('\n\n')
+      [authoritative, budget, replyInstruction].join('\n\n')
     : full;
 }
 
@@ -925,6 +938,8 @@ export class OrnithImplementationService {
 
     const rolling: RollingResult[] = [];
     let turnsUsed = 0;
+    // At most one resample per whole loop, consuming an ordinary model turn. Never retries dispatch.
+    let formatCorrectionUsed = false;
     let nonterminalActionsUsed = 0;
     let verificationsUsed = 0;
     let cumulativeReadBytes = 0;
@@ -1125,7 +1140,7 @@ export class OrnithImplementationService {
         writeBytes: Math.max(0, ORNITH_LIMITS.maxCumulativeWriteBytes - cumulativeWriteBytes),
         validationBytes: Math.max(0, ORNITH_LIMITS.maxCumulativeMutationValidationBytes - tools.validationReadBytesUsed()),
         changedFiles: Math.max(0, ORNITH_LIMITS.maxChangedFiles - tools.changedFileCount())
-      }, promptBudget);
+      }, promptBudget, formatCorrectionUsed);
       if (promptText === null) {
         return finish(
           'fail',
@@ -1202,6 +1217,17 @@ export class OrnithImplementationService {
 
       const parsed = parseOrnithCompletion(response.completion);
       if (!parsed.ok) {
+        request.onProgress({
+          type: 'progress',
+          text: `Ornith output rejected: ${parsed.reason}`,
+          data: {
+            kind: 'ornith_completion_rejected', turn: turnsUsed, code: parsed.code,
+            failureKind: parsed.failureKind, invalidJsonShape: parsed.invalidJsonShape, syntaxReason: parsed.syntaxReason, schemaFields: parsed.schemaFields ?? [],
+            completionBytes: Buffer.byteLength(response.completion, 'utf8'),
+            finishReason: response.finishReason.kind,
+            promptTokens: response.promptTokens, completionTokens: response.completionTokens
+          }
+        });
         if (response.finishReason.kind === 'length') {
           return finish(
             'fail',
@@ -1211,7 +1237,14 @@ export class OrnithImplementationService {
             ['limit_output_exceeded']
           );
         }
-        return finish('fail', 'Ornith returned output that could not be accepted.', 'configuration', [parsed.code]);
+        // Schema refusals (including unsafe paths/prose), oversized and truncated replies stay terminal.
+        // The strict parser has accepted NO action here, so no rejected mutation can be executed twice.
+        if (parsed.failureKind === 'invalid_json' && !formatCorrectionUsed && turnsUsed < ORNITH_LIMITS.maxModelTurns) {
+          formatCorrectionUsed = true;
+          request.onProgress({ type: 'progress', text: 'Ornith will make one format-correction attempt within the remaining turn and time budgets.' });
+          continue;
+        }
+        return finish('fail', `Ornith returned output that could not be accepted. ${parsed.reason}`, 'configuration', [parsed.code]);
       }
       const action = parsed.action;
 

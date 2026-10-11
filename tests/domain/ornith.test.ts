@@ -588,12 +588,53 @@ describe('parseOrnithCompletion', () => {
     if (!result.ok) expect(result.code).toBe('oversized_output');
   });
 
-  it('never asks for repair: malformed output is terminal, not retried', () => {
+  it('rejects malformed output without extracting or executing an action', () => {
     // Enforced by contract, not by this test alone: parseOrnithCompletion has
     // no retry/repair path and returns a denial code on the first parse.
     const result = parseOrnithCompletion('not json at all');
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.code).toBe('malformed_output');
+  });
+});
+
+describe('safe completion diagnostics', () => {
+  it.each([
+    [' ', 'empty'],
+    ['```json\n{"version":1,"action":"git_status"}\n```', 'invalid_json'],
+    ['{"version":1,"action":"read_file","path":"src/file.js"}', 'schema'],
+    ['x'.repeat(ORNITH_LIMITS.maxCompletionBytes + 1), 'oversized']
+  ])('classifies a refusal as %s without including the rejected text', (raw, expected) => {
+    const parsed = parseOrnithCompletion(raw);
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.failureKind).toBe(expected);
+  });
+
+  it('reports only fixed protocol fields for missing/invalid fields, never unknown keys or values', () => {
+    const sensitive = '/home/private/sk-sensitive-value';
+    const parsed = parseOrnithCompletion(JSON.stringify({
+      version: 1, action: 'replace_text', path: sensitive, sha256: sensitive,
+      replacements: [{ oldText: 17, newText: sensitive, [sensitive]: sensitive }], [sensitive]: sensitive
+    }));
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.failureKind).toBe('schema');
+    expect(parsed.schemaFields).toContain('sha256');
+    expect(parsed.schemaFields).toContain('replacements.[].oldText');
+    expect(JSON.stringify(parsed)).not.toContain(sensitive);
+  });
+
+  it.each([
+    ['```json\n{"action":"git_status"}\n```', 'markdown_fence', 'other'],
+    ['{"a":"/home/private"} /home/private', 'object', 'trailing_text'],
+    ['{"a":"/home/private" "b":1}', 'object', 'separator'],
+    ['credential-shaped prose /home/private', 'text', 'other']
+  ])('reports bounded JSON syntax facts without JSON.parse error text', (raw, shape, syntaxReason) => {
+    const parsed = parseOrnithCompletion(raw);
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.invalidJsonShape).toBe(shape);
+    expect(parsed.syntaxReason).toBe(syntaxReason);
+    expect(JSON.stringify(parsed)).not.toContain('/home/private');
   });
 });
 

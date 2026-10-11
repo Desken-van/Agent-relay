@@ -126,6 +126,12 @@ const DIAGNOSTIC_LINE = /AssertionError|\berror TS\d{4,5}\b|✖ \d+ problems?|\b
 const SYNTAX_ERROR_LINE = /\bSyntaxError:/;
 const LOCATION_LINE = /^\s*(?:#\s)?[^\s:]+:\d+$/;
 const LOCATION_LOOKBACK_LINES = 5;
+// node:test's TAP location precedes its assertion details; spec prints "test at ...".
+// Preserve that already-relativized location with the assertion, also on re-summarization.
+const ASSERTION_ERROR_LINE = /\bAssertionError\b/;
+const ASSERTION_LOCATION_LINE = /^\s*(?:location:\s*['"]?[^'"\n]+:\d+:\d+['"]?|test at [^\n]+:\d+(?::\d+)?)\s*$/;
+const ASSERTION_LOCATION_LOOKBACK_LINES = 32;
+const NODE_TEST_BOUNDARY_LINE = /^\s*(?:#\s*)?(?:ok|not ok)\s+\d+\b|^\s*#\s*Subtest:/;
 const SUMMARY_LINE_MAX = 200;
 const SUMMARY_TAIL_LINES = 8;
 const SUMMARY_FAILING_LINES = 6;
@@ -209,16 +215,21 @@ export function summarizeVerificationOutput(
 }
 
 /**
- * The lines that state an error, each SyntaxError preceded by the location Node printed for it: without it a
- * repair round is told that a name is declared twice but not in which file.
+ * Error lines together with the location Node printed for a SyntaxError or assertion: otherwise a repair
+ * round is told what failed but loses which project file to read. Only sanitized, bounded lines enter here.
  */
 function diagnosticLines(lines: readonly string[]): string[] {
   const picked: string[] = [];
   lines.forEach((line, index) => {
     if (!DIAGNOSTIC_LINE.test(line)) return;
-    if (SYNTAX_ERROR_LINE.test(line)) {
-      for (let back = index - 1; back >= Math.max(0, index - LOCATION_LOOKBACK_LINES); back -= 1) {
-        if (LOCATION_LINE.test(lines[back]!)) {
+    const syntax = SYNTAX_ERROR_LINE.test(line);
+    const assertion = ASSERTION_ERROR_LINE.test(line);
+    if (syntax || assertion) {
+      const lookback = syntax ? LOCATION_LOOKBACK_LINES : ASSERTION_LOCATION_LOOKBACK_LINES;
+      const location = syntax ? LOCATION_LINE : ASSERTION_LOCATION_LINE;
+      for (let back = index - 1; back >= Math.max(0, index - lookback); back -= 1) {
+        if (assertion && NODE_TEST_BOUNDARY_LINE.test(lines[back]!)) break;
+        if (location.test(lines[back]!)) {
           picked.push(lines[back]!);
           break;
         }
@@ -262,8 +273,21 @@ function relativizeWorktreePaths(text: string, roots: readonly string[]): string
     return url;
   });
   for (const slashed of slashedRoots) {
-    for (const spelling of new Set([`${slashed}/`, `${slashed.replace(/\//g, '\\')}\\`])) {
-      result = result.replace(new RegExp(escapeRegExp(spelling), /^[A-Za-z]:/.test(slashed) ? 'gi' : 'g'), '');
+    const windows = /^[A-Za-z]:/.test(slashed);
+    const native = `${slashed.replace(/\//g, '\\')}\\`;
+    // TAP quotes Windows locations as YAML and doubles each separator. Match only a
+    // supplied worktree root, then normalize its relative suffix for the POSIX tool protocol.
+    for (const spelling of new Set([`${slashed}/`, native, ...(windows ? [native.replace(/\\/g, '\\\\')] : [])])) {
+      if (windows) {
+        const path = new RegExp(`${escapeRegExp(spelling)}[^\\s)\\]}"'>,;]*`, 'gi');
+        result = result.replace(path, (match) => {
+          const relative = match.slice(spelling.length).replace(/\\+/g, '/');
+          if (relative.split('/').some((segment) => segment === '.' || segment === '..')) return '[absolute-path-omitted]';
+          return relative;
+        });
+      } else {
+        result = result.replace(new RegExp(escapeRegExp(spelling), 'g'), '');
+      }
     }
   }
   return result;
