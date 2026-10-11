@@ -205,7 +205,7 @@ const FILE_MECHANISM =
   /\b(?:file\s+)?handles?\b|\bfile\s+descriptors?\b|\braw\s+bytes\b|\bbyte\s+stream\b|\bbinary\s+(?:data|content|bytes)\b|\b(?:file|unix|posix|execute|executable|write|read)\s+permissions?\b|\bmode\s+bits\b|\bexecutable\s+bits?\b|\bsymlinks?\b|\bsymbolic\s+links?\b|\bhard\s+links?\b|\bjunctions?\b|\bfile\s+locks?\b/i;
 
 /** The adjective alone is not a mechanism: source filenames and runnable tests use it too. */
-const EXECUTABLE_MODE = /\bexecutable\b(?![-/\\]|\.\w)/i;
+const EXECUTABLE_MODE = /\bexecutable\b(?![-/\\]|\.\w)(?=$|[.!?;,]|\s+(?:on|for|by|with|using|and|before|after)\b)/i;
 /** "Keep" changes no mode by itself; require a file target, rather than behavior tests on hosts. */
 const KEPT_EXECUTABLE_FILE = /\b(?:files?|scripts?|programs?|binaries|it|them)\b[^;\n]*\bexecutable\b(?![-/\\]|\.\w)|\S+(?:[/\\]\S+|\.\w+)[`'"]?\s+executable\b(?![-/\\]|\.\w)/i;
 
@@ -252,7 +252,7 @@ const RULES: readonly Rule[] = [
   { category: 'command', verbs: ['open', 'use', 'launch', 'start'], objects: [TERMINAL] },
   { category: 'command', verbs: ['build', 'compile', 'lint', 'typecheck'], objects: [BUILDABLE] },
   { category: 'file_operation', verbs: ['seek', 'flush', 'chmod', 'chown', 'symlink', 'truncate', 'mount', 'unmount'] },
-  { category: 'file_operation', verbs: ['make', 'set', 'change'], objects: [EXECUTABLE_MODE] },
+  { category: 'file_operation', verbs: ['make', 'set', 'change', 'mark'], objects: [EXECUTABLE_MODE, KEPT_EXECUTABLE_FILE] },
   { category: 'file_operation', verbs: ['keep'], objects: [KEPT_EXECUTABLE_FILE] },
   {
     category: 'file_operation',
