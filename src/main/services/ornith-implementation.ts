@@ -565,7 +565,7 @@ function buildOrnithPromptText(
     changedFiles: number;
   },
   promptBudget: OrnithPromptBudget,
-  formatCorrectionPending = false
+  formatCorrectionRequired = false
 ): string | null {
   const authoritative = authoritativePromptText(request);
 
@@ -585,9 +585,9 @@ Maximum retained tool-result bytes: ${promptBudget.maxToolResultBytes}
 Round ${request.round} of at most ${request.maxRounds}.`;
 
   // Fixed feedback only: rejected text is neither history nor a tool result, and never replayed.
-  const replyInstruction = formatCorrectionPending
-    ? 'FORMAT CORRECTION: Your previous reply was rejected because it was not a single valid JSON document. ' +
-      'No action from that reply was executed. Reply with exactly one JSON action matching the protocol above. ' +
+  const replyInstruction = formatCorrectionRequired
+    ? 'FORMAT CORRECTION: A reply in this run was rejected because it was not a single valid JSON document. ' +
+      'No action from that reply was executed. Every subsequent reply must be exactly one JSON action matching the protocol above. ' +
       'Do not explain your reasoning or use Markdown. Use the prior tool results to choose your next action; ' +
       'already applied changes remain applied and must not be repeated.'
     : 'Reply with exactly one JSON action now.';
@@ -935,7 +935,6 @@ export class OrnithImplementationService {
     let turnsUsed = 0;
     // At most one resample per whole loop, consuming an ordinary model turn. Never retries dispatch.
     let formatCorrectionUsed = false;
-    let formatCorrectionPending = false;
     let nonterminalActionsUsed = 0;
     let verificationsUsed = 0;
     let cumulativeReadBytes = 0;
@@ -1136,7 +1135,7 @@ export class OrnithImplementationService {
         writeBytes: Math.max(0, ORNITH_LIMITS.maxCumulativeWriteBytes - cumulativeWriteBytes),
         validationBytes: Math.max(0, ORNITH_LIMITS.maxCumulativeMutationValidationBytes - tools.validationReadBytesUsed()),
         changedFiles: Math.max(0, ORNITH_LIMITS.maxChangedFiles - tools.changedFileCount())
-      }, promptBudget, formatCorrectionPending);
+      }, promptBudget, formatCorrectionUsed);
       if (promptText === null) {
         return finish(
           'fail',
@@ -1211,7 +1210,6 @@ export class OrnithImplementationService {
         );
       }
 
-      formatCorrectionPending = false;
       const parsed = parseOrnithCompletion(response.completion);
       if (!parsed.ok) {
         request.onProgress({
@@ -1238,7 +1236,6 @@ export class OrnithImplementationService {
         // The strict parser has accepted NO action here, so no rejected mutation can be executed twice.
         if (parsed.failureKind === 'invalid_json' && !formatCorrectionUsed) {
           formatCorrectionUsed = true;
-          formatCorrectionPending = true;
           request.onProgress({ type: 'progress', text: 'Ornith will make one format-correction attempt within the remaining turn and time budgets.' });
           continue;
         }

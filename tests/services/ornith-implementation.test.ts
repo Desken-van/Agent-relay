@@ -975,6 +975,7 @@ describe('OrnithImplementationService limits and cancellation', () => {
     expect(result.ornithAudit.verificationAttempts[0]?.outcome).toBe('passed');
     expect(verify).toHaveBeenCalledTimes(1);
     expect(prompts[2]).toContain('FORMAT CORRECTION:');
+    for (const prompt of prompts.slice(3)) expect(prompt).toContain('FORMAT CORRECTION:');
     expect(prompts[2]).toContain('rendering with priorities and escaping failed');
     expect(prompts[2]).toContain(view.replaceAll('\n', '\\n'));
     expect(prompts.join('\n')).not.toContain(rejected);

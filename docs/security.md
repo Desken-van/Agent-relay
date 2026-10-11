@@ -590,7 +590,8 @@ Git ref/revision/option. Parsing is intolerant by design: the whole trimmed
 completion is handed to `JSON.parse` once, with no Markdown-fence stripping,
 no substring recovery. A syntactically invalid JSON reply may consume exactly
 one format-correction turn per implementation loop: fixed feedback asks for a
-new action using the existing tool results; the rejected text is never replayed
+new action using the existing tool results. The reminder stays for subsequent
+turns without granting another retry; the rejected text is never replayed
 or dispatched. The correction uses the same turn, prompt, output and deadline
 budgets and checkout/lease checks. Empty, oversized, token-truncated or
 schema-invalid replies (including unknown actions, extra properties and unsafe
