@@ -7,6 +7,7 @@
  * which would block every round.
  */
 
+import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closeDatabase, openDatabase, type Db } from '../../src/main/db/database';
 import { SqliteSettingsRepository } from '../../src/main/db/repositories/settings-repository';
@@ -391,11 +392,11 @@ describe('external review settings that no round could satisfy', () => {
     const saved = store.update({
       externalCodeReviewEnabled: true,
       localInferenceReleaseBeforeVerification: true,
-      coaiMcpExecutablePath: 'C:\\tools\\coai-mcp.exe'
+      coaiMcpExecutablePath: resolve('tools', 'coai-mcp.exe')
     });
 
     expect(saved.externalCodeReviewEnabled).toBe(true);
-    expect(store.get().coaiMcpExecutablePath).toBe('C:\\tools\\coai-mcp.exe');
+    expect(store.get().coaiMcpExecutablePath).toBe(resolve('tools', 'coai-mcp.exe'));
   });
 
   it('keeps refusing both integrations off with no executable as perfectly fine', () => {

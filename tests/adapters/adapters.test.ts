@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ClaudeCliAdapter,
   destructiveToolDenyRules
@@ -911,6 +911,7 @@ describe('GitHub adapter diagnostics', () => {
 /* -------------------------------------------------------------------------- */
 
 describe('executable locator', () => {
+  afterEach(() => vi.restoreAllMocks());
   it('returns null for a configured path that does not exist', () => {
     expect(locateExecutable('claude', { configuredPath: 'C:\\nope\\claude.exe' })).toBeNull();
   });
@@ -936,6 +937,7 @@ describe('executable locator', () => {
   });
 
   it('resolves a WinGet-installed Claude when PATH does not have it', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     // The exact case a stale process hits: WinGet appended the package
     // directory to PATH after this process inherited its environment.
     const root = mkdtempSync(join(tmpdir(), 'agent-relay-winget-'));
@@ -958,6 +960,7 @@ describe('executable locator', () => {
   });
 
   it('ignores unrelated WinGet packages, and nested executables', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     const root = mkdtempSync(join(tmpdir(), 'agent-relay-winget-'));
     try {
       const packages = join(root, 'Microsoft', 'WinGet', 'Packages');
@@ -1030,6 +1033,7 @@ describe('executable locator', () => {
   });
 
   it('prefers PATH over the WinGet package directory', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     const root = mkdtempSync(join(tmpdir(), 'agent-relay-winget-'));
     try {
       const packages = join(root, 'Microsoft', 'WinGet', 'Packages');
@@ -1050,6 +1054,7 @@ describe('executable locator', () => {
   });
 
   it('looks in the WinGet Links directory', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     // The official Claude Code package installs a shim here and appends the
     // directory to PATH, which an already-running shell will not have picked up.
     const candidates = wellKnownWindowsLocations('claude');
@@ -1065,6 +1070,7 @@ describe('executable locator', () => {
   });
 
   it('scans the WinGet Packages directory only for claude, and only when bounded', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     const root = mkdtempSync(join(tmpdir(), 'agent-relay-winget-'));
     try {
       const packages = join(root, 'Microsoft', 'WinGet', 'Packages');
@@ -1075,7 +1081,7 @@ describe('executable locator', () => {
       // Only `claude` triggers the package scan; other tools do not get one.
       expect(
         wellKnownWindowsLocations('gh', { LOCALAPPDATA: root }).some((c) =>
-          c.includes('WinGet\\Packages')
+          c.includes(join('WinGet', 'Packages'))
         )
       ).toBe(false);
 
@@ -1108,6 +1114,7 @@ describe('executable locator', () => {
   });
 
   it('still looks in the native ~/.local/bin location', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     expect(wellKnownWindowsLocations('claude')).toContain(
       join(homedir(), '.local', 'bin', 'claude.exe')
     );

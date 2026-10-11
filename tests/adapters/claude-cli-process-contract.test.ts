@@ -420,7 +420,8 @@ describe('a stream that does not arrive in tidy lines', () => {
     worktrees.push(tree);
 
     const lines = [
-      JSON.stringify(claudeStream.init(tree.path)),
+      // Resolve the placeholder before fragmenting; the fake expands each write separately.
+      JSON.stringify(claudeStream.init(tree.path)).replace('{{sessionId}}', 'sess-fragmented'),
       JSON.stringify(claudeStream.assistantText('Working.')),
       JSON.stringify(claudeStream.toolUse('toolu_1', 'Bash', { command: 'npm run verify' })),
       JSON.stringify(claudeStream.toolResult('toolu_1')),

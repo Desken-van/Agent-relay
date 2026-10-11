@@ -6,6 +6,8 @@
  * GitHub call is made anywhere in the test suite.
  */
 
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { ToolDiagnostic } from '../../src/shared/domain/diagnostics';
 import type { GitChangeSet, RepositoryInfo, WorktreeInfo } from '../../src/shared/domain/git';
 import type { SpecificationGrounding } from '../../src/shared/domain/specification-grounding';
@@ -333,7 +335,7 @@ export function makeGrounding(overrides: Partial<SpecificationGrounding> = {}): 
 export function makeRepositoryInfo(overrides: Partial<RepositoryInfo> = {}): RepositoryInfo {
   return {
     isRepository: true,
-    root: 'C:\\repo',
+    root: join(tmpdir(), 'agent-relay-fake-repo'),
     currentBranch: 'main',
     defaultBranchGuess: 'main',
     branches: ['main'],

@@ -158,7 +158,7 @@ describe('durable external plan review gate', () => {
     });
     expect(value.reviewer.reviewCalls[0]?.planText).toContain(rules.sha256);
     expect(value.reviewer.openCalls[0]).toEqual({
-      repositoryPath: 'C:\\repo',
+      repositoryPath: value.harness.projects.findById(task.projectId)!.localPath,
       branch: task.branchName
     });
   });
