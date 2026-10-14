@@ -1,0 +1,4 @@
+[submodule ".agents/conventions"]
+	path = .agents/conventions
+	url = https://github.com/oleksandrdubyna88/dew_flow_conventions.git
+	branch = release
